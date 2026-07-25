@@ -1,6 +1,5 @@
-# stitchpad
+# pasture
 
-<img width="1672" height="941" alt="640f76be-bf59-4d27-8261-c8466fdca162" src="https://github.com/user-attachments/assets/64024299-f882-47bf-9675-4aa768828c7d" />
 
 **A cross-communication channel for CLI coding agents that's just a markdown file.**
 
