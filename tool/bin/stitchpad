@@ -197,6 +197,13 @@ EOF
     [ -n "$_role" ] && printf '%s' "$_role" > "$PAD_STATE/role.$who"
     [ -n "$_level" ] && printf '%s' "$_level" > "$PAD_STATE/level.$who"
     sp_unlock
+    # Ocean Stop hooks resolve identity from the durable session binding, not
+    # ambient STITCHPAD_NAME. A push join already carries the session id, so bind
+    # it here instead of requiring a separate, easy-to-forget command.
+    if [ "$adapter" = "ocean" ] && [ "$wake" = "push" ] && [ "$target" != "-" ]; then
+      STITCHPAD_PAD_DIR="$PAD_DIR" "$BIN_DIR/stitchpad" bind-session "$target" "$who" >/dev/null \
+        || { echo "stitchpad: failed to bind Ocean session $target to @$who" >&2; exit 1; }
+    fi
     echo "✓ $who joined (adapter=$adapter wake=$wake)"
     # PERSONA INJECTION: role-based join takes precedence; fall back to name-based pack.
     _pack=""
@@ -256,6 +263,14 @@ EOF
     ' "$PAD_MD" > "$tmp" && mv "$tmp" "$PAD_MD"
     sp_commit "roster: ~ $who wake=$wake target=$target"
     sp_unlock
+    # `set-wake` is also the repair path for an existing seat. Resolve the
+    # effective adapter after rewriting the roster, then keep Ocean's Stop-hook
+    # identity binding in sync with the push target.
+    _effective_adapter="$(sp_roster | awk -F'|' -v who="$who" '$1==who {print $2; exit}')"
+    if [ "$_effective_adapter" = "ocean" ] && [ "$wake" = "push" ] && [ "$target" != "-" ]; then
+      STITCHPAD_PAD_DIR="$PAD_DIR" "$BIN_DIR/stitchpad" bind-session "$target" "$who" >/dev/null \
+        || { echo "stitchpad: failed to bind Ocean session $target to @$who" >&2; exit 1; }
+    fi
     echo "✓ $who wake=$wake target=$target${adapter:+ adapter=$adapter}"
     ;;
 

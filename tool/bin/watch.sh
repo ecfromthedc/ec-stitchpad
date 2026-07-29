@@ -146,11 +146,24 @@ react() {
     # overwrite, do not fire a newer mention over an unresolved one.
     # The existing pending ordinal will be resolved by the stop-hook;
     # the next watcher cycle then handles the new mention naturally.
+    # Ocean push turns are durably accepted by ocean-daemon and the adapter waits
+    # for that exact turn to finish. They do not need the shell-level
+    # consumed-but-not-displayed recovery stamp: keeping one makes the normal
+    # Ocean Stop hook force-deliver the same mention a second time. Retain crash
+    # recovery for terminal adapters, but make daemon-owned delivery exactly-once.
+    local needs_pending_recovery=1
+    if [ "$adapter" = "ocean" ]; then
+      needs_pending_recovery=0
+      # Self-heal stamps left by older watchers so an old mention cannot replay.
+      rm -f "$PAD_STATE/pending.$name" "$PAD_STATE/delivered_no_reply.$name" 2>/dev/null || true
+    fi
     _existing_pending=0
-    [ -f "$PAD_STATE/pending.$name" ] && _existing_pending="$(cat "$PAD_STATE/pending.$name" 2>/dev/null || echo 0)"
-    if [ "${_existing_pending:-0}" -gt 0 ]; then
-      echo "[stitchpad] deferring @$name — pending recovery target (ordinal $_existing_pending) unresolved" >&2
-      continue
+    if [ "$needs_pending_recovery" -eq 1 ] && [ -f "$PAD_STATE/pending.$name" ]; then
+      _existing_pending="$(cat "$PAD_STATE/pending.$name" 2>/dev/null || echo 0)"
+      if [ "${_existing_pending:-0}" -gt 0 ]; then
+        echo "[stitchpad] deferring @$name — pending recovery target (ordinal $_existing_pending) unresolved" >&2
+        continue
+      fi
     fi
 
     if [ -n "$("$BIN_DIR/stitchpad" wake "$name" --peek 2>/dev/null)" ]; then
@@ -160,9 +173,11 @@ react() {
       # reads this ordinal and re-presents the mention via --force.
       # Uses --peek-ordinal (gate-derived, NEVER consumed) so the stamp
       # is always the SAME ordinal the wake saw — not a shifted cursor.
-      _pend_ord="$("$BIN_DIR/stitchpad" wake "$name" --peek-ordinal 2>/dev/null)"
-      if [ -n "$_pend_ord" ]; then
-        printf '%s' "$_pend_ord" > "$PAD_STATE/pending.$name"
+      if [ "$needs_pending_recovery" -eq 1 ]; then
+        _pend_ord="$("$BIN_DIR/stitchpad" wake "$name" --peek-ordinal 2>/dev/null)"
+        if [ -n "$_pend_ord" ]; then
+          printf '%s' "$_pend_ord" > "$PAD_STATE/pending.$name"
+        fi
       fi
       # Pass the current seen cursor to fire_adapter so sp_latest_to returns
       # the same mention that sp_engagement found (FIFO-aligned).

@@ -409,4 +409,54 @@ fi
 	[ "${_failcount:-0}" -ge 2 ] \
 	  || fail "invariant5: expected >=2 adapter-failure calls, got $_failcount"
 
+
+	# Regression 13: Ocean push delivery is daemon-durable and must not create a
+	# pending crash-recovery stamp. Such a stamp makes the normal Ocean Stop hook
+	# force-deliver the same mention again. Also prove that joining with an Ocean
+	# session target automatically writes the Stop-hook identity binding.
+	case13="$tmp/case13"
+	mkdir "$case13"
+	cd "$case13"
+	"$SP" init --name case13 >/dev/null
+	"$SP" join agent ocean push ocean-session >/dev/null
+	stop_watcher "$case13"
+	rm -f "$case13/.stitchpad/.state/alive.agent"
+	[ "$(cat "$case13/.stitchpad/.state/sessions/ocean-session" 2>/dev/null)" = "agent" ] \
+	  || fail 'ocean join did not bind push session identity'
+
+	# Fake the daemon status probe and heartbeat binary: idle session + successful
+	# durable turn delivery, without touching the operator's live daemon.
+	mockbin="$case13/mockbin"
+	mkdir "$mockbin"
+	cat > "$mockbin/curl" <<'EOF'
+#!/usr/bin/env bash
+printf '{"session":{"active_turn":null}}\n'
+EOF
+	cat > "$mockbin/ocean-heartbeat" <<'EOF'
+#!/usr/bin/env bash
+exit 0
+EOF
+	chmod +x "$mockbin/curl" "$mockbin/ocean-heartbeat"
+
+	STITCHPAD_NAME=sender "$SP" say '@agent exactly once over ocean push' >/dev/null
+	PATH="$mockbin:$PATH" "$SP" watch > "$case13/watcher.out" 2>&1 &
+	WATCH_PID=$!
+	sleep 0.5
+	printf '\n' >> "$case13/.stitchpad/stitchpad.md"
+	for _ in 1 2 3 4 5 6 7 8 9 10; do
+	  [ "$(cat "$case13/.stitchpad/.state/seen.agent" 2>/dev/null || echo 0)" -eq 1 ] && break
+	  sleep 0.5
+	done
+	kill -9 $WATCH_PID 2>/dev/null || true
+	wait $WATCH_PID 2>/dev/null || true
+	pkill -9 -f "fswatch.*$case13" 2>/dev/null || true
+	rm -rf "$case13/.stitchpad/.state/watch.lock.d" 2>/dev/null || true
+
+	grep -q 'unanswered @agent -> firing ocean (push)' "$case13/watcher.out" \
+	  || fail 'ocean exactly-once branch did not fire adapter'
+	[ "$(cat "$case13/.stitchpad/.state/seen.agent" 2>/dev/null || echo 0)" -eq 1 ] \
+	  || fail 'ocean successful delivery did not consume seen cursor'
+	[ ! -f "$case13/.stitchpad/.state/pending.agent" ] \
+	  || fail 'ocean successful delivery left replay-causing pending stamp'
+
 	printf 'wake regression ok\n'
