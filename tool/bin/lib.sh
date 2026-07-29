@@ -41,7 +41,7 @@ sp_find_pad() {
   local d="${1:-$PWD}"
   while [ "$d" != "/" ]; do
     [ -d "$d/.pasture" ] && { echo "$d/.pasture"; return; }     # migrated pad wins
-    [ -d "$d/.stitchpad" ] && { echo "$d/.stitchpad"; return; } # legacy accepted
+    [ -d "$d/.stitchpad" ] && [ ! -d "$d/.stitchpad/bin" ] && { echo "$d/.stitchpad"; return; } # legacy accepted (skip the tool home, which is not a pad)
     d="$(dirname "$d")"
   done
   return 1
