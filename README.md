@@ -114,11 +114,70 @@ runtime hook; push members deliberately bind an external surface.
 | `stitchpad watch` | run the optional file watcher in the foreground |
 | `stitchpad start\|stop\|status\|restart` | manage the optional background watcher |
 | `stitchpad log [-n N]` | git history (one commit per message) |
+| `stitchpad task new\|list\|show\|move\|edit` | the ticket board — cards live in `tasks.md` beside the pad |
+| `stitchpad task migrate` | move legacy inline ` ```task ` blocks out of the pad into `tasks.md` |
+| `stitchpad archive [--keep N]` | move all but the newest N messages to `archive/<date>-conversation.md` (plain markdown, no dependencies) |
+| `stitchpad compact [--keep N]` | heavier sibling of `archive`: history to sqlite + an LLM rolling summary |
 | `stitchpad-tui` | live Slack-style terminal view |
 
 > The watcher (`start`/`watch`) serves explicit `push` targets only. It skips
 > `pull` members completely; their configured runtime hooks remain the sole wake
 > path, so the visible interactive session stays authoritative.
+
+## If you are an agent watching the pad — read this
+
+**Do not `tail -f` / `tail -F` the pad.** Poll by position instead.
+
+The pad is not append-only. `archive`, `compact`, `clear`, `join`, `leave`,
+`set-wake` and `rename` all rewrite the whole file, and `tail` handles a rewrite
+badly in two different ways:
+
+* `tail -F` re-opens the file when the **inode** changes and replays the entire
+  history as if it were new;
+* any `tail` rewinds to offset 0 when the file gets **shorter**, and replays it
+  all over again.
+
+Writes now go back through the *same* inode without truncating (see
+`sp_write_inplace` in `bin/lib.sh`), which removes the first failure mode
+entirely and the second for everything except a deliberate trim. But a shrink is
+still a shrink: `archive` is *supposed* to make the pad smaller. So the only
+watcher that is correct in every case is one that tracks its own position:
+
+```bash
+# poll by position — immune to inode swaps, rewrites and trims
+last=$(grep -c '^## @eric ' .stitchpad/stitchpad.md)
+while sleep 20; do
+  now=$(grep -c '^## @eric ' .stitchpad/stitchpad.md)
+  [ "$now" -gt "$last" ] && stitchpad read -n 40   # only on growth
+  last=$now
+done
+```
+
+Better still, use `stitchpad read --new`, which diffs against the pad's own git
+commit you last read and is unaffected by any rewrite.
+
+**Keep your heartbeat fresh.** `.state/alive.<name>` must be touched at least
+every **90 seconds** or you are treated as dead: you disappear from
+`stitchpad roster` (live view), stop receiving wakes, and show as **OFFLINE** in
+the PWA. `join` starts a heartbeat ticker for you; if you run the CLI directly,
+`stitchpad heartbeat start <name>` does the same. A human staring at an OFFLINE
+dot assumes nobody is listening — refresh it.
+
+## Where things live in a pad
+
+Message flow and task state are separate files, so a ticket update no longer
+rewrites (or re-commits) the whole conversation:
+
+* `stitchpad.md` — the roster block and the conversation.
+* `tasks.md` — the ` ```task ` cards. `task new` writes here; `task move`/`edit`
+  rewrite only this file.
+* `archive/<date>-conversation.md` — older messages moved out by
+  `stitchpad archive`, with a pointer left in the pad. **If the pad looks like
+  it is missing context, read the archive before assuming it was lost.**
+
+Old pads keep working untouched: inline ` ```task ` blocks left in
+`stitchpad.md` are still parsed, listed and editable in place. Moving them is
+optional — `stitchpad task migrate` (or `--dry-run` first).
 
 ## Adapters (how a teammate gets woken)
 
@@ -160,11 +219,13 @@ A pad is a directory `.stitchpad/`:
 ```
 .stitchpad/
 ├── stitchpad.md      the markdown bus (roster block + messages)
+├── tasks.md          the task board (```task cards) — split out of the pad
+├── archive/          older conversation moved out by `stitchpad archive`
 ├── stitchpad-git/    isolated git history — one commit per post (blame/diff)
 └── .state/           runtime flags and per-name wake cursors (gitignored)
 ```
 
-The isolated git tracks only `stitchpad.md`, separate from your project repo. The
+The isolated git tracks `stitchpad.md`, `tasks.md` and `archive/`, separate from your project repo. The
 entire `.stitchpad/` directory is ignored by the surrounding project repository
 (`.git/info/exclude`, plus `.gitignore` on new pads), so `git stash -u` and
 `git clean` cannot remove the live roster while agents are running. Writes fail
