@@ -77,7 +77,15 @@ sp_init_paths() {
   if [ -f "$PAD_DIR/pasture.md" ]; then PAD_MD="$PAD_DIR/pasture.md"; else PAD_MD="$PAD_DIR/stitchpad.md"; fi
   if [ -d "$PAD_DIR/pasture-git" ]; then PAD_GIT="$PAD_DIR/pasture-git"; else PAD_GIT="$PAD_DIR/stitchpad-git"; fi
   PAD_STATE="$PAD_DIR/.state"
+  # Task cards live in a SIBLING file so a `task move` never rewrites (or
+  # commits) the whole conversation. Legacy inline ```task blocks in the pad are
+  # still read — see sp_tasks() — so existing pads keep working untouched.
+  PAD_TASKS="$PAD_DIR/tasks.md"
+  PAD_ARCHIVE_DIR="$PAD_DIR/archive"
   mkdir -p "$PAD_STATE/sessions"
+  # Replay an in-place rewrite that was interrupted between truncate and write.
+  sp_recover_inplace "$PAD_MD"
+  sp_recover_inplace "$PAD_TASKS"
   sp_ensure_outer_git_ignore
   # Pad git is load-bearing (read --new deltas, say auto-commits, compaction
   # audit trail) but NOTHING ever initialized it — sp_commit just no-ops when
@@ -191,6 +199,80 @@ sp_unlock() {
   _SP_LOCK_DIR=""
 }
 
+# ── Inode-stable rewrites ────────────────────────────────────────────
+# EVERY full-file rewrite used to end in `mv tmp pad`, which REPLACES the pad's
+# inode. A `tail -f` / `tail -F` watcher then re-opens the new file and replays
+# the ENTIRE pad as if it were new — 200 KB and 200+ messages arriving at once,
+# every single time anyone ran `task move`. That silently broke live agent
+# watchers (the operator's messages went unanswered for hours because the agent
+# watching the pad drowned in replayed history and was killed).
+#
+# The cure is to write back over the SAME file, through the existing inode and
+# WITHOUT truncating it first: `dd conv=notrunc` overwrites in place, and the
+# file is shortened afterwards only when the new content is genuinely smaller.
+# A reader therefore never sees the pad's size go backwards, which matters just
+# as much as the inode: `tail` treats a shrink as "file truncated" and rewinds
+# to offset 0, replaying everything all over again. Roster edits and task edits
+# grow the file, so after this change they produce a delta and nothing more.
+#
+#   sp_stage <target>            → path to a staging file next to <target>
+#   sp_write_inplace <staged> <target>
+#       0 = written · 2 = identical, nothing written · 1 = failed, target intact
+#   sp_recover_inplace <target>  → replay an interrupted write
+#
+# Crash-safety is preserved WITHOUT a rename over the pad. The staged file is a
+# complete copy on disk; it is promoted to "<target>.ready" (a rename between
+# two TEMP files — the pad is never the destination) and only then copied over
+# the target. If the process dies mid-copy, "<target>.ready" survives with the
+# full intended content and sp_recover_inplace() replays it on the next command.
+# A half-written staging file is never promoted, so it can never be replayed.
+sp_stage() {
+  local target="${1:-$PAD_MD}"
+  mktemp "$(dirname "$target")/.sp-stage.XXXXXX"
+}
+
+sp_write_inplace() {
+  local staged="$1" target="$2" ready="$2.ready"
+  # Never let a broken awk/sed pipeline truncate a live pad to nothing.
+  if [ ! -s "$staged" ]; then
+    echo "stitchpad: refusing to write an empty $(basename "$target") — staged write produced no content" >&2
+    rm -f "$staged" 2>/dev/null
+    return 1
+  fi
+  # No-op guard: identical content means no write, no mtime bump, no watcher
+  # event and no commit churn. `task move X <same status>` is now free.
+  if [ -f "$target" ] && cmp -s "$staged" "$target"; then
+    rm -f "$staged" 2>/dev/null
+    return 2
+  fi
+  mv -f "$staged" "$ready" 2>/dev/null || { rm -f "$staged" 2>/dev/null; return 1; }
+  local newsize oldsize
+  newsize="$(wc -c < "$ready" | tr -d ' ')"
+  oldsize="$(wc -c < "$target" 2>/dev/null | tr -d ' ')"; oldsize="${oldsize:-0}"
+  # THE fix: same inode, and no truncation — so no watcher rewinds.
+  if dd if="$ready" of="$target" conv=notrunc bs=65536 2>/dev/null; then
+    if [ "$newsize" -lt "$oldsize" ]; then
+      # genuinely shorter (clear/compact/archive): drop the stale tail bytes
+      perl -e 'truncate($ARGV[0], $ARGV[1]) or exit 1' "$target" "$newsize" 2>/dev/null \
+        || cat "$ready" > "$target"
+    fi
+    rm -f "$ready" 2>/dev/null
+    return 0
+  fi
+  echo "stitchpad: in-place write of $(basename "$target") failed — content preserved in $ready" >&2
+  return 1
+}
+
+sp_recover_inplace() {
+  local target="${1:-$PAD_MD}" ready
+  [ -n "$target" ] || return 0
+  ready="$target.ready"
+  [ -s "$ready" ] || { rm -f "$ready" 2>/dev/null; return 0; }
+  echo "stitchpad: recovering interrupted write of $(basename "$target")" >&2
+  cat "$ready" > "$target" && rm -f "$ready" 2>/dev/null
+  return 0
+}
+
 # Append a small italic system/presence line to the pad (join/leave, etc.).
 # Not a message — no @sender — so it never trips mention detection or the gate.
 sp_system() {
@@ -201,15 +283,33 @@ sp_system() {
 # Isolated git wrapper: history of just stitchpad.md, separate from project repo.
 sgit() { git --git-dir="$PAD_GIT" --work-tree="$PAD_DIR" "$@"; }
 
+# The pad's isolated git ignores everything but the pad file (info/exclude is
+# `*` + `!stitchpad.md`). tasks.md and archive/ are pad content too — un-ignore
+# them so they are versioned alongside the conversation.
+sp_ensure_pad_git_exclude() {
+  local ex="$PAD_GIT/info/exclude" pat
+  [ -d "$PAD_GIT" ] || return 0
+  mkdir -p "$PAD_GIT/info" 2>/dev/null || return 0
+  for pat in '!tasks.md' '!archive/' '!archive/**'; do
+    grep -Fqx "$pat" "$ex" 2>/dev/null || printf '%s\n' "$pat" >> "$ex"
+  done
+}
+
+# sp_commit <msg> [path...]  — paths are relative to the pad dir; defaults to
+# the pad file. Passing paths lets a task-only or archive-only change commit
+# just that file instead of the whole conversation.
 sp_commit() {
-  local msg="$1"
+  local msg="$1"; shift 2>/dev/null || true
+  local paths=("$@")
+  [ "${#paths[@]}" -eq 0 ] && paths=("$(basename "$PAD_MD")")
   sgit rev-parse --git-dir >/dev/null 2>&1 || return 0
   # Never turn a transient outer-repo stash/clean window into a durable pad
   # deletion. Stage first so a file recreated after an older deletion is not
   # invisible as "untracked" to `git diff`, then inspect the staged delta.
   [ -f "$PAD_MD" ] || return 0
-  sgit add -A -- stitchpad.md 2>/dev/null || return 0
-  sgit diff --cached --quiet -- stitchpad.md 2>/dev/null && return 0
+  sp_ensure_pad_git_exclude
+  sgit add -A -f -- "${paths[@]}" 2>/dev/null || return 0
+  sgit diff --cached --quiet -- "${paths[@]}" 2>/dev/null && return 0
   sgit commit -q -m "$msg" 2>/dev/null || true
 }
 
@@ -268,6 +368,30 @@ sp_roster_live() {
 # sp_tasks                → all tasks in created order
 # sp_tasks --mine <name>  → tasks assigned to <name>
 # sp_tasks --status <s>    → tasks with matching status
+#
+# BACKWARD COMPATIBILITY: tasks are read from the pad AND from the sibling
+# tasks.md. Old pads with inline ```task blocks keep working with no migration;
+# new tasks are written to tasks.md. tasks.md is read LAST so a migrated card
+# wins over a stale inline copy of the same id (the parser is last-wins).
+sp_task_files() {
+  local out=("$PAD_MD")
+  [ -n "${PAD_TASKS:-}" ] && [ -f "$PAD_TASKS" ] && out+=("$PAD_TASKS")
+  printf '%s\n' "${out[@]}"
+}
+
+# Which file holds <id>? tasks.md wins. Prints the path, or fails if unknown —
+# so `task move` on a typo'd id errors instead of rewriting the whole pad.
+sp_task_file() {
+  local id="$1" f
+  for f in "${PAD_TASKS:-}" "$PAD_MD"; do
+    [ -n "$f" ] && [ -f "$f" ] || continue
+    if awk -v tid="$id" '$1=="```task" && $2==tid { found=1; exit } END { exit !found }' "$f"; then
+      printf '%s' "$f"; return 0
+    fi
+  done
+  return 1
+}
+
 sp_tasks() {
   local filter_name="" filter_status=""
   while [ $# -gt 0 ]; do
@@ -277,8 +401,12 @@ sp_tasks() {
       *) shift ;;
     esac
   done
+  local _tf=(); while IFS= read -r _f; do _tf+=("$_f"); done < <(sp_task_files)
   awk -v fn="$filter_name" -v fs="$filter_status" '
     BEGIN { id=""; title=""; status=""; priority=""; assignee=""; labels=""; created=""; desc="" }
+    # multiple inputs (pad + tasks.md): never let an unterminated block in one
+    # file bleed into the next
+    FNR==1                           { inblk=0; meta=0; id="" }
     /^```task /                      { inblk=1; meta=1; id=$2; gsub(/^ *| *$/,"",id); title=""; status="todo"; priority="none"; assignee=""; labels=""; created=""; desc="" }
     /^```$/ && inblk                 { inblk=0; if (id!="") {
       # duplicate blocks (compact-carried copies, re-posts): LAST occurrence wins
@@ -301,7 +429,55 @@ sp_tasks() {
     }
     END { for (i=1; i<=nord; i++) { k=order[i]
       if ((fn=="" || fa[k]==fn) && (fs=="" || fst[k]==fs)) print data[k] } }
-  ' "$PAD_MD"
+  ' "${_tf[@]}"
+}
+
+# Create tasks.md (with its header) if it does not exist yet. Callers hold the lock.
+sp_ensure_tasks_file() {
+  [ -n "${PAD_TASKS:-}" ] || return 1
+  [ -f "$PAD_TASKS" ] && return 0
+  cat > "$PAD_TASKS" <<'TASKSEOF'
+# 📋 tasks
+
+> Task cards for this pad, split out of the conversation so that creating or
+> moving a ticket no longer rewrites (and re-commits) the whole transcript.
+> Format is unchanged: one ```task TASK-N fenced block per ticket.
+>
+> Legacy inline ```task blocks still in the pad are read too — run
+> `stitchpad task migrate` to move them here.
+
+TASKSEOF
+}
+
+# Leave ONE pointer in the pad so every reader (and the phone bridge, which only
+# ships the pad) knows where the board went. Idempotent: the marker means done.
+# Callers hold the lock.
+sp_ensure_tasks_pointer() {
+  [ -f "$PAD_MD" ] || return 0
+  grep -Fq '<!-- tasks:file -->' "$PAD_MD" 2>/dev/null && return 0
+  local base tmp
+  base="$(basename "$PAD_TASKS")"
+  if grep -q '^## Tasks' "$PAD_MD" 2>/dev/null; then
+    tmp="$(sp_stage "$PAD_MD")"
+    awk -v base="$base" '
+      { print }
+      !stamped && /^## Tasks/ {
+        print ""
+        print "<!-- tasks:file -->"
+        print "> 📋 Task cards live in `" base "` beside this pad. `stitchpad task list|new|move|edit` reads and writes there, so a ticket update no longer rewrites this conversation. Legacy task blocks left below are still read."
+        stamped=1
+      }
+    ' "$PAD_MD" > "$tmp"
+    sp_write_inplace "$tmp" "$PAD_MD"
+  else
+    # No Tasks section: append (cheap, tail-safe — an append never moves bytes
+    # a watcher already read).
+    {
+      printf '\n## Tasks\n\n<!-- tasks:file -->\n'
+      printf '> 📋 Task cards live in `%s` beside this pad. `stitchpad task list|new|move|edit` reads and writes there.\n' "$base"
+    } >> "$PAD_MD"
+  fi
+  return 0
 }
 
 # Look up one field for a user. sp_user_field <name> <adapter|wake|target>
@@ -566,6 +742,13 @@ sp_reap_dead() {
     [ -e "$f" ] || continue
     local pid="${f##*.}"
     kill -0 "$pid" 2>/dev/null || rm -f "$f"
+  done
+  # 1b. abandoned .sp-stage.* files from a rewrite that died before promotion.
+  #     Never touches .ready files — those are recoverable content, not litter.
+  for f in "$PAD_DIR"/.sp-stage.*; do
+    [ -f "$f" ] || continue
+    local sts; sts=$(stat -f %m "$f" 2>/dev/null || stat -c %Y "$f" 2>/dev/null || echo "$now")
+    [ $(( now - sts )) -gt 3600 ] && rm -f "$f"
   done
   # 2. presence heartbeats (alive.<name>) gone stale: mtime >90s AND pid dead.
   #    operators/humans have no pid and never expire — leave them.
