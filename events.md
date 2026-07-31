@@ -878,3 +878,71 @@ area:      [frontend]
 
 Pasture TUI overhaul, four fronts. (1) Theme auto-match: new theme.rs reads ~/.config/herdr/config.toml [theme] — all 18 herdr built-ins mapped to semantic tokens (solarized-light finally renders right), auto_switch follows macOS appearance, config mtime-watched so changing herdr's theme re-skins a running TUI within a tick; /theme <name> pins, /theme auto follows. NO_COLOR honored. (2) Lore pass: ⛵ replaced with ∩ᴥ∩ lamb mark, tabs are pasture/barn, watcher is the shepherd, online is grazing, ASCII sheep art in empty states + flock rail foot + field guide (/help or ? in barn). (3) Barn redesign: nested borders cut, status-colored column rules, priority glyphs (!!/!/◆/◇/·) paired with color, assignee-colored card bars, selected card on raised surface, h/l column nav + j/k in-column, p cycles priority via task edit, per-column windowing with "… N more". (4) Compact + summarize: new `stitchpad summarize [-n N]` CLI command (read-only haiku summary, pad untouched); TUI slash commands /compact (/shear) and /summarize (/ruminate) run off-thread with a braille spinner, summary lands in a scrollable rumination modal (^Y copies). Pad discovery now mirrors lib.sh (walks up, .pasture wins, pasture.md else stitchpad.md). Verified: 19 tests green, tmux captures at 120×35 + 80×24 floor, live nord↔solarized-light switch confirmed via ANSI RGB on the wire, summarize end-to-end through haiku.
 _________________________________________________________________________________
+time:      [04:44] [07-22-26]
+agent:     [claude] [fable 5]
+worktree:  feat/rich-pad
+type:      [feature-request]
+area:      [frontend]
+
+Rich-pad spike (1b8faf2, pushed). Grammar v2 keeps everything in the pad: say mints #m-… header ids and --re threads replies (re:#parent, refuses ghosts); react writes toggleable *reacted* system lines that never wake anyone; @flock aliases @all for gang-prompts; ```ui <type> fences carry schema-validated JSON with a mandatory alt line. One schema source (tool/pwa/ui/schemas.mjs, 8 component types + reply types, 16KB cap) validates at both MCP write time and PWA render time. MCP grew say.reply_to + react + a generic ui tool whose description tells agents to default to prose — john's no-sideshow rule enforced at the tool boundary. PWA: thread folding, reaction chips/picker, component renderers; votes/verdicts/form-submissions are structured threaded replies so tallies derive from the thread with zero new server state; worker+bridge pass re/react down the existing outbox. TUI renders ↳ reply markers, citable ids, reaction chips, ⟦ui type⟧ placeholders. Verified: cargo 21, pwa-contract 22, wake-regression, new thread-react-ui contract suite, headless render tests (XSS escape, tallies, fallbacks), live worker passthrough on wrangler --local. Not merged — awaiting dogfood with real agents per john.
+_________________________________________________________________________________
+time:      [04:56] [07-22-26]
+agent:     [claude] [fable 5]
+worktree:  feat/rich-pad
+type:      [review]
+area:      [testing]
+
+Dogfood run on the rich-pad spike: three subagents (dale/ernie/wren) collaborated in a live pad through the worktree CLI on a real decision — phase-2 component selection. Final pad: 19 messages, 10 reactions, 10 threaded replies, 11 agent-authored ui components, 0 validation fallbacks. Full arc worked: kickoff → candidates table → threaded pushback → usage-evidence table → poll → three convergent votes → build-order checklist → approve request → conditional verdict → conditions folded in and locked. Restraint held (ernie posted zero decorative cards; reactions replaced +1 posts). Genuinely useful output: phase-2 shortlist = timeline (base primitive) / run-report / stat-row, link-preview parked until provably zero-network, kanban-embed cut. One orchestration bug (mine, not the product): subagent sandbox blocks foreground sleep, so the stagger choreography stalled until re-briefed sleepless. Live PWA round-trip served at localhost:8790 via wrangler --local + a mini outbox bridge; retro form open for @smaths. Merge decision awaits john.
+_________________________________________________________________________________
+time:      [05:24] [07-22-26]
+agent:     [claude] [fable 5]
+worktree:  feat/rich-pad
+type:      [bug-report]
+area:      [frontend]
+
+John's "window dressing" call surfaced a real prod bug and a real gap. Bug (50381b1): /img and /f media routes sat BEHIND the relay's bearer-token gate — <img> tags can't send auth headers, so every uploaded image 401'd and rendered broken, in prod too; also upload-image returned a hardcoded prod-domain URL (and url.origin lies under wrangler dev), breaking all local embeds. Fix: media served above the gate (sha-256 capability URLs, tokenless GET is the correct trade), root-relative /img/… upload URLs, PWA image regex widened to relative media paths. Verified end-to-end: CLI say --image → local R2 → inline render. Gap answered with a real-work dogfood: a builder agent implemented the timeline component (the flock's voted phase-2 primitive) in the worktree (5041969, schemas+renderer+CSS, 16/0 headless tests, hostile-payload escaping), narrating in the live pad with the actual git diff as a ui diff card, actual test output threaded, and a ui timeline OF ITS OWN BUILD rendered by the code it had just written — pad as a workbench, not a widget demo. Both commits pushed on feat/rich-pad.
+_________________________________________________________________________________
+time:      [05:57] [07-23-26]
+agent:     [claude] [fable 5]
+worktree:  feat/rich-pad
+type:      [feature-request]
+area:      [frontend]
+
+Images proven in a real browser this time (john was right to demand it): headless Chrome via puppeteer-core against the live PWA showed the pipeline worked but my test image was an 8×8px dot — invisible, functionally broken. Re-proved with a full-size screenshot embedded inline, screenshot sent to john. Real bug found the same way: the PWA paperclip routed image attachments to the dropbox as a text line (exactly what john hit) — images now go through /upload-image and embed as markdown (47ad3c0). Then the shed (bda913c): `stitchpad drop <file> [note]` → pad's dropbox/ + relay mirror + one 📎 pad line as the files feed; TUI grew a third tab (shelf: name·size·age, Enter opens via OS); PWA grew a files button + panel derived from the 📎 lines; [text](url) markdown links render scheme-restricted. Verified: cargo 21, grammar contract suite, drop end-to-end with /f/ view link, shed panel + TUI tab both eyeballed (browser screenshot / tmux capture). Next per john: execution timelines — needs an amend-by-id grammar verb so a posted timeline can flip step states live; design noted, not started.
+_________________________________________________________________________________
+time:      [06:15] [07-23-26]
+agent:     [claude] [fable 5]
+worktree:  feat/rich-pad
+type:      [feature-request]
+area:      [backend]
+
+Execution timelines shipped. New grammar verb `amend <#m-id>` — python rewrite of one block's body under the pad lock, header/id/thread links untouched, author-only, one git commit per amend (append-only spirit survives as history). On top: `stitchpad run [--title] label=cmd...` posts one ui timeline and amends it live as steps flip todo→active→done/failed with real durations; first failure stops the run and threads the output tail under the card as an artifact. MCP grew an `amend` tool. Contract suite extended (amend semantics + run semantics) — all green plus wake regression. Demonstrated live in the dogfood pad against the real verification suite: one red run (my own bad step command — the failure path demoed itself) and one green 4-step run, screenshot to john. PWA/TUI needed ZERO changes — amended blocks just re-parse, which is the payoff of the pad-is-truth architecture.
+_________________________________________________________________________________
+_________________________________________________________________________________
+time:      [15:32] [07-27-26]
+agent:     [pi] [gpt-5.4] [thoth]
+worktree:  [master]
+type:      [bug report]
+area:      [backend]
+
+Stopped the parked global pasture at `~/.pasture` from bleeding into descendant
+projects. Pad discovery now stops at `$HOME` for child working directories while
+keeping the global room explicitly available from `$HOME` or through
+`PASTURE_PAD_DIR=\"$HOME/.pasture\"`; project-local `.pasture` / `.stitchpad`
+pads still win. Added `test/pad-resolution.sh`, documented the opt-in global-room
+contract, verified the rotational-posting-agent cwd fails closed with no local pad,
+and passed every `test/*.sh` regression script.
+time:      [18:59] [07-30-26]
+agent:     [claude] [fable 5]
+type:      [bug-report]
+area:      [infra]
+
+Stitchpad relay outage root-caused and fixed. John's bridges were 401ing since 07-29: deployment history on the `stitchpad-relay` worker showed a "Secret Change" deployment at 03:56Z authored by ec@risingtidesent.com (version a7df5fa8) — EC rotated STITCHPAD_TOKEN on john's worker, killing every client holding the old token. Restored john's token via `wrangler secret put STITCHPAD_TOKEN`, verified /pads returns the pad list with his bearer again, kickstarted org.stitchpad.bridge — sockets up, all pads pushed. Note: the relay auths everyone with ONE shared bearer token and EC has write access to john's Cloudflare account, so any of the 4 users rotating a secret takes everyone else down; needs per-user tokens or per-person worker deployments.
+_________________________________________________________________________________
+time:      [22:43] [07-30-26]
+agent:     [claude] [fable 5]
+type:      [feature-request]
+area:      [infra]
+
+Per-person relay tokens so one teammate's rotation can never lock out the rest (the EC incident). worker.js auth now accepts the legacy STITCHPAD_TOKEN OR any value in the new STITCHPAD_TOKENS secret (JSON handle→token); /login and /join-request return the caller's own token when their handle has one. Minted tokens for jay, sam, ec and set the secret; deployed (version de4cb838); verified live: all four tokens 200 on /pads, bogus token 401, john's bridge reconnected clean after the deploy. Tokens handed to john to distribute — each person drops theirs into STITCHPAD_TOKEN in their bridge plist. Rotating one person now = edit one key in STITCHPAD_TOKENS.
+_________________________________________________________________________________

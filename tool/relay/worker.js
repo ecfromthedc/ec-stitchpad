@@ -17,7 +17,10 @@
 // delivered to it instantly; otherwise they fall back to the KV queues the
 // bridge already drains over HTTP. KV keeps: pads index, invites, queues.
 //
-// Auth: shared bearer token (STITCHPAD_TOKEN) on every request (WS: ?token=).
+// Auth: bearer token on every request (WS: ?token=). STITCHPAD_TOKEN is the
+// owner/legacy token; STITCHPAD_TOKENS (JSON: {"handle":"token"}) adds per-person
+// tokens so one person's rotation can't lock everyone else out. /login and
+// /join-request hand back the caller's own token when their handle has one.
 const json = (o, s = 200) => new Response(JSON.stringify(o), { status: s, headers: { "content-type": "application/json", "access-control-allow-origin": "*" } });
 const cors = { "access-control-allow-origin": "*", "access-control-allow-methods": "GET,POST,OPTIONS", "access-control-allow-headers": "authorization,content-type" };
 
@@ -188,6 +191,12 @@ export default {
     const url = new URL(req.url);
     if (req.method === "OPTIONS") return new Response(null, { headers: cors });
 
+    // handle → personal token map; legacy shared token stays valid alongside it
+    let TOKENS = {};
+    try { TOKENS = JSON.parse((env.PASTURE_TOKENS || env.STITCHPAD_TOKENS) || "{}"); } catch {}
+    const legacyToken = env.PASTURE_TOKEN || env.STITCHPAD_TOKEN;
+    const tokenFor = (handle) => TOKENS[handle] || legacyToken;
+
     // Login: username+password → {token, handle}. Multi-user so coworkers each get
     // their OWN identity (posts show as them, not @smaths). Users come from the
     // STITCHPAD_USERS secret (JSON: {"user":{"pass":"...","handle":"..."}}) with the
@@ -197,9 +206,9 @@ export default {
       let users = {};
       try { users = JSON.parse((env.PASTURE_USERS || env.STITCHPAD_USERS) || "{}"); } catch {}
       const u = users[user];
-      if (u && u.pass === pass) return json({ token: (env.PASTURE_TOKEN || env.STITCHPAD_TOKEN), handle: u.handle || user });
+      if (u && u.pass === pass) return json({ token: tokenFor(u.handle || user), handle: u.handle || user });
       // fallback: the original single operator login
-      if (user === (env.PASTURE_USER || env.STITCHPAD_USER) && pass === (env.PASTURE_PASS || env.STITCHPAD_PASS)) return json({ token: (env.PASTURE_TOKEN || env.STITCHPAD_TOKEN), handle: "smaths" });
+      if (user === (env.PASTURE_USER || env.STITCHPAD_USER) && pass === (env.PASTURE_PASS || env.STITCHPAD_PASS)) return json({ token: tokenFor("smaths"), handle: "smaths" });
       return json({ error: "bad credentials" }, 401);
     }
 
@@ -218,7 +227,7 @@ export default {
         return json({ error: "invite expired" }, 403);
       }
       // Valid → hand back the relay token scoped to this pad + the invited handle.
-      return json({ token: (env.PASTURE_TOKEN || env.STITCHPAD_TOKEN), pad: inv.pad, handle: inv.handle });
+      return json({ token: tokenFor(inv.handle), pad: inv.pad, handle: inv.handle });
     }
 
     // Non-API paths → serve the PWA static assets (index.html, manifest).
@@ -228,7 +237,7 @@ export default {
     }
     // WS can't set headers from the browser — accept the bearer as ?token= there.
     const tok = (req.headers.get("authorization") || "").replace(/^Bearer\s+/i, "") || (url.searchParams.get("token") || "");
-    if (!(env.PASTURE_TOKEN || env.STITCHPAD_TOKEN) || tok !== (env.PASTURE_TOKEN || env.STITCHPAD_TOKEN)) return json({ error: "unauthorized" }, 401);
+    if (!tok || !(tok === legacyToken || Object.values(TOKENS).includes(tok))) return json({ error: "unauthorized" }, 401);
 
     const pad = (url.searchParams.get("pad") || "").trim();
 
