@@ -15,6 +15,16 @@ api() { curl -fsS -H "authorization: Bearer $TOKEN" -H "content-type: applicatio
 PADMD="$padd/pasture.md"; [ -f "$PADMD" ] || PADMD="$padd/stitchpad.md"; [ -f "$PADMD" ] || exit 0
 name="$(basename "$(dirname "$padd")")"            # pad name = project dir
 md="$(cat "$PADMD")"
+# Task cards live in the sibling tasks.md now, but the PHONE BOARD renders from
+# this pushed doc (parseTasks over body.pad in the PWA) — append tasks.md's
+# ```task blocks or every migrated/new card silently vanishes from the kanban.
+# Appended AFTER the pad so the PWA's last-wins parser prefers these over any
+# stale legacy inline copy of the same id still sitting in the conversation.
+TASKSMD="$padd/tasks.md"
+if [ -s "$TASKSMD" ]; then
+  tblocks="$(awk '/^```task /{inblk=1} inblk{print} inblk&&/^```$/{inblk=0; print ""}' "$TASKSMD")"
+  [ -n "$tblocks" ] && md="$md"$'\n\n'"$tblocks"
+fi
 # Cloudflare WS frames cap at 1MiB — a pad past that kills the DO broadcast
 # (error 1101) and NOTHING updates. Phones only need the recent window; keep
 # the roster block + EVERY task block (the board renders from this doc — a
@@ -40,6 +50,9 @@ parts.append("\n" + tail)
 sys.stdout.write("".join(parts))
 ')"
 fi
+# --doc: print the assembled doc (exactly what the phone will render) and stop.
+# Lets tests assert the pad↔tasks.md↔board contract without a relay.
+if [ "${2:-}" = "--doc" ]; then printf '%s\n' "$md"; exit 0; fi
 roster="$(cd "$(dirname "$padd")" && "$SP" roster 2>/dev/null | awk -F'|' '{gsub(/[ \t]/,"",$4); printf "%s{\"name\":\"%s\",\"adapter\":\"%s\",\"target\":\"%s\"}", (NR>1?",":""), $1, $2, $4}')"
 # file list for the `>` attach dropdown: project files, relative paths, skip junk/dotdirs
 proj="$(dirname "$padd")"
