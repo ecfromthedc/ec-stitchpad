@@ -45,8 +45,15 @@ if [ "$active" = "busy" ]; then
   exit 3
 fi
 
+# Pin the seat's model when the roster annotates one (name|adapter|MODEL|wake|target).
+# Without it the daemon's single current model answers for EVERY seat, so a pad of
+# differently-named agents is really one model wearing name tags.
+model_args=()
+[ -n "${SP_MODEL:-}" ] && [ "${SP_MODEL}" != "-" ] && model_args=(--model "$SP_MODEL")
+
 "$bin" wake \
   --session-id "$session_id" \
+  "${model_args[@]}" \
   --cwd "$pad_dir" \
   --client-type "stitchpad" \
   --timeout-seconds 600 \
