@@ -252,9 +252,12 @@ sp_write_inplace() {
   # THE fix: same inode, and no truncation — so no watcher rewinds.
   if dd if="$ready" of="$target" conv=notrunc bs=65536 2>/dev/null; then
     if [ "$newsize" -lt "$oldsize" ]; then
-      # genuinely shorter (clear/compact/archive): drop the stale tail bytes
+      # genuinely shorter (clear/compact/archive): drop the stale tail bytes.
+      # The cat fallback MUST be guarded: if .ready is gone (a concurrent
+      # recovery consumed it), `cat missing > target` would truncate the pad
+      # to nothing before failing. Stale tail bytes beat a blanked pad.
       perl -e 'truncate($ARGV[0], $ARGV[1]) or exit 1' "$target" "$newsize" 2>/dev/null \
-        || cat "$ready" > "$target"
+        || { [ -s "$ready" ] && cat "$ready" > "$target"; }
     fi
     rm -f "$ready" 2>/dev/null
     return 0
@@ -264,10 +267,17 @@ sp_write_inplace() {
 }
 
 sp_recover_inplace() {
-  local target="${1:-$PAD_MD}" ready
+  local target="${1:-$PAD_MD}" ready now mt
   [ -n "$target" ] || return 0
   ready="$target.ready"
   [ -s "$ready" ] || { rm -f "$ready" 2>/dev/null; return 0; }
+  # A LIVE writer's .ready exists only for the instant between promotion and
+  # copy — recovery runs in sp_init_paths, OUTSIDE the lock, so replaying (and
+  # deleting) a fresh .ready would race the writer that owns it. Only a .ready
+  # that has sat around (its writer is genuinely dead) is recovered.
+  now="$(date +%s)"
+  mt="$(stat -f %m "$ready" 2>/dev/null || stat -c %Y "$ready" 2>/dev/null || echo 0)"
+  [ $(( now - mt )) -lt 5 ] && return 0
   echo "stitchpad: recovering interrupted write of $(basename "$target")" >&2
   cat "$ready" > "$target" && rm -f "$ready" 2>/dev/null
   return 0

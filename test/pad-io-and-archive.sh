@@ -163,11 +163,35 @@ git --git-dir="$WORK/.stitchpad/stitchpad-git" --work-tree="$WORK/.stitchpad" \
 sp archive --keep 500 2>&1 | grep -q 'nothing to archive' && ok "archive is a no-op when under --keep" \
   || bad "archive is a no-op when under --keep"
 
-# ── 5. crash recovery ───────────────────────────────────────────────
+# ── 5. phone board contract: tasks.md cards reach the pushed doc ────
+# The PWA kanban renders from the doc the bridge pushes (parseTasks over
+# body.pad, last-wins by id). Cards that moved to tasks.md MUST still appear
+# there, appended after the pad so a stale inline copy can never shadow them.
+echo "── phone board contract (bridge doc)"
+BR="$HERE/../tool/relay/bridge-push-once.sh"
+brdoc() { STITCHPAD_RELAY=http://invalid.local STITCHPAD_TOKEN=x HOME="$WORK/home" \
+          bash "$BR" "$WORK/.stitchpad" --doc; }
+doc="$(brdoc)"
+printf '%s\n' "$doc" | grep -q "^\`\`\`task $T1\$" && ok "tasks.md card reaches the phone doc" \
+  || bad "tasks.md card reaches the phone doc"
+printf '%s\n' "$doc" | grep -q "^\`\`\`task TASK-77\$" && ok "migrated card reaches the phone doc" \
+  || bad "migrated card reaches the phone doc"
+printf '\n```task TASK-88\ntitle: stale copy\nstatus: todo\npriority: low\nassignee:\nlabels:\ncreated: 01-01 00:00\n---\nstale\n```\n' >> "$PAD"
+printf '\n```task TASK-88\ntitle: fresh copy\nstatus: done\npriority: low\nassignee:\nlabels:\ncreated: 01-01 00:00\n---\nfresh\n```\n' >> "$TASKS"
+laststatus="$(brdoc | awk '/^```task TASK-88$/{inblk=1} inblk && /^status:/{s=$2} inblk && /^```$/{inblk=0} END{print s}')"
+check "stale inline copy loses to the tasks.md copy (last wins)" "$laststatus" "done"
+
+# ── 6. crash recovery ───────────────────────────────────────────────
 echo "── crash recovery"
 cp "$PAD" "$WORK/expected.md"
 printf 'RECOVERED PAD CONTENT\n' > "$PAD.ready"     # simulate a write killed mid-copy
 : > "$PAD"                                          # ...leaving the pad truncated
+sp roster >/dev/null 2>&1
+# a FRESH .ready may belong to a live writer mid-copy — it must NOT be replayed
+# (recovery runs outside the lock; see sp_recover_inplace)
+check "fresh .ready is left for its writer (no replay)" "$(cat "$PAD")" ""
+[ -f "$PAD.ready" ] && ok "fresh .ready is kept, not consumed" || bad "fresh .ready is kept, not consumed"
+touch -t 202001010000 "$PAD.ready"                  # now provably abandoned
 sp roster >/dev/null 2>&1                           # any command triggers recovery
 check "interrupted write is replayed on next command" "$(cat "$PAD")" "RECOVERED PAD CONTENT"
 [ -f "$PAD.ready" ] && bad "recovery cleared its .ready file" || ok "recovery cleared its .ready file"

@@ -581,9 +581,12 @@ PY
     } >> "$arch_file"
     tmp="$(sp_stage "$PAD_MD")"
     {
-      # preamble = everything before the first message, minus any previous pointer
+      # preamble = everything before the first message, minus any previous
+      # pointer AND any previous carried-blocks label (repeated archives must
+      # not stack "*carried through archiving:*" lines — a fresh one is added
+      # below whenever this run carries blocks)
       sed -n "1,$((first_msg-1))p" "$PAD_MD" \
-        | awk '/^<!-- archived:/{next} /^> 📦 \*\*Archived:/{next} {print}'
+        | awk '/^<!-- archived:/{next} /^> 📦 \*\*Archived:/{next} /^\*carried through archiving:\*$/{next} {print}'
       if [ -s "$carried" ]; then printf '\n*carried through archiving:*\n\n'; cat "$carried"; fi
       printf '\n<!-- archived:%s -->\n' "$day"
       printf '> 📦 **Archived:** %s older message(s) moved to `%s` (%s). Agents: READ THAT FILE before assuming context is missing — it is the earlier part of this same conversation.\n\n' \
