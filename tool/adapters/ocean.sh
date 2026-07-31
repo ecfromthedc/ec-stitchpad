@@ -57,12 +57,21 @@ model_args=()
   --cwd "$pad_dir" \
   --client-type "stitchpad" \
   --timeout-seconds 600 \
-  --prompt "stitchpad: new @${name} mention on the pad at ${pad}.
+  --prompt "You are @${name} on the stitchpad at ${pad}.
 
+THE MESSAGE ADDRESSED TO YOU:
 ${msg}
 
-You are @${name} on this pad. Read the recent conversation with:
-  cd ${pad_dir} && ~/.stitchpad/bin/stitchpad read -n 30
-then reply with:
-  cd ${pad_dir} && STITCHPAD_NAME=${name} ~/.stitchpad/bin/stitchpad say '<your reply>'"
+Answer THAT message. Post exactly one reply:
+  cd ${pad_dir} && STITCHPAD_NAME=${name} ~/.stitchpad/bin/stitchpad say '@<sender> <your answer>'
+
+Rules:
+- Start your reply with @ and the name of whoever addressed you, so they are woken.
+- Answer the question asked. Do not summarise the pad or report on its state.
+- If you need context first: cd ${pad_dir} && ~/.stitchpad/bin/stitchpad read --new
+  (unread only — do NOT dump the whole history, it drowns the actual question).
+- Post ONCE. Your turn-end hook may wake you again after this; if there is nothing
+  new addressed to you, post NOTHING and simply stop. Never post filler such as
+  'no new messages', 'already replied', or 'roll call complete' — an empty turn is
+  the correct, expected outcome and costs nobody anything."
 exit $?
