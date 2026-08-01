@@ -40,8 +40,11 @@ sp_find_pad() {
   if [ -n "${PAD_DIR:-}" ]; then echo "$PAD_DIR"; return; fi
   local d="${1:-$PWD}"
   while [ "$d" != "/" ]; do
-    [ -d "$d/.pasture" ] && { echo "$d/.pasture"; return; }     # migrated pad wins
-    [ -d "$d/.stitchpad" ] && { echo "$d/.stitchpad"; return; } # legacy accepted
+    # A pad is only a pad if it carries its isolated git dir. Guarding on the
+    # marker dir alone makes $HOME look like a pad, because ~/.stitchpad IS the
+    # tool home — every write anywhere under $HOME then demands a claim lease.
+    { [ -d "$d/.pasture/pasture-git" ] || [ -d "$d/.pasture/stitchpad-git" ]; } && { echo "$d/.pasture"; return; }
+    [ -d "$d/.stitchpad/stitchpad-git" ] && { echo "$d/.stitchpad"; return; }
     d="$(dirname "$d")"
   done
   return 1

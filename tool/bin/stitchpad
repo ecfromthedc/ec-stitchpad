@@ -1430,7 +1430,7 @@ except: print("")' 2>/dev/null)"
     # Claims only apply INSIDE a pad. No .stitchpad here → not a shared worktree,
     # fail-open (else we'd block every write in every non-pad project). Walk up like the CLI does.
     _d="$PWD"; _pad=""
-    while [ "$_d" != "/" ]; do [ -d "$_d/.stitchpad" ] && { _pad="$_d/.stitchpad"; break; }; _d="$(dirname "$_d")"; done
+    while [ "$_d" != "/" ]; do [ -d "$_d/.stitchpad/stitchpad-git" ] && { _pad="$_d/.stitchpad"; break; }; _d="$(dirname "$_d")"; done
     [ -z "$_pad" ] && exit 0   # not in a pad → allow
     # Try to lease it. `claim` exits 0 if I get/hold it, non-zero if someone else holds a fresh one.
     if "$0" claim "$fp" >/dev/null 2>&1; then
