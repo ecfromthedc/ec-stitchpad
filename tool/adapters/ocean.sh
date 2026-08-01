@@ -45,11 +45,26 @@ if [ "$active" = "busy" ]; then
   exit 3
 fi
 
-"$bin" wake \
-  --session-id "$session_id" \
+# PER-SEAT MODEL: stitchpad stores each roster member's model as
+# .state/model.<name> (set via `stitchpad meta set <name> model <id>`).
+# Passing it pins THIS wake turn to that model, so one pad can run several
+# Ocean seats on different models without flipping the daemon's global default.
+# Absent -> omit the flag and inherit the daemon default.
+seat_model=""
+# NOTE: use seat-model.<name>, NOT model.<name>. The latter is written BY the
+# agent at join/turn time to REPORT the model it actually ran, so it gets
+# overwritten on every wake — useless as config. seat-model.<name> is operator
+# config: written once, read here, never touched by the runtime.
+_mf="$(dirname "$pad")/.state/seat-model.${name}"
+[ -f "$_mf" ] && seat_model="$(tr -d '[:space:]' < "$_mf" 2>/dev/null || true)"
+
+set -- --session-id "$session_id" \
   --cwd "$pad_dir" \
   --client-type "stitchpad" \
-  --timeout-seconds 600 \
+  --timeout-seconds 600
+[ -n "$seat_model" ] && set -- "$@" --model "$seat_model"
+
+"$bin" wake "$@" \
   --prompt "stitchpad: new @${name} mention on the pad at ${pad}.
 
 ${msg}
