@@ -15,7 +15,9 @@
 #   stitchpad roster                      print parsed roster
 #   stitchpad rename <old> <new>          rename a member everywhere local state knows them
 #   stitchpad reset [name]                repair a wedged seat (or whole pad): zombie tickers, stale locks, wake cursors
+#   stitchpad archive [--keep N]          move old messages to .stitchpad/archive/<date>-conversation.md (plain md, no deps)
 #   stitchpad compact [--keep N]          archive old transcript to sqlite, replace with rolling summary block
+#   stitchpad task migrate                move legacy inline ```task blocks out of the pad into tasks.md
 #   stitchpad summarize [-n N]            LLM summary of the recent thread (read-only, nothing archived)
 #   stitchpad search <query> [-n N]       full-history search: live pad + compaction archive
 #   stitchpad shift-change --save <n> --file <f>   agent hands itself off to a fresh session (bridge clears + rebriefs)
@@ -112,7 +114,9 @@ EOF
     git --git-dir="$dir/stitchpad-git" --work-tree="$dir" init -q
     git --git-dir="$dir/stitchpad-git" --work-tree="$dir" config user.name "stitchpad"
     git --git-dir="$dir/stitchpad-git" --work-tree="$dir" config user.email "stitchpad@agents.local"
-    printf '*\n!stitchpad.md\n' > "$dir/stitchpad-git/info/exclude"
+    # pad content that is versioned alongside the conversation: the task board
+    # (tasks.md) and archived transcripts (archive/). Everything else is runtime.
+    printf '*\n!stitchpad.md\n!tasks.md\n!archive/\n!archive/**\n' > "$dir/stitchpad-git/info/exclude"
     git --git-dir="$dir/stitchpad-git" --work-tree="$dir" add stitchpad.md
     git --git-dir="$dir/stitchpad-git" --work-tree="$dir" commit -q -m "stitchpad created"
     # The entire pad is runtime state with its own isolated Git history. Ignore
@@ -145,7 +149,7 @@ EOF
       echo "stitchpad: roster already present"
       exit 0
     fi
-    body="$(mktemp)"; tmp="$(mktemp "$PAD_DIR/.stitchpad-repair.XXXXXX")"
+    body="$(mktemp)"; tmp="$(sp_stage "$PAD_MD")"
     [ -f "$PAD_MD" ] && cat "$PAD_MD" > "$body"
     {
       printf '# 🧵 #%s — agent stitchpad\n\n' "$(basename "$(dirname "$PAD_DIR")")"
@@ -153,7 +157,7 @@ EOF
       printf '\n\n---\n\n'
       cat "$body"
     } > "$tmp"
-    mv "$tmp" "$PAD_MD"
+    sp_write_inplace "$tmp" "$PAD_MD"
     rm -f "$body"
     sp_commit "repair: restore missing roster header"
     sp_unlock
@@ -185,12 +189,12 @@ EOF
     sp_lock || exit 1
     if sp_user_exists "$who"; then sp_unlock; echo "$who already in roster"; exit 0; fi
     # Insert before the closing fence of the roster block (atomic under lock).
-    tmp="$(mktemp)"
+    tmp="$(sp_stage "$PAD_MD")"
     awk -v line="$who | $adapter | $wake | $target" '
       /^```roster/ { inblk=1; print; next }
       inblk && /^```/ { print line; inblk=0; print; next }
       { print }
-    ' "$PAD_MD" > "$tmp" && mv "$tmp" "$PAD_MD"
+    ' "$PAD_MD" > "$tmp" && sp_write_inplace "$tmp" "$PAD_MD"
     sp_system "@$who joined the stitchpad ($adapter)"
     sp_commit "roster: + $who ($adapter/$wake)"
     # Persist role/level for bridge profiles push + roster cards.
@@ -246,7 +250,7 @@ EOF
     # in a different pad (this also stops the bridge auto-heal from stealing).
     if [ "$target" != "-" ]; then sp_term_lock_claim "$target" "$who" || exit 1; fi
     sp_lock || exit 1
-    tmp="$(mktemp)"
+    tmp="$(sp_stage "$PAD_MD")"
     awk -v who="$who" -v wake="$wake" -v target="$target" -v adapter="$adapter" '
       /^```roster/ { inblk=1; print; next }
       inblk && /^```/ { inblk=0; print; next }
@@ -260,7 +264,7 @@ EOF
         }
       }
       { print }
-    ' "$PAD_MD" > "$tmp" && mv "$tmp" "$PAD_MD"
+    ' "$PAD_MD" > "$tmp" && sp_write_inplace "$tmp" "$PAD_MD"
     sp_commit "roster: ~ $who wake=$wake target=$target"
     sp_unlock
     # `set-wake` is also the repair path for an existing seat. Resolve the
@@ -295,7 +299,7 @@ EOF
     [ -d "$_hlck" ] && kill -0 "$(cat "$_hlck/pid" 2>/dev/null)" 2>/dev/null && _hb_live=1
     "$BIN_DIR/stitchpad" heartbeat --stop "$old" >/dev/null 2>&1 || true
     sp_lock || exit 1
-    tmp="$(mktemp)"
+    tmp="$(sp_stage "$PAD_MD")"
     awk -v old="$old" -v new="$new" '
       /^```roster/ { inblk=1; print; next }
       inblk && /^```/ { inblk=0; print; next }
@@ -305,11 +309,16 @@ EOF
         if (n >= 2 && f[1] == old) { out=new; for (i=2; i<=n; i++) out=out " | " f[i]; print out; next }
       }
       { print }
-    ' "$PAD_MD" > "$tmp" && mv "$tmp" "$PAD_MD"
+    ' "$PAD_MD" > "$tmp" && sp_write_inplace "$tmp" "$PAD_MD"
     # history rewrite: @old → @new everywhere in the pad (headers, mentions,
     # presence lines). In-place text swap — line count is untouched, so
     # message ordinals and every agent's wake cursor stay valid.
-    perl -i -pe 's/\@\Q'"$old"'\E(?![A-Za-z0-9_-])/\@'"$new"'/g' "$PAD_MD"
+    # NB: plain `perl -i` writes a new file and renames it, which swaps the
+    # pad's inode and makes every tail-based watcher replay the whole history.
+    # Stage to a temp and copy back through the original inode instead.
+    tmp="$(sp_stage "$PAD_MD")"
+    perl -pe 's/\@\Q'"$old"'\E(?![A-Za-z0-9_-])/\@'"$new"'/g' "$PAD_MD" > "$tmp" \
+      && sp_write_inplace "$tmp" "$PAD_MD"
     # per-agent state files keyed by name
     for _pfx in seen seen.relay count alive role level runtime forcewake dnd delivered_no_reply; do
       [ -f "$PAD_STATE/$_pfx.$old" ] && mv "$PAD_STATE/$_pfx.$old" "$PAD_STATE/$_pfx.$new" 2>/dev/null
@@ -501,7 +510,7 @@ PY
       _auth="$(awk '/^## @/{a=$2; sub(/^@/,"",a); print a}' "$span_file" | sort | uniq -c | sort -rn | head -6 | awk '{printf "%s×%s ", $2, $1}')"
       sum="(no LLM summary) archived $arch_count messages through $now_label — top authors: ${_auth:-n/a}"
     fi
-    tmp="$(mktemp)"
+    tmp="$(sp_stage "$PAD_MD")"
     {
       sed -n "1,${head_end}p" "$PAD_MD"
       printf '\n<!-- compact:gen=%s -->\n' "$gen"
@@ -511,7 +520,7 @@ PY
       if [ -s "$carried" ]; then printf '\n*open tasks carried through compaction:*\n\n'; cat "$carried"; fi
       printf '\n'
       sed -n "${cut_line},\$p" "$PAD_MD"
-    } > "$tmp" && mv "$tmp" "$PAD_MD"
+    } > "$tmp" && sp_write_inplace "$tmp" "$PAD_MD"
     rm -f "$PAD_STATE"/seen.* 2>/dev/null
     sp_commit "compact: gen $gen — $arch_count msgs → archive (keep $keep)"
     _h="$(sgit rev-parse HEAD 2>/dev/null || true)"
@@ -519,6 +528,97 @@ PY
     sp_unlock
     rm -f "$span_file" "$carried"
     echo "✓ compact gen $gen: $arch_count messages → archive.sqlite, kept $keep + open tasks + rolling summary"
+    ;;
+
+  archive)
+    # Plain-markdown transcript archive — the zero-dependency sibling of
+    # `compact`. compact needs sqlite3 (and wants an LLM for its summary) and
+    # hides history inside .state/archive.sqlite. archive just MOVES the old
+    # messages to .stitchpad/archive/<date>-conversation.md, a file any agent
+    # can open, and leaves a pointer line in the pad telling them to read it.
+    # The roster, the header and every ```task block stay in the pad.
+    #   stitchpad archive [--keep N] [--dry-run]
+    sp_init_paths || exit 1
+    keep=60; dry=0
+    while [ $# -gt 0 ]; do case "$1" in
+      --keep) keep="${2:-60}"; shift 2 ;;
+      --dry-run) dry=1; shift ;;
+      *) shift ;;
+    esac; done
+    case "$keep" in ''|*[!0-9]*) echo "stitchpad: --keep wants a number" >&2; exit 1 ;; esac
+    sp_lock || exit 1
+    # Refuse on a pad with no roster block — that pad is damaged, not archivable.
+    awk '/^```roster/{r=1} r&&/^```$/&&!/^```roster/{print NR; exit}' "$PAD_MD" | grep -q . \
+      || { sp_unlock; echo "stitchpad: no roster block — refusing to archive" >&2; exit 1; }
+    first_msg="$(awk '/^## @/{print NR; exit}' "$PAD_MD")"
+    [ -n "$first_msg" ] || { sp_unlock; echo "stitchpad: no messages — nothing to archive"; exit 0; }
+    msg_lines="$(awk '/^## @/{print NR}' "$PAD_MD")"
+    msg_count="$(printf '%s\n' "$msg_lines" | grep -c . || true)"
+    if [ "$msg_count" -le "$keep" ]; then
+      sp_unlock; echo "stitchpad: only $msg_count messages (keep=$keep) — nothing to archive"; exit 0
+    fi
+    cut_line="$(printf '%s\n' "$msg_lines" | tail -n "$keep" | head -1)"
+    arch_count=$(( msg_count - keep ))
+    if [ "$dry" -eq 1 ]; then
+      sp_unlock; echo "would archive $arch_count of $msg_count messages (keep $keep)"; exit 0
+    fi
+    day="$(date '+%Y-%m-%d')"
+    mkdir -p "$PAD_ARCHIVE_DIR"
+    arch_file="$PAD_ARCHIVE_DIR/$day-conversation.md"
+    arch_rel="archive/$day-conversation.md"
+    span="$(mktemp)"; sed -n "${first_msg},$((cut_line-1))p" "$PAD_MD" > "$span"
+    # Split the archived span: ```task / ```roster blocks are CARRIED BACK into
+    # the pad (a ticket board must not disappear into an archive), everything
+    # else is the transcript that moves out. Stale archive pointers from earlier
+    # runs are dropped — the fresh pointer below supersedes them.
+    carried="$(mktemp)"; body="$(mktemp)"
+    awk -v carry="$carried" '
+      /^```(task|roster)/ { inblk=1; print > carry; next }
+      inblk && /^```$/    { inblk=0; print "```" > carry; print "" > carry; next }
+      inblk               { print > carry; next }
+      /^<!-- archived:/                                { next }
+      /^> 📦 \*\*Archived:/                             { next }
+      /^\*carried through archiving:\*$/               { next }
+      { print }
+    ' "$span" > "$body"
+    if [ ! -f "$arch_file" ]; then
+      {
+        printf '# 🗄 archived conversation — %s\n\n' "$day"
+        printf '> Older messages moved out of `%s` by `stitchpad archive`, oldest first.\n' "$(basename "$PAD_MD")"
+        printf '> If the pad looks like it is missing context, it is in here.\n'
+        printf '> The roster and every task card stayed in the pad.\n\n'
+      } > "$arch_file"
+    fi
+    {
+      printf -- '---\n\n*archived %s · %s message(s)*\n\n' "$(date '+%Y-%m-%d %H:%M')" "$arch_count"
+      cat "$body"
+      printf '\n'
+    } >> "$arch_file"
+    tmp="$(sp_stage "$PAD_MD")"
+    {
+      # preamble = everything before the first message, minus any previous
+      # pointer AND any previous carried-blocks label (repeated archives must
+      # not stack "*carried through archiving:*" lines — a fresh one is added
+      # below whenever this run carries blocks)
+      sed -n "1,$((first_msg-1))p" "$PAD_MD" \
+        | awk '/^<!-- archived:/{next} /^> 📦 \*\*Archived:/{next} /^\*carried through archiving:\*$/{next} {print}'
+      if [ -s "$carried" ]; then printf '\n*carried through archiving:*\n\n'; cat "$carried"; fi
+      printf '\n<!-- archived:%s -->\n' "$day"
+      printf '> 📦 **Archived:** %s older message(s) moved to `%s` (%s). Agents: READ THAT FILE before assuming context is missing — it is the earlier part of this same conversation.\n\n' \
+        "$arch_count" "$arch_rel" "$(date '+%Y-%m-%d %H:%M')"
+      sed -n "${cut_line},\$p" "$PAD_MD"
+    } > "$tmp"
+    sp_write_inplace "$tmp" "$PAD_MD" || { sp_unlock; rm -f "$span" "$carried" "$body"; exit 1; }
+    # Message ordinals shrink, so wake cursors must reset — same contract as
+    # compact. A still-unanswered mention in the kept tail may re-fire once,
+    # which is correct: it IS unanswered.
+    rm -f "$PAD_STATE"/seen.* 2>/dev/null
+    sp_commit "archive: $arch_count msgs → $arch_rel (keep $keep)" "$(basename "$PAD_MD")" archive
+    _h="$(sgit rev-parse HEAD 2>/dev/null || true)"
+    if [ -n "$_h" ]; then for _f in "$PAD_STATE"/readref.*; do [ -f "$_f" ] && printf '%s' "$_h" > "$_f"; done; fi
+    sp_unlock
+    rm -f "$span" "$carried" "$body"
+    echo "✓ archived $arch_count messages → $arch_file (kept $keep + roster + task blocks)"
     ;;
 
   summarize)
@@ -615,12 +715,12 @@ PY
     sp_lock || exit 1
     # Keep everything through the roster block's closing fence, drop the rest,
     # add a fresh separator. Reset wake cursors so old mentions don't re-fire.
-    tmp="$(mktemp)"
+    tmp="$(sp_stage "$PAD_MD")"
     awk '
       { print }
       /^```roster/ { inblk=1; next }
       inblk && /^```$/ { print ""; print "---"; exit }
-    ' "$PAD_MD" > "$tmp" && mv "$tmp" "$PAD_MD"
+    ' "$PAD_MD" > "$tmp" && sp_write_inplace "$tmp" "$PAD_MD"
     rm -f "$PAD_STATE"/cursor.* 2>/dev/null
     sp_commit "pad cleared (roster kept)"
     sp_unlock
@@ -634,13 +734,13 @@ PY
     who="${1:-$(sp_me)}"
     [ -z "$who" ] && { echo "usage: stitchpad leave <name>" >&2; exit 1; }
     sp_lock || exit 1
-    tmp="$(mktemp)"
+    tmp="$(sp_stage "$PAD_MD")"
     awk -v who="$who" '
       /^```roster/ { inblk=1; print; next }
       inblk && /^```/ { inblk=0; print; next }
       inblk && tolower($1)==tolower(who) { next }   # drop this roster line
       { print }
-    ' "$PAD_MD" > "$tmp" && mv "$tmp" "$PAD_MD"
+    ' "$PAD_MD" > "$tmp" && sp_write_inplace "$tmp" "$PAD_MD"
     sp_system "@$who left the stitchpad"
     sp_commit "roster: - $who"
     # also release any file claims and wake state this agent held
@@ -2006,8 +2106,13 @@ except: print("")' 2>/dev/null)"
         # Build the block — always include all core fields so edit can find them
         ts="$(date -u '+%m-%d %H:%M')"
         block="\`\`\`task $id"$'\n'"title: $title"$'\n'"status: todo"$'\n'"priority: $priority"$'\n'"assignee: ${assignee:-}"$'\n'"labels: ${labels:-}"$'\n'"created: $ts"$'\n'"---"$'\n'"${desc:-$id created}"$'\n'"\`\`\`"
-        printf '\n%s\n' "$block" >> "$PAD_MD"
-        sp_commit "task $id: $title"
+        # Tasks are written to the SIBLING tasks.md, not the conversation. A
+        # ticket op no longer rewrites or re-commits the whole transcript.
+        # (Legacy inline blocks in the pad are still read — see sp_tasks.)
+        sp_ensure_tasks_file
+        printf '\n%s\n' "$block" >> "$PAD_TASKS"
+        sp_ensure_tasks_pointer
+        sp_commit "task $id: $title" "$(basename "$PAD_TASKS")" "$(basename "$PAD_MD")"
         sp_unlock
         echo "$id created"
         # Wake assignee if set
@@ -2023,22 +2128,31 @@ except: print("")' 2>/dev/null)"
 
       show)
         tid="${1:?usage: stitchpad task show <TASK-N>}"
-        awk -v want="\`\`\`task $tid" '$0==want{p=1} p{print; if (p>1 && $0=="\`\`\`") exit; p=2}' "$PAD_MD"
+        _tf=(); while IFS= read -r _f; do _tf+=("$_f"); done < <(sp_task_files)
+        awk -v want="\`\`\`task $tid" '$0==want{p=1} p{print; if (p>1 && $0=="\`\`\`") exit; p=2}' "${_tf[@]}"
         ;;
 
       move)
         id="${1:-}"; new_status="${2:-}"
         [ -z "$id" ] && { echo "usage: stitchpad task move <id> <status>" >&2; exit 1; }
         [ -z "$new_status" ] && { echo "usage: stitchpad task move <id> <status>" >&2; exit 1; }
-        # Find the task block and update status in-place
         sp_lock || exit 1
+        # Edit only the file that actually holds the card. A migrated task lives
+        # in tasks.md, so moving it never touches (or re-commits) the pad; a
+        # legacy inline task is still edited where it sits. An unknown id fails
+        # instead of rewriting the whole pad for nothing.
+        tfile="$(sp_task_file "$id")" || { sp_unlock; echo "stitchpad: no such task: $id" >&2; exit 1; }
+        tmp="$(sp_stage "$tfile")"
         awk -v tid="$id" -v ns="$new_status" '
           /^```task / && $2==tid { inblk=1; inmeta=1 }
           inblk && inmeta && /^status:/ { sub(/status:.*/, "status: " ns) }
           /^```$/ && inblk { inblk=0 }
           { print }
-        ' "$PAD_MD" > "$PAD_MD.tmp" && mv "$PAD_MD.tmp" "$PAD_MD"
-        sp_commit "task $id → $new_status"
+        ' "$tfile" > "$tmp"
+        sp_write_inplace "$tmp" "$tfile"; rc=$?
+        [ "$rc" -eq 1 ] && { sp_unlock; exit 1; }
+        # rc=2 → status already was $new_status: no write, no commit, no churn
+        if [ "$rc" -eq 0 ]; then sp_commit "task $id → $new_status" "$(basename "$tfile")"; fi
         sp_unlock
         echo "$id → $new_status"
         ;;
@@ -2057,6 +2171,8 @@ except: print("")' 2>/dev/null)"
             *) shift ;;
           esac
         done
+        tfile="$(sp_task_file "$id")" || { sp_unlock; echo "stitchpad: no such task: $id" >&2; exit 1; }
+        tmp="$(sp_stage "$tfile")"
         awk -v tid="$id" -v np="$new_priority" -v na="$new_assignee" -v nl="$new_labels" '
           /^```task / && $2==tid { inblk=1; inmeta=1 }
           inblk && inmeta && np!="" && /^priority:/ { sub(/priority:.*/, "priority: " np) }
@@ -2064,13 +2180,45 @@ except: print("")' 2>/dev/null)"
           inblk && inmeta && nl!="" && /^labels:/ { sub(/labels:.*/, "labels: " nl) }
           /^```$/ && inblk { inblk=0 }
           { print }
-        ' "$PAD_MD" > "$PAD_MD.tmp" && mv "$PAD_MD.tmp" "$PAD_MD"
-        sp_commit "task $id metadata updated"
+        ' "$tfile" > "$tmp"
+        sp_write_inplace "$tmp" "$tfile"; rc=$?
+        [ "$rc" -eq 1 ] && { sp_unlock; exit 1; }
+        if [ "$rc" -eq 0 ]; then sp_commit "task $id metadata updated" "$(basename "$tfile")"; fi
         sp_unlock
         echo "$id updated"
         ;;
 
-      *) echo "usage: stitchpad task {new|list|move|edit}" >&2; exit 1 ;;
+      migrate)
+        # One-time move of legacy inline ```task blocks out of the pad and into
+        # tasks.md. Optional — nothing breaks if it is never run, because
+        # sp_tasks reads both files. --dry-run reports without writing.
+        dry=0; [ "${1:-}" = "--dry-run" ] && dry=1
+        sp_lock || exit 1
+        n_inline="$(awk '/^```task /{c++} END{print c+0}' "$PAD_MD")"
+        if [ "$n_inline" -eq 0 ]; then
+          sp_unlock; echo "no inline task blocks in $(basename "$PAD_MD") — nothing to migrate"; exit 0
+        fi
+        if [ "$dry" -eq 1 ]; then
+          sp_unlock; echo "would move $n_inline inline task block(s) → $(basename "$PAD_TASKS")"; exit 0
+        fi
+        sp_ensure_tasks_file
+        moved="$(mktemp)"; kept="$(sp_stage "$PAD_MD")"
+        awk -v out="$moved" '
+          /^```task / { inblk=1; print > out; next }
+          inblk && /^```$/ { inblk=0; print "```" > out; print "" > out; next }
+          inblk { print > out; next }
+          { print }
+        ' "$PAD_MD" > "$kept"
+        printf '\n' >> "$PAD_TASKS"; cat "$moved" >> "$PAD_TASKS"; rm -f "$moved"
+        sp_write_inplace "$kept" "$PAD_MD"
+        sp_ensure_tasks_pointer
+        sp_commit "tasks: migrated $n_inline inline block(s) → $(basename "$PAD_TASKS")" \
+          "$(basename "$PAD_TASKS")" "$(basename "$PAD_MD")"
+        sp_unlock
+        echo "✓ migrated $n_inline task block(s) → $PAD_TASKS"
+        ;;
+
+      *) echo "usage: stitchpad task {new|list|show|move|edit|migrate}" >&2; exit 1 ;;
     esac
     ;;
 

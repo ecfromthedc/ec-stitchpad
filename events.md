@@ -946,3 +946,11 @@ area:      [infra]
 
 Per-person relay tokens so one teammate's rotation can never lock out the rest (the EC incident). worker.js auth now accepts the legacy STITCHPAD_TOKEN OR any value in the new STITCHPAD_TOKENS secret (JSON handle→token); /login and /join-request return the caller's own token when their handle has one. Minted tokens for jay, sam, ec and set the secret; deployed (version de4cb838); verified live: all four tokens 200 on /pads, bogus token 401, john's bridge reconnected clean after the deploy. Tokens handed to john to distribute — each person drops theirs into STITCHPAD_TOKEN in their bridge plist. Rotating one person now = edit one key in STITCHPAD_TOKENS.
 _________________________________________________________________________________
+time:      [14:18] [07-31-26]
+agent:     [claude] [fable 5]
+worktree:  fix/pad-io-and-archive
+type:      [merge]
+area:      [backend]
+
+Reviewed, fixed and merged EC's PR #4 (inode-stable pad writes, tasks.md split, stitchpad archive) as 6014254. Review verified his diagnosis and test rigor (35/35 in an isolated worktree, self-controlled inode test) but caught one real regression his writeup explicitly denied: the phone kanban renders from the doc the bridge pushes, so cards moved to tasks.md vanished from the board. Synthesis commit efc849e pushed to his branch: bridge-push-once.sh appends tasks.md's task blocks after the pad text (PWA's last-wins parser then also beats stale inline copies — zero PWA changes), new --doc dry-run flag for tests, sp_recover_inplace age-gates .ready files (recovery runs outside the lock; replaying a live writer's .ready had a thin path to a blanked pad via the unguarded cat fallback, now -s-guarded), archive no longer stacks carried-labels. Suite extended to 40 assertions, all green; other suites at master parity. NOTE: ~/pasture main checkout NOT pulled — pi's uncommitted lib.sh work would collide with the PR's lib.sh changes on autostash; sync when that session lands. Until then john's local CLI+bridge stay consistently pre-PR.
+_________________________________________________________________________________
