@@ -122,6 +122,7 @@ button{font:inherit}
 .bubble .bd a{color:#4cc3e8;text-decoration:none}
 .bubble .bd a:hover{text-decoration:underline}
 .msg-img{max-width:min(360px,100%);max-height:280px;border-radius:var(--r-m);margin:6px 0;display:block;border:1px solid var(--edge)}
+.msg-audio{max-width:min(360px,100%);margin:6px 0;display:block}
 .bubble code{background:#1c212b;border:1px solid var(--edge-soft);border-radius:5px;padding:1px 5px;font-size:13px;font-family:ui-monospace,SFMono-Regular,Menlo,monospace}
 .bubble pre{background:#0e1117;border:1px solid var(--edge-soft);border-radius:var(--r-m);padding:11px 12px;overflow:auto;font-size:13px;margin:0;line-height:1.55;font-family:ui-monospace,SFMono-Regular,Menlo,monospace}
 .cb{position:relative;margin:7px 0}
@@ -148,6 +149,8 @@ button{font:inherit}
 
 /* ── composer ── */
 #cwrap{padding:10px 16px;padding-bottom:calc(10px + env(safe-area-inset-bottom));position:relative}
+#newpill{position:absolute;left:50%;transform:translateX(-50%);bottom:100%;margin-bottom:8px;background:var(--accent);color:#fff;border:0;border-radius:18px;padding:7px 14px;font:700 13px inherit;box-shadow:0 6px 20px rgba(0,0,0,.42);cursor:pointer;display:none;z-index:var(--z-ac)}
+#newpill.show{display:block}
 #composer{border:1px solid #3a4150;border-radius:14px;background:var(--panel);display:flex;align-items:flex-end;transition:border-color .15s var(--ease),box-shadow .15s var(--ease)}
 #composer:focus-within{border-color:var(--teal);box-shadow:0 0 0 3px var(--teal-soft)}
 #atbtn,#attbtn{background:transparent;border:0;color:var(--dim);width:34px;height:34px;flex:0 0 34px;margin:7px 0 7px 7px;border-radius:9px;font-size:17px;font-weight:700;cursor:pointer;display:flex;align-items:center;justify-content:center;transition:background .15s var(--ease),color .15s var(--ease)}

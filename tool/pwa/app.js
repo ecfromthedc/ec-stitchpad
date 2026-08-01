@@ -49,8 +49,14 @@ function fmt(t) {
   // [text](url) markdown links — scheme-restricted (https?: or our /img /f
   // media routes) so a hostile pad line can never mint a javascript: href
   t = t.replace(/\[([^\]]+)\]\(((?:https?:\/\/|\/(?:img|f)\/)[^\s)]+)\)/g, (m, txt, url) => `<a href="${url}" target="_blank" rel="noopener">${txt}</a>`);
+  // Standalone media links play inline. Keep this before bare autolinking so
+  // the generated src attributes are not wrapped in anchor tags.
+  t = t.replace(/(^|[\s])(https?:\/\/[^\s<"]+?\.(mp4|mov|webm|m4v))(\?[^\s<"]*)?(?=[\s]|$)/gi,
+    (m, p, url, ext, q) => `${p}<video class="msg-img" src="${url}${q || ""}" controls preload="metadata" playsinline></video>`);
+  t = t.replace(/(^|[\s])(https?:\/\/[^\s<"]+?\.(mp3|m4a|ogg|oga|wav))(\?[^\s<"]*)?(?=[\s]|$)/gi,
+    (m, p, url, ext, q) => `${p}<audio src="${url}${q || ""}" controls preload="metadata" class="msg-audio"></audio>`);
   t = t.replace(/\*\*([^*]+)\*\*/g, "<b>$1</b>");
-  t = t.replace(/(https?:\/\/[^\s]+)/g, '<a href="$1" target="_blank" rel="noopener">$1</a>');
+  t = t.replace(/(?<!["'=])(https?:\/\/[^\s<"]+)/g, '<a href="$1" target="_blank" rel="noopener">$1</a>');
   t = t.replace(/(^|[\s(])@([a-zA-Z0-9_-]+)/g, (m, p, n) => `${p}<b style="color:${colorFor(n)}">@${n}</b>`);
   return t;
 }
@@ -90,6 +96,10 @@ function fmtMd(t, ctx) {
     .replace(/`([^`]+)`/g, "<code>$1</code>")
     .replace(/!\[([^\]]*)\]\(((?:https?:\/\/|\/(?:img|f)\/)[^\s)]+)\)/g, (m, alt, url) => `<img class="msg-img" src="${url}" alt="${alt}" loading="lazy" referrerpolicy="no-referrer">`)
     .replace(/\[([^\]]+)\]\(((?:https?:\/\/|\/(?:img|f)\/)[^\s)]+)\)/g, (m, txt, url) => `<a href="${url}" target="_blank" rel="noopener">${txt}</a>`)
+    .replace(/(^|[\s])(https?:\/\/[^\s<"]+?\.(mp4|mov|webm|m4v))(\?[^\s<"]*)?(?=[\s]|$)/gi,
+      (m, p, url, ext, q) => `${p}<video class="msg-img" src="${url}${q || ""}" controls preload="metadata" playsinline></video>`)
+    .replace(/(^|[\s])(https?:\/\/[^\s<"]+?\.(mp3|m4a|ogg|oga|wav))(\?[^\s<"]*)?(?=[\s]|$)/gi,
+      (m, p, url, ext, q) => `${p}<audio src="${url}${q || ""}" controls preload="metadata" class="msg-audio"></audio>`)
     .replace(/\*\*([^*]+)\*\*/g, "<b>$1</b>")
     .replace(/(^|[\s(])\*([^*\n]+)\*(?=$|[\s).,;:!?])/g, "$1<i>$2</i>")
     .replace(/(?<!["'=])(https?:\/\/[^\s<">]+)/g, '<a href="$1" target="_blank" rel="noopener">$1</a>')
@@ -154,6 +164,7 @@ const store = {
   replyTo: null,      // {id, who} while composing a threaded reply
   threads: {},        // #m-id → true when a thread is expanded
   filesOpen: false,   // shed panel — files derived from 📎 pad lines
+  newBelow: 0,        // messages received while the reader is scrolled up
 };
 const subs = new Set();
 const publish = () => subs.forEach(f => f());
@@ -322,7 +333,7 @@ document.addEventListener("visibilitychange", () => {
   else { poll(); loadPads(); startPolling(); connectWS(); if (store.dmWith) startTermPoll(); }
 });
 function switchPad(name) {
-  store.pad = name; store.dmWith = ""; store.doc = null; store.blocks = null; store.pending = []; store.notices = []; store.dmlogs = {}; store.terms = {};
+  store.pad = name; store.dmWith = ""; store.doc = null; store.blocks = null; store.pending = []; store.notices = []; store.dmlogs = {}; store.terms = {}; store.newBelow = 0;
   stopTermPoll();
   PAD_ETAG = "";
   localStorage.removeItem("sp_dm"); localStorage.setItem("sp_pad", name);
@@ -362,8 +373,8 @@ async function requestTerm() {
 }
 function startTermPoll() { stopTermPoll(); requestTerm(); termTimer = setInterval(requestTerm, 5000); }
 function stopTermPoll() { clearInterval(termTimer); termTimer = null; }
-function openDM(n) { store.dmWith = n; localStorage.setItem("sp_dm", n); store.notices = []; publish(); loadDmLog(n); startTermPoll(); }
-function closeDM() { store.dmWith = ""; localStorage.removeItem("sp_dm"); store.notices = []; stopTermPoll(); publish(); }
+function openDM(n) { store.dmWith = n; store.newBelow = 0; localStorage.setItem("sp_dm", n); store.notices = []; publish(); loadDmLog(n); startTermPoll(); }
+function closeDM() { store.dmWith = ""; store.newBelow = 0; localStorage.removeItem("sp_dm"); store.notices = []; stopTermPoll(); publish(); }
 function startApp() {
   store.authed = true;
   store.dmWith = localStorage.getItem("sp_dm") || "";
@@ -698,6 +709,14 @@ function Log() {
   const known = useRef(new Set());
   const first = useRef(true);
   useEffect(() => { known.current = new Set(); first.current = true; }, [s.pad, s.dmWith]);
+  useEffect(() => {
+    const l = logEl(); if (!l) return;
+    const onScroll = () => {
+      if (nearBottom() && store.newBelow) { store.newBelow = 0; publish(); }
+    };
+    l.addEventListener("scroll", onScroll, { passive: true });
+    return () => l.removeEventListener("scroll", onScroll);
+  }, [s.pad, s.dmWith]);
 
   let items = [];
   if (s.dmWith) {
@@ -761,9 +780,13 @@ function Log() {
     // the bottom BEFORE this update. Scrolled up → re-pin the row they were
     // reading (the merge window can insert/remove rows above the viewport,
     // which otherwise shifts the page under them — the "jolt").
-    if (atBottom) stick(false);
+    if (atBottom) {
+      stick(false);
+      if (store.newBelow) { store.newBelow = 0; publish(); }
+    }
     else if (anchor && anchor.el.isConnected) {
       const l = logEl(); if (l) l.scrollTop = anchor.el.offsetTop - anchor.top;
+      if (fresh.size) { store.newBelow += fresh.size; publish(); }
     }
   });
 
@@ -799,10 +822,19 @@ const SLASH = [
 function Composer() {
   const s = useStore();
   const ta = useRef(), hl = useRef(), fpick = useRef();
-  const [val, setVal] = useState("");
+  const draftKey = "sp_draft_" + (s.dmWith ? "dm:" + s.dmWith : s.pad || "none");
+  const [val, setVal] = useState(() => localStorage.getItem(draftKey) || "");
   const [ac, setAc] = useState(null); // {kind, start, items, sel}
   const roster = (s.doc?.roster || []).map(m => m.name);
   const filesList = s.doc?.files || [];
+
+  const setDraft = v => {
+    setVal(v);
+    try { v ? localStorage.setItem(draftKey, v) : localStorage.removeItem(draftKey); } catch (_) {}
+  };
+  useEffect(() => {
+    try { setVal(localStorage.getItem(draftKey) || ""); } catch (_) { setVal(""); }
+  }, [draftKey]);
 
   const syncHl = v => {
     if (!hl.current) return;
@@ -839,16 +871,16 @@ function Composer() {
     const ins = (a.kind === "@" ? "@" + pick : a.kind === "/" ? "/" + pick[0] : pick) + " ";
     const t = ta.current;
     const nv = t.value.slice(0, a.start) + ins + t.value.slice(t.selectionStart);
-    setVal(nv); setAc(null);
+    setDraft(nv); setAc(null);
     requestAnimationFrame(() => { const pos = a.start + ins.length; t.setSelectionRange(pos, pos); t.focus(); });
   };
   const doSend = async () => {
     const text = val.trim(); if (!text) return;
     const re = s.replyTo?.id;
-    setVal(""); setAc(null);
+    setDraft(""); setAc(null);
     if (re) { store.replyTo = null; publish(); }
     const res = await sendText(text, re);
-    if (!res.ok) setVal(res.text);   // restore so the send isn't lost
+    if (!res.ok) setDraft(res.text);   // restore so the send isn't lost
   };
   const onKey = e => {
     if (ac) {
@@ -862,11 +894,14 @@ function Composer() {
   const atClick = () => {
     const t = ta.current, c = t.selectionStart, before = t.value.slice(0, c);
     const pre = (before && !/[\s(]$/.test(before)) ? " @" : "@";
-    setVal(before + pre + t.value.slice(t.selectionEnd));
+    setDraft(before + pre + t.value.slice(t.selectionEnd));
     requestAnimationFrame(() => { const pos = c + pre.length; t.setSelectionRange(pos, pos); t.focus(); updateAc(); });
   };
 
   return html`<div id="cwrap">
+    <button id="newpill" class=${s.newBelow ? "show" : ""} onClick=${() => { store.newBelow = 0; publish(); stick(true); }}>
+      ↓ ${s.newBelow > 1 ? s.newBelow + " new messages" : "new message"}
+    </button>
     ${ac && html`<div id="ac" class="show">
       <div class="ac-list">
         ${ac.items.map((it, i) => ac.kind === "@"
@@ -895,7 +930,7 @@ function Composer() {
       <div id="edwrap">
         <div id="hl" ref=${hl} aria-hidden="true"></div>
         <textarea id="text" ref=${ta} rows="1" placeholder="Message…" value=${val}
-          onInput=${e => { setVal(e.target.value); requestAnimationFrame(updateAc); }}
+          onInput=${e => { setDraft(e.target.value); requestAnimationFrame(updateAc); }}
           onClick=${updateAc} onKeyDown=${onKey}
           onScroll=${() => hl.current && (hl.current.scrollTop = ta.current.scrollTop)}
           onBlur=${() => setTimeout(() => setAc(null), 150)}
