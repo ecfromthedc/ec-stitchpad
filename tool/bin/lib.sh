@@ -641,6 +641,10 @@ sp_stop_watchers_for_pad() {
   done < <(sp_watch_processes_for_pad)
 
   rm -rf "$watch_lock" 2>/dev/null || true
+  # bash 3.2 (macOS) expands "${arr[@]}" on an EMPTY array as an unbound
+  # variable under `set -u`, aborting the caller. That broke `stitchpad start`:
+  # stop-then-start bailed here before ever spawning the watcher.
+  [ "${#pids[@]}" -eq 0 ] && return 0
   for p in "${pids[@]}"; do
     kill "$p" 2>/dev/null || true
   done
