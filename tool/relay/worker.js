@@ -191,6 +191,19 @@ export default {
     const url = new URL(req.url);
     if (req.method === "OPTIONS") return new Response(null, { headers: cors });
 
+    // Keep legacy API/WebSocket clients working on the old domains, but send
+    // browser visits to the Pasture-branded URL. A 308 preserves the path and
+    // query string without turning old POST endpoints into redirects.
+    const pastureHost = {
+      "stitchpad.agentsworld.org": "pasture.agentsworld.org",
+      "ec-stitchpad.agentsworld.org": "ec-pasture.agentsworld.org",
+    }[url.hostname];
+    const wantsHtml = (req.headers.get("accept") || "").includes("text/html");
+    if (pastureHost && (req.method === "GET" || req.method === "HEAD") && (url.pathname === "/" || wantsHtml)) {
+      url.hostname = pastureHost;
+      return Response.redirect(url.toString(), 308);
+    }
+
     // handle → personal token map; legacy shared token stays valid alongside it
     let TOKENS = {};
     try { TOKENS = JSON.parse((env.PASTURE_TOKENS || env.STITCHPAD_TOKENS) || "{}"); } catch {}

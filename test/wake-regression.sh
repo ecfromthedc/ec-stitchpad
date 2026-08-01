@@ -23,13 +23,22 @@ contains() {
 
 stop_watcher() {
   local d="$1"
-  "$SP" daemon stop >/dev/null 2>&1 || true
-  pkill -9 -f "fswatch.*$d" 2>/dev/null || true
-  for _pidfile in "$d"/.stitchpad/.state/alive-ticker.*.pid "$d"/.stitchpad/.state/heartbeat.*.lock/pid; do
+  # Stop heartbeat tickers cleanly before the daemon. A live ticker calls
+  # ensure-watcher and can otherwise recreate the watcher in the narrow gap
+  # after an initial daemon stop, making the test race its own background copy.
+  for _lock in "$d"/.stitchpad/.state/heartbeat.*.lock; do
+    [ -d "$_lock" ] || continue
+    _name="$(basename "$_lock")"
+    _name="${_name#heartbeat.}"; _name="${_name%.lock}"
+    "$SP" heartbeat stop "$_name" >/dev/null 2>&1 || true
+  done
+  for _pidfile in "$d"/.stitchpad/.state/alive-ticker.*.pid; do
     [ -f "$_pidfile" ] || continue
     _pid="$(timeout 2 cat "$_pidfile" 2>/dev/null || true)"
     [ -n "$_pid" ] && kill -9 "$_pid" 2>/dev/null || true
   done
+  "$SP" daemon stop >/dev/null 2>&1 || true
+  pkill -9 -f "fswatch.*$d" 2>/dev/null || true
   sleep 0.2
 }
 
