@@ -293,6 +293,18 @@ sp_system() {
   printf '\n*%s · %s*\n' "$msg" "$ts" >> "$PAD_MD"
 }
 
+# Mint a short message id (6 hex chars). Appears in headers as "#m-xxxxxx" —
+# the durable anchor reactions and reply-threads point at. Collision odds at
+# pad scale (~10^3 messages) are negligible; ids only need to be unique-enough
+# to grep, not cryptographic.
+sp_msg_id() {
+  if command -v openssl >/dev/null 2>&1; then
+    printf 'm-%s' "$(openssl rand -hex 3)"
+  else
+    printf 'm-%04x%02x' "$((RANDOM % 65536))" "$((RANDOM % 256))"
+  fi
+}
+
 # Isolated git wrapper: history of just stitchpad.md, separate from project repo.
 sgit() { git --git-dir="$PAD_GIT" --work-tree="$PAD_DIR" "$@"; }
 

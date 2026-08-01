@@ -299,14 +299,73 @@ const TOOLS = [
     description:
       "Post a message to the stitchpad as yourself (the name you joined as — the " +
       "server knows who you are, you cannot post as anyone else). To address a " +
-      "teammate and wake them, start your text with @their-name. This is also how " +
-      "you reply when the wake hook blocks you with an incoming message.",
+      "teammate and wake them, start your text with @their-name; @flock (or @all) " +
+      "wakes everyone at once. This is also how you reply when the wake hook " +
+      "blocks you with an incoming message. Pass reply_to (a #m-… id from a " +
+      "message header) to thread your message under that one — do this whenever " +
+      "you're answering a specific message in a busy room.",
     inputSchema: {
       type: "object",
       properties: {
-        text: { type: "string", description: "The message. Start with @name to address+wake someone." },
+        text: { type: "string", description: "The message. Start with @name to address+wake someone; @flock wakes everyone." },
+        reply_to: { type: "string", description: "Optional #m-… id to thread this message under." },
       },
       required: ["text"],
+    },
+  },
+  {
+    name: "amend",
+    description:
+      "Rewrite the BODY of one of YOUR OWN messages in place (by its #m-… id). " +
+      "Header, id, and thread links survive; each amend is a git commit so " +
+      "history keeps every version. Use it for LIVE cards — e.g. update a " +
+      "posted ui timeline as your run progresses — or to correct your last " +
+      "message. You cannot amend other agents' messages.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        message_id: { type: "string", description: "The #m-… id of YOUR message to rewrite." },
+        text: { type: "string", description: "The full replacement body (markdown, fences included)." },
+      },
+      required: ["message_id", "text"],
+    },
+  },
+  {
+    name: "react",
+    description:
+      "React to a message (by its #m-… header id) with an emoji or short word — " +
+      "a lightweight ack that never wakes anyone. Use it instead of a whole " +
+      "message when 👍 / ✅ / 👀 is the entire content. Same emoji again removes " +
+      "your reaction.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        message_id: { type: "string", description: "The #m-… id from the target message's header." },
+        emoji: { type: "string", description: "One emoji or a short word (≤24 chars), e.g. 👍 ✅ 👀 🔥 ship-it." },
+      },
+      required: ["message_id", "emoji"],
+    },
+  },
+  {
+    name: "ui",
+    description:
+      "Post a rich component into the chat — ONLY when it genuinely beats prose " +
+      "at collaborating on work: a diff to review, a table to scan, a poll to " +
+      "decide, a form to fill, a checklist to track, sign-off to request. " +
+      "Default to plain say; a room full of components is noise. Types: " +
+      "callout, checklist, table, progress, diff, poll, approve, form (+ their " +
+      ".vote/.verdict/.response reply types, which MUST set reply_to to the " +
+      "originating component's #m-… id). `alt` is the one-line plain-text " +
+      "stand-in every non-rich surface shows — write it like a normal message.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        type: { type: "string", description: "Component type, e.g. 'table', 'poll', 'approve.verdict'." },
+        payload: { type: "object", description: "The component payload — schema-checked; invalid payloads are rejected with the exact problems." },
+        alt: { type: "string", description: "One-line plain-text fallback shown by the TUI/CLI. Required." },
+        reply_to: { type: "string", description: "Optional #m-… id to thread under (REQUIRED for *.vote/*.verdict/*.response)." },
+      },
+      required: ["type", "payload", "alt"],
     },
   },
   {
@@ -519,14 +578,57 @@ server.setRequestHandler(CallToolRequestSchema, async (req) => {
           : `\n(you are @${handle}; @${handle} mentions wake this Herdr pane. Reply with the say tool — identity is locked to your session.)`;
         break;
       }
-      case "say":
+      case "say": {
         if (RELAY_MODE) {
           out = await relaySay(a.text);
           break;
         }
         if (!ME) return text("call join first — you have no identity in this stitchpad yet.", true);
-        out = padStamp(await sp(["say", a.text], ME));   // sender derived from server memory, never the agent
+        const sayArgs = ["say"];
+        if (a.reply_to) sayArgs.push("--re", String(a.reply_to));
+        sayArgs.push(a.text);
+        out = padStamp(await sp(sayArgs, ME));   // sender derived from server memory, never the agent
         break;
+      }
+      case "react":
+        if (RELAY_MODE) return text("reactions are not available over relay yet.", true);
+        if (!ME) return text("call join first — reactions need your identity.", true);
+        out = padStamp(await sp(["react", String(a.message_id), String(a.emoji)], ME));
+        break;
+      case "amend": {
+        if (RELAY_MODE) return text("amend is not available over relay yet.", true);
+        if (!ME) return text("call join first — amend needs your identity.", true);
+        const os = await import("node:os");
+        const tmp = path.join(os.tmpdir(), `amend-${ME}-${process.pid}.md`);
+        fsSync.writeFileSync(tmp, String(a.text || ""));
+        out = padStamp(await sp(["amend", String(a.message_id), "--file", tmp], ME));
+        try { fsSync.unlinkSync(tmp); } catch {}
+        break;
+      }
+      case "ui": {
+        if (RELAY_MODE) return text("ui components are not available over relay yet.", true);
+        if (!ME) return text("call join first — ui components need your identity.", true);
+        const { validate, composeFence } = await import(
+          new URL("../pwa/ui/schemas.mjs", import.meta.url)
+        );
+        const uiType = String(a.type || "");
+        const problems = validate(uiType, a.payload);
+        if (problems.length) {
+          return text(`ui rejected:\n- ${problems.join("\n- ")}`, true);
+        }
+        const isReplyType = /\.(vote|verdict|response)$/.test(uiType);
+        if (isReplyType && !a.reply_to) {
+          return text(`ui rejected: type "${uiType}" is a reply component — reply_to (the origin's #m-… id) is required.`, true);
+        }
+        const alt = String(a.alt || "").split("\n")[0].trim();
+        if (!alt) return text("ui rejected: alt (one-line plain-text fallback) is required.", true);
+        const body = composeFence(uiType, a.payload, alt);
+        const uiArgs = ["say"];
+        if (a.reply_to) uiArgs.push("--re", String(a.reply_to));
+        uiArgs.push(body);
+        out = padStamp(await sp(uiArgs, ME));
+        break;
+      }
       case "shift_change": {
         if (RELAY_MODE) return text("shift-change is not available over relay yet.", true);
         if (!ME) return text("call join first — shift-change needs your identity.", true);

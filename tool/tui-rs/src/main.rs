@@ -62,7 +62,7 @@ pub fn pad_state() -> String {
 /// irssi/weechat convention — plus /slash commands (`/help` lists them).
 /// The barn (tasks) has no input, so it keeps plain vim keys.
 struct App {
-    tab: u8, // 0=pasture 1=barn
+    tab: u8, // 0=pasture 1=barn 2=shed
     input: String,
     /// Cursor position in the input, as a CHAR index (0..=input char len).
     cursor: usize,
@@ -80,12 +80,12 @@ struct App {
     /// by hit-testing against this (drag-select, wheel scroll).
     msg_inner: Rect,
     /// Header tab labels' clickable column ranges from the last draw.
-    tab_hits: [(u16, u16); 2],
+    tab_hits: [(u16, u16); 3],
     /// Live mouse drag anchor (inner-relative row), while the left button is down.
     drag_anchor: Option<u16>,
 }
 
-const TAB_LABELS: [&str; 2] = ["pasture", "barn"];
+const TAB_LABELS: [&str; 3] = ["pasture", "barn", "shed"];
 
 /// Slash commands the prompt understands. (name, args, blurb) — Tab completes
 /// them, /help prints them.
@@ -265,6 +265,7 @@ fn main() -> io::Result<()> {
     let mut roster = RosterRail::from_doctor();
     let mut messages = widgets::messages::MessageList::from_pad();
     let mut board = widgets::tasks::TaskBoard::from_pad();
+    let mut shed = widgets::shed::Shed::from_dropbox();
     let mut app = App {
         tab: 0,
         input: String::new(),
@@ -278,7 +279,7 @@ fn main() -> io::Result<()> {
         watcher_alive: RosterRail::watcher_alive(),
         flash: None,
         msg_inner: Rect::default(),
-        tab_hits: [(0, 0); 2],
+        tab_hits: [(0, 0); 3],
         drag_anchor: None,
     };
 
@@ -337,6 +338,7 @@ fn main() -> io::Result<()> {
         if changed {
             messages.refresh();
             board.refresh();
+            shed.refresh();
         }
         // Drain background roster updates.
         while let Ok((members, alive)) = roster_rx.try_recv() {
@@ -481,7 +483,9 @@ fn main() -> io::Result<()> {
             f.render_widget(Paragraph::new(Line::from(header)), header_row);
 
             // ── Main area ────────────────────────────────────────────────
-            if app.tab == 1 {
+            if app.tab == 2 {
+                f.render_widget(&shed, main_row);
+            } else if app.tab == 1 {
                 f.render_widget(&board, main_row);
                 if app.detail_open {
                     if let Some(task) = board.selected_task() {
@@ -696,9 +700,14 @@ fn main() -> io::Result<()> {
                 ])
             } else if let Some(fmsg) = app.flash_line() {
                 Line::from(Span::styled(fmsg.to_string(), Style::default().fg(t.fg)))
+            } else if app.tab == 2 {
+                Line::from(Span::styled(
+                    "j/k:nav  Enter:open  r:refresh  ?:help  ^T:next tab  q:quit",
+                    dim,
+                ))
             } else if app.tab == 1 {
                 Line::from(Span::styled(
-                    "h/l/j/k:nav  Enter:detail  ]/[:move  p:priority  d:done  x:cancel  ?:help  ^T:chat  q:quit",
+                    "h/l/j/k:nav  Enter:detail  ]/[:move  p:priority  d:done  x:cancel  ?:help  ^T:shed  q:quit",
                     dim,
                 ))
             } else {
@@ -725,6 +734,8 @@ fn main() -> io::Result<()> {
                                 app.summary_scroll = app.summary_scroll.saturating_sub(1);
                             } else if app.tab == 0 {
                                 messages.scroll_up();
+                            } else if app.tab == 2 {
+                                shed.previous();
                             } else {
                                 board.previous();
                             }
@@ -734,6 +745,8 @@ fn main() -> io::Result<()> {
                                 app.summary_scroll = app.summary_scroll.saturating_add(1);
                             } else if app.tab == 0 {
                                 messages.scroll_down();
+                            } else if app.tab == 2 {
+                                shed.next();
                             } else {
                                 board.next();
                             }
@@ -849,8 +862,11 @@ fn main() -> io::Result<()> {
                         match key.code {
                             KeyCode::Char('c') => break,
                             KeyCode::Char('t') => {
-                                app.tab ^= 1;
+                                app.tab = (app.tab + 1) % 3;
                                 app.detail_open = false;
+                                if app.tab == 2 {
+                                    shed.refresh();
+                                }
                                 continue;
                             }
                             KeyCode::Char('r') => {
@@ -859,6 +875,7 @@ fn main() -> io::Result<()> {
                                 roster.refresh();
                                 messages.refresh();
                                 board.refresh();
+                                shed.refresh();
                                 app.watcher_alive = RosterRail::watcher_alive();
                                 app.flash(format!("refreshed · theme {}", label));
                                 continue;
@@ -900,6 +917,25 @@ fn main() -> io::Result<()> {
                         }
                     }
 
+                    if app.tab == 2 {
+                        // Shed: file shelf → plain vim keys.
+                        match key.code {
+                            KeyCode::Char('q') => break,
+                            KeyCode::Esc | KeyCode::Char('1') => app.tab = 0,
+                            KeyCode::Char('2') => app.tab = 1,
+                            KeyCode::Char('?') => app.help_open = true,
+                            KeyCode::Char('j') | KeyCode::Down => shed.next(),
+                            KeyCode::Char('k') | KeyCode::Up => shed.previous(),
+                            KeyCode::Enter => {
+                                let msg = shed.open_selected();
+                                app.flash(msg);
+                            }
+                            KeyCode::Char('r') => shed.refresh(),
+                            _ => {}
+                        }
+                        continue;
+                    }
+
                     if app.tab == 1 {
                         // Barn: no text input → plain vim keys.
                         match key.code {
@@ -914,6 +950,11 @@ fn main() -> io::Result<()> {
                             KeyCode::Char('t') | KeyCode::Char('1') => {
                                 app.tab = 0;
                                 app.detail_open = false;
+                            }
+                            KeyCode::Char('3') => {
+                                app.tab = 2;
+                                app.detail_open = false;
+                                shed.refresh();
                             }
                             KeyCode::Char('?') => app.help_open = true,
                             KeyCode::Char('j') | KeyCode::Down => board.next_in_column(),
