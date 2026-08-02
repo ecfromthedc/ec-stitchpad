@@ -188,6 +188,11 @@ sp_date_divider_needed() {
 #   1. No backward clock drift (epoch must be >= last divider epoch).
 #   2. First-authored message per canonical pad-local date inserts the divider.
 #   3. A forward date change (new day) is always allowed, even if epoch is close.
+#
+# State writes are ATOMIC: temp file + rename, symlink-safe (never follows a
+# symlink to write). When the state file is absent, the divider is reconciled
+# from the pad itself so a backward clock cannot add duplicates after a
+# state loss.
 
 _sp_divider_last_epoch() {
   local f="$PAD_STATE/last-divider-epoch"
@@ -196,9 +201,71 @@ _sp_divider_last_epoch() {
   fi
 }
 
+# Atomically persist the last-divider epoch. Temp file + rename so a crash
+# mid-write cannot leave a truncated/garbage state file. Symlink-safe: if the
+# target is a symlink, refuse (never write through a symlink).
 _sp_divider_save_last_epoch() {
   local epoch="$1"
-  printf '%s' "$epoch" > "$PAD_STATE/last-divider-epoch" 2>/dev/null || true
+  local f="$PAD_STATE/last-divider-epoch"
+  # Refuse to write through a symlink — never follow.
+  if [ -L "$f" ]; then
+    echo "stitchpad: last-divider-epoch is a symlink — refusing write" >&2
+    return 1
+  fi
+  mkdir -p "$PAD_STATE" 2>/dev/null || true
+  # Temp file in the same directory (so rename is atomic on the same filesystem).
+  local tmp
+  tmp="$(mktemp "$PAD_STATE/.last-divider.XXXXXX")" || return 1
+  if ! printf '%s' "$epoch" > "$tmp" 2>/dev/null; then
+    rm -f "$tmp"
+    return 1
+  fi
+  # mv -f replaces the target atomically. On POSIX, mv uses rename(2) for
+  # same-directory moves, which is atomic. The -f suppresses the overwrite
+  # prompt. This is no-follow safe because we already rejected the symlink
+  # case above, and rename() itself replaces the directory entry (it does
+  # not follow symlinks in the target path).
+  if ! mv -f "$tmp" "$f" 2>/dev/null; then
+    rm -f "$tmp"
+    return 1
+  fi
+  return 0
+}
+
+# Reconcile the last-divider epoch from the pad when state is absent.
+# Scans the pad for the most recent divider line and derives its epoch from
+# the date string in the captured timezone. This prevents a backward clock
+# from inserting duplicate dividers after a state file loss.
+_sp_divider_reconcile_last_epoch() {
+  [ -n "$_SP_DATE_TZ" ] || return 1
+  [ -f "$PAD_MD" ] || return 1
+
+  # Find the last divider line's date in the pad.
+  # Format: *— YYYY-MM-DD (Zone) · Weekday —*
+  local last_div_date
+  last_div_date="$(grep '^\*— [0-9]\{4\}-[0-9]\{2\}-[0-9]\{2\} ' "$PAD_MD" 2>/dev/null \
+    | tail -1 \
+    | sed -n 's/^\*— \([0-9]\{4\}-[0-9]\{2\}-[0-9]\{2\}\) .*/\1/p' || true)"
+
+  [ -n "$last_div_date" ] || return 1
+
+  # Convert that date to an epoch at noon UTC (midpoint of the day) so it's
+  # a stable representative epoch. The exact time doesn't matter — only that
+  # it's within the same canonical date for the monotonic comparison.
+  local reconciled
+  reconciled="$(python3 -c '
+from datetime import datetime
+import zoneinfo, sys
+d = sys.argv[1]
+z = zoneinfo.ZoneInfo(sys.argv[2])
+# Parse the date, set to noon in the zone so the epoch is unambiguous
+dt = datetime.strptime(d, "%Y-%m-%d").replace(hour=12, tzinfo=z)
+print(int(dt.timestamp()))
+' "$last_div_date" "$_SP_DATE_TZ" 2>/dev/null || true)"
+
+  [ -n "$reconciled" ] || return 1
+  _sp_divider_save_last_epoch "$reconciled" || true
+  printf '%s' "$reconciled"
 }
 
 # Canonical date (YYYY-MM-DD) for an epoch in an IANA zone. Argv only.
@@ -224,8 +291,14 @@ sp_date_divider_insert() {
   # The locked last-divider epoch only moves forward. A backward clock is
   # tolerated within the same canonical date (late message, no new divider)
   # and refused across dates — never insert a divider for an older date.
+  # When state is absent, reconcile from the pad so a backward clock cannot
+  # add duplicates after a state file loss.
   local last_epoch
   last_epoch="$(_sp_divider_last_epoch)"
+  if [ -z "$last_epoch" ]; then
+    # State is absent — reconcile from the pad's existing dividers.
+    last_epoch="$(_sp_divider_reconcile_last_epoch || true)"
+  fi
   if [ -n "$last_epoch" ] && [ "$_SP_DATE_EPOCH" -lt "$last_epoch" ]; then
     local last_date
     last_date="$(_sp_divider_date_of "$last_epoch" "$_SP_DATE_TZ")"

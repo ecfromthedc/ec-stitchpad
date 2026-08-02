@@ -1133,6 +1133,12 @@ PY
     # restores prefixed assignments after the function returns, so no ambient
     # GIT_*_DATE leaks into later commands.
     _captured_epoch="$(sp_date_divider_epoch)"
+    # Record this operation in the append-only session registry BEFORE the
+    # commit so durable state cannot lag behind a successful sp_commit. All
+    # timestamps derive from the same captured epoch — no second date +%s.
+    # A failed registry write rolls back (no partial visible state) and is
+    # non-fatal to the post itself.
+    sp_session_registry_append "$_captured_epoch" || true
     _say_subject="$from: $(printf '%s' "$text" | tr '\n' ' ' | cut -c1-60)"
     if [ -n "$_captured_epoch" ]; then
       GIT_COMMITTER_DATE="@$_captured_epoch" GIT_AUTHOR_DATE="@$_captured_epoch" \
@@ -1140,8 +1146,6 @@ PY
     else
       sp_commit "$_say_subject"
     fi
-    # Record this operation in the append-only session registry.
-    sp_session_registry_append || true
     # Posting IS the reply — clear both dropped-turn markers (the pending re-block
     # bound AND the delivered_no_reply visibility flag) so a reply resolves them and
     # they can't cause a spurious re-block or stale doctor state later.
