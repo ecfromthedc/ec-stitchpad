@@ -4139,8 +4139,10 @@ def cmd_review_status(args):
                     not f.get("terminal_observed") and \
                     r["state"] not in ("closed", "abandoned"):
                 blockers.append("stale_session")
-    if r["state"] in ("closed", "abandoned"):
-        blockers = []  # closed reviews have no active blockers
+    # Closed reviews RETAIN their recorded blockers and bounded history:
+    # closure never erases conflict evidence. Only the phase-progress
+    # blockers (not_terminal, stale_session) are scoped to open reviews by
+    # the state guards above.
 
     result = {
         "ok": True, "command": "review-status",
@@ -4576,14 +4578,374 @@ def cmd_review_submit_report(args):
 
 
 # ---------------------------------------------------------------------------
-# Section 14. CLI front matter (invoked only by tool/bin/coordination.sh)
+# Section 13e. Verified closure (closed_verified) and the exact-PASS merge gate
 # ---------------------------------------------------------------------------
 
-def cmd_not_implemented(args):
-    fail("not_implemented",
-         "%s is deferred to the review-core increment; "
-         "see docs/AUTONOMOUS-BUILDS.md and the core checkpoint report"
-         % (args.verb,))
+_CLOSURE_VERIFIED = "closed_verified"
+
+
+def _require_review_open(review, facts):
+    """Closure is explicit and write-once: any recorded closure refuses
+    a second transition. Nothing here reopens, repairs, or auto-closes."""
+    if review["state"] in ("closed", "abandoned") \
+            or review.get("closure") is not None:
+        fail("review_already_closed",
+             "the review already carries closure %r"
+             % (review.get("closure") or review["state"],))
+    if facts is not None and facts.get("closure") is not None:
+        fail("review_already_closed",
+             "the review facts already carry closure %r"
+             % (facts.get("closure"),))
+
+
+def _identity_blockers(review, pointer, manifest):
+    """Exact pinned-OID agreement between review, manifest, and pointer."""
+    blockers = []
+    algo = review["algo"]
+    try:
+        require_oid(review["commit"], algo, "review commit")
+        require_oid(review["tree"], algo, "review tree")
+    except CoordError:
+        blockers.append("review_oid_invalid")
+    if manifest.get("algo") != algo \
+            or manifest.get("commit") != review["commit"] \
+            or manifest.get("tree") != review["tree"] \
+            or manifest.get("review_id") != review["review_id"]:
+        blockers.append("manifest_identity_mismatch")
+    if pointer.get("review_id") != review["review_id"] \
+            or pointer.get("payload_name") != review["payload_name"] \
+            or pointer.get("inventory_digest") != manifest.get("inventory_digest"):
+        blockers.append("pointer_identity_mismatch")
+    return blockers
+
+
+def _report_blockers(fds, binding, review, facts):
+    """Sealed-report agreement: sticky facts and sealed bytes must both be
+    present, valid, and identical. Returns (blockers, sealed-or-None)."""
+    blockers = []
+    if not facts.get("report_sealed") \
+            or facts.get("report_digest") is None \
+            or facts.get("report_verdict") not in VERDICTS:
+        blockers.append("report_not_sealed")
+    residue = detect_incomplete_report(fds, binding.payload_fd)
+    if residue is not None:
+        blockers.append(residue)
+    sealed = None
+    try:
+        sealed = read_sealed_report(fds, binding, review["commit"],
+                                    review["reviewer_actor"])
+    except CoordError as exc:
+        blockers.append(exc.code)
+    if sealed is None:
+        if "report_not_sealed" not in blockers:
+            blockers.append("report_missing")
+    else:
+        if sealed["digest"] != facts.get("report_digest"):
+            blockers.append("report_digest_mismatch")
+        if sealed["verdict"] != facts.get("report_verdict"):
+            blockers.append("report_verdict_mismatch")
+    return blockers, sealed
+
+
+def _closure_blockers(fds, binding, review, facts, pointer, manifest):
+    """Exact blocker projection for verified closure. Read-only.
+
+    ``closed_verified`` requires ALL of: a bound review whose exact terminal
+    completion is ``completed``; a valid write-once sealed report agreeing
+    with the sticky facts; process evidence with every registered record
+    exited (no unknown/alive/unstable/reused/foreign and no unregistered
+    discriminator hit); and stable exact final source and payload roots
+    whose OIDs still match the pinned manifest. Any conflict or instability
+    remains a blocker; nothing here repairs, retries, or erases evidence.
+    """
+    blockers = []
+    if facts.get("session_id") is None or facts.get("request_id") is None:
+        blockers.append("not_bound")
+    if not facts.get("terminal_observed"):
+        blockers.append("not_terminal")
+    elif facts.get("terminal_completion") != "completed":
+        blockers.append("terminal_not_completed")
+    if facts.get("conflict") is not None:
+        blockers.append(bounded(facts["conflict"], 64))
+    if facts.get("session_rotation_required"):
+        blockers.append("session_rotation_required")
+
+    report_blockers, sealed = _report_blockers(fds, binding, review, facts)
+    blockers.extend(report_blockers)
+
+    try:
+        evidence = process_evidence(fds, binding.payload_fd,
+                                    review["review_id"],
+                                    pointer.get("payload_path"))
+        blockers.extend(evidence["blockers"])
+    except CoordError as exc:
+        blockers.append(exc.code)
+
+    blockers.extend(_identity_blockers(review, pointer, manifest))
+
+    # Stable exact final source: the walked inventory must still hash to the
+    # pinned manifest digest. Instability inside the walk is itself a blocker.
+    try:
+        final_records = walk_inventory(fds, binding.src_fd, review["algo"])
+        if sha256_hex(encode_inventory(final_records)) \
+                != manifest.get("inventory_digest"):
+            blockers.append("inventory_mismatch")
+    except CoordError as exc:
+        blockers.append(exc.code)
+
+    # Stable roots: the published payload/src entries must still name the
+    # retained FDs with the exact owner/mode policy.
+    try:
+        binding.recheck()
+    except CoordError as exc:
+        blockers.append(exc.code)
+
+    return sorted(set(blockers)), sealed
+
+
+def _refuse_blocked_closure(blockers):
+    raise CoordError(
+        "closure_blocked",
+        "verified closure requires zero blockers: %s"
+        % (",".join(blockers),),
+        {"blockers": blockers},
+    )
+
+
+def cmd_review_close(args):
+    """Explicit, write-once ``closed_verified`` transition.
+
+    ``--verified`` succeeds only when every requirement holds at decision
+    time under the transition mutex: exact bound ``completed`` terminal,
+    valid sealed report agreeing with the sticky facts, clean process
+    evidence, and stable exact final source and payload roots/OIDs. Any
+    blocker refuses closure with the exact projected list; evidence and
+    bounded history are never erased. ``--abandoned`` closure is deferred
+    and still fails closed. No HTTP, signals, deletion, retry, scheduling,
+    repair, cleanup, or auto-close.
+    """
+    if getattr(args, "abandoned", False):
+        fail("not_implemented",
+             "review-close --abandoned is deferred to a later increment; "
+             "only --verified closure is implemented")
+
+    ctx = open_context(args, need_git_home=False)
+    fds, base, repo, state = (
+        ctx["fds"], ctx["base"], ctx["repo"], ctx["state"])
+
+    review = _load_review(state, args.id)
+    if review["repo_id"] != repo["repo_id"] or review["top"] != repo["top"]:
+        fail("identity_mismatch",
+             "the review does not belong to this repository")
+
+    payload_fd = _open_payload(fds, base, review)
+    facts = _read_facts(payload_fd)
+    if facts is None:
+        fail("review_not_bound",
+             "the review must be bound before verified closure")
+    _require_review_open(review, facts)
+
+    pointer = _read_pointer(payload_fd)
+    manifest = _read_manifest(payload_fd)
+
+    binding = RootBinding(fds, base, review["payload_name"],
+                          expect_payload=pointer["payload_identity"],
+                          expect_src=pointer["src_identity"])
+    binding.bind()
+
+    blockers, _sealed = _closure_blockers(
+        fds, binding, review, facts, pointer, manifest)
+    if blockers:
+        _refuse_blocked_closure(blockers)
+
+    # Bounded history projection for the result (read before the transition;
+    # the observation records themselves are never touched).
+    latest = read_flat_record(payload_fd, "latest.json", "latest",
+                              "review latest", allow_missing=True)
+    observation_count = latest.get("observation_count", 0) \
+        if latest is not None else 0
+
+    generation = facts["generation"]
+    now = int(time.time())
+
+    mutex = TransitionMutex(state)
+    with mutex:
+        # Re-read both records under the lock: write-once and generation CAS.
+        locked_review = _load_review(state, args.id)
+        locked_facts = _read_facts(payload_fd)
+        if locked_facts is None:
+            fail("review_not_bound",
+                 "the review facts disappeared under the lock")
+        _require_review_open(locked_review, locked_facts)
+        if locked_facts["generation"] != generation:
+            fail("generation_conflict",
+                 "the review facts changed (generation %d -> %d)"
+                 % (generation, locked_facts["generation"]))
+
+        # Re-project every blocker at decision time: closure publishes only
+        # against a state that is still clean under the lock.
+        locked_blockers, sealed = _closure_blockers(
+            fds, binding, locked_review, locked_facts, pointer, manifest)
+        if locked_blockers:
+            _refuse_blocked_closure(locked_blockers)
+
+        new_generation = generation + 1
+        updated_facts = dict(locked_facts)
+        updated_facts["generation"] = new_generation
+        updated_facts["artifact_verified"] = True
+        updated_facts["verified_at"] = now
+        updated_facts["closure"] = _CLOSURE_VERIFIED
+        updated_facts["closure_reason"] = "verified"
+        updated_facts["closed_at"] = now
+        updated_facts["last_activity_at"] = now
+
+        facts_record = new_record("facts", new_generation, {
+            "review_id": updated_facts["review_id"],
+            "session_id": updated_facts["session_id"],
+            "request_id": updated_facts["request_id"],
+            "bound_at": updated_facts["bound_at"],
+            "cancel_requested": updated_facts["cancel_requested"],
+            "cancel_requested_at": updated_facts["cancel_requested_at"],
+            "terminal_observed": updated_facts["terminal_observed"],
+            "terminal_completion": updated_facts["terminal_completion"],
+            "terminal_at": updated_facts["terminal_at"],
+            "report_sealed": updated_facts["report_sealed"],
+            "report_digest": updated_facts["report_digest"],
+            "report_verdict": updated_facts["report_verdict"],
+            "report_sealed_at": updated_facts["report_sealed_at"],
+            "artifact_verified": updated_facts["artifact_verified"],
+            "verified_at": updated_facts["verified_at"],
+            "closure": updated_facts["closure"],
+            "closure_reason": updated_facts["closure_reason"],
+            "closed_at": updated_facts["closed_at"],
+            "conflict": updated_facts["conflict"],
+            "provider": updated_facts["provider"],
+            "provider_model": updated_facts["provider_model"],
+            "session_rotation_required":
+                updated_facts["session_rotation_required"],
+            "last_activity_at": updated_facts["last_activity_at"],
+        })
+        publish_flat_record(payload_fd, "facts.json", "facts", facts_record,
+                            "review facts")
+
+        updated_review = dict(locked_review)
+        updated_review["generation"] = locked_review["generation"] + 1
+        updated_review["state"] = "closed"
+        updated_review["closure"] = _CLOSURE_VERIFIED
+        updated_review["closure_reason"] = "verified"
+        updated_review["updated_at"] = now
+        publish_record(fds, state.reviews, review["review_id"], "review",
+                       updated_review, "review record")
+
+    fds.close_all()
+    return {
+        "ok": True, "command": "review-close",
+        "review_id": review["review_id"],
+        "closure": _CLOSURE_VERIFIED,
+        "closure_reason": "verified",
+        "state": "closed",
+        "report_verdict": sealed["verdict"] if sealed is not None else None,
+        "report_digest": sealed["digest"] if sealed is not None else None,
+        "closed_at": _format_ts(now),
+        "closed_at_epoch": now,
+        "observation_count": observation_count,
+        "blockers": [],
+        "generation": new_generation,
+    }
+
+
+def cmd_review_verify(args):
+    """Exact-PASS merge gate. Read-only; never mutates any record.
+
+    The gate succeeds ONLY for a review whose write-once closure is exactly
+    ``closed_verified`` AND whose sealed report verdict is exactly ``PASS``.
+    ``HOLD`` and ``FAIL`` never pass. An open, abandoned, or inconsistent
+    review fails closed with an exact code. No HTTP, signals, deletion,
+    retry, scheduling, repair, cleanup, or auto-close.
+    """
+    ctx = open_context(args, need_git_home=False)
+    fds, base, repo, state = (
+        ctx["fds"], ctx["base"], ctx["repo"], ctx["state"])
+
+    review = _load_review(state, args.id)
+    if review["repo_id"] != repo["repo_id"] or review["top"] != repo["top"]:
+        fail("identity_mismatch",
+             "the review does not belong to this repository")
+
+    payload_fd = _open_payload(fds, base, review)
+    facts = _read_facts(payload_fd)
+    if facts is None:
+        fail("merge_gate_not_verified",
+             "the merge gate passes only a closed_verified review; "
+             "this review has no facts record")
+    if review["state"] != "closed" \
+            or review.get("closure") != _CLOSURE_VERIFIED \
+            or facts.get("closure") != _CLOSURE_VERIFIED:
+        fail("merge_gate_not_verified",
+             "the merge gate passes only a closed_verified review "
+             "(state=%s closure=%s)"
+             % (bounded(review["state"], 32),
+                bounded(review.get("closure"), 32)))
+
+    # Exact PASS from the sticky facts first: HOLD/FAIL/absent never pass.
+    if not facts.get("report_sealed") or facts.get("report_verdict") != "PASS":
+        fail("merge_gate_verdict_not_pass",
+             "the merge gate passes only an exact PASS verdict, not %r"
+             % (bounded(facts.get("report_verdict"), 16),))
+
+    pointer = _read_pointer(payload_fd)
+    manifest = _read_manifest(payload_fd)
+    identity_blockers = _identity_blockers(review, pointer, manifest)
+    if identity_blockers:
+        fail("merge_gate_identity_mismatch",
+             "pinned identity disagreement: %s"
+             % (",".join(identity_blockers),))
+
+    binding = RootBinding(fds, base, review["payload_name"],
+                          expect_payload=pointer["payload_identity"],
+                          expect_src=pointer["src_identity"])
+    binding.bind()
+
+    residue = detect_incomplete_report(fds, binding.payload_fd)
+    if residue is not None:
+        raise CoordError(residue,
+                         "crash residue from an incomplete report seal "
+                         "refuses the merge gate")
+    sealed = read_sealed_report(fds, binding, review["commit"],
+                                review["reviewer_actor"])
+    if sealed is None:
+        fail("merge_gate_report_missing",
+             "the sealed report is absent; the merge gate refuses")
+    if sealed["digest"] != facts.get("report_digest"):
+        fail("merge_gate_report_mismatch",
+             "the sealed report digest disagrees with the sticky facts")
+    if sealed["verdict"] != "PASS":
+        fail("merge_gate_verdict_not_pass",
+             "the sealed report verdict is %r, not exact PASS"
+             % (bounded(sealed["verdict"], 16),))
+    binding.recheck()
+
+    fds.close_all()
+    return {
+        "ok": True, "command": "review-verify",
+        "merge_gate": "pass",
+        "review_id": review["review_id"],
+        "closure": _CLOSURE_VERIFIED,
+        "verdict": "PASS",
+        "commit": review["commit"],
+        "tree": review["tree"],
+        "algo": review["algo"],
+        "report_digest": sealed["digest"],
+        "report_bytes": sealed["bytes"],
+        "closed_at": _format_ts(facts.get("closed_at")),
+        "closed_at_epoch": facts.get("closed_at"),
+        "generation": facts["generation"],
+    }
+
+
+# ---------------------------------------------------------------------------
+# Section 14. CLI front matter (invoked only by tool/bin/coordination.sh)
+# ---------------------------------------------------------------------------
 
 
 def _fd_number(value):
@@ -4636,9 +4998,9 @@ def build_parser():
     # only flags, and EVERY other review verb takes the review ID as its first
     # POSITIONAL argument (design v5 section 2; audit P2-6). There is no `--id`
     # flag anywhere, so the Bash front controller in tool/bin/coordination.sh
-    # and this parser cannot drift apart. The verb bodies still fail closed
-    # with not_implemented until the review-core increment lands; nothing here
-    # silently half-runs.
+    # and this parser cannot drift apart. Only `review-close --abandoned`
+    # remains deferred; it fails closed as not_implemented inside
+    # cmd_review_close, so nothing here silently half-runs.
     def with_review_id(target):
         target.add_argument("id", metavar="ID",
                             help="review id: exactly 32 lowercase hex characters")
@@ -4673,9 +5035,8 @@ def build_parser():
     status = with_review_id(common(sub.add_parser("review-status")))
     status.set_defaults(func=cmd_review_status)
 
-    for verb in ("review-verify",):
-        command = with_review_id(common(sub.add_parser(verb)))
-        command.set_defaults(func=cmd_not_implemented)
+    verify = with_review_id(common(sub.add_parser("review-verify")))
+    verify.set_defaults(func=cmd_review_verify)
 
     submit_report = with_review_id(common(sub.add_parser("review-submit-report")))
     submit_report.set_defaults(func=cmd_review_submit_report)
@@ -4684,7 +5045,7 @@ def build_parser():
     group = close.add_mutually_exclusive_group(required=True)
     group.add_argument("--verified", action="store_true")
     group.add_argument("--abandoned", action="store_true")
-    close.set_defaults(func=cmd_not_implemented)
+    close.set_defaults(func=cmd_review_close)
 
     return parser
 
