@@ -185,6 +185,23 @@ reports `unavailable` honestly. Plain `health` never performs network I/O.
 > `pull` members completely; their configured runtime hooks remain the sole wake
 > path, so the visible interactive session stays authoritative.
 
+Watcher admission publishes generation, launcher, and owner evidence
+atomically. A crash before launcher publication leaves an exact
+generation-only shape which is preserved during the shared
+`STITCHPAD_WATCH_START_GRACE` (five seconds by default), reported by health as
+`starting`, and safely retired after that same grace without treating any PID-
+shaped text as signal authority. Abandoned `.watch-generation.*`,
+`.watch-launcher*`, and `.watch-owner.*` publication stages are reaped only
+when their exact filename shape is valid, their named publisher PID is dead,
+they are old enough, and the bounded regular file is re-proven immediately
+before unlink. Test-only generation barriers also time out boundedly and retire
+their own admission instead of wedging a lifecycle command.
+
+The aggregate test runner tracks each fixture's descendant PID, process-start
+identity, and command digest while it runs. Any exact survivor makes that test
+fail and is reaped with identity revalidation, so a passing aggregate cannot
+silently leave a `watch.sh` or `fswatch` child reparented under PID 1.
+
 Heartbeat ticker locks record the PID, process-start identity, exact command,
 pad, and seat before publishing the PID. `heartbeat --stop` and `reset` signal a
 live process only when every field still matches; legacy or mismatched live PID

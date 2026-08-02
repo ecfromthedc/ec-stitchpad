@@ -645,7 +645,7 @@ def process_table() -> list[tuple[int, int, str]]:
     return rows
 
 
-def watcher_health(state: Path, pad_md: Path) -> dict[str, Any]:
+def watcher_health(state: Path, pad_md: Path, watch_start_grace: int) -> dict[str, Any]:
     lock = state / "watch.lock.d"
     pid_info = read_scalar(lock / "pid", root=state, max_value=MAX_PID)
     pid = pid_info.get("value") if pid_info.get("parse") == "ok" else None
@@ -675,7 +675,7 @@ def watcher_health(state: Path, pad_md: Path) -> dict[str, Any]:
     elif not lock.is_dir():
         status = "stopped"
     elif generation_only:
-        status = "stale_lock" if (lock_age or 0) >= 5 else "starting"
+        status = "stale_lock" if (lock_age or 0) >= watch_start_grace else "starting"
     elif pid_info.get("parse") != "ok":
         status = "malformed_lock"
     elif not alive:
@@ -690,6 +690,7 @@ def watcher_health(state: Path, pad_md: Path) -> dict[str, Any]:
         status = "running"
     return {
         "status": status, "lock_present": lock.is_dir(), "lock_age_seconds": lock_age,
+        "start_grace_seconds": watch_start_grace,
         "pid": pid, "pid_parse": pid_info.get("parse"), "pid_alive": alive,
         "pid_matches_watcher": matches, "fswatch_processes": len(fswatch_rows),
         "watcher_parents": parents, "singleton": len(parents) <= 1,
@@ -964,7 +965,7 @@ def build(args: argparse.Namespace) -> dict[str, Any]:
 
     pad_issues.extend(binding_issues)
     pad_issues.extend(f"orphan_session:{item['session_id']}->{item['name']}" for item in orphan_bindings)
-    watcher = watcher_health(state, pad_md)
+    watcher = watcher_health(state, pad_md, args.watch_start_grace)
     if watcher["status"] in {"malformed_lock", "stale_lock", "pid_mismatch", "duplicate", "stalled"}:
         pad_issues.append(f"watcher:{watcher['status']}")
     pad_repairs: list[str] = []
@@ -1040,10 +1041,13 @@ def main() -> int:
     parser.add_argument("--pad-md", required=True)
     parser.add_argument("--state-dir", required=True)
     parser.add_argument("--adapter-dir", required=True)
+    parser.add_argument("--watch-start-grace", required=True, type=int)
     parser.add_argument("--json", action="store_true")
     parser.add_argument("--deep", action="store_true")
     parser.add_argument("-h", "--help", action="help")
     args = parser.parse_args()
+    if args.watch_start_grace < 0:
+        parser.error("--watch-start-grace must be non-negative")
     snapshot = build(args)
     if args.json:
         print(json.dumps(snapshot, sort_keys=True, separators=(",", ":"), allow_nan=False))

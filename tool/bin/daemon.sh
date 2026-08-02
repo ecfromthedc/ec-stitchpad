@@ -40,8 +40,10 @@ case "${1:-status}" in
     }
     if [ -n "${STITCHPAD_WATCH_TEST_AFTER_GENERATION_BARRIER:-}" ]; then
       watch_generation_barrier="$STITCHPAD_WATCH_TEST_AFTER_GENERATION_BARRIER"
-      printf '%s' ready > "$watch_generation_barrier.ready"
-      while [ ! -f "$watch_generation_barrier.release" ]; do sleep 0.01; done
+      sp_watch_test_barrier_wait "$watch_generation_barrier" "daemon watch generation" || {
+        sp_watch_lock_remove_generation "$LOCKDIR" "$watch_generation" 2>/dev/null || true
+        exit 1
+      }
     fi
     sp_watch_launcher_write "$LOCKDIR" "$watch_generation" || {
       sp_watch_lock_remove_generation "$LOCKDIR" "$watch_generation" 2>/dev/null || true
@@ -114,14 +116,25 @@ case "${1:-status}" in
     # while leaving fswatch orphaned under PID 1. The helper excludes PID 1 and
     # signals only the recorded supervisor and processes bound to this PAD_MD.
     if [ -d "$LOCKDIR" ] || [ -n "$(sp_watch_processes_for_pad)" ]; then
-      sp_stop_watchers_for_pad
+      if ! sp_stop_watchers_for_pad; then
+        sp_stop_delivery_workers
+        echo "stitchpad: watcher stop left unverified ownership evidence" >&2
+        exit 1
+      fi
       watcher_was_running=1
     else watcher_was_running=0; fi
     # Per-seat supervisors are independent of fswatch and can outlive a watcher
     # crash. Daemon lifecycle operations own both layers.
     sp_stop_delivery_workers
     if [ "$watcher_was_running" -eq 1 ]; then echo "stopped"; else echo "not running"; fi ;;
-  restart) "$0" stop; sleep 1; "$0" start ;;
+  restart)
+    "$0" stop || {
+      echo "stitchpad: watcher restart refused unverified ownership evidence" >&2
+      exit 1
+    }
+    sleep 1
+    "$0" start
+    ;;
   status)  if is_running; then echo "running (pid $(cat "$PIDFILE"))"; else echo "stopped"; fi ;;
   *) echo "usage: $0 {start|stop|status|restart}"; exit 1 ;;
 esac

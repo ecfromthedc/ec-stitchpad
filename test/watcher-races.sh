@@ -116,6 +116,46 @@ orphan_pid=""
 [ -z "$(watch_processes)" ] && [ ! -d "$lock" ] \
   || fail "restart-gap stop left exact watcher processes"
 
+# Atomic publication stages are pure litter once their exact named publisher
+# is dead and the file is old.  Reaping must preserve live-publisher, fresh,
+# symlinked, directory-shaped, oversized and malformed-name evidence.
+printf 'generation-stage' > "$state/.watch-generation.99999991.1"
+printf 'launcher-stage' > "$state/.watch-launcher.99999991.2"
+printf 'transfer-stage' > "$state/.watch-launcher-transfer.99999991.3"
+printf 'owner-stage' > "$state/.watch-owner.99999991.4"
+printf 'live-owner-stage' > "$state/.watch-owner.$$.5"
+printf 'fresh-launcher-stage' > "$state/.watch-launcher.99999991.6"
+printf 'malformed-stage' > "$state/.watch-generation.bad.7"
+mkdir "$state/.watch-owner.99999991.8"
+printf 'outside' > "$base/stage-outside"
+ln -s "$base/stage-outside" "$state/.watch-generation.99999991.9"
+dd if=/dev/zero of="$state/.watch-owner.99999991.10" bs=4097 count=1 >/dev/null 2>&1
+touch -t 202001010000 \
+  "$state/.watch-generation.99999991.1" \
+  "$state/.watch-launcher.99999991.2" \
+  "$state/.watch-launcher-transfer.99999991.3" \
+  "$state/.watch-owner.99999991.4" \
+  "$state/.watch-owner.$$.5" \
+  "$state/.watch-generation.bad.7" \
+  "$state/.watch-owner.99999991.10"
+"$SP" stop >/dev/null
+for stage in .watch-generation.99999991.1 .watch-launcher.99999991.2 \
+             .watch-launcher-transfer.99999991.3 .watch-owner.99999991.4; do
+  [ ! -e "$state/$stage" ] || fail "old dead-publisher stage survived: $stage"
+done
+[ -f "$state/.watch-owner.$$.5" ] || fail "reaper removed a live-publisher stage"
+[ -f "$state/.watch-launcher.99999991.6" ] || fail "reaper removed a fresh stage"
+[ -f "$state/.watch-generation.bad.7" ] || fail "reaper removed a malformed-name stage"
+[ -d "$state/.watch-owner.99999991.8" ] || fail "reaper removed a directory-shaped stage"
+[ -L "$state/.watch-generation.99999991.9" ] && [ "$(cat "$base/stage-outside")" = outside ] \
+  || fail "reaper traversed or removed a symlinked stage"
+[ -f "$state/.watch-owner.99999991.10" ] || fail "reaper removed an oversized stage"
+STITCHPAD_WATCH_STAGE_STALE_SECONDS=0 "$SP" stop >/dev/null
+[ ! -e "$state/.watch-launcher.99999991.6" ] || fail "zero-grace reaper left a dead stage"
+rm -f "$state/.watch-owner.$$.5" "$state/.watch-generation.bad.7" \
+  "$state/.watch-generation.99999991.9" "$state/.watch-owner.99999991.10"
+rmdir "$state/.watch-owner.99999991.8"
+
 # Stop during the gap must cancel the exact supervisor. Releasing its test seam
 # cannot resurrect watch.sh or create a new direct generation.
 printf '0' > "$count"
@@ -175,6 +215,13 @@ fresh_before="$(find "$lock" -mindepth 1 -maxdepth 1 -type f -exec cksum {} \; |
 health_json="$("$SP" health --json)"
 [ "$(printf '%s' "$health_json" | python3 -c 'import json,sys; print(json.load(sys.stdin)["pad"]["watcher"]["status"])')" = starting ] \
   || fail "health did not classify a fresh generation-only admission as starting"
+custom_grace_json="$(STITCHPAD_WATCH_START_GRACE=0 "$SP" health --json)"
+python3 - "$custom_grace_json" <<'PY'
+import json, sys
+watcher = json.loads(sys.argv[1])["pad"]["watcher"]
+assert watcher["status"] == "stale_lock", watcher
+assert watcher["start_grace_seconds"] == 0, watcher
+PY
 fresh_after="$(find "$lock" -mindepth 1 -maxdepth 1 -type f -exec cksum {} \; | sort)"
 [ "$fresh_before" = "$fresh_after" ] || fail "readonly status/health mutated a fresh admission lock"
 "$SP" ensure-watcher >/dev/null
@@ -212,6 +259,40 @@ done
 [ ! -d "$lock" ] && [ -z "$(watch_processes)" ] \
   || fail "generation-only daemon recovery left lock or process residue"
 
+# Accidentally exported test barriers must fail boundedly and retire their own
+# exact generation instead of wedging ensure, daemon, or direct-watch forever.
+for surface in ensure daemon direct; do
+  barrier="$base/bounded-$surface"
+  case "$surface" in
+    ensure)
+      if STITCHPAD_WATCH_TEST_BARRIER_TICKS=2 \
+          STITCHPAD_WATCH_TEST_AFTER_GENERATION_BARRIER="$barrier" \
+          "$SP" ensure-watcher >"$base/bounded-$surface.out" 2>&1; then
+        fail "ensure generation barrier timeout reported success"
+      fi
+      ;;
+    daemon)
+      if STITCHPAD_WATCH_TEST_BARRIER_TICKS=2 \
+          STITCHPAD_WATCH_TEST_AFTER_GENERATION_BARRIER="$barrier" \
+          "$SP" daemon start >"$base/bounded-$surface.out" 2>&1; then
+        fail "daemon generation barrier timeout reported success"
+      fi
+      ;;
+    direct)
+      if STITCHPAD_WATCH_TEST_BARRIER_TICKS=2 \
+          STITCHPAD_WATCH_TEST_AFTER_GENERATION_BARRIER="$barrier" \
+          "$SP" watch >"$base/bounded-$surface.out" 2>&1; then
+        fail "direct watch generation barrier timeout reported success"
+      fi
+      ;;
+  esac
+  [ -f "$barrier.ready" ] || fail "$surface generation barrier was not reached"
+  grep -q 'test barrier timed out' "$base/bounded-$surface.out" \
+    || fail "$surface generation barrier timeout was not diagnosed"
+  [ ! -d "$lock" ] && [ -z "$(watch_processes)" ] \
+    || fail "$surface generation barrier timeout left lock or process residue"
+done
+
 # Generation strings contain a PID-shaped component but are never signal
 # authority.  Reclaiming an aged ownerless generation must not touch a live
 # foreign process whose PID happens to appear in that string.
@@ -235,6 +316,22 @@ touch -t 202001010000 "$lock" "$lock/generation" "$lock/junk"
 STITCHPAD_WATCH_START_GRACE=0 "$SP" ensure-watcher >/dev/null
 [ -f "$lock/generation" ] && [ -f "$lock/junk" ] \
   || fail "reclaim removed a richer malformed watcher lock"
+if STITCHPAD_WATCH_START_GRACE=0 "$SP" daemon stop >"$base/malformed-daemon-stop.out" 2>&1; then
+  fail "daemon stop reported success for unverified watcher ownership evidence"
+fi
+grep -q '^stopped$' "$base/malformed-daemon-stop.out" \
+  && fail "daemon stop printed a false success message for malformed ownership" \
+  || true
+[ -f "$lock/generation" ] && [ -f "$lock/junk" ] \
+  || fail "daemon stop mutated malformed watcher evidence"
+if STITCHPAD_WATCH_START_GRACE=0 "$SP" daemon restart >"$base/malformed-daemon-restart.out" 2>&1; then
+  fail "daemon restart proceeded past unverified watcher ownership evidence"
+fi
+grep -q 'started stitchpad watcher' "$base/malformed-daemon-restart.out" \
+  && fail "daemon restart started after a refused stop" \
+  || true
+[ -f "$lock/generation" ] && [ -f "$lock/junk" ] \
+  || fail "daemon restart mutated malformed watcher evidence"
 if STITCHPAD_WATCH_START_GRACE=0 "$SP" stop >"$base/malformed-stop.out" 2>&1; then
   fail "stop reported success for unverified watcher ownership evidence"
 fi

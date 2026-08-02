@@ -47,8 +47,10 @@ if [ ! -d "$WATCH_LOCK" ]; then
   sp_watch_generation_write "$WATCH_LOCK" "$WATCH_GENERATION" || exit 1
   if [ -n "${STITCHPAD_WATCH_TEST_AFTER_GENERATION_BARRIER:-}" ]; then
     watch_generation_barrier="$STITCHPAD_WATCH_TEST_AFTER_GENERATION_BARRIER"
-    printf '%s' ready > "$watch_generation_barrier.ready"
-    while [ ! -f "$watch_generation_barrier.release" ]; do sleep 0.01; done
+    sp_watch_test_barrier_wait "$watch_generation_barrier" "direct watch generation" || {
+      sp_watch_lock_remove_generation "$WATCH_LOCK" "$WATCH_GENERATION" 2>/dev/null || true
+      exit 1
+    }
   fi
   sp_watch_launcher_write "$WATCH_LOCK" "$WATCH_GENERATION" || exit 1
 else

@@ -1505,7 +1505,7 @@ PY
     # already holds the lock or no agents have fresh heartbeats.
     sp_init_paths || exit 1
     ensure_watcher
-    exit 0
+    exit $?
     ;;
 
   meta)
@@ -2032,7 +2032,7 @@ except: print("")' 2>/dev/null)"
 
   start)
     sp_init_paths || exit 1
-    ensure_watcher
+    ensure_watcher || exit 1
     if sp_any_alive && ! sp_watcher_alive; then
       echo "stitchpad: watcher could not be ensured" >&2
       exit 1
@@ -2057,7 +2057,7 @@ except: print("")' 2>/dev/null)"
       exit 1
     }
     sp_stop_delivery_workers
-    ensure_watcher
+    ensure_watcher || exit 1
     if sp_any_alive && ! sp_watcher_alive; then
       echo "stitchpad: watcher restart did not establish a verified owner" >&2
       exit 1
@@ -2179,6 +2179,84 @@ except: print("")' 2>/dev/null)"
     # Discover and run all test scripts in test/ and bin/test-*.sh
     passed=0; failed=0; total=0
     tests=()
+    _runner_command_sha256() {
+      printf '%s' "$1" | shasum -a 256 2>/dev/null | awk '{print $1}'
+    }
+    _runner_process_is_alive() {
+      local _rp_pid="$1" _rp_start="$2" _rp_command_sha="$3" _rp_stat _rp_command
+      _rp_stat="$(ps -p "$_rp_pid" -o stat= 2>/dev/null || true)"
+      case "$_rp_stat" in ''|*Z*) return 1 ;; esac
+      _rp_command="$(sp_process_command "$_rp_pid")"
+      [ "$(sp_process_start "$_rp_pid")" = "$_rp_start" ] \
+        && [ "$(_runner_command_sha256 "$_rp_command")" = "$_rp_command_sha" ]
+    }
+    _runner_register_descendants() {
+      local _rp_root="$1" _rp_registry="$2" _rp_scan
+      _rp_scan="${_rp_registry}.scan"
+      local _rp_known=" $_rp_root " _rp_changed=1 _rp_pid _rp_ppid _rp_start _rp_command _rp_command_sha _rp_line
+      ps -axo pid=,ppid= > "$_rp_scan" 2>/dev/null || return 0
+      while [ "$_rp_changed" -eq 1 ]; do
+        _rp_changed=0
+        while read -r _rp_pid _rp_ppid; do
+          case "$_rp_known" in
+            *" $_rp_ppid "*)
+              case "$_rp_known" in *" $_rp_pid "*) ;; *)
+                _rp_known="${_rp_known}${_rp_pid} "
+                _rp_changed=1
+                ;;
+              esac
+              ;;
+          esac
+        done < "$_rp_scan"
+      done
+      rm -f "$_rp_scan"
+      for _rp_pid in $_rp_known; do
+        [ "$_rp_pid" = "$_rp_root" ] && continue
+        _rp_start="$(sp_process_start "$_rp_pid")"
+        _rp_command="$(sp_process_command "$_rp_pid")"
+        [ -n "$_rp_start" ] && [ -n "$_rp_command" ] || continue
+        _rp_command_sha="$(_runner_command_sha256 "$_rp_command")"
+        [ -n "$_rp_command_sha" ] || continue
+        _rp_line="${_rp_pid}|$(sp_b64_encode "$_rp_start")|${_rp_command_sha}"
+        grep -Fqx "$_rp_line" "$_rp_registry" 2>/dev/null || printf '%s\n' "$_rp_line" >> "$_rp_registry"
+      done
+    }
+    _runner_reap_registered() {
+      local _rp_registry="$1" _rp_pid _rp_start64 _rp_command_sha _rp_start
+      local _rp_i=0 _rp_any=0 _rp_found=0
+      # Give well-behaved teardown a short bounded window before classifying a
+      # surviving exact descendant as fixture residue.
+      while [ "$_rp_i" -lt 10 ]; do
+        _rp_any=0
+        while IFS='|' read -r _rp_pid _rp_start64 _rp_command_sha; do
+          [ -n "$_rp_pid" ] || continue
+          _rp_start="$(sp_b64_decode "$_rp_start64" 2>/dev/null || true)"
+          _runner_process_is_alive "$_rp_pid" "$_rp_start" "$_rp_command_sha" \
+            && { _rp_any=1; break; }
+        done < "$_rp_registry"
+        [ "$_rp_any" -eq 0 ] && break
+        sleep 0.05
+        _rp_i=$((_rp_i + 1))
+      done
+      while IFS='|' read -r _rp_pid _rp_start64 _rp_command_sha; do
+        [ -n "$_rp_pid" ] || continue
+        _rp_start="$(sp_b64_decode "$_rp_start64" 2>/dev/null || true)"
+        if _runner_process_is_alive "$_rp_pid" "$_rp_start" "$_rp_command_sha"; then
+          _rp_found=1
+          echo "stitchpad: fixture process residue: exact pid=$_rp_pid command_sha256=$_rp_command_sha" >&2
+          kill "$_rp_pid" 2>/dev/null || true
+        fi
+      done < "$_rp_registry"
+      [ "$_rp_found" -eq 0 ] && return 0
+      sleep 0.2
+      while IFS='|' read -r _rp_pid _rp_start64 _rp_command_sha; do
+        [ -n "$_rp_pid" ] || continue
+        _rp_start="$(sp_b64_decode "$_rp_start64" 2>/dev/null || true)"
+        _runner_process_is_alive "$_rp_pid" "$_rp_start" "$_rp_command_sha" \
+          && kill -KILL "$_rp_pid" 2>/dev/null || true
+      done < "$_rp_registry"
+      return 1
+    }
     # STITCHPAD_HOME is tool/; repo root is one level up
     REPO_ROOT="$(cd "$STITCHPAD_HOME/.." && pwd)"
     for dir in "$STITCHPAD_HOME/test" "$REPO_ROOT/test"; do
@@ -2203,10 +2281,25 @@ except: print("")' 2>/dev/null)"
       name="$(basename "$t")"
       echo "--- $name ---"
       rc=0
+      _runner_registry="$(mktemp "${TMPDIR:-/tmp}/stitchpad-test-processes.XXXXXX")"
+      _runner_output="$(mktemp "${TMPDIR:-/tmp}/stitchpad-test-output.XXXXXX")"
       STITCHPAD_HOME="$STITCHPAD_HOME" env \
         -u HERDR_PANE_ID -u HERDR_TAB_ID -u HERDR_ENV \
         -u HERDR_SOCKET_PATH -u HERDR_WORKSPACE_ID \
-        bash "$t" 2>&1 || rc=$?
+        bash "$t" > "$_runner_output" 2>&1 &
+      _runner_test_pid=$!
+      while true; do
+        _runner_stat="$(ps -p "$_runner_test_pid" -o stat= 2>/dev/null || true)"
+        case "$_runner_stat" in ''|*Z*) break ;; esac
+        _runner_register_descendants "$_runner_test_pid" "$_runner_registry"
+        sleep 0.05
+      done
+      wait "$_runner_test_pid" || rc=$?
+      cat "$_runner_output"
+      if ! _runner_reap_registered "$_runner_registry"; then
+        [ "$rc" -ne 0 ] || rc=97
+      fi
+      rm -f "$_runner_registry" "$_runner_output"
       if [ "$rc" -eq 0 ]; then
         echo "  PASS: $name"
         passed=$((passed + 1))
@@ -2314,7 +2407,7 @@ except: print("")' 2>/dev/null)"
     command -v python3 >/dev/null 2>&1 || { echo "stitchpad: health requires python3" >&2; exit 1; }
     exec python3 "$BIN_DIR/health.py" \
       --pad-dir "$PAD_DIR" --pad-md "$PAD_MD" --state-dir "$PAD_STATE" \
-      --adapter-dir "$ADAPTER_DIR" "$@"
+      --adapter-dir "$ADAPTER_DIR" --watch-start-grace "$STITCHPAD_WATCH_START_GRACE" "$@"
     ;;
 
   doctor)

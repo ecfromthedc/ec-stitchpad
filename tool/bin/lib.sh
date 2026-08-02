@@ -34,6 +34,12 @@ fi
 STITCHPAD_HOME="${STITCHPAD_HOME:-$HOME/.stitchpad}"
 ADAPTER_DIR="$STITCHPAD_HOME/adapters"
 
+# Watch admission policy has one shell-owned source of truth.  Python health
+# receives this exact value from the CLI rather than carrying a drifting copy.
+STITCHPAD_WATCH_START_GRACE="${STITCHPAD_WATCH_START_GRACE:-5}"
+STITCHPAD_WATCH_STAGE_STALE_SECONDS="${STITCHPAD_WATCH_STAGE_STALE_SECONDS:-60}"
+export STITCHPAD_WATCH_START_GRACE STITCHPAD_WATCH_STAGE_STALE_SECONDS
+
 # One canonical prompt fragment for every runtime. Keep model adapters thin:
 # they call this builder instead of carrying per-model copies that drift.
 # `full` is Ponytail's upstream default; an explicit `off` is the only opt-out.
@@ -1549,9 +1555,48 @@ sp_any_alive() {
 # self-healing (roster/sp_any_alive skip stale mtime); this just reclaims disk.
 # Safe to call any time — it only removes things proven dead. Called on join
 # and on supervisor exit.
+sp_watch_stage_reap() {
+  [ -n "${PAD_STATE:-}" ] && [ -d "$PAD_STATE" ] && [ ! -L "$PAD_STATE" ] || return 0
+  local now stale f base pid mtime size age observed_mtime observed_size
+  now="$(date +%s)"
+  stale="$STITCHPAD_WATCH_STAGE_STALE_SECONDS"
+  case "$stale" in ''|*[!0-9]*) return 1 ;; esac
+  # Publication stages are never runtime authority.  Remove only an exact,
+  # bounded regular-file shape whose named publisher PID is dead and whose age
+  # exceeds the configured grace.  Symlinks, directories and richer names are
+  # preserved as evidence.
+  for f in "$PAD_STATE"/.watch-generation.* "$PAD_STATE"/.watch-launcher.* \
+           "$PAD_STATE"/.watch-launcher-transfer.* "$PAD_STATE"/.watch-owner.*; do
+    [ -e "$f" ] || [ -L "$f" ] || continue
+    [ -f "$f" ] && [ ! -L "$f" ] || continue
+    base="${f##*/}"
+    printf '%s\n' "$base" | grep -Eq \
+      '^\.watch-(generation|launcher|launcher-transfer|owner)\.[0-9]+\.[0-9]+$' \
+      || continue
+    pid="$(printf '%s\n' "$base" | sed -E \
+      's/^\.watch-(generation|launcher|launcher-transfer|owner)\.([0-9]+)\.[0-9]+$/\2/')"
+    case "$pid" in ''|*[!0-9]*) continue ;; esac
+    kill -0 "$pid" 2>/dev/null && continue
+    mtime="$(stat -f %m "$f" 2>/dev/null || stat -c %Y "$f" 2>/dev/null || echo "$now")"
+    size="$(stat -f %z "$f" 2>/dev/null || stat -c %s "$f" 2>/dev/null || echo 999999)"
+    case "$mtime:$size" in *[!0-9:]*) continue ;; esac
+    [ "$size" -le 4096 ] || continue
+    age=$((now - mtime))
+    [ "$age" -ge "$stale" ] || continue
+    # Re-prove the leaf immediately before unlinking its name.
+    [ -f "$f" ] && [ ! -L "$f" ] || continue
+    observed_mtime="$(stat -f %m "$f" 2>/dev/null || stat -c %Y "$f" 2>/dev/null || echo -1)"
+    observed_size="$(stat -f %z "$f" 2>/dev/null || stat -c %s "$f" 2>/dev/null || echo -1)"
+    [ "$observed_mtime" = "$mtime" ] && [ "$observed_size" = "$size" ] || continue
+    rm -f "$f" 2>/dev/null || return 1
+  done
+  return 0
+}
+
 sp_reap_dead() {
   [ -n "${PAD_STATE:-}" ] || return 0
   local now; now=$(date +%s)
+  sp_watch_stage_reap || true
   # 1. leftover atomic-write tmp files (.alive.<who>.<pid>) whose rename never
   #    completed — never read by anything, pure litter.
   for f in "$PAD_STATE"/.alive.*; do
@@ -1845,6 +1890,19 @@ sp_watch_launcher_lease_is_fresh() {
   [ "$age" -ge 0 ] && [ "$age" -lt "${STITCHPAD_WATCH_RESTART_GRACE:-5}" ]
 }
 
+sp_watch_test_barrier_wait() {
+  local barrier="$1" label="$2" i=0 limit="${STITCHPAD_WATCH_TEST_BARRIER_TICKS:-500}"
+  case "$limit" in ''|*[!0-9]*) limit=500 ;; esac
+  printf '%s' ready > "$barrier.ready" || return 1
+  while [ ! -f "$barrier.release" ] && [ "$i" -lt "$limit" ]; do
+    sleep 0.01
+    i=$((i + 1))
+  done
+  [ -f "$barrier.release" ] && return 0
+  echo "stitchpad: $label test barrier timed out" >&2
+  return 1
+}
+
 sp_watch_empty_lock_reclaim() {
   local lock="$1" now mtime age
   [ -d "$lock" ] || return 1
@@ -1852,7 +1910,7 @@ sp_watch_empty_lock_reclaim() {
   now="$(date +%s)"
   mtime="$(stat -f %m "$lock" 2>/dev/null || stat -c %Y "$lock" 2>/dev/null || echo "$now")"
   age=$((now - mtime))
-  [ "$age" -ge "${STITCHPAD_WATCH_START_GRACE:-5}" ] || return 1
+  [ "$age" -ge "$STITCHPAD_WATCH_START_GRACE" ] || return 1
   rmdir "$lock" 2>/dev/null
 }
 
@@ -1873,23 +1931,30 @@ sp_watch_generation_only_lock_reclaim() {
   now="$(date +%s)"
   mtime="$(stat -f %m "$lock" 2>/dev/null || stat -c %Y "$lock" 2>/dev/null || echo "$now")"
   age=$((now - mtime))
-  [ "$age" -ge "${STITCHPAD_WATCH_START_GRACE:-5}" ] || return 1
+  [ "$age" -ge "$STITCHPAD_WATCH_START_GRACE" ] || return 2
   [ "$(cat "$lock/generation" 2>/dev/null || true)" = "$generation" ] || return 1
   sp_watch_lock_remove_generation "$lock" "$generation"
 }
 
 sp_watcher_alive() {
   local watch_lock="$PAD_STATE/watch.lock.d"
+  sp_watch_stage_reap || true
   [ -d "$watch_lock" ] || return 1
-  local generation pid observed
+  local generation pid observed reclaim_rc
   generation="$(cat "$watch_lock/generation" 2>/dev/null || true)"
   if [ -z "$generation" ]; then
     sp_watch_empty_lock_reclaim "$watch_lock" 2>/dev/null || true
     return 1
   fi
   if ! sp_watch_launcher_is_valid "$watch_lock" "$generation"; then
-    sp_watch_generation_only_lock_reclaim "$watch_lock" 2>/dev/null && return 1
-    echo "stitchpad: malformed or unknown watcher lock left untouched" >&2
+    sp_watch_generation_only_lock_reclaim "$watch_lock" 2>/dev/null
+    reclaim_rc=$?
+    [ "$reclaim_rc" -eq 0 ] && return 1
+    if [ "$reclaim_rc" -eq 2 ]; then
+      echo "stitchpad: watcher admission is still within startup grace" >&2
+    else
+      echo "stitchpad: malformed or unknown watcher lock left untouched" >&2
+    fi
     return 1
   fi
   if [ -f "$watch_lock/owner" ]; then
@@ -2070,7 +2135,8 @@ sp_stop_watchers_for_pad() {
   local watch_lock="$PAD_STATE/watch.lock.d"
   # A scalar list avoids macOS Bash 3.2 treating an empty declared array as an
   # unbound variable under `set -u`.
-  local p pids="" records="" started command sha start64 command64 remaining i=0 generation owner_pid launcher_pid
+  local p pids="" records="" started command sha start64 command64 remaining i=0 generation owner_pid launcher_pid reclaim_rc
+  sp_watch_stage_reap || true
   # Do not trust a bare PID file: the PID may have been reused. The exact
   # fswatch command path below proves both the fixture child and its live
   # parent relationship before either PID enters the signal list.
@@ -2084,8 +2150,14 @@ sp_stop_watchers_for_pad() {
     return 1
   fi
   if [ -d "$watch_lock" ] && ! sp_watch_launcher_is_valid "$watch_lock" "$generation"; then
-    sp_watch_generation_only_lock_reclaim "$watch_lock" 2>/dev/null && return 0
-    echo "stitchpad: malformed or unknown watcher lock left untouched for $PAD_MD" >&2
+    sp_watch_generation_only_lock_reclaim "$watch_lock" 2>/dev/null
+    reclaim_rc=$?
+    [ "$reclaim_rc" -eq 0 ] && return 0
+    if [ "$reclaim_rc" -eq 2 ]; then
+      echo "stitchpad: watcher admission is still within startup grace for $PAD_MD" >&2
+    else
+      echo "stitchpad: malformed or unknown watcher lock left untouched for $PAD_MD" >&2
+    fi
     return 1
   fi
   if [ -f "$watch_lock/owner" ]; then
@@ -2190,6 +2262,7 @@ ensure_watcher() {
   [ -n "${PAD_DIR:-}" ] || sp_init_paths || return 0
   local watch_lock="$PAD_STATE/watch.lock.d"
   local watch_log="$PAD_STATE/watch.log" watch_generation
+  sp_watch_stage_reap || true
   # Only spawn if someone is alive and listening
   sp_any_alive || return 0
   # Already running? Nothing to do.
@@ -2221,8 +2294,10 @@ ensure_watcher() {
   }
   if [ -n "${STITCHPAD_WATCH_TEST_AFTER_GENERATION_BARRIER:-}" ]; then
     local watch_generation_barrier="$STITCHPAD_WATCH_TEST_AFTER_GENERATION_BARRIER"
-    printf '%s' ready > "$watch_generation_barrier.ready"
-    while [ ! -f "$watch_generation_barrier.release" ]; do sleep 0.01; done
+    sp_watch_test_barrier_wait "$watch_generation_barrier" "watch generation" || {
+      sp_watch_lock_remove_generation "$watch_lock" "$watch_generation" 2>/dev/null || true
+      return 1
+    }
   fi
   sp_watch_launcher_write "$watch_lock" "$watch_generation" || {
     sp_watch_lock_remove_generation "$watch_lock" "$watch_generation" 2>/dev/null || true
