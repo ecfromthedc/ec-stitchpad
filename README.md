@@ -114,7 +114,7 @@ runtime hook; push members deliberately bind an external surface.
 | `stitchpad watch` | run the optional file watcher in the foreground |
 | `stitchpad start\|stop\|status\|restart` | manage the optional background watcher |
 | `stitchpad reset [name] [--redeliver N]` | repair without rewinding seen cursors; exact positive-ordinal redelivery requires an open gate and canonical session-bound pull/hook seat |
-| `stitchpad keeper [--config FILE] <repo>…` | one-shot Ocean seat keeper driven by current unread ordinals and open task cards |
+| `stitchpad keeper [--config FILE] <repo>…` | one-shot Ocean seat keeper driven only by open task cards; unread delivery stays supervisor-owned |
 | `stitchpad log [-n N]` | git history (one commit per message) |
 | `stitchpad task new\|list\|show\|move\|edit` | the ticket board — cards live in `tasks.md` beside the pad |
 | `stitchpad task migrate` | move legacy inline ` ```task ` blocks out of the pad into `tasks.md` |
@@ -128,11 +128,18 @@ runtime hook; push members deliberately bind an external surface.
 
 The optional keeper is also deliberately narrow. It considers only `ocean |
 push | <session>` roster rows whose `sessions/<session>` binding names the same
-seat. DND, active turns, and unresolved delivery markers are skipped. A wake is
-based on `wake --peek-ordinal` plus current `todo`/`in_progress`/`in_review`
-cards, coalesced into one turn; historical mention counts and `done`/`canceled`
-cards never create work. Concurrent keepers serialize each seat with an atomic,
-owner-validated reservation and persist an accepted timestamp before release.
+seat. DND, active turns, and unresolved delivery markers are skipped. The
+watcher/delivery supervisor exclusively owns unread mentions and seen cursors;
+the keeper neither peeks nor consumes them. Only current
+`todo`/`in_progress`/`in_review` cards create keeper work, while historical
+mention counts and `done`/`canceled` cards never do. Concurrent keepers
+serialize each seat with an atomic, owner-validated lock. Before submitting,
+the keeper also persists `delivery.<seat>.keeper-reservation` as
+`ordinal|message_id|state|attempt_id`. An interrupted or otherwise uncertain
+submission becomes `acceptance_unknown` and is never retried automatically,
+because the wake client provides no idempotency key. Task-only reservations use
+ordinal `0` as an explicit non-message sentinel; positive pad ordinals remain
+reserved for the unread delivery supervisor.
 Pass repository paths explicitly or keep them in an
 untracked file supplied with `--config`; no operator configuration is shipped.
 `ocean-heartbeat` must be on `PATH` or named explicitly with

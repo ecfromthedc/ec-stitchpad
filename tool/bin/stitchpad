@@ -15,7 +15,7 @@
 #   stitchpad roster                      print parsed roster
 #   stitchpad rename <old> <new>          rename a member everywhere local state knows them
 #   stitchpad reset [name] [--redeliver N] repair a wedged seat without rewinding its cursor
-#   stitchpad keeper [repo ...]           wake idle Ocean seats for real unread/open work
+#   stitchpad keeper [repo ...]           wake idle Ocean seats for current open tasks
 #   stitchpad archive [--keep N]          move old messages to .stitchpad/archive/<date>-conversation.md (plain md, no deps)
 #   stitchpad compact [--keep N]          archive old transcript to sqlite, replace with rolling summary block
 #   stitchpad task migrate                move legacy inline ```task blocks out of the pad into tasks.md
