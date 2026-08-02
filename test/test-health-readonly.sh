@@ -200,17 +200,19 @@ who="$($SP who)"
 read_window="$($SP read -n 5)"
 deep_json="$(OCEAN_DAEMON_URL=http://127.0.0.1:1 "$SP" health --deep --json)"
 hostname_json="$(OCEAN_DAEMON_URL=http://localhost:1 "$SP" health --deep --json)"
-bad_url_json="$(OCEAN_DAEMON_URL='http://[::1]@evil.test' "$SP" health --deep --json)"
 
 # A loopback daemon may be compromised or misconfigured. Refuse its redirect
 # instead of following a nominally local health request onto the network.
 start_http_fixture() {
-  _mode="$1"; _port_file="$2"
-  python3 - "$_port_file" "$_mode" <<'PY' &
-import http.server, sys
+  _mode="$1"; _port_file="$2"; _hits_file="${3:-}"
+  python3 - "$_port_file" "$_mode" "$_hits_file" <<'PY' &
+import http.server, sys, time
 mode = sys.argv[2]
+hits_file = sys.argv[3]
 class Handler(http.server.BaseHTTPRequestHandler):
+    hits = 0
     def do_GET(self):
+        type(self).hits += 1
         if mode == "redirect":
             self.send_response(302)
             self.send_header("Location", "http://example.invalid/stitchpad-health-leak")
@@ -241,12 +243,34 @@ class Handler(http.server.BaseHTTPRequestHandler):
 server = http.server.HTTPServer(("127.0.0.1", 0), Handler)
 with open(sys.argv[1], "w", encoding="ascii") as stream:
     stream.write(str(server.server_port))
-server.handle_request()
+if mode == "blocked":
+    deadline = time.monotonic() + 0.75
+    while time.monotonic() < deadline:
+        server.timeout = max(0.01, deadline - time.monotonic())
+        server.handle_request()
+    with open(hits_file, "w", encoding="ascii") as stream:
+        stream.write(str(Handler.hits))
+else:
+    server.handle_request()
 PY
   SERVER_PID=$!
   for _ in $(seq 1 100); do [ -s "$_port_file" ] && return; sleep 0.02; done
   fail "HTTP fixture did not start"
 }
+
+# Pin malformed and spoofed URL classification independently of urllib.parse
+# version. Both strings would resolve to this fixture if they escaped the URL
+# validation boundary; the request counter proves neither form reaches it.
+blocked_port_file="$TMP/blocked.port"
+blocked_hits_file="$TMP/blocked.hits"
+start_http_fixture blocked "$blocked_port_file" "$blocked_hits_file"
+blocked_port="$(cat "$blocked_port_file")"
+malformed_url_json="$(OCEAN_DAEMON_URL="http://127.0.0.1:${blocked_port}:bad" "$SP" health --deep --json)"
+spoof_url_json="$(OCEAN_DAEMON_URL="http://127.0.0.1@localhost:${blocked_port}" "$SP" health --deep --json)"
+wait "$SERVER_PID"
+SERVER_PID=""
+[ "$(cat "$blocked_hits_file")" = "0" ] \
+  || fail "malformed or spoofed daemon URL reached the HTTP fixture"
 
 redirect_port_file="$TMP/redirect.port"
 start_http_fixture redirect "$redirect_port_file"
@@ -291,12 +315,13 @@ read_new_second="$($SP read --new)"
 state_after_second="$(snapshot "$TMP/project")"
 [ "$state_after_first" = "$state_after_second" ] || fail "second read --new rewrote an unchanged cursor or other state"
 
-python3 - "$local_json" "$deep_json" "$hostname_json" "$bad_url_json" \
-  "$redirect_json" "$malformed_deep_json" "$slow_deep_json" "$slow_elapsed_ms" "$doctor_json" <<'PY'
+python3 - "$local_json" "$deep_json" "$hostname_json" "$malformed_url_json" \
+  "$spoof_url_json" "$redirect_json" "$malformed_deep_json" "$slow_deep_json" \
+  "$slow_elapsed_ms" "$doctor_json" <<'PY'
 import json, sys
-local, deep, hostname, bad_url, redirect, malformed_deep, slow_deep = map(json.loads, sys.argv[1:8])
-slow_elapsed_ms = int(sys.argv[8])
-doctor = json.loads(sys.argv[9])
+local, deep, hostname, malformed_url, spoof_url, redirect, malformed_deep, slow_deep = map(json.loads, sys.argv[1:9])
+slow_elapsed_ms = int(sys.argv[9])
+doctor = json.loads(sys.argv[10])
 assert local["schema_version"] == 1 and local["mode"] == "local"
 assert all(seat["deep_ocean"] is None for seat in local["seats"])
 assert local["pad"]["watcher"]["status"] == "malformed_lock"
@@ -345,8 +370,10 @@ assert deep["mode"] == "deep"
 assert deep_seats["bob"]["deep_ocean"]["status"] == "unavailable"
 hostname_seats = {seat["name"]: seat for seat in hostname["seats"]}
 assert hostname_seats["bob"]["deep_ocean"]["status"] == "refused_non_loopback"
-bad_url_seats = {seat["name"]: seat for seat in bad_url["seats"]}
-assert bad_url_seats["bob"]["deep_ocean"]["status"] == "malformed_url"
+malformed_url_seats = {seat["name"]: seat for seat in malformed_url["seats"]}
+assert malformed_url_seats["bob"]["deep_ocean"]["status"] == "malformed_url"
+spoof_url_seats = {seat["name"]: seat for seat in spoof_url["seats"]}
+assert spoof_url_seats["bob"]["deep_ocean"]["status"] == "refused_non_loopback"
 redirect_seats = {seat["name"]: seat for seat in redirect["seats"]}
 assert redirect_seats["bob"]["deep_ocean"]["status"] == "unavailable"
 assert redirect_seats["bob"]["deep_ocean"]["detail"] == "HTTPError"
