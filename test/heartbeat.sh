@@ -15,6 +15,7 @@ cleanup() {
 trap cleanup EXIT
 mkdir -p "$FIXTURE_DIR/home"
 export HOME="$FIXTURE_DIR/home"
+unset HERDR_PANE_ID HERDR_TAB_ID HERDR_ENV HERDR_SOCKET_PATH HERDR_WORKSPACE_ID 2>/dev/null || true
 
 cd "$FIXTURE_DIR"
 "$SP" init --name heartbeat >/dev/null
@@ -49,9 +50,17 @@ pid="$(jq -r '.pid' "$alive")"
 kill -0 "$pid"
 
 mtime1="$(stat -f %m "$alive" 2>/dev/null || stat -c %Y "$alive")"
-sleep 2
-mtime2="$(stat -f %m "$alive" 2>/dev/null || stat -c %Y "$alive")"
-[ "$mtime2" -gt "$mtime1" ]
+mtime2="$mtime1"
+for _ in $(seq 1 40); do
+  [ "$mtime2" -gt "$mtime1" ] && break
+  kill -0 "$pid" 2>/dev/null || break
+  sleep 0.25
+  mtime2="$(stat -f %m "$alive" 2>/dev/null || stat -c %Y "$alive")"
+done
+[ "$mtime2" -gt "$mtime1" ] || {
+  echo "heartbeat ticker did not refresh alive metadata within 10 seconds" >&2
+  exit 1
+}
 
 "$SP" heartbeat --stop alice >/dev/null
 for _ in 1 2 3 4 5 6 7 8 9 10; do

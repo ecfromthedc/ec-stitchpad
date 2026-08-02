@@ -32,6 +32,9 @@ if [ -n "${STITCHPAD_CWD:-}" ]; then
 else
   pad_dir="$(mktemp -d)"
   owns_fixture=1
+  mkdir -p "$pad_dir/home"
+  export HOME="$pad_dir/home"
+  unset HERDR_PANE_ID HERDR_TAB_ID HERDR_ENV HERDR_SOCKET_PATH HERDR_WORKSPACE_ID 2>/dev/null || true
   cd "$pad_dir"
   "$SP" init --name identity-regtest >/dev/null
 fi

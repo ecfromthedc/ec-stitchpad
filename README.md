@@ -147,6 +147,10 @@ surface. It reports watcher singleton state plus per-seat heartbeat/ticker and
 parent PID liveness, DND, cursors and the true open mention ordinal, session
 bindings, and optional durable delivery-worker state. Malformed state is
 returned as evidence; health never repairs, starts, touches, or deletes it.
+Exact reset-redelivery provenance (`pending.<seat>.reset`) is included as
+read-only evidence. If malformed, health preserves it, reports both the marker
+and its paired pending ordinal, and directs an operator to inspect the pair;
+it never guesses that either file is safe to replay or delete.
 Keeper reservations are included; `acceptance_unknown` is an error that tells
 operators to hold position, never to auto-retry or advance the delivery.
 `--deep` adds only a bounded loopback GET for Ocean session state and otherwise

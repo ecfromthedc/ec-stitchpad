@@ -7,8 +7,10 @@ base="$(mktemp -d /tmp/stitchpad-watcher-races.XXXXXX)"
 tmp="$base/pipe | restart"
 ensure_pid=""
 orphan_pid=""
+canary_pid=""
 cleanup() {
   [ -z "$ensure_pid" ] || { kill "$ensure_pid" 2>/dev/null || true; wait "$ensure_pid" 2>/dev/null || true; }
+  [ -z "$canary_pid" ] || { kill "$canary_pid" 2>/dev/null || true; wait "$canary_pid" 2>/dev/null || true; }
   if [ -d "$tmp/.stitchpad" ]; then
     STITCHPAD_PAD_DIR="$tmp/.stitchpad" "$SP" daemon stop >/dev/null 2>&1 || true
     STITCHPAD_PAD_DIR="$tmp/.stitchpad" "$SP" heartbeat --stop watcher >/dev/null 2>&1 || true
@@ -40,6 +42,7 @@ watch_pairs() {
 mkdir -p "$tmp/home" "$base/mockbin"
 export HOME="$tmp/home"
 export STITCHPAD_HEARTBEAT_AUTOSTART=0
+unset HERDR_PANE_ID HERDR_TAB_ID HERDR_ENV HERDR_SOCKET_PATH HERDR_WORKSPACE_ID 2>/dev/null || true
 cd "$tmp"
 "$SP" init --name watcher-races >/dev/null
 "$SP" join watcher codex pull - >/dev/null
@@ -152,5 +155,96 @@ done
 "$SP" daemon stop >/dev/null
 [ ! -d "$lock" ] && [ -z "$(watch_processes)" ] \
   || fail "recovered watcher left lock or process residue"
+
+# SIGKILL after generation publication but before launcher publication leaves
+# a generation-only lock.  Once its bounded admission grace expires, both CLI
+# ensure and daemon start must retire that exact generation without signalling
+# any PID, then converge to one supervised watcher.
+barrier="$base/watch-generation-kill"
+STITCHPAD_WATCH_TEST_AFTER_GENERATION_BARRIER="$barrier" "$SP" ensure-watcher >/dev/null 2>&1 &
+ensure_pid=$!
+wait_file "$barrier.ready"
+kill -KILL "$ensure_pid" 2>/dev/null || true
+wait "$ensure_pid" 2>/dev/null || true
+ensure_pid=""
+[ -d "$lock" ] && [ -f "$lock/generation" ] \
+  && [ "$(find "$lock" -mindepth 1 -maxdepth 1 -print)" = "$lock/generation" ] \
+  || fail "watch admission SIGKILL did not leave the exact generation-only shape"
+fresh_before="$(find "$lock" -mindepth 1 -maxdepth 1 -type f -exec cksum {} \; | sort)"
+[ "$("$SP" status)" = stopped ] || fail "readonly status hid the ownerless admission state"
+health_json="$("$SP" health --json)"
+[ "$(printf '%s' "$health_json" | python3 -c 'import json,sys; print(json.load(sys.stdin)["pad"]["watcher"]["status"])')" = starting ] \
+  || fail "health did not classify a fresh generation-only admission as starting"
+fresh_after="$(find "$lock" -mindepth 1 -maxdepth 1 -type f -exec cksum {} \; | sort)"
+[ "$fresh_before" = "$fresh_after" ] || fail "readonly status/health mutated a fresh admission lock"
+"$SP" ensure-watcher >/dev/null
+[ "$fresh_before" = "$(find "$lock" -mindepth 1 -maxdepth 1 -type f -exec cksum {} \; | sort)" ] \
+  || fail "default grace reclaimed a fresh generation-only admission"
+STITCHPAD_WATCH_START_GRACE=0 "$SP" ensure-watcher >/dev/null
+for _ in $(seq 1 500); do
+  [ -s "$lock/owner" ] && [ "$(watch_pairs | wc -l | tr -d ' ')" = 1 ] && break
+  sleep 0.01
+done
+[ -s "$lock/owner" ] && [ "$(watch_pairs | wc -l | tr -d ' ')" = 1 ] \
+  || fail "ensure-watcher did not recover a generation-only admission lock"
+"$SP" daemon stop >/dev/null
+[ ! -d "$lock" ] && [ -z "$(watch_processes)" ] \
+  || fail "generation-only ensure recovery left lock or process residue"
+
+barrier="$base/daemon-generation-kill"
+STITCHPAD_WATCH_TEST_AFTER_GENERATION_BARRIER="$barrier" "$SP" daemon start >/dev/null 2>&1 &
+ensure_pid=$!
+wait_file "$barrier.ready"
+kill -KILL "$ensure_pid" 2>/dev/null || true
+wait "$ensure_pid" 2>/dev/null || true
+ensure_pid=""
+[ -d "$lock" ] && [ -f "$lock/generation" ] \
+  && [ "$(find "$lock" -mindepth 1 -maxdepth 1 -print)" = "$lock/generation" ] \
+  || fail "daemon admission SIGKILL did not leave the exact generation-only shape"
+STITCHPAD_WATCH_START_GRACE=0 "$SP" daemon start >/dev/null
+for _ in $(seq 1 500); do
+  [ -s "$lock/owner" ] && [ "$(watch_pairs | wc -l | tr -d ' ')" = 1 ] && break
+  sleep 0.01
+done
+[ -s "$lock/owner" ] && [ "$(watch_pairs | wc -l | tr -d ' ')" = 1 ] \
+  || fail "daemon start did not recover a generation-only admission lock"
+"$SP" daemon stop >/dev/null
+[ ! -d "$lock" ] && [ -z "$(watch_processes)" ] \
+  || fail "generation-only daemon recovery left lock or process residue"
+
+# Generation strings contain a PID-shaped component but are never signal
+# authority.  Reclaiming an aged ownerless generation must not touch a live
+# foreign process whose PID happens to appear in that string.
+sleep 30 &
+canary_pid=$!
+mkdir "$lock"
+printf '1.%s.1' "$canary_pid" > "$lock/generation"
+touch -t 202001010000 "$lock" "$lock/generation"
+STITCHPAD_WATCH_START_GRACE=0 "$SP" stop >/dev/null
+kill -0 "$canary_pid" 2>/dev/null || fail "generation-only reclaim signalled a foreign PID"
+[ ! -d "$lock" ] || fail "stop did not reclaim an aged generation-only lock"
+kill "$canary_pid" 2>/dev/null || true
+wait "$canary_pid" 2>/dev/null || true
+canary_pid=""
+
+# Any richer or aliased shape remains fail-closed evidence.
+mkdir "$lock"
+printf '1.2.3' > "$lock/generation"
+printf 'evidence' > "$lock/junk"
+touch -t 202001010000 "$lock" "$lock/generation" "$lock/junk"
+STITCHPAD_WATCH_START_GRACE=0 "$SP" ensure-watcher >/dev/null
+[ -f "$lock/generation" ] && [ -f "$lock/junk" ] \
+  || fail "reclaim removed a richer malformed watcher lock"
+if STITCHPAD_WATCH_START_GRACE=0 "$SP" stop >"$base/malformed-stop.out" 2>&1; then
+  fail "stop reported success for unverified watcher ownership evidence"
+fi
+grep -q 'watcher stopped' "$base/malformed-stop.out" \
+  && fail "stop printed a false success message for malformed ownership" \
+  || true
+rm -f "$lock/generation" "$lock/junk"
+rmdir "$lock"
+
+[ -z "$(find "$state" -maxdepth 1 -name 'watch.lock.d.retired.*' -print -quit)" ] \
+  || fail "watcher race scenarios left a retired generation alias"
 
 echo "watcher races ok"

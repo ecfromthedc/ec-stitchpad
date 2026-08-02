@@ -7,23 +7,47 @@ ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 SP="$ROOT/tool/bin/stitchpad"
 export STITCHPAD_HOME="$ROOT/tool"
 TMP="$(mktemp -d /tmp/stitchpad-ponytail-test.XXXXXX)"
+mkdir -p "$TMP/home"
+export HOME="$TMP/home"
+unset HERDR_PANE_ID HERDR_TAB_ID HERDR_ENV HERDR_SOCKET_PATH HERDR_WORKSPACE_ID 2>/dev/null || true
 cleanup() {
+  local remaining="" pid current cleanup_failed=0
   if [ -d "$TMP/project/.stitchpad" ]; then
-    # Capture only this fixture's watcher tree before `stop` removes its lock.
-    # The production stop path is TERM-only; tests must not leave a stubborn
-    # watcher or heartbeat behind after deleting the fixture directory.
-    local watch_pid watch_pids=""
-    watch_pid="$(cat "$TMP/project/.stitchpad/.state/watch.lock.d/pid" 2>/dev/null || true)"
-    if [ -n "$watch_pid" ]; then
-      watch_pids="$(ps -axo pid=,ppid= | awk -v root="$watch_pid" '$1==root || $2==root {print $1}')"
-    fi
     (cd "$TMP/project" && "$SP" heartbeat stop fable >/dev/null 2>&1 || true)
     (cd "$TMP/project" && "$SP" stop >/dev/null 2>&1 || true)
-    for pid in $watch_pids; do
-      kill -0 "$pid" 2>/dev/null && kill -KILL "$pid" 2>/dev/null || true
+    # A watcher parent can die before its fswatch child.  Re-query by the exact
+    # fixture pad path after shutdown, then let the production identity checks
+    # retire any late child before the fixture directory disappears.
+    for _ in 1 2 3; do
+      remaining="$(STITCHPAD_PAD_DIR="$TMP/project/.stitchpad" bash -c '
+        source "$1"; sp_init_paths >/dev/null; sp_watch_processes_for_pad
+      ' _ "$ROOT/tool/bin/lib.sh" 2>/dev/null || true)"
+      [ -n "$remaining" ] || break
+      STITCHPAD_PAD_DIR="$TMP/project/.stitchpad" bash -c '
+        source "$1"; sp_init_paths >/dev/null; sp_stop_watchers_for_pad
+      ' _ "$ROOT/tool/bin/lib.sh" >/dev/null 2>&1 || true
+      sleep 0.1
     done
+    remaining="$(STITCHPAD_PAD_DIR="$TMP/project/.stitchpad" bash -c '
+      source "$1"; sp_init_paths >/dev/null; sp_watch_processes_for_pad
+    ' _ "$ROOT/tool/bin/lib.sh" 2>/dev/null || true)"
+    if [ -n "$remaining" ]; then
+      cleanup_failed=1
+      # Last-resort fixture cleanup remains exact: re-prove each PID is still
+      # returned by the pad-specific process matcher immediately before signal.
+      for pid in $remaining; do
+        current="$(STITCHPAD_PAD_DIR="$TMP/project/.stitchpad" bash -c '
+          source "$1"; sp_init_paths >/dev/null; sp_watch_processes_for_pad
+        ' _ "$ROOT/tool/bin/lib.sh" 2>/dev/null || true)"
+        case " $current " in *" $pid "*) kill -KILL "$pid" 2>/dev/null || true ;; esac
+      done
+    fi
   fi
   rm -rf "$TMP"
+  if [ "$cleanup_failed" -ne 0 ]; then
+    echo "FAIL: Ponytail fixture left an exact watcher child after bounded teardown" >&2
+    exit 1
+  fi
 }
 trap cleanup EXIT
 

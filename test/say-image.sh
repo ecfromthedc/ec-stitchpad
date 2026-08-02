@@ -8,7 +8,9 @@ FIXTURE_DIR="$(mktemp -d)"
 FAKE_BIN="$FIXTURE_DIR/bin"
 trap 'rm -rf "$FIXTURE_DIR"' EXIT
 
-mkdir -p "$FAKE_BIN"
+mkdir -p "$FAKE_BIN" "$FIXTURE_DIR/home"
+export HOME="$FIXTURE_DIR/home"
+unset HERDR_PANE_ID HERDR_TAB_ID HERDR_ENV HERDR_SOCKET_PATH HERDR_WORKSPACE_ID 2>/dev/null || true
 cat > "$FAKE_BIN/curl" <<'CURL'
 #!/usr/bin/env bash
 printf '%s\n' "$*" > "$STITCHPAD_FAKE_CURL_LOG"

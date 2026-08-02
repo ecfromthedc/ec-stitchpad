@@ -63,7 +63,7 @@ sp_autostart_name() {
 sp_maybe_start_heartbeat() {
   [ "${STITCHPAD_HEARTBEAT_AUTOSTART:-1}" = "0" ] && return 0
   case "$cmd" in
-    init|instructions|prompt-context|doctor|health|status|roster|who|read|heartbeat|hook|bind-session|whoami|leave|stop|daemon|watch|migration-check|reset|keeper|compact|restore-roster|help|-h|--help) return 0 ;;
+    init|instructions|prompt-context|doctor|health|status|roster|who|read|heartbeat|hook|bind-session|whoami|leave|stop|daemon|watch|migration-check|reset|keeper|compact|restore-roster|color|help|-h|--help) return 0 ;;
   esac
   sp_init_paths >/dev/null 2>&1 || return 0
   local who
@@ -2030,10 +2030,40 @@ except: print("")' 2>/dev/null)"
     printf '{"decision":"block","reason":%s}\n' "$esc"
     ;;
 
-  start)  sp_init_paths || exit 1; ensure_watcher; echo "→ watcher ensured"; ;;
-  stop)   sp_init_paths || exit 1; sp_stop_watchers_for_pad; sp_stop_delivery_workers; echo "→ watcher stopped"; ;;
+  start)
+    sp_init_paths || exit 1
+    ensure_watcher
+    if sp_any_alive && ! sp_watcher_alive; then
+      echo "stitchpad: watcher could not be ensured" >&2
+      exit 1
+    fi
+    echo "→ watcher ensured"
+    ;;
+  stop)
+    sp_init_paths || exit 1
+    if ! sp_stop_watchers_for_pad; then
+      sp_stop_delivery_workers
+      echo "stitchpad: watcher stop left unverified ownership evidence" >&2
+      exit 1
+    fi
+    sp_stop_delivery_workers
+    echo "→ watcher stopped"
+    ;;
   status) sp_init_paths_readonly || exit 1; sp_watcher_alive_readonly && echo "running (pid $(cat "$PAD_STATE/watch.lock.d/pid" 2>/dev/null))" || echo "stopped"; ;;
-  restart) sp_init_paths || exit 1; sp_stop_watchers_for_pad; sp_stop_delivery_workers; ensure_watcher; echo "→ watcher restarted"; ;;
+  restart)
+    sp_init_paths || exit 1
+    sp_stop_watchers_for_pad || {
+      echo "stitchpad: watcher restart refused unverified ownership evidence" >&2
+      exit 1
+    }
+    sp_stop_delivery_workers
+    ensure_watcher
+    if sp_any_alive && ! sp_watcher_alive; then
+      echo "stitchpad: watcher restart did not establish a verified owner" >&2
+      exit 1
+    fi
+    echo "→ watcher restarted"
+    ;;
   watch)   exec "$STITCHPAD_HOME/bin/watch.sh" ;;
   daemon)  exec "$STITCHPAD_HOME/bin/daemon.sh" "${@}" ;;
 
@@ -2173,7 +2203,10 @@ except: print("")' 2>/dev/null)"
       name="$(basename "$t")"
       echo "--- $name ---"
       rc=0
-      STITCHPAD_HOME="$STITCHPAD_HOME" bash "$t" 2>&1 || rc=$?
+      STITCHPAD_HOME="$STITCHPAD_HOME" env \
+        -u HERDR_PANE_ID -u HERDR_TAB_ID -u HERDR_ENV \
+        -u HERDR_SOCKET_PATH -u HERDR_WORKSPACE_ID \
+        bash "$t" 2>&1 || rc=$?
       if [ "$rc" -eq 0 ]; then
         echo "  PASS: $name"
         passed=$((passed + 1))
@@ -2195,30 +2228,21 @@ except: print("")' 2>/dev/null)"
     # Single source of truth: terminal surfaces and the TUI both shell out to this.
     sp_init_paths || exit 1
 
-    # FIXED 1:1 color map — explicit, maximally distinct, no hash, no drift.
-    declare -A _overrides=(
-      [smaths]='#f1ece4'   # warm paper — the human/TUI window
-      [randy]='#0d9488'    # teal — orchestrator (was john); = brand accent
-      [dale]='#00d000'     # green
-      [larry]='#e01010'    # red
-      [ernie]='#9b30ff'    # purple
-      [dennis]='#ff8c00'   # orange
-      [Jill]='#ff1493'     # pink
-      [jill]='#ff1493'     # pink
-      [mark]='#ffd700'     # yellow
-      [nancy]='#00ffff'    # cyan
-      [henry]='#1e90ff'    # blue — remote writer (Eric's machine)
-      # harness agents: brand-matched, not palette neon — mirrors their logos
-      [codex]='#a8a3ff'        # OpenAI codex periwinkle (mark gradient)
-      [fable]='#d97757'        # Anthropic coral (starburst tile)
-      [claude]='#d97757'       # Anthropic coral
-      [claude-main]='#c96442'  # Anthropic coral, deeper (distinct from fable)
-      [pi]='#aeb8c4'           # pi monochrome silver
-      [ocean]='#38bdf8'        # ocean waves blue (distinct from brand teal)
-      [deepseek]='#4d6bfe'     # deepseek brand blue
-      [kimi-pi]='#1783ff'      # Kimi (Moonshot) brand blue — matches the K tile
-      [kimi]='#1783ff'         # Kimi brand blue
-    )
+    # FIXED 1:1 color map — a case function keeps Apple Bash 3.2 support.
+    color_override() {
+      case "$1" in
+        smaths) echo '#f1ece4' ;; randy) echo '#0d9488' ;;
+        dale) echo '#00d000' ;; larry) echo '#e01010' ;;
+        ernie) echo '#9b30ff' ;; dennis) echo '#ff8c00' ;;
+        Jill|jill) echo '#ff1493' ;; mark) echo '#ffd700' ;;
+        nancy) echo '#00ffff' ;; henry) echo '#1e90ff' ;;
+        codex) echo '#a8a3ff' ;; fable|claude) echo '#d97757' ;;
+        claude-main) echo '#c96442' ;; pi) echo '#aeb8c4' ;;
+        ocean) echo '#38bdf8' ;; deepseek) echo '#4d6bfe' ;;
+        kimi-pi|kimi) echo '#1783ff' ;;
+        *) return 1 ;;
+      esac
+    }
 
     # 20-color palette (256-index → hex). Used when no override exists.
     declare -a _pidx=(39 208 76 170 214 51 199 220 123 141 203 82 205 114 177 226 87 213 155 159)
@@ -2238,32 +2262,32 @@ except: print("")' 2>/dev/null)"
       done
       echo $(( sum % plist ))
     }
-    # Get the full roster as array of names
-    mapfile -t _names < <(sp_roster | awk -F'|' '{gsub(/^[ \t]+|[ \t]+$/, "", $1); print $1}')
-    # Collision-aware assignment: walk names, each gets hashed slot, skip collisions
-    declare -A _taken=()
-    declare -A _color_map=()
-    for _n in "${_names[@]}"; do
-      # Check override first
-      if [ -n "${_overrides[$_n]+x}" ]; then
-        _color_map[$_n]="${_overrides[$_n]}"
-        continue
-      fi
+    # Roster names are validated tokens, so a newline/space scalar is safe and
+    # avoids mapfile/associative arrays unavailable in macOS Bash 3.2.
+    _names="$(sp_roster | awk -F'|' '{gsub(/^[ \t]+|[ \t]+$/, "", $1); if ($1 != "") print $1}')"
+    _taken=""; _color_rows=""
+    for _n in $_names; do
+      _color="$(color_override "$_n" 2>/dev/null || true)"
+      if [ -z "$_color" ]; then
       h=$(color_hash "$_n")
       idx=$h
-      while [ -n "${_taken[$idx]+x}" ]; do
-        idx=$(( (idx + 1) % plist ))
-        if [ "$idx" -eq "$h" ]; then break; fi
-      done
-      _taken[$idx]=1
-      _color_map[$_n]="${_phex[$idx]}"
+        while :; do
+          case "|$_taken|" in
+            *"|$idx|"*) idx=$(( (idx + 1) % plist )); [ "$idx" -ne "$h" ] || break ;;
+            *) break ;;
+          esac
+        done
+        _taken="${_taken:+$_taken|}$idx"
+        _color="${_phex[$idx]}"
+      fi
+      _color_rows="${_color_rows}${_n}|${_color}
+"
     done
     if [ -z "${1:-}" ] || [ "${1:-}" = "--all" ]; then
-      for _n in "${_names[@]}"; do
-        printf '%s %s\n' "$_n" "${_color_map[$_n]}"
-      done
+      printf '%s' "$_color_rows" | awk -F'|' 'NF == 2 {print $1, $2}'
     else
-      echo "${_color_map[$1]:-#808080}"
+      _color="$(printf '%s' "$_color_rows" | awk -F'|' -v name="$1" '$1 == name {print $2; exit}')"
+      echo "${_color:-#808080}"
     fi
     ;;
 

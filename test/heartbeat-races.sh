@@ -39,6 +39,7 @@ mkdir -p "$tmp/home"
 export HOME="$tmp/home"
 export STITCHPAD_HEARTBEAT_AUTOSTART=0
 export STITCHPAD_HEARTBEAT_PARENT_PID="$$"
+unset HERDR_PANE_ID HERDR_TAB_ID HERDR_ENV HERDR_SOCKET_PATH HERDR_WORKSPACE_ID 2>/dev/null || true
 cd "$tmp"
 "$SP" init --name heartbeat-races >/dev/null
 state="$tmp/.stitchpad/.state"

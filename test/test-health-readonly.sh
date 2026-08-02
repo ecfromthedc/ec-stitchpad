@@ -105,6 +105,7 @@ printf 'operator' > "$STATE/runtime.operator"
 printf '0' > "$STATE/seen.bob"
 printf '99999999999999999999' > "$STATE/seen.dave"
 printf '1' > "$STATE/pending.bob"
+printf 'garbage-reset-provenance' > "$STATE/pending.bob.reset"
 printf '%s' "$READREF_OLD" > "$STATE/readref.bob"
 : > "$STATE/dnd.bob"
 
@@ -298,6 +299,7 @@ ready_after="$(cksum < "$PAD/stitchpad.md.ready")|$(stat -f %m "$PAD/stitchpad.m
 [ "$status" = "stopped" ] || fail "malformed watcher lock should report stopped"
 [ "$roster" = "$who" ] || fail "roster/who compatibility changed"
 [ -n "$read_window$human" ] || fail "read/human health unexpectedly empty"
+case "$human" in *'reset recovery:'*'malformed'*) ;; *) fail "human health hid malformed reset provenance" ;; esac
 case "$doctor_human" in *'# health fixture'*) fail "doctor followed a symlinked session file" ;; esac
 
 # `read --new` is an explicit acknowledgement, not a passive diagnostic. It
@@ -338,6 +340,11 @@ assert seats["bob"]["dnd"] is True
 assert seats["bob"]["seen_cursor"]["value"] == 0
 assert seats["bob"]["open_pending_ordinal"]["value"] == 1
 assert seats["bob"]["recovery_pending_ordinal"]["value"] == 1
+assert seats["bob"]["reset_recovery_provenance"]["present"] is True
+assert seats["bob"]["reset_recovery_provenance"]["parse"] == "malformed"
+assert "reset_recovery:malformed_provenance" in seats["bob"]["issues"]
+assert any("pending.bob.reset" in item and "never be auto-replayed" in item
+           for item in seats["bob"]["repair"])
 assert seats["bob"]["delivery"]["active"] is True
 assert seats["bob"]["delivery"]["last_result"]["turn_id"] == "turn-1"
 assert seats["bob"]["delivery"]["keeper_reservation"]["state"] == "acceptance_unknown"
@@ -457,6 +464,25 @@ with tempfile.TemporaryDirectory() as root:
         elif value in attention:
             assert severity(issues) == "warn", (value, issues)
 PY
+
+# A generation-only watcher admission older than the startup grace is
+# recoverable stale evidence, not generic malformed ownership. Health must
+# classify it read-only so its repair guidance is actionable.
+STALE="$TMP/stale/.stitchpad"
+mkdir -p "$STALE/.state/watch.lock.d"
+cat > "$STALE/stitchpad.md" <<'EOF'
+# stale watcher fixture
+```roster
+```
+EOF
+printf '1.2.3' > "$STALE/.state/watch.lock.d/generation"
+touch -t 202001010000 "$STALE/.state/watch.lock.d" "$STALE/.state/watch.lock.d/generation"
+stale_before="$(snapshot "$TMP/stale")"
+stale_json="$(cd "$TMP/stale" && STITCHPAD_PAD_DIR="$STALE" "$SP" health --json)"
+[ "$(printf '%s' "$stale_json" | python3 -c 'import json,sys; print(json.load(sys.stdin)["pad"]["watcher"]["status"])')" = stale_lock ] \
+  || fail "health did not classify an aged generation-only watcher lock as stale"
+[ "$stale_before" = "$(snapshot "$TMP/stale")" ] \
+  || fail "health mutated generation-only stale watcher evidence"
 
 # A read-only command on a pad with no runtime state must not create `.state`,
 # sessions, pad git, or any watcher/heartbeat scaffolding as a side effect.

@@ -33,11 +33,16 @@ case "${1:-status}" in
       mkdir "$LOCKDIR" 2>/dev/null || { echo "could not acquire watcher lock"; exit 1; }
     fi
     watch_generation="$(date +%s).$$.${RANDOM:-0}"
-    printf '%s' "$watch_generation" > "$LOCKDIR/generation" || {
+    sp_watch_generation_write "$LOCKDIR" "$watch_generation" || {
       rmdir "$LOCKDIR" 2>/dev/null || true
       echo "could not publish watcher generation"
       exit 1
     }
+    if [ -n "${STITCHPAD_WATCH_TEST_AFTER_GENERATION_BARRIER:-}" ]; then
+      watch_generation_barrier="$STITCHPAD_WATCH_TEST_AFTER_GENERATION_BARRIER"
+      printf '%s' ready > "$watch_generation_barrier.ready"
+      while [ ! -f "$watch_generation_barrier.release" ]; do sleep 0.01; done
+    fi
     sp_watch_launcher_write "$LOCKDIR" "$watch_generation" || {
       sp_watch_lock_remove_generation "$LOCKDIR" "$watch_generation" 2>/dev/null || true
       echo "could not publish watcher launcher ownership"

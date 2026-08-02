@@ -36,6 +36,7 @@ ready_digest() {
 }
 
 export STITCHPAD_HEARTBEAT_AUTOSTART=0
+unset HERDR_PANE_ID HERDR_TAB_ID HERDR_ENV HERDR_SOCKET_PATH HERDR_WORKSPACE_ID 2>/dev/null || true
 # Isolate the MACHINE-GLOBAL terminal registry ($HOME/.stitchpad-terminals) so a
 # test run can neither be refused by, nor leak a claim into, the developer's
 # real pads.

@@ -27,6 +27,7 @@ trap cleanup EXIT
 mkdir -p "$tmp/home"
 export HOME="$tmp/home"
 export STITCHPAD_HEARTBEAT_AUTOSTART=0
+unset HERDR_PANE_ID HERDR_TAB_ID HERDR_ENV HERDR_SOCKET_PATH HERDR_WORKSPACE_ID 2>/dev/null || true
 
 fail() { echo "FAIL: $*" >&2; exit 1; }
 contains() { case "$1" in *"$2"*) return 0;; *) return 1;; esac; }

@@ -1631,6 +1631,18 @@ PY
   sp_watch_owner_matches "$lock" "$generation" "$pid"
 }
 
+sp_watch_generation_write() {
+  local lock="$1" generation="$2" tmp="$PAD_STATE/.watch-generation.$$.$RANDOM"
+  sp_generation_is_safe "$generation" || return 1
+  printf '%s' "$generation" > "$tmp" || return 1
+  [ -d "$lock" ] && [ ! -e "$lock/generation" ] && [ ! -L "$lock/generation" ] \
+    && ln "$tmp" "$lock/generation" 2>/dev/null || {
+      rm -f "$tmp" 2>/dev/null || true
+      return 1
+    }
+  rm -f "$tmp" 2>/dev/null || true
+}
+
 sp_watch_launcher_write() {
   local lock="$1" generation="$2" tmp="$PAD_STATE/.watch-launcher.$$.$RANDOM"
   python3 - "$generation" "$PAD_MD" > "$tmp" <<'PY'
@@ -1844,6 +1856,28 @@ sp_watch_empty_lock_reclaim() {
   rmdir "$lock" 2>/dev/null
 }
 
+# Reclaim only the exact crash shape left after singleton acquisition published
+# its generation but died before publishing launcher authority.  Richer or
+# malformed lock directories remain fail-closed.  Retirement is generation-CAS
+# by directory rename, so a resumed stale publisher cannot attach to a newer
+# generation and no PID is ever signalled from this ownerless evidence.
+sp_watch_generation_only_lock_reclaim() {
+  local lock="$1" generation now mtime age only
+  [ "$lock" = "$PAD_STATE/watch.lock.d" ] || return 1
+  [ ! -L "$PAD_STATE" ] && [ ! -L "$lock" ] || return 1
+  [ -d "$lock" ] && [ -f "$lock/generation" ] && [ ! -L "$lock/generation" ] || return 1
+  generation="$(cat "$lock/generation" 2>/dev/null || true)"
+  sp_generation_is_safe "$generation" || return 1
+  only="$(find "$lock" -mindepth 1 -maxdepth 1 -print 2>/dev/null || true)"
+  [ "$only" = "$lock/generation" ] || return 1
+  now="$(date +%s)"
+  mtime="$(stat -f %m "$lock" 2>/dev/null || stat -c %Y "$lock" 2>/dev/null || echo "$now")"
+  age=$((now - mtime))
+  [ "$age" -ge "${STITCHPAD_WATCH_START_GRACE:-5}" ] || return 1
+  [ "$(cat "$lock/generation" 2>/dev/null || true)" = "$generation" ] || return 1
+  sp_watch_lock_remove_generation "$lock" "$generation"
+}
+
 sp_watcher_alive() {
   local watch_lock="$PAD_STATE/watch.lock.d"
   [ -d "$watch_lock" ] || return 1
@@ -1854,6 +1888,7 @@ sp_watcher_alive() {
     return 1
   fi
   if ! sp_watch_launcher_is_valid "$watch_lock" "$generation"; then
+    sp_watch_generation_only_lock_reclaim "$watch_lock" 2>/dev/null && return 1
     echo "stitchpad: malformed or unknown watcher lock left untouched" >&2
     return 1
   fi
@@ -2049,6 +2084,7 @@ sp_stop_watchers_for_pad() {
     return 1
   fi
   if [ -d "$watch_lock" ] && ! sp_watch_launcher_is_valid "$watch_lock" "$generation"; then
+    sp_watch_generation_only_lock_reclaim "$watch_lock" 2>/dev/null && return 0
     echo "stitchpad: malformed or unknown watcher lock left untouched for $PAD_MD" >&2
     return 1
   fi
@@ -2179,10 +2215,15 @@ ensure_watcher() {
     while [ ! -f "$watch_mkdir_barrier.release" ]; do sleep 0.01; done
   fi
   watch_generation="$(date +%s).$$.${RANDOM:-0}"
-  printf '%s' "$watch_generation" > "$watch_lock/generation" || {
+  sp_watch_generation_write "$watch_lock" "$watch_generation" || {
     rmdir "$watch_lock" 2>/dev/null || true
     return 0
   }
+  if [ -n "${STITCHPAD_WATCH_TEST_AFTER_GENERATION_BARRIER:-}" ]; then
+    local watch_generation_barrier="$STITCHPAD_WATCH_TEST_AFTER_GENERATION_BARRIER"
+    printf '%s' ready > "$watch_generation_barrier.ready"
+    while [ ! -f "$watch_generation_barrier.release" ]; do sleep 0.01; done
+  fi
   sp_watch_launcher_write "$watch_lock" "$watch_generation" || {
     sp_watch_lock_remove_generation "$watch_lock" "$watch_generation" 2>/dev/null || true
     return 0

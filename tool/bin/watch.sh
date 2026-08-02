@@ -44,7 +44,12 @@ if [ ! -d "$WATCH_LOCK" ]; then
   [ -z "${STITCHPAD_WATCH_GENERATION:-}" ] || exit 1
   mkdir "$WATCH_LOCK" 2>/dev/null || exit 1
   WATCH_GENERATION="$(date +%s).$$.${RANDOM:-0}"
-  printf '%s' "$WATCH_GENERATION" > "$WATCH_LOCK/generation" || exit 1
+  sp_watch_generation_write "$WATCH_LOCK" "$WATCH_GENERATION" || exit 1
+  if [ -n "${STITCHPAD_WATCH_TEST_AFTER_GENERATION_BARRIER:-}" ]; then
+    watch_generation_barrier="$STITCHPAD_WATCH_TEST_AFTER_GENERATION_BARRIER"
+    printf '%s' ready > "$watch_generation_barrier.ready"
+    while [ ! -f "$watch_generation_barrier.release" ]; do sleep 0.01; done
+  fi
   sp_watch_launcher_write "$WATCH_LOCK" "$WATCH_GENERATION" || exit 1
 else
   WATCH_LAUNCHED=1

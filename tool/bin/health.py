@@ -609,6 +609,27 @@ def parse_delivery(state: Path, name: str) -> tuple[dict[str, Any] | None, list[
     }, issues
 
 
+def reset_recovery_provenance(state: Path, name: str) -> tuple[dict[str, Any], list[str]]:
+    """Read the exact reset-owned pending marker without mutating it."""
+    path = state / f"pending.{name}.reset"
+    raw, error = read_text(path, 4096, root=state)
+    if error:
+        return ({"present": True, "parse": error, "ordinal": None, "identity": None},
+                [f"reset_recovery:{error}"])
+    if raw is None:
+        return ({"present": False, "parse": "missing", "ordinal": None, "identity": None}, [])
+    line = raw.rstrip("\n")
+    fields = line.split("|")
+    ordinal, ordinal_parse = strict_int(fields[0], allow_zero=False) if len(fields) == 2 else (None, "malformed")
+    identity = fields[1] if len(fields) == 2 else ""
+    identity_ok = bool(re.fullmatch(r"[0-9]{1,10}-[0-9]{1,20}", identity))
+    if ordinal_parse == "ok" and identity_ok and "\n" not in line:
+        return ({"present": True, "parse": "ok", "ordinal": ordinal,
+                 "identity": identity}, [])
+    return ({"present": True, "parse": "malformed", "ordinal": None,
+             "identity": None, "raw": raw[:256]}, ["reset_recovery:malformed_provenance"])
+
+
 def process_table() -> list[tuple[int, int, str]]:
     try:
         raw = subprocess.run(["ps", "-axo", "pid=,ppid=,command="], text=True,
@@ -636,10 +657,25 @@ def watcher_health(state: Path, pad_md: Path) -> dict[str, Any]:
     parents = sorted({parent for _proc, parent in fswatch_rows})
     lock_symlink = lock.is_symlink()
     lock_age = None if lock_symlink else file_age(lock, time.time())
+    generation_only = False
+    if not lock_symlink and lock.is_dir():
+        try:
+            entries = list(lock.iterdir())
+            generation = lock / "generation"
+            generation_raw, generation_error = read_text(generation, 128, root=state)
+            generation_only = (
+                len(entries) == 1 and entries[0].name == "generation"
+                and generation_error is None and generation_raw is not None
+                and bool(re.fullmatch(r"[A-Za-z0-9._-]{1,128}", generation_raw))
+            )
+        except OSError:
+            generation_only = False
     if lock_symlink:
         status = "malformed_lock"
     elif not lock.is_dir():
         status = "stopped"
+    elif generation_only:
+        status = "stale_lock" if (lock_age or 0) >= 5 else "starting"
     elif pid_info.get("parse") != "ok":
         status = "malformed_lock"
     elif not alive:
@@ -750,6 +786,8 @@ def unavailable_seat(row: dict[str, str], reason: str, issues: list[str]) -> dic
         "heartbeat": unavailable_heartbeat(reason),
         "ticker": {**scalar, "pid_alive": None}, "dnd": None,
         "seen_cursor": dict(scalar), "recovery_pending_ordinal": dict(scalar),
+        "reset_recovery_provenance": {"present": False, "parse": f"unavailable:{reason}",
+                                      "ordinal": None, "identity": None},
         "open_pending_ordinal": {"value": None, "status": f"unavailable:{reason}"},
         "next_unseen_ordinal": {"value": None, "status": f"unavailable:{reason}"},
         "session_bindings": [], "delivery": None, "deep_ocean": None,
@@ -856,6 +894,8 @@ def build(args: argparse.Namespace) -> dict[str, Any]:
             ticker = {**unavailable_scalar(unavailable), "pid_alive": None}
             seen = seen_cache[name.lower()]
             pending_stamp = unavailable_scalar(unavailable)
+            reset_provenance = {"present": False, "parse": f"unavailable:{unavailable}",
+                                "ordinal": None, "identity": None}
             next_unseen = {"value": None, "status": f"unavailable:{unavailable}"}
             dnd = None
             delivery = None
@@ -882,6 +922,12 @@ def build(args: argparse.Namespace) -> dict[str, Any]:
             pending_stamp = read_scalar(state / f"pending.{name}", root=state)
             if pending_stamp["present"] and pending_stamp["parse"] != "ok":
                 issues.append("pending:malformed")
+            reset_provenance, reset_issues = reset_recovery_provenance(state, name)
+            issues.extend(reset_issues)
+            if reset_provenance["present"] and reset_provenance["parse"] != "ok":
+                repairs.append(
+                    f"inspect pending.{name} and pending.{name}.reset together; malformed reset provenance is preserved and must never be auto-replayed or deleted by guesswork"
+                )
             next_unseen = {"value": open_values["next"].get(name.lower(), 0), "status": "ok"}
             dnd = (state / f"dnd.{name}").is_file()
             if dnd and (true_open.get("value") or pending_stamp.get("value")):
@@ -907,6 +953,7 @@ def build(args: argparse.Namespace) -> dict[str, Any]:
             **row, "target": target, "runtime": runtime, "operator": operator,
             "heartbeat": hb, "ticker": ticker, "dnd": dnd,
             "seen_cursor": seen, "recovery_pending_ordinal": pending_stamp,
+            "reset_recovery_provenance": reset_provenance,
             "open_pending_ordinal": true_open, "next_unseen_ordinal": next_unseen,
             "session_bindings": seat_bindings, "delivery": delivery,
             "deep_ocean": deep, "issues": sorted(set(issues)),
@@ -960,6 +1007,9 @@ def human(snapshot: dict[str, Any]) -> str:
             f"parent={hb.get('parent_pid')}/{hb.get('parent_alive')} dnd={seat.get('dnd')} "
             f"seen={seat.get('seen_cursor', {}).get('value')} open={open_ord}"
         )
+        reset_provenance = seat.get("reset_recovery_provenance", {})
+        if reset_provenance.get("present"):
+            lines.append(f"  reset recovery: {reset_provenance}")
         delivery = seat.get("delivery")
         if delivery:
             lines.append(f"  delivery: state={delivery['state_file']['values'].get('state')} "

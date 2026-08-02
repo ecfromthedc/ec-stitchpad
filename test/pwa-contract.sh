@@ -73,6 +73,9 @@ echo "--- bridge loop fixture ---"
 # Simulate: outbox contains a message from PWA → bridge drains it → stitchpad say injects it
 FIXTURE_DIR="$(mktemp -d)"
 trap 'rm -rf "$FIXTURE_DIR"' EXIT
+mkdir -p "$FIXTURE_DIR/home"
+export HOME="$FIXTURE_DIR/home"
+unset HERDR_PANE_ID HERDR_TAB_ID HERDR_ENV HERDR_SOCKET_PATH HERDR_WORKSPACE_ID 2>/dev/null || true
 
 # Create a minimal pad for the fixture (needs git init for stitchpad say to work)
 mkdir -p "$FIXTURE_DIR/.stitchpad/.state"
