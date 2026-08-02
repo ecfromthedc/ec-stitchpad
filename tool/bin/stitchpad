@@ -14,6 +14,7 @@
 #   stitchpad start|stop|status|restart   manage the daemon (background)
 #   stitchpad health [--json] [--deep]    non-mutating local health snapshot
 #   stitchpad roster                      print parsed roster
+#   stitchpad sessions [--json]           read-only session-registry projection
 #   stitchpad rename <old> <new>          rename a member everywhere local state knows them
 #   stitchpad reset [name] [--redeliver N] repair a wedged seat without rewinding its cursor
 #   stitchpad keeper [repo ...]           wake idle Ocean seats for current open tasks
@@ -39,6 +40,8 @@ _src="${BASH_SOURCE[0]}"; while [ -h "$_src" ]; do
 done
 BIN_DIR="$(cd -P "$(dirname "$_src")" && pwd)"
 source "$BIN_DIR/lib.sh"
+source "$BIN_DIR/date-divider.sh"
+source "$BIN_DIR/session-registry.sh"
 
 cmd="${1:-help}"; shift || true
 
@@ -63,7 +66,7 @@ sp_autostart_name() {
 sp_maybe_start_heartbeat() {
   [ "${STITCHPAD_HEARTBEAT_AUTOSTART:-1}" = "0" ] && return 0
   case "$cmd" in
-    init|instructions|prompt-context|doctor|health|status|roster|who|read|heartbeat|hook|bind-session|whoami|leave|stop|daemon|watch|migration-check|reset|keeper|compact|restore-roster|color|help|-h|--help) return 0 ;;
+    init|instructions|prompt-context|doctor|health|status|roster|who|sessions|read|heartbeat|hook|bind-session|whoami|leave|stop|daemon|watch|migration-check|reset|keeper|compact|restore-roster|color|help|-h|--help) return 0 ;;
   esac
   sp_init_paths >/dev/null 2>&1 || return 0
   local who
@@ -1082,6 +1085,10 @@ PY
     # Hold the mutation lock while reading the roster and appending. A missing
     # or headerless file must fail closed: appending would recreate a pad with no
     # members, silently strip @all, and make every mention unwakeable.
+    # Capture an epoch snapshot for the date divider (before the lock, so we
+    # record the wall-clock time the operation was authored). Failures are
+    # non-fatal — the message still posts.
+    sp_date_divider_snapshot || true
     sp_lock || exit 1
     if [ ! -f "$PAD_MD" ] || ! grep -q '^```roster[[:space:]]*$' "$PAD_MD" 2>/dev/null; then
       sp_unlock
@@ -1113,9 +1120,28 @@ PY
       cleaned="$(printf '%s' "$text" | sed -E 's/(^|[[:space:]])-@[a-zA-Z0-9_-]+//g; s/(^|[[:space:]])@all([^a-zA-Z0-9_-]|$)/\2/Ig')"
       text="$(printf '%s' "${mentions# } $(printf '%s' "$cleaned" | sed -E 's/^[[:space:]]+//')")"
     fi
-    ts="$(date '+%I:%M %p')"
+    # Derive the message timestamp from the captured epoch (same as the
+    # date divider) so the divider, message HH:MM, and commit timestamp all
+    # originate from the same wall-clock snapshot.
+    ts="$(sp_date_divider_hhmm || date '+%I:%M %p')"
+    # Insert date divider for the first message on a new canonical date.
+    # Under the lock so exactly one divider is written per date.
+    sp_date_divider_insert || true
     printf '\n## %s · %s\n\n%s\n' "@$from" "$ts" "$text" >> "$PAD_MD"
-    sp_commit "$from: $(printf '%s' "$text" | tr '\n' ' ' | cut -c1-60)"
+    # Align the git commit timestamp with the same captured epoch ("@<epoch>"
+    # is git's strict epoch form). Scoped to this one sp_commit call — bash
+    # restores prefixed assignments after the function returns, so no ambient
+    # GIT_*_DATE leaks into later commands.
+    _captured_epoch="$(sp_date_divider_epoch)"
+    _say_subject="$from: $(printf '%s' "$text" | tr '\n' ' ' | cut -c1-60)"
+    if [ -n "$_captured_epoch" ]; then
+      GIT_COMMITTER_DATE="@$_captured_epoch" GIT_AUTHOR_DATE="@$_captured_epoch" \
+        sp_commit "$_say_subject"
+    else
+      sp_commit "$_say_subject"
+    fi
+    # Record this operation in the append-only session registry.
+    sp_session_registry_append || true
     # Posting IS the reply — clear both dropped-turn markers (the pending re-block
     # bound AND the delivered_no_reply visibility flag) so a reply resolves them and
     # they can't cause a spurious re-block or stale doctor state later.
@@ -2301,6 +2327,19 @@ except: print("")' 2>/dev/null)"
     ;;
 
   roster|who)  sp_init_paths_readonly || exit 1; sp_roster ;;
+
+  sessions)
+    # Read-only projection of the session registry: who ran here, on which
+    # provider/model/worktree, how many requests, and derived status
+    # (active/idle/stale/terminal). Mutates nothing — resolves paths through
+    # the readonly initializer and only reads .state.
+    sp_init_paths_readonly || exit 1
+    if [ "${1:-}" = "--json" ]; then
+      sp_session_registry_project
+    else
+      sp_session_registry_list
+    fi
+    ;;
   log)
     sp_init_paths || exit 1
     n=10; [ "${1:-}" = "-n" ] && n="$2"
