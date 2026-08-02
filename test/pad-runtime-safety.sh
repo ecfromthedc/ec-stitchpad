@@ -8,7 +8,13 @@ export STITCHPAD_HOME="$ROOT/tool"
 fail() { printf 'FAIL: %s\n' "$1" >&2; exit 1; }
 
 tmp="$(mktemp -d /tmp/stitchpad-pad-safety.XXXXXX)"
-trap 'pkill -9 -f "fswatch.*$tmp" 2>/dev/null || true; rm -rf "$tmp"' EXIT
+cleanup() {
+  if [ -d "$tmp/.stitchpad" ]; then
+    STITCHPAD_PAD_DIR="$tmp/.stitchpad" "$SP" daemon stop >/dev/null 2>&1 || true
+  fi
+  rm -rf "$tmp"
+}
+trap cleanup EXIT
 cd "$tmp"
 git init -q
 git config user.name test
@@ -20,7 +26,6 @@ git commit -qm init
 
 "$SP" init --name safety >/dev/null
 "$SP" daemon stop >/dev/null 2>&1 || true
-pkill -9 -f "fswatch.*$tmp/.stitchpad/stitchpad.md" 2>/dev/null || true
 
 # The outer repository must ignore the whole runtime directory. Otherwise
 # `git stash -u` removes stitchpad.md while live bridge writers keep running.

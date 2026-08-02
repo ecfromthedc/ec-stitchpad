@@ -6,17 +6,19 @@ ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 SP="$ROOT/tool/bin/stitchpad"
 FIXTURE_DIR="$(mktemp -d)"
 cleanup() {
+  for name in alice legacy; do
+    STITCHPAD_PAD_DIR="$FIXTURE_DIR/.stitchpad" "$SP" heartbeat --stop "$name" >/dev/null 2>&1 || true
+  done
+  STITCHPAD_PAD_DIR="$FIXTURE_DIR/.stitchpad" "$SP" daemon stop >/dev/null 2>&1 || true
   rm -rf "$FIXTURE_DIR"
-  rm -f "$HOME/.stitchpad-terminals/term-alice" "$HOME/.stitchpad-terminals/term-legacy"
 }
 trap cleanup EXIT
-# The fixture intentionally uses a stable fake surface; clear residue from an
-# interrupted prior run so the machine-global one-terminal/one-pad guard remains
-# testable and repeatable.
-rm -f "$HOME/.stitchpad-terminals/term-alice" "$HOME/.stitchpad-terminals/term-legacy"
+mkdir -p "$FIXTURE_DIR/home"
+export HOME="$FIXTURE_DIR/home"
 
 cd "$FIXTURE_DIR"
 "$SP" init --name heartbeat >/dev/null
+PAD_CANON="$(cd -P "$FIXTURE_DIR/.stitchpad" && pwd)"
 
 export STITCHPAD_NAME="alice"
 export STITCHPAD_SESSION="session-test"
@@ -30,11 +32,17 @@ export STITCHPAD_HEARTBEAT_PARENT_PID="$$"
 "$SP" heartbeat start >/dev/null
 
 alive="$FIXTURE_DIR/.stitchpad/.state/alive.alice"
-for _ in 1 2 3 4 5; do
+for _ in 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19 20; do
   [ -f "$alive" ] && break
   sleep 0.2
 done
 [ -f "$alive" ]
+
+owner="$FIXTURE_DIR/.stitchpad/.state/heartbeat.alice.lock/owner"
+[ -s "$owner" ]
+jq -e --arg pad "$PAD_CANON" \
+  '.name == "alice" and .pad == $pad and (.generation | length > 0) and (.pid | type == "number") and (.processStart | length > 0) and (.command | contains(" heartbeat start"))' \
+  "$owner" >/dev/null
 
 jq -e '.name == "alice" and .session == "session-test" and .surface == "term-alice" and .target == "term-alice" and (.pid | type == "number") and (.ts | type == "number")' "$alive" >/dev/null
 pid="$(jq -r '.pid' "$alive")"
@@ -69,11 +77,12 @@ legacy_alive="$FIXTURE_DIR/.stitchpad/.state/alive.legacy"
 
 (
   unset STITCHPAD_SESSION STITCHPAD_HEARTBEAT_PARENT_PID STITCHPAD_HEARTBEAT_INTERVAL
+  export STITCHPAD_HEARTBEAT_AUTOSTART=1
   export STITCHPAD_NAME=legacy
   "$SP" read -n 1 >/dev/null
 )
 
-for _ in 1 2 3 4 5; do
+for _ in 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19 20; do
   [ -f "$legacy_alive" ] && break
   sleep 0.2
 done
@@ -83,3 +92,5 @@ legacy_pid="$(jq -r '.pid' "$legacy_alive")"
 kill -0 "$legacy_pid"
 
 STITCHPAD_NAME=legacy "$SP" heartbeat --stop legacy >/dev/null
+
+echo "heartbeat ok"

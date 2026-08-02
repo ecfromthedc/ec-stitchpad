@@ -52,3 +52,5 @@ STITCHPAD_NAME=alice "$SP" say --image "$IMG" "look at this" >/dev/null
 grep -q "/upload-image?pad=$STITCHPAD_EXPECT_PAD" "$STITCHPAD_FAKE_CURL_LOG"
 grep -qF '![tiny.png](https://relay.test/img/abc.png)' "$FIXTURE_DIR/.stitchpad/stitchpad.md"
 grep -qF 'look at this' "$FIXTURE_DIR/.stitchpad/stitchpad.md"
+
+echo "say image ok"

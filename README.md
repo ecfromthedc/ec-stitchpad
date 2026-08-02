@@ -168,6 +168,8 @@ reports `unavailable` honestly. Plain `health` never performs network I/O.
 | `stitchpad roster` / `who` | print the parsed roster |
 | `stitchpad watch` | run the optional file watcher in the foreground |
 | `stitchpad start\|stop\|status\|restart` | manage the optional background watcher |
+| `stitchpad reset [name] [--redeliver N]` | repair without rewinding seen cursors; exact positive-ordinal redelivery requires an open gate and canonical session-bound pull/hook seat |
+| `stitchpad keeper [--config FILE] <repo>…` | one-shot Ocean seat keeper driven only by open task cards; unread delivery stays supervisor-owned |
 | `stitchpad log [-n N]` | git history (one commit per message) |
 | `stitchpad task new\|list\|show\|move\|edit` | the ticket board — cards live in `tasks.md` beside the pad |
 | `stitchpad task migrate` | move legacy inline ` ```task ` blocks out of the pad into `tasks.md` |
@@ -178,6 +180,36 @@ reports `unavailable` honestly. Plain `health` never performs network I/O.
 > The watcher (`start`/`watch`) serves explicit `push` targets only. It skips
 > `pull` members completely; their configured runtime hooks remain the sole wake
 > path, so the visible interactive session stays authoritative.
+
+Heartbeat ticker locks record the PID, process-start identity, exact command,
+pad, and seat before publishing the PID. `heartbeat --stop` and `reset` signal a
+live process only when every field still matches; legacy or mismatched live PID
+records are reported and left untouched rather than risking PID-reuse damage.
+Explicit reset redelivery is likewise message-bound: the open gate is checked
+before repair and again under the shared pad lock immediately before an atomic
+`pending.<seat>` plus `pending.<seat>.reset` queue. The hook clears that
+provenance after successful recovery, or self-heals it without replay when the
+exact reset-owned message was answered or changed. Unrelated legacy pending
+state is never inferred to be reset-owned.
+
+The optional keeper is also deliberately narrow. It considers only `ocean |
+push | <session>` roster rows whose `sessions/<session>` binding names the same
+seat. DND, active turns, and unresolved delivery markers are skipped. The
+watcher/delivery supervisor exclusively owns unread mentions and seen cursors;
+the keeper neither peeks nor consumes them. Only current
+`todo`/`in_progress`/`in_review` cards create keeper work, while historical
+mention counts and `done`/`canceled` cards never do. Concurrent keepers
+serialize each seat with an atomic, owner-validated lock. Before submitting,
+the keeper also persists `delivery.<seat>.keeper-reservation` as
+`ordinal|message_id|state|attempt_id`. An interrupted or otherwise uncertain
+submission becomes `acceptance_unknown` and is never retried automatically,
+because the wake client provides no idempotency key. Task-only reservations use
+ordinal `0` as an explicit non-message sentinel; positive pad ordinals remain
+reserved for the unread delivery supervisor.
+Pass repository paths explicitly or keep them in an
+untracked file supplied with `--config`; no operator configuration is shipped.
+`ocean-heartbeat` must be on `PATH` or named explicitly with
+`OCEAN_HEARTBEAT_BIN`—the keeper does not guess a checkout-specific binary path.
 
 ## If you are an agent watching the pad — read this
 
@@ -197,6 +229,14 @@ Writes now go back through the *same* inode without truncating (see
 entirely and the second for everything except a deliberate trim. But a shrink is
 still a shrink: `archive` is *supposed* to make the pad smaller. So the only
 watcher that is correct in every case is one that tracks its own position:
+
+Each rewrite promotes a generation directory containing the complete staged
+content and an exact owner/target/size/digest manifest. Promotion, copy, and
+crash recovery all run under the same generation-owned pad mutation lock.
+Read-only commands never recover `.ready`; a later mutator replays only a valid
+abandoned generation whose recorded writer is no longer live. This preserves
+the inode while preventing a concurrent initializer from consuming an active
+writer's staged content.
 
 ```bash
 # poll by position — immune to inode swaps, rewrites and trims
