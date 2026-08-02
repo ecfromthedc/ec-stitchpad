@@ -38,10 +38,14 @@ stop_watcher() {
 
 wait_for_fswatch() {
   local d="$1"
+  d="$(cd -P "$d" && pwd)"
   for _ in $(seq 1 100); do
     pgrep -f "fswatch -0 $d/.stitchpad/stitchpad.md" >/dev/null 2>&1 && return 0
     sleep 0.05
   done
+  sed -n '1,120p' "$d/watcher.out" >&2 || true
+  find "$d/.stitchpad/.state" -maxdepth 2 -type f -print -exec sh -c \
+    'printf "  "; sed -n "1,12p" "$1"; printf "\n"' _ {} \; >&2 || true
   fail "watcher fswatch did not become ready for $d"
 }
 
