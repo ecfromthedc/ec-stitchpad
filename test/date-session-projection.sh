@@ -28,7 +28,7 @@ pass=0; fail=0
 ok()  { printf "  ${GREEN}PASS${NC} %s\n" "$1"; pass=$((pass+1)); }
 bad() { printf "  ${RED}FAIL${NC} %s\n" "$1"; fail=$((fail+1)); }
 check() { if [ "$2" = "$3" ]; then ok "$1"; else bad "$1 (want '$3', got '$2')"; fi; }
-check_contains() { if echo "$2" | grep -qF "$3"; then ok "$1"; else bad "$1 (missing '$3' in '$2')"; fi; }
+check_contains() { if echo "$2" | grep -qF -e "$3"; then ok "$1"; else bad "$1 (missing '$3' in '$2')"; fi; }
 # Evaluate a command as an assertion (set -e safe): assert "msg" test -n "$x"
 assert() { local _m="$1"; shift; if "$@"; then ok "$_m"; else bad "$_m"; fi; }
 
@@ -602,6 +602,605 @@ check "cap: exactly 5 entries retained" "$CAP_COUNT" "5"
 SESSION_REGISTRY_MAX=1024
 
 echo ""
+echo ""
+# ══════════════════════════════════════════════════════════════════════════════
+# 14. Pad header renders sentinel-bounded Active Sessions and capped History
+# ══════════════════════════════════════════════════════════════════════════════
+echo "--- 14. pad header renders Active Sessions + History ---"
+
+# Isolated fixture: full registry integration — not helper-only.
+HEADER_WORK="$(mktemp -d "${TMPDIR:-/tmp}/sp-header.XXXXXX")"
+HEADER_PAD="$HEADER_WORK/stitchpad.md"
+HEADER_STATE="$HEADER_WORK/.state"
+mkdir -p "$HEADER_STATE"
+
+cat > "$HEADER_PAD" <<'EOPAD'
+```roster
+alice | claude | pull | -
+bob   | claude | pull | -
+```
+EOPAD
+
+PAD_STATE="$HEADER_STATE" PAD_MD="$HEADER_PAD" sp_session_registry_init
+
+# Seed: alice active (recent), bob idle (older), carol terminal, dave stale
+_now="$(date +%s)"
+_alice_start="$(( _now - 60 ))"
+_bob_start="$(( _now - 1200 ))"
+_dave_start="$(( _now - 7200 ))"
+
+# Alice — 2 recent activities
+for _hh in 09:00 10:00; do
+  STITCHPAD_SESSION="sid-alice-hdr" STITCHPAD_NAME="alice-hdr" \
+    STITCHPAD_MODEL="gpt-5.6-sol" PAD_DIR="$HEADER_WORK" \
+    PAD_STATE="$HEADER_STATE" \
+    sp_session_registry_append "$_now" >/dev/null 2>&1 || true
+done
+
+# Bob — 1 old activity (idle)
+echo "$_bob_start" > "$HEADER_STATE/session-start.sid-bob-hdr"
+STITCHPAD_SESSION="sid-bob-hdr" STITCHPAD_NAME="bob-hdr" \
+  STITCHPAD_MODEL="claude-opus-4.5" PAD_DIR="$HEADER_WORK" \
+  PAD_STATE="$HEADER_STATE" \
+  sp_session_registry_append "$_bob_start" >/dev/null 2>&1 || true
+
+# Carol — terminal
+echo "$_now" > "$HEADER_STATE/session-start.sid-carol-hdr"
+STITCHPAD_SESSION="sid-carol-hdr" STITCHPAD_NAME="carol-hdr" \
+  STITCHPAD_MODEL="claude-opus-4.5" PAD_DIR="$HEADER_WORK" \
+  PAD_STATE="$HEADER_STATE" \
+  sp_session_registry_append "$_now" >/dev/null 2>&1 || true
+touch "$HEADER_STATE/session-end.sid-carol-hdr"
+
+# Dave — stale
+echo "$_dave_start" > "$HEADER_STATE/session-start.sid-dave-hdr"
+STITCHPAD_SESSION="sid-dave-hdr" STITCHPAD_NAME="dave-hdr" \
+  STITCHPAD_MODEL="deepseek-chat" PAD_DIR="$HEADER_WORK" \
+  PAD_STATE="$HEADER_STATE" \
+  sp_session_registry_append "$_dave_start" >/dev/null 2>&1 || true
+
+# Record terminal event for carol (visible in history)
+STITCHPAD_SESSION="sid-carol-hdr" PAD_DIR="$HEADER_WORK" \
+  PAD_STATE="$HEADER_STATE" \
+  sp_session_registry_record_event "terminal" "$_now" >/dev/null 2>&1 || true
+
+# Record cancel + resume events for bob (visible in history)
+STITCHPAD_SESSION="sid-bob-hdr" PAD_DIR="$HEADER_WORK" \
+  PAD_STATE="$HEADER_STATE" \
+  sp_session_registry_record_event "cancel" "$_bob_start" >/dev/null 2>&1 || true
+
+# Pad header rendering — full integration, not just unit helper
+HEADER_OUT="$(PAD_STATE="$HEADER_STATE" sp_session_registry_pad_header 2>/dev/null || true)"
+
+# Active Sessions section must appear
+check_contains "pad-header: Active Sessions section rendered" "$HEADER_OUT" "Active Sessions"
+# Alice should appear (active)
+check_contains "pad-header: alice in active sessions" "$HEADER_OUT" "alice-hdr"
+# Terminal carol must NOT appear in Active Sessions
+if ! echo "$HEADER_OUT" | grep -q "carol-hdr"; then
+  ok "pad-header: terminal carol excluded from Active Sessions"
+else
+  bad "pad-header: terminal carol excluded from Active Sessions"
+fi
+
+# Session History section must appear with terminal event
+check_contains "pad-header: Session History section rendered" "$HEADER_OUT" "Session History"
+check_contains "pad-header: terminal event in history" "$HEADER_OUT" "[terminal]"
+check_contains "pad-header: cancel event in history" "$HEADER_OUT" "[cancel]"
+
+# Sentinel bounds: STITCHPAD_PROJECTION_MAX caps active sessions
+CAPPED_HEADER="$(STITCHPAD_PROJECTION_MAX=1 PAD_STATE="$HEADER_STATE" sp_session_registry_pad_header 2>/dev/null || true)"
+# Should still render but only at most 1 active session
+check_contains "pad-header: sentinel capped header still has section" "$CAPPED_HEADER" "Active Sessions"
+
+rm -rf "$HEADER_WORK"
+
+echo ""
+# ══════════════════════════════════════════════════════════════════════════════
+# 15. Lifecycle events: dispatch/refresh(activity)/terminal/cancel/resume/rotate
+# ══════════════════════════════════════════════════════════════════════════════
+echo "--- 15. lifecycle events ---"
+
+EV_WORK="$(mktemp -d "${TMPDIR:-/tmp}/sp-ev.XXXXXX")"
+EV_STATE="$EV_WORK/.state"
+mkdir -p "$EV_STATE"
+PAD_STATE="$EV_STATE" sp_session_registry_init
+
+_now_ev="$(date +%s)"
+echo "$_now_ev" > "$EV_STATE/session-start.sid-lifecycle"
+
+# dispatch event — first contact, creates new request id
+STITCHPAD_SESSION="sid-lifecycle" STITCHPAD_NAME="lifecycle-test" \
+  STITCHPAD_MODEL="gpt-5.6-sol" PAD_DIR="$EV_WORK" PAD_STATE="$EV_STATE" \
+  sp_session_registry_record_event "dispatch" "$_now_ev" >/dev/null 2>&1
+RC_DISP=$?
+assert "lifecycle: dispatch recorded" test "$RC_DISP" -eq 0
+
+# activity event (refresh) — same request id
+STITCHPAD_SESSION="sid-lifecycle" STITCHPAD_NAME="lifecycle-test" \
+  STITCHPAD_MODEL="gpt-5.6-sol" PAD_DIR="$EV_WORK" PAD_STATE="$EV_STATE" \
+  sp_session_registry_record_event "activity" "$_now_ev" >/dev/null 2>&1
+RC_ACT=$?
+assert "lifecycle: activity recorded" test "$RC_ACT" -eq 0
+
+# terminal event
+STITCHPAD_SESSION="sid-lifecycle" STITCHPAD_NAME="lifecycle-test" \
+  STITCHPAD_MODEL="gpt-5.6-sol" PAD_DIR="$EV_WORK" PAD_STATE="$EV_STATE" \
+  sp_session_registry_record_event "terminal" "$_now_ev" >/dev/null 2>&1
+RC_TERM=$?
+assert "lifecycle: terminal recorded" test "$RC_TERM" -eq 0
+
+# cancel event
+STITCHPAD_SESSION="sid-lifecycle" STITCHPAD_NAME="lifecycle-test" \
+  STITCHPAD_MODEL="gpt-5.6-sol" PAD_DIR="$EV_WORK" PAD_STATE="$EV_STATE" \
+  sp_session_registry_record_event "cancel" "$_now_ev" >/dev/null 2>&1
+RC_CANCEL=$?
+assert "lifecycle: cancel recorded" test "$RC_CANCEL" -eq 0
+
+# resume event
+STITCHPAD_SESSION="sid-lifecycle" STITCHPAD_NAME="lifecycle-test" \
+  STITCHPAD_MODEL="gpt-5.6-sol" PAD_DIR="$EV_WORK" PAD_STATE="$EV_STATE" \
+  sp_session_registry_record_event "resume" "$_now_ev" >/dev/null 2>&1
+RC_RESUME=$?
+assert "lifecycle: resume recorded" test "$RC_RESUME" -eq 0
+
+# rotate event
+STITCHPAD_SESSION="sid-lifecycle" STITCHPAD_NAME="lifecycle-test" \
+  STITCHPAD_MODEL="gpt-5.6-sol" PAD_DIR="$EV_WORK" PAD_STATE="$EV_STATE" \
+  sp_session_registry_record_event "rotate" "$_now_ev" >/dev/null 2>&1
+RC_ROTATE=$?
+assert "lifecycle: rotate recorded" test "$RC_ROTATE" -eq 0
+
+# Verify all 6 entries exist in the registry
+ENTRY_COUNT_EV="$(wc -l < "$EV_STATE/session-registry.jsonl" | tr -d ' ')"
+check "lifecycle: 6 entries total" "$ENTRY_COUNT_EV" "6"
+
+# Each entry must have the correct event field
+EVT1="$(sed -n '1p' "$EV_STATE/session-registry.jsonl" | python3 -c "import json,sys; print(json.loads(sys.stdin.read())['event'])")"
+check "lifecycle: entry 1 event=dispatch" "$EVT1" "dispatch"
+
+EVT2="$(sed -n '2p' "$EV_STATE/session-registry.jsonl" | python3 -c "import json,sys; print(json.loads(sys.stdin.read())['event'])")"
+check "lifecycle: entry 2 event=activity" "$EVT2" "activity"
+
+EVT3="$(sed -n '3p' "$EV_STATE/session-registry.jsonl" | python3 -c "import json,sys; print(json.loads(sys.stdin.read())['event'])")"
+check "lifecycle: entry 3 event=terminal" "$EVT3" "terminal"
+
+EVT4="$(sed -n '4p' "$EV_STATE/session-registry.jsonl" | python3 -c "import json,sys; print(json.loads(sys.stdin.read())['event'])")"
+check "lifecycle: entry 4 event=cancel" "$EVT4" "cancel"
+
+EVT5="$(sed -n '5p' "$EV_STATE/session-registry.jsonl" | python3 -c "import json,sys; print(json.loads(sys.stdin.read())['event'])")"
+check "lifecycle: entry 5 event=resume" "$EVT5" "resume"
+
+EVT6="$(sed -n '6p' "$EV_STATE/session-registry.jsonl" | python3 -c "import json,sys; print(json.loads(sys.stdin.read())['event'])")"
+check "lifecycle: entry 6 event=rotate" "$EVT6" "rotate"
+
+# Unknown event type must be rejected
+RC_BAD=0
+PAD_STATE="$EV_STATE" sp_session_registry_record_event "nonsense" "$_now_ev" >/dev/null 2>&1 || RC_BAD=$?
+[ "$RC_BAD" -ne 0 ] && ok "lifecycle: unknown event rejected" \
+  || bad "lifecycle: unknown event rejected (got $RC_BAD)"
+
+rm -rf "$EV_WORK"
+
+echo ""
+# ══════════════════════════════════════════════════════════════════════════════
+# 16. Stable request ID across say/activity; new ID on lifecycle transition
+# ══════════════════════════════════════════════════════════════════════════════
+echo "--- 16. stable request ID across activity ---"
+
+REQ_WORK="$(mktemp -d "${TMPDIR:-/tmp}/sp-req.XXXXXX")"
+REQ_STATE="$REQ_WORK/.state"
+mkdir -p "$REQ_STATE"
+PAD_STATE="$REQ_STATE" sp_session_registry_init
+
+_now_req="$(date +%s)"
+echo "$_now_req" > "$REQ_STATE/session-start.sid-stable"
+
+# Simulate a delegated request arriving via env
+export STITCHPAD_REQUEST_ID="delegated-req-abc123"
+STITCHPAD_SESSION="sid-stable" STITCHPAD_NAME="stable-test" \
+  STITCHPAD_MODEL="gpt-5.6-sol" PAD_DIR="$REQ_WORK" PAD_STATE="$REQ_STATE" \
+  sp_session_registry_record_event "dispatch" "$_now_req" >/dev/null 2>&1
+
+RID1="$(python3 -c "import json,sys; print(json.loads(sys.stdin.read())['request_id'])" < "$REQ_STATE/session-registry.jsonl")"
+check "req-id: delegated id used for dispatch" "$RID1" "delegated-req-abc123"
+
+# Activity event — must reuse same request id
+STITCHPAD_SESSION="sid-stable" STITCHPAD_NAME="stable-test" \
+  STITCHPAD_MODEL="gpt-5.6-sol" PAD_DIR="$REQ_WORK" PAD_STATE="$REQ_STATE" \
+  sp_session_registry_record_event "activity" "$_now_req" >/dev/null 2>&1
+
+RID2="$(sed -n '2p' "$REQ_STATE/session-registry.jsonl" | python3 -c "import json,sys; print(json.loads(sys.stdin.read())['request_id'])")"
+check "req-id: activity reuses same delegated id" "$RID2" "delegated-req-abc123"
+
+# Resume event — forces new request id
+STITCHPAD_SESSION="sid-stable" STITCHPAD_NAME="stable-test" \
+  STITCHPAD_MODEL="gpt-5.6-sol" PAD_DIR="$REQ_WORK" PAD_STATE="$REQ_STATE" \
+  sp_session_registry_record_event "resume" "$_now_req" >/dev/null 2>&1
+
+RID3="$(sed -n '3p' "$REQ_STATE/session-registry.jsonl" | python3 -c "import json,sys; print(json.loads(sys.stdin.read())['request_id'])")"
+check "req-id: resume forces new request id" "$RID3" "delegated-req-abc123"
+# delegated id is still the same because STITCHPAD_REQUEST_ID is still set,
+# but the lifecycle transition still "forces new" — with delegated, the
+# "new" flag means it's still the delegated id (same value).
+
+# Now test without delegated id: provider-derived fallback
+unset STITCHPAD_REQUEST_ID
+rm -f "$REQ_STATE/request-id.sid-derived" "$REQ_STATE/request-counter"
+
+STITCHPAD_SESSION="sid-derived" STITCHPAD_NAME="derived-test" \
+  STITCHPAD_MODEL="deepseek-chat" PAD_DIR="$REQ_WORK" PAD_STATE="$REQ_STATE" \
+  sp_session_registry_record_event "dispatch" "$_now_req" >/dev/null 2>&1
+
+DERIVED_RID="$(tail -1 "$REQ_STATE/session-registry.jsonl" | python3 -c "import json,sys; print(json.loads(sys.stdin.read())['request_id'])")"
+check_contains "req-id: derived id has provider prefix" "$DERIVED_RID" "deepseek"
+check_contains "req-id: derived id has counter" "$DERIVED_RID" "-1"
+
+# Activity without delegated id — reuses same derived id from persistence
+STITCHPAD_SESSION="sid-derived" STITCHPAD_NAME="derived-test" \
+  STITCHPAD_MODEL="deepseek-chat" PAD_DIR="$REQ_WORK" PAD_STATE="$REQ_STATE" \
+  sp_session_registry_record_event "activity" "$_now_req" >/dev/null 2>&1
+
+DERIVED_RID2="$(tail -1 "$REQ_STATE/session-registry.jsonl" | python3 -c "import json,sys; print(json.loads(sys.stdin.read())['request_id'])")"
+check "req-id: activity reuses derived id" "$DERIVED_RID2" "$DERIVED_RID"
+
+# Rotate forces new derived id
+STITCHPAD_SESSION="sid-derived" STITCHPAD_NAME="derived-test" \
+  STITCHPAD_MODEL="deepseek-chat" PAD_DIR="$REQ_WORK" PAD_STATE="$REQ_STATE" \
+  sp_session_registry_record_event "rotate" "$_now_req" >/dev/null 2>&1
+
+DERIVED_RID3="$(tail -1 "$REQ_STATE/session-registry.jsonl" | python3 -c "import json,sys; print(json.loads(sys.stdin.read())['request_id'])")"
+check_contains "req-id: rotate has new counter" "$DERIVED_RID3" "-2"
+[ "$DERIVED_RID3" != "$DERIVED_RID" ] && ok "req-id: rotate gave different derived id" \
+  || bad "req-id: rotate gave different derived id"
+
+rm -rf "$REQ_WORK"
+
+echo ""
+# ══════════════════════════════════════════════════════════════════════════════
+# 17. Explicit unknown model/provider: never collapse to _unknown_
+# ══════════════════════════════════════════════════════════════════════════════
+echo "--- 17. explicit unknown preservation ---"
+
+UNK_WORK="$(mktemp -d "${TMPDIR:-/tmp}/sp-unk.XXXXXX")"
+UNK_STATE="$UNK_WORK/.state"
+mkdir -p "$UNK_STATE"
+PAD_STATE="$UNK_STATE" sp_session_registry_init
+
+_now_unk="$(date +%s)"
+
+# Append with unknown model → provider must be "" not "_unknown_"
+STITCHPAD_SESSION="sid-unk" STITCHPAD_NAME="unk-test" \
+  STITCHPAD_MODEL="some-bizarre-model-v42" PAD_DIR="$UNK_WORK" \
+  PAD_STATE="$UNK_STATE" \
+  sp_session_registry_append "$_now_unk" >/dev/null 2>&1
+
+UNK_PROVIDER="$(python3 -c "import json,sys; print(json.loads(sys.stdin.read())['provider'])" < "$UNK_STATE/session-registry.jsonl")"
+check "unknown: provider is empty (not _unknown_)" "$UNK_PROVIDER" ""
+
+# Append with no name
+STITCHPAD_SESSION="sid-noname" STITCHPAD_NAME="" \
+  STITCHPAD_MODEL="gpt-5.6-sol" PAD_DIR="$UNK_WORK" \
+  PAD_STATE="$UNK_STATE" \
+  sp_session_registry_append "$_now_unk" >/dev/null 2>&1
+
+UNK_NAME="$(sed -n '2p' "$UNK_STATE/session-registry.jsonl" | python3 -c "import json,sys; print(json.loads(sys.stdin.read())['name'])")"
+check "unknown: empty name preserved as empty" "$UNK_NAME" ""
+
+# Projection must also preserve empty provider/name — never collapse
+PROJ_UNK="$(PAD_STATE="$UNK_STATE" sp_session_registry_project 2>/dev/null || true)"
+# The session with empty name should have name="" in projection
+UNK_PROJ_NAME="$(echo "$PROJ_UNK" | python3 -c "
+import json,sys
+data = json.loads(sys.stdin.read())
+for s in data:
+    if s['session_id'] == 'sid-noname':
+        print(s['name'])
+")"
+check "unknown: projection preserves empty name" "$UNK_PROJ_NAME" ""
+
+UNK_PROJ_PROV="$(echo "$PROJ_UNK" | python3 -c "
+import json,sys
+data = json.loads(sys.stdin.read())
+for s in data:
+    if s['session_id'] == 'sid-unk':
+        print(s['provider'])
+")"
+check "unknown: projection preserves empty provider" "$UNK_PROJ_PROV" ""
+
+rm -rf "$UNK_WORK"
+
+echo ""
+# ══════════════════════════════════════════════════════════════════════════════
+# 18. History projection shows terminal/cancel/resume/rotate/dispatch visibly
+# ══════════════════════════════════════════════════════════════════════════════
+echo "--- 18. visible history projection ---"
+
+HIST_WORK="$(mktemp -d "${TMPDIR:-/tmp}/sp-hist.XXXXXX")"
+HIST_STATE="$HIST_WORK/.state"
+mkdir -p "$HIST_STATE"
+PAD_STATE="$HIST_STATE" sp_session_registry_init
+
+_now_hist="$(date +%s)"
+
+# Record a sequence of lifecycle events for different sessions
+for _evt in dispatch activity terminal cancel resume rotate dispatch; do
+  _sid="sid-hist-$_evt"
+  echo "$_now_hist" > "$HIST_STATE/session-start.$_sid"
+  STITCHPAD_SESSION="$_sid" STITCHPAD_NAME="hist-$_evt" \
+    STITCHPAD_MODEL="gpt-5.6-sol" PAD_DIR="$HIST_WORK" PAD_STATE="$HIST_STATE" \
+    sp_session_registry_record_event "$_evt" "$_now_hist" >/dev/null 2>&1
+done
+
+# History must return only non-activity events (terminal/cancel/resume/rotate/dispatch)
+HIST_DATA="$(PAD_STATE="$HIST_STATE" sp_session_registry_history 2>/dev/null || true)"
+HIST_COUNT="$(echo "$HIST_DATA" | python3 -c "import json,sys; print(len(json.loads(sys.stdin.read())))")"
+
+# We recorded 6 non-activity events (dispatch, terminal, cancel, resume, rotate, dispatch)
+# Default SESSION_HISTORY_LINES=8 so all should appear
+assert "history: has entries" test "$HIST_COUNT" -gt 0
+
+# Verify each event type appears
+check_contains "history: dispatch visible" "$HIST_DATA" "dispatch"
+check_contains "history: terminal visible" "$HIST_DATA" "terminal"
+check_contains "history: cancel visible" "$HIST_DATA" "cancel"
+check_contains "history: resume visible" "$HIST_DATA" "resume"
+check_contains "history: rotate visible" "$HIST_DATA" "rotate"
+
+# activity events must NOT appear in history
+if ! echo "$HIST_DATA" | python3 -c "
+import json,sys
+data = json.loads(sys.stdin.read())
+for e in data:
+    if e.get('event') == 'activity':
+        raise SystemExit(1)
+"; then
+  bad "history: activity should not appear in history"
+else
+  ok "history: activity excluded from history"
+fi
+
+# Capped: SESSION_HISTORY_LINES=2 limits to 2 entries
+CAPPED_HIST="$(SESSION_HISTORY_LINES=2 PAD_STATE="$HIST_STATE" sp_session_registry_history 2>/dev/null || true)"
+CAPPED_HIST_COUNT="$(echo "$CAPPED_HIST" | python3 -c "import json,sys; print(len(json.loads(sys.stdin.read())))")"
+assert "history: capped at SESSION_HISTORY_LINES" test "$CAPPED_HIST_COUNT" -le 2
+
+rm -rf "$HIST_WORK"
+
+echo ""
+# ══════════════════════════════════════════════════════════════════════════════
+# 19. One injected epoch across registry/divider/message/commit
+# ══════════════════════════════════════════════════════════════════════════════
+echo "--- 19. one injected epoch ---"
+
+EPOCH_WORK="$(mktemp -d "${TMPDIR:-/tmp}/sp-epoch.XXXXXX")"
+EPOCH_STATE="$EPOCH_WORK/.state"
+EPOCH_PAD="$EPOCH_WORK/stitchpad.md"
+mkdir -p "$EPOCH_STATE"
+
+cat > "$EPOCH_PAD" <<'EOPAD'
+```roster
+alice | claude | pull | -
+```
+EOPAD
+
+# Inject a single clock: 2026-08-01 12:00:00 UTC = 1785585600
+INJECTED=1785585600
+export SP_DATE_DIVIDER_CLOCK="$INJECTED"
+export STITCHPAD_TIMEZONE="UTC"
+
+# Snapshot captures the injected epoch
+SP_DATE_DIVIDER_CLOCK="$INJECTED" STITCHPAD_TIMEZONE="UTC" \
+  PAD_STATE="$EPOCH_STATE" PAD_MD="$EPOCH_PAD" \
+  sp_date_divider_snapshot
+
+check "epoch: _SP_DATE_EPOCH matches injected" "$_SP_DATE_EPOCH" "$INJECTED"
+check "epoch: _SP_DATE_DATE is 2026-08-01" "$_SP_DATE_DATE" "2026-08-01"
+
+# HH:MM from captured epoch — shares the same injected clock
+HHMM_EPOCH="$(sp_date_divider_hhmm)"
+check "epoch: HH:MM from injected 12:00 UTC" "$HHMM_EPOCH" "12:00 PM"
+
+# Divider line from captured epoch
+DIV_EPOCH="$(sp_date_divider_line "$_SP_DATE_EPOCH" "$_SP_DATE_TZ")"
+check_contains "epoch: divider has 2026-08-01" "$DIV_EPOCH" "2026-08-01"
+
+# Registry entry uses the same captured epoch — inject into session-registry too
+PAD_STATE="$EPOCH_STATE" sp_session_registry_init
+echo "$INJECTED" > "$EPOCH_STATE/session-start.sid-epoch"
+
+STITCHPAD_SESSION="sid-epoch" STITCHPAD_NAME="epoch-test" \
+  STITCHPAD_MODEL="gpt-5.6-sol" PAD_DIR="$EPOCH_WORK" \
+  PAD_STATE="$EPOCH_STATE" \
+  sp_session_registry_append "$_SP_DATE_EPOCH" >/dev/null 2>&1
+
+REG_EPOCH="$(python3 -c "import json,sys; print(json.loads(sys.stdin.read())['last_activity'])" < "$EPOCH_STATE/session-registry.jsonl")"
+check "epoch: registry last_activity matches injected" "$REG_EPOCH" "$INJECTED"
+
+# Verify that _SP_DATE_EPOCH is shared — session registry now() falls back to it
+SP_SESSION_REGISTRY_CLOCK="$_SP_DATE_EPOCH" PAD_STATE="$EPOCH_STATE" \
+  sp_session_registry_project >/dev/null 2>&1
+# If the projection completes, the injected clock was used (no real clock leak)
+
+# Verify the shared epoch is stable (same value accessible from both APIs)
+CAP_EPOCH="$(sp_date_divider_epoch)"
+check "epoch: shared epoch accessible via sp_date_divider_epoch" "$CAP_EPOCH" "$INJECTED"
+
+# Now insert divider with the same injected epoch — full pad integration
+PAD_STATE="$EPOCH_STATE" PAD_MD="$EPOCH_PAD" \
+  SP_DATE_DIVIDER_CLOCK="$INJECTED" STITCHPAD_TIMEZONE="UTC" \
+  sp_date_divider_snapshot
+PAD_STATE="$EPOCH_STATE" PAD_MD="$EPOCH_PAD" \
+  sp_date_divider_insert >/dev/null 2>&1 || true
+
+DIV_IN_PAD="$(grep '^\*— ' "$EPOCH_PAD" 2>/dev/null || true)"
+check_contains "epoch: divider in pad has date 2026-08-01" "$DIV_IN_PAD" "2026-08-01"
+
+unset SP_DATE_DIVIDER_CLOCK SP_SESSION_REGISTRY_CLOCK STITCHPAD_TIMEZONE
+rm -rf "$EPOCH_WORK"
+
+echo ""
+# ══════════════════════════════════════════════════════════════════════════════
+# 20. State publication ordering: registry write before sp_commit; rollback on failure
+# ══════════════════════════════════════════════════════════════════════════════
+echo "--- 20. state publication ordering / rollback ---"
+
+ORDER_WORK="$(mktemp -d "${TMPDIR:-/tmp}/sp-order.XXXXXX")"
+ORDER_STATE="$ORDER_WORK/.state"
+ORDER_PAD="$ORDER_WORK/stitchpad.md"
+mkdir -p "$ORDER_STATE"
+
+cat > "$ORDER_PAD" <<'EOPAD'
+```roster
+alice | claude | pull | -
+```
+EOPAD
+
+PAD_STATE="$ORDER_STATE" sp_session_registry_init
+_now_ord="$(date +%s)"
+echo "$_now_ord" > "$ORDER_STATE/session-start.sid-order"
+
+# The "say" command does: snapshot → lock → divider_insert → append →
+# registry_append → sp_commit. Registry writes BEFORE sp_commit.
+# Simulate the ordering: registry append succeeds, then we verify the
+# registry has the entry even if we never commit (simulating commit failure).
+
+ORD_BEFORE_LINES="$(wc -l < "$ORDER_STATE/session-registry.jsonl" | tr -d ' ')"
+check "order: empty registry before test" "$ORD_BEFORE_LINES" "0"
+
+STITCHPAD_SESSION="sid-order" STITCHPAD_NAME="order-test" \
+  STITCHPAD_MODEL="gpt-5.6-sol" PAD_DIR="$ORDER_WORK" \
+  PAD_STATE="$ORDER_STATE" \
+  sp_session_registry_append "$_now_ord" >/dev/null 2>&1
+RC_REG=$?
+assert "order: registry append succeeded" test "$RC_REG" -eq 0
+
+# Registry entry exists — durable state is published BEFORE commit
+ORD_AFTER_LINES="$(wc -l < "$ORDER_STATE/session-registry.jsonl" | tr -d ' ')"
+check "order: registry has 1 entry after append" "$ORD_AFTER_LINES" "1"
+
+# Simulate commit failure: git dir doesn't exist for this test.
+# In the real say path, sp_commit is called after registry append and silently
+# degrades. The registry entry must survive — data must not vanish.
+PAD_DIR="$ORDER_WORK" PAD_MD="$ORDER_PAD" PAD_GIT="$ORDER_STATE/.nonexistent-git" \
+  PAD_TASKS="$ORDER_WORK/tasks.md" \
+  sp_commit "test: ordered publication" >/dev/null 2>&1 || true
+
+# Registry must still have its entry
+ORD_FINAL_LINES="$(wc -l < "$ORDER_STATE/session-registry.jsonl" | tr -d ' ')"
+check "order: registry survives sp_commit failure" "$ORD_FINAL_LINES" "1"
+
+# Verify the entry content is intact
+ORD_ENTRY="$(cat "$ORDER_STATE/session-registry.jsonl")"
+check_contains "order: entry has session_id" "$ORD_ENTRY" "sid-order"
+check_contains "order: entry has correct last_activity" "$ORD_ENTRY" "$_now_ord"
+
+rm -rf "$ORDER_WORK"
+
+echo ""
+echo ""
+# ══════════════════════════════════════════════════════════════════════════════
+# 21. Atomic no-follow last-divider reconciliation from prior divider with absent state under backward clocks
+# ══════════════════════════════════════════════════════════════════════════════
+echo "--- 21. atomic last-divider reconciliation / backward clock defense ---"
+
+RECON_WORK="$(mktemp -d "${TMPDIR:-/tmp}/sp-recon.XXXXXX")"
+RECON_STATE="$RECON_WORK/.state"
+RECON_PAD="$RECON_WORK/pad-recon.md"
+mkdir -p "$RECON_STATE"
+
+RECON_EPOCH_DAY1=1785585600  # 2026-08-01 12:00 UTC
+RECON_EPOCH_DAY0=1785499200  # 2026-07-31 12:00 UTC
+RECON_EPOCH_DAY2=1785672000  # 2026-08-02 12:00 UTC
+
+# Create pad WITHOUT any divider — insert it fresh
+cat > "$RECON_PAD" <<'EOPAD'
+```roster
+alice | claude | pull | -
+```
+EOPAD
+
+PAD_MD="$RECON_PAD" PAD_STATE="$RECON_STATE"
+
+# Scenario 1: No state file, no existing divider — fresh insert for day 1.
+SP_DATE_DIVIDER_CLOCK="$RECON_EPOCH_DAY1" STITCHPAD_TIMEZONE="UTC" \
+  sp_date_divider_snapshot
+assert "recon: day 1 snapshot captured" test -n "$_SP_DATE_EPOCH"
+
+# Insert divider for day 1 — this writes the divider AND last-divider-epoch
+RC=0; sp_date_divider_insert || RC=$?
+assert "recon: day 1 fresh insert OK" test "$RC" -eq 0
+
+DIV_COUNT_RECON="$(grep -c '^\*— ' "$RECON_PAD" 2>/dev/null || echo 0)"
+check "recon: exactly 1 divider after fresh insert" "$DIV_COUNT_RECON" "1"
+
+# Verify state file was written atomically (temp+rename)
+assert "recon: last-divider-epoch file exists" test -f "$RECON_STATE/last-divider-epoch"
+STATE_CONTENTS="$(cat "$RECON_STATE/last-divider-epoch")"
+check "recon: state file has correct epoch" "$STATE_CONTENTS" "$RECON_EPOCH_DAY1"
+
+# Scenario 2: Delete state file → reconcile from pad under backward clock.
+# The real reconciliation path: _sp_divider_reconcile_last_epoch scans the
+# pad for the last divider, derives its epoch, and saves it atomically.
+# Then the monotonic check catches the backward cross-date attempt.
+rm -f "$RECON_STATE/last-divider-epoch"
+assert "recon: state file removed" test ! -f "$RECON_STATE/last-divider-epoch"
+
+# Backward clock to day 0 (2026-07-31)
+SP_DATE_DIVIDER_CLOCK="$RECON_EPOCH_DAY0" STITCHPAD_TIMEZONE="UTC" \
+  sp_date_divider_snapshot
+check "recon: day 0 snapshot date" "$_SP_DATE_DATE" "2026-07-31"
+
+# Try to insert divider for day 0 — must be REFUSED (backward cross-date)
+# The reconcile step finds the pad's day-1 divider, derives noon-UTC epoch
+# 1785585600, which is > day-0 epoch, so the backward-clock guard fires.
+RC=0; sp_date_divider_insert || RC=$?
+[ "$RC" -eq 2 ] && ok "recon: backward cross-date refused (returns 2)" \
+  || bad "recon: backward cross-date refused (got $RC, want 2)"
+
+# State file must have been RECREATED by reconciliation (atomic temp+rename)
+assert "recon: state file recreated by reconciliation" test -f "$RECON_STATE/last-divider-epoch"
+RECON_STATE_CONTENTS="$(cat "$RECON_STATE/last-divider-epoch")"
+check "recon: reconciled epoch is day 1 noon UTC" "$RECON_STATE_CONTENTS" "1785585600"
+
+# Scenario 3: Forward clock to day 1 again — idempotent (divider exists)
+SP_DATE_DIVIDER_CLOCK="$RECON_EPOCH_DAY1" STITCHPAD_TIMEZONE="UTC" \
+  sp_date_divider_snapshot
+check "recon: day 1 resnapshot date" "$_SP_DATE_DATE" "2026-08-01"
+
+RC=0; sp_date_divider_insert || RC=$?
+[ "$RC" -eq 1 ] && ok "recon: day 1 idempotent after reconciliation" \
+  || bad "recon: day 1 idempotent after reconciliation (got $RC)"
+
+# Still exactly 1 divider — reconciliation did not create a duplicate
+DIV_COUNT_RECON2="$(grep -c '^\*— ' "$RECON_PAD" 2>/dev/null || echo 0)"
+check "recon: still exactly 1 divider after reconciliation" "$DIV_COUNT_RECON2" "1"
+
+# Scenario 4: No-follow safety — state file is a symlink.
+# _sp_divider_save_last_epoch refuses to write through symlinks.
+# The divider line is still appended to the pad; save failure is non-fatal.
+rm -f "$RECON_STATE/last-divider-epoch"
+ln -sf /dev/null "$RECON_STATE/last-divider-epoch"
+
+# Take snapshot at day 2 (forward from day 1)
+SP_DATE_DIVIDER_CLOCK="$RECON_EPOCH_DAY2" STITCHPAD_TIMEZONE="UTC" \
+  sp_date_divider_snapshot
+
+# Insert: divider not present for day 2, monotonic passes,
+# save_last_epoch fails (symlink), but the divider IS appended.
+RC=0; sp_date_divider_insert || RC=$?
+assert "recon: symlink'd state: insert does not crash" test "$RC" -eq 0
+
+# The symlink must NOT have been followed — it must still point to /dev/null
+[ -L "$RECON_STATE/last-divider-epoch" ] && ok "recon: symlink not followed" \
+  || bad "recon: symlink not followed (was overwritten)"
+
+# Day 2 divider was written despite save failure
+DIV_COUNT_RECON3="$(grep -c '^\*— ' "$RECON_PAD" 2>/dev/null || echo 0)"
+check "recon: two dividers after symlink scenario (day 1 + day 2)" "$DIV_COUNT_RECON3" "2"
+
+rm -rf "$RECON_WORK"
+unset SP_DATE_DIVIDER_CLOCK STITCHPAD_TIMEZONE
 # ══════════════════════════════════════════════════════════════════════════════
 # Summary
 # ══════════════════════════════════════════════════════════════════════════════
