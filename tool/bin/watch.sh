@@ -864,9 +864,12 @@ delivery_enqueue_locked() {
             errored)
               delivery_drop_current "$name" "$old_generation" "$old_ordinal" "$old_message" "$old_task" \
                 "$old_accepted" "$DELIVERY_TASK_REASON" "$DELIVERY_TASK_STATUS" "$old_turn" errored ;;
-            cancelled|no_turn)
+            cancelled)
               delivery_drop_current "$name" "$old_generation" "$old_ordinal" "$old_message" "$old_task" \
                 "$old_accepted" "$DELIVERY_TASK_REASON" "$DELIVERY_TASK_STATUS" "$old_turn" cancelled ;;
+            no_turn)
+              delivery_drop_current "$name" "$old_generation" "$old_ordinal" "$old_message" "$old_task" \
+                "$old_accepted" "$DELIVERY_TASK_REASON" "$DELIVERY_TASK_STATUS" "$old_turn" not_submitted ;;
           esac
         else
           delivery_drop_current "$name" "$old_generation" "$old_ordinal" "$old_message" "$old_task" \
