@@ -672,7 +672,7 @@ sp_ready_generation_validate() {
   local ready="$1" target="$2" expected="${3:-}"
   [ -d "$ready" ] || return 1
   python3 - "$ready" "$target" "$expected" <<'PY'
-import hashlib, json, os, stat, sys
+import hashlib, json, os, re, stat, sys
 ready, target, expected = sys.argv[1:]
 try:
     if not stat.S_ISDIR(os.lstat(ready).st_mode):
@@ -693,6 +693,8 @@ try:
         raise ValueError("wrong target or pid")
     if not all(isinstance(owner[k], str) and owner[k] for k in ("generation", "processStart", "command", "sha256")):
         raise ValueError("incomplete manifest")
+    if not re.fullmatch(r"[A-Za-z0-9._-]{1,128}", owner["generation"]):
+        raise ValueError("unsafe generation")
     if expected and owner["generation"] != expected:
         raise ValueError("wrong generation")
     stat = os.stat(content)

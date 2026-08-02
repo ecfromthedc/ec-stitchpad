@@ -375,6 +375,31 @@ fi
 check "ready symlink target remains byte-exact" "$(cksum < "$outside_ready/content")" "$outside_sum"
 rm -f "$PAD.ready" "$outside_ready/content"; rmdir "$outside_ready"
 
+# Manifest generations become part of the applied-tombstone pathname. Reject
+# separators/traversal even when every other target/size/digest field is valid.
+mkdir "$PAD.ready"
+cp "$PAD" "$PAD.ready/content"
+pad_canon="$(cd -P "$(dirname "$PAD")" && pwd)/$(basename "$PAD")"
+python3 - "$PAD.ready/content" "$PAD.ready/owner" "$pad_canon" <<'PY'
+import hashlib, json, os, sys
+content, owner, target = sys.argv[1:]
+with open(content, "rb") as handle:
+    body = handle.read()
+with open(owner, "w", encoding="utf-8") as handle:
+    json.dump({"generation": "bad/../escape", "pid": 99999991,
+               "processStart": "dead", "command": "dead", "target": target,
+               "size": len(body), "sha256": hashlib.sha256(body).hexdigest()},
+              handle, separators=(",", ":"))
+PY
+unsafe_ready_before="$(ready_digest)"
+if SP_LOCK_STALE=0 sp say 'must not apply unsafe generation' >/dev/null 2>&1; then
+  bad "unsafe ready generation should block mutation"
+else
+  ok "unsafe ready generation blocks mutation"
+fi
+check "unsafe ready generation evidence remains byte-exact" "$(ready_digest)" "$unsafe_ready_before"
+rm -f "$PAD.ready/content" "$PAD.ready/owner"; rmdir "$PAD.ready"
+
 mv "$TASKS" "$TASKS.real"
 printf 'outside-task-target' > "$WORK/outside-tasks"
 ln -s "$WORK/outside-tasks" "$TASKS"
