@@ -136,7 +136,10 @@ barrier="$tmp/reset-reply-race"
     exec "$SP" reset racer --redeliver "$racer_ord"
 ) > "$tmp/reset-racer.out" 2>&1 &
 reset_pid=$!
-for _ in 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19 20 21 22 23 24 25 26 27 28 29 30 31 32 33 34 35 36 37 38 39 40 41 42 43 44 45 46 47 48 49 50; do
+# Full CLI startup plus exact worker/ticker ownership checks can approach one
+# second on a loaded Mac. Match the production test seam's five-second bound so
+# this asserts the race semantics instead of scheduler luck.
+for _ in $(seq 1 250); do
   [ -f "$barrier.ready" ] && break
   sleep 0.02
 done
