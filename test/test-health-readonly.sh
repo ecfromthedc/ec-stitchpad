@@ -381,6 +381,52 @@ assert all(value == 1 for value in opened["true"].values())
 assert elapsed < 4.0, elapsed
 PY
 
+# Keep health's delivery vocabulary aligned with every state emitted by the
+# supervised-delivery writer. Terminal daemon outcomes are valid state, not
+# corrupt input; only retry-safe durable states advertise recovery.
+python3 - "$ROOT/tool/bin/health.py" <<'PY'
+import runpy, sys, tempfile
+from pathlib import Path
+sys.dont_write_bytecode = True
+module = runpy.run_path(sys.argv[1])
+parse_delivery = module["parse_delivery"]
+severity = module["severity"]
+states = {
+    "accepted", "started", "busy", "error", "in_flight", "cancel_pending",
+    "deferred_dnd", "acceptance_unknown", "completed", "tombstoned",
+    "errored", "cancelled",
+}
+assert module["DELIVERY_STATES"] == states
+recoverable = {"accepted", "busy", "error", "cancel_pending", "deferred_dnd"}
+attention = {"cancel_pending", "deferred_dnd"}
+errors = {"error", "errored", "cancelled", "acceptance_unknown"}
+with tempfile.TemporaryDirectory() as root:
+    state = Path(root)
+    pending = "1|1|m-1|TASK-1|2026-08-02T12:00:00Z|ocean|push|session-1"
+    for value in sorted(states | {"garbage_state"}):
+        name = value
+        (state / f"delivery.{name}.pending").write_text(pending, encoding="utf-8")
+        (state / f"delivery.{name}.state").write_text(
+            f"state={value}\ngeneration=1\nordinal=1\naccepted_at=2026-08-02T12:00:00Z\n",
+            encoding="utf-8",
+        )
+        delivery, issues = parse_delivery(state, name)
+        assert delivery is not None
+        if value == "garbage_state":
+            assert f"delivery_state:unknown:{value}" in issues
+            assert delivery["recoverable"] is False
+            continue
+        assert not any(issue.startswith("delivery_state:unknown:") or "malformed" in issue
+                       for issue in issues), (value, issues)
+        assert delivery["recoverable"] is (value in recoverable), value
+        if value in attention | errors:
+            assert f"delivery_state:{value}" in issues
+        if value in errors:
+            assert severity(issues) == "error", (value, issues)
+        elif value in attention:
+            assert severity(issues) == "warn", (value, issues)
+PY
+
 # A read-only command on a pad with no runtime state must not create `.state`,
 # sessions, pad git, or any watcher/heartbeat scaffolding as a side effect.
 BARE="$TMP/bare/.stitchpad"

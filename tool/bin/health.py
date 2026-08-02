@@ -35,8 +35,12 @@ DELIVERY_KEYS = {
     "started_at", "completed_at", "error_at", "error_code", "turn_id", "turn_status",
 }
 DELIVERY_STATES = {
-    "accepted", "started", "busy", "error", "in_flight", "cancel_pending", "completed", "tombstoned",
+    "accepted", "started", "busy", "error", "in_flight", "cancel_pending",
+    "deferred_dnd", "acceptance_unknown", "completed", "tombstoned",
+    "errored", "cancelled",
 }
+DELIVERY_ATTENTION_STATES = {"cancel_pending", "deferred_dnd"}
+DELIVERY_ERROR_STATES = {"error", "errored", "cancelled", "acceptance_unknown"}
 DELIVERY_TIMESTAMP_KEYS = {"accepted_at", "started_at", "completed_at", "error_at"}
 KEEPER_STATES = {"accepted", "in_flight", "completed", "acceptance_unknown"}
 
@@ -522,6 +526,8 @@ def parse_delivery(state: Path, name: str) -> tuple[dict[str, Any] | None, list[
     delivery_state = snapshot.get("state")
     if delivery_state and delivery_state not in DELIVERY_STATES:
         issues.append(f"delivery_state:unknown:{delivery_state}")
+    elif delivery_state in DELIVERY_ATTENTION_STATES | DELIVERY_ERROR_STATES:
+        issues.append(f"delivery_state:{delivery_state}")
 
     pending: dict[str, Any] | None = None
     pending_raw, pending_error = read_text(pending_file, root=state)
@@ -577,11 +583,15 @@ def parse_delivery(state: Path, name: str) -> tuple[dict[str, Any] | None, list[
                       "turn_id": turn_id.strip() if turn_id else None, "parse_error": turn_error})
     if len(turn_files) > 16:
         issues.append("delivery_turns:truncated_at_16")
-    active = bool(worker.get("pid_alive") and delivery_state in {"started", "busy", "in_flight"})
+    active = bool(worker.get("pid_alive") and delivery_state in {
+        "started", "busy", "in_flight", "cancel_pending", "deferred_dnd",
+    })
     pending_valid = bool(pending is not None and pending.get("parse") == "ok")
     state_valid = error is None and not malformed_lines and delivery_state in DELIVERY_STATES
     recoverable = bool(pending_valid and state_valid
-                       and delivery_state in {"accepted", "error", "cancel_pending"})
+                       and delivery_state in {
+                           "accepted", "busy", "error", "cancel_pending", "deferred_dnd",
+                       })
     last_result = {
         key: snapshot.get(key) for key in
         ("state", "completed_at", "error_at", "error_code", "turn_id", "turn_status")
@@ -722,7 +732,8 @@ def deep_ocean(target: str) -> dict[str, Any]:
 
 def severity(issues: list[str]) -> str:
     errors = ("duplicate_", "invalid_", "missing_adapter", "malformed", "dead_pid",
-              "pid_mismatch", "acceptance_unknown", "pad_file:")
+              "pid_mismatch", "acceptance_unknown", "delivery_state:error",
+              "delivery_state:cancelled", "pad_file:")
     return "error" if any(any(token in issue for token in errors) for issue in issues) else ("warn" if issues else "ok")
 
 
