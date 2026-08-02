@@ -4202,6 +4202,243 @@ def cmd_review_status(args):
 
 
 # ---------------------------------------------------------------------------
+# Section 13c. Review register-process and cancel-requested
+# ---------------------------------------------------------------------------
+
+def _require_role(role):
+    """Validate a process role against the strict role regex."""
+    return require_match(ROLE_RE, role, "role_invalid", "process role")
+
+
+def cmd_review_register_process(args):
+    """Register exact process evidence for a bound review.
+
+    The review must be bound (facts.json must exist with a non-null
+    session/request).  The capability proves registration authority but is
+    never treated as process identity: the PID is sampled independently via
+    ``sample_process`` and recorded as evidence.  Every identifier is
+    validated.  The process record is published under the payload's
+    ``processes/`` directory, named by a helper-minted 32-hex ID.
+    """
+    ctx = open_context(args)
+    fds, base, git_home, repo, state = (
+        ctx["fds"], ctx["base"], ctx["git_home"], ctx["repo"], ctx["state"])
+
+    review = _load_review(state, args.id)
+    if review["repo_id"] != repo["repo_id"] or review["top"] != repo["top"]:
+        fail("identity_mismatch",
+             "the review does not belong to this repository")
+
+    payload_fd = _open_payload(fds, base, review)
+
+    # The review must be bound before a process can be registered.
+    facts = _read_facts(payload_fd)
+    if facts is None:
+        fail("review_not_bound",
+             "the review must be bound before registering a process")
+    if facts.get("session_id") is None or facts.get("request_id") is None:
+        fail("review_not_bound",
+             "the review facts carry no bound session/request")
+
+    # Validate the role against the strict regex.
+    role = _require_role(args.role)
+
+    # Validate the PID is a plausible positive integer.
+    require_int(args.pid, 2, 2 ** 31 - 1, "pid_invalid", "pid")
+
+    # Read and verify the capability token.  The capability proves the
+    # caller has registration authority for this review; it is never
+    # process identity.  The PID is sampled independently.
+    token = read_capability_fd(args.process_token_fd)
+    if not capability_matches(review.get("process_capability"), token):
+        fail("capability_rejected",
+             "the supplied capability does not authorize this review")
+
+    # Sample the process evidence: this is observation only.  A live process
+    # produces a full evidence record; an exited/unknown one still registers
+    # (the evidence is the absence, which is itself a sticky fact).  The
+    # capability is authority to register; it is never process identity.
+    sample = sample_process(args.pid)
+
+    # Generate a helper-minted positional ID for the process record.
+    process_record_id = secrets.token_hex(16)
+    if not ID_RE.match(process_record_id):
+        fail("process_id_invalid", "generated process record id is malformed")
+
+    now = int(time.time())
+    generation = facts["generation"]
+
+    mutex = TransitionMutex(state)
+    with mutex:
+        # Re-read facts under the lock to confirm the review is still bound.
+        locked_facts = _read_facts(payload_fd)
+        if locked_facts is None:
+            fail("review_not_bound",
+                 "the review facts disappeared under the lock")
+        if locked_facts.get("session_id") is None or \
+                locked_facts.get("request_id") is None:
+            fail("review_not_bound",
+                 "the review is no longer bound under the lock")
+
+        # Build the process evidence record.  Fields with no observed value
+        # are recorded as null; they are never fabricated.
+        lstart = sample.get("lstart") if sample.get("state") == "alive" else None
+        ppid = sample.get("ppid") if sample.get("state") == "alive" else None
+        pgid = sample.get("pgid") if sample.get("state") == "alive" else None
+        command_digest = sample.get("command_digest") \
+            if sample.get("state") == "alive" else None
+        command_display = sample.get("command_display") \
+            if sample.get("state") == "alive" else None
+
+        process = new_record("process", generation, {
+            "review_id": review["review_id"],
+            "role": role,
+            "pid": args.pid,
+            "ppid": ppid,
+            "pgid": pgid,
+            "lstart": lstart,
+            "command_digest": command_digest,
+            "command_display": command_display,
+            "registered_at": now,
+        })
+
+        # Publish under the payload's processes/ directory, named by the
+        # helper-minted positional ID.
+        processes_fd, _ = ensure_owned_dir(
+            fds, payload_fd, "processes", "processes directory", mode=DIR_MODE)
+        process_name = process_record_id + ".json"
+        if try_lstat_at(processes_fd, process_name) is not None:
+            fail("process_conflict", "process record id collision")
+        publish_flat_record(processes_fd, process_name, "process", process,
+                            "process record")
+
+    git_home.release()
+    fds.close_all()
+    return {
+        "ok": True, "command": "review-register-process",
+        "review_id": review["review_id"],
+        "process_record_id": process_record_id,
+        "role": role,
+        "pid": args.pid,
+        "process_state": sample.get("state", "unknown"),
+        "generation": generation,
+    }
+
+
+def cmd_review_cancel_requested(args):
+    """Record a sticky cancel-requested flag on a bound review.
+
+    Before bind, cancel is rejected: the review has no session/request
+    identity and nothing to cancel.  After bind, cancel records the sticky
+    ``cancel_requested`` fact (and timestamp), advances the facts generation
+    via CAS, and performs ZERO HTTP calls and ZERO signals.  The review
+    remains nonterminal: cancel is a request, not a terminal state.  It
+    never erases terminal truth — if the review is already terminal, the
+    cancel flag is still recorded but terminal_observed is preserved.
+
+    Concurrent generations fail closed: the facts generation is re-read
+    under the transition mutex and compared (CAS).
+    """
+    ctx = open_context(args, need_git_home=False)
+    fds, base, repo, state = (
+        ctx["fds"], ctx["base"], ctx["repo"], ctx["state"])
+
+    review = _load_review(state, args.id)
+    if review["repo_id"] != repo["repo_id"] or review["top"] != repo["top"]:
+        fail("identity_mismatch",
+             "the review does not belong to this repository")
+
+    payload_fd = _open_payload(fds, base, review)
+
+    # Cancel before bind: rejected.  The review must have a bound identity.
+    facts = _read_facts(payload_fd)
+    if facts is None:
+        fail("review_not_bound",
+             "the review must be bound before cancel can be requested")
+    if facts.get("session_id") is None or facts.get("request_id") is None:
+        fail("review_not_bound",
+             "the review carries no bound session/request; "
+             "cancel cannot be requested before bind")
+
+    generation = facts["generation"]
+    now = int(time.time())
+
+    mutex = TransitionMutex(state)
+    with mutex:
+        # Generation CAS: re-read facts under the lock.
+        locked_facts = _read_facts(payload_fd)
+        if locked_facts is None:
+            fail("review_not_bound",
+                 "the review facts disappeared under the lock")
+        if locked_facts["generation"] != generation:
+            fail("generation_conflict",
+                 "the review facts changed (generation %d -> %d)"
+                 % (generation, locked_facts["generation"]))
+
+        # The cancel flag is sticky: once True it stays True.  A repeat
+        # cancel-requested is idempotent if the generation matches.
+        cancel_requested = True
+        cancel_requested_at = locked_facts.get("cancel_requested_at")
+        if cancel_requested_at is None:
+            cancel_requested_at = now
+        else:
+            # Already requested: preserve the original timestamp.  The flag
+            # and its first-request timestamp are immutable once set.
+            cancel_requested = True
+
+        new_generation = generation + 1
+
+        # Preserve all sticky terminal truth.  Cancel never erases terminal
+        # evidence: terminal_observed, terminal_completion, terminal_at,
+        # report_sealed, report_digest, etc. all carry forward unchanged.
+        updated_facts = dict(locked_facts)
+        updated_facts["generation"] = new_generation
+        updated_facts["cancel_requested"] = cancel_requested
+        updated_facts["cancel_requested_at"] = cancel_requested_at
+        updated_facts["last_activity_at"] = now
+
+        facts_record = new_record("facts", new_generation, {
+            "review_id": updated_facts["review_id"],
+            "session_id": updated_facts["session_id"],
+            "request_id": updated_facts["request_id"],
+            "bound_at": updated_facts["bound_at"],
+            "cancel_requested": updated_facts["cancel_requested"],
+            "cancel_requested_at": updated_facts["cancel_requested_at"],
+            "terminal_observed": updated_facts["terminal_observed"],
+            "terminal_completion": updated_facts["terminal_completion"],
+            "terminal_at": updated_facts["terminal_at"],
+            "report_sealed": updated_facts["report_sealed"],
+            "report_digest": updated_facts["report_digest"],
+            "report_verdict": updated_facts["report_verdict"],
+            "report_sealed_at": updated_facts["report_sealed_at"],
+            "artifact_verified": updated_facts["artifact_verified"],
+            "verified_at": updated_facts["verified_at"],
+            "closure": updated_facts["closure"],
+            "closure_reason": updated_facts["closure_reason"],
+            "closed_at": updated_facts["closed_at"],
+            "conflict": updated_facts["conflict"],
+            "provider": updated_facts["provider"],
+            "provider_model": updated_facts["provider_model"],
+            "session_rotation_required":
+                updated_facts["session_rotation_required"],
+            "last_activity_at": updated_facts["last_activity_at"],
+        })
+        publish_flat_record(payload_fd, "facts.json", "facts", facts_record,
+                            "review facts")
+
+    fds.close_all()
+    return {
+        "ok": True, "command": "review-cancel-requested",
+        "review_id": review["review_id"],
+        "cancel_requested": True,
+        "cancel_requested_at": _format_ts(cancel_requested_at),
+        "cancel_requested_at_epoch": cancel_requested_at,
+        "already_requested": locked_facts.get("cancel_requested", False),
+        "generation": new_generation,
+    }
+
+
+# ---------------------------------------------------------------------------
 # Section 14. CLI front matter (invoked only by tool/bin/coordination.sh)
 # ---------------------------------------------------------------------------
 
@@ -4287,10 +4524,10 @@ def build_parser():
     register.add_argument("--role", required=True)
     register.add_argument("--pid", required=True, type=int)
     register.add_argument("--process-token-fd", required=True, type=_fd_number)
-    register.set_defaults(func=cmd_not_implemented)
+    register.set_defaults(func=cmd_review_register_process)
 
     cancel = with_review_id(common(sub.add_parser("review-cancel-requested")))
-    cancel.set_defaults(func=cmd_not_implemented)
+    cancel.set_defaults(func=cmd_review_cancel_requested)
 
     refresh = with_review_id(common(sub.add_parser("review-refresh")))
     refresh.add_argument("--provider-rows-fd", required=True, type=_fd_number)
