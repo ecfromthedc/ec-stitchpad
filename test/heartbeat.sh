@@ -18,6 +18,7 @@ export HOME="$FIXTURE_DIR/home"
 
 cd "$FIXTURE_DIR"
 "$SP" init --name heartbeat >/dev/null
+PAD_CANON="$(cd -P "$FIXTURE_DIR/.stitchpad" && pwd)"
 
 export STITCHPAD_NAME="alice"
 export STITCHPAD_SESSION="session-test"
@@ -39,8 +40,8 @@ done
 
 owner="$FIXTURE_DIR/.stitchpad/.state/heartbeat.alice.lock/owner"
 [ -s "$owner" ]
-jq -e --arg pad "$FIXTURE_DIR/.stitchpad" \
-  '.name == "alice" and .pad == $pad and (.pid | type == "number") and (.processStart | length > 0) and (.command | contains(" heartbeat start"))' \
+jq -e --arg pad "$PAD_CANON" \
+  '.name == "alice" and .pad == $pad and (.generation | length > 0) and (.pid | type == "number") and (.processStart | length > 0) and (.command | contains(" heartbeat start"))' \
   "$owner" >/dev/null
 
 jq -e '.name == "alice" and .session == "session-test" and .surface == "term-alice" and .target == "term-alice" and (.pid | type == "number") and (.ts | type == "number")' "$alive" >/dev/null

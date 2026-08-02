@@ -7,13 +7,26 @@ tmp="$(mktemp -d /tmp/stitchpad-seat-keeper.XXXXXX)"
 keeper_one=""
 keeper_two=""
 cleanup() {
+  local leaked=""
   for pid in "$keeper_one" "$keeper_two"; do
     [ -n "$pid" ] && kill -TERM "$pid" 2>/dev/null || true
   done
   for n in alice historical mentiononly dnd busy recovery durable worker mismatch finished acceptedcrash ambiguity; do
     STITCHPAD_PAD_DIR="$tmp/.stitchpad" "$SP" heartbeat --stop "$n" >/dev/null 2>&1 || true
   done
+  STITCHPAD_PAD_DIR="$tmp/.stitchpad" "$SP" daemon stop >/dev/null 2>&1 || true
+  if [ -d "$tmp/.stitchpad" ]; then
+    leaked="$(
+      STITCHPAD_PAD_DIR="$tmp/.stitchpad" bash -c \
+        'BIN_DIR="$1/tool/bin"; source "$BIN_DIR/lib.sh"; sp_init_paths >/dev/null 2>&1; sp_watch_processes_for_pad' \
+        _ "$ROOT" 2>/dev/null || true
+    )"
+  fi
   rm -rf "$tmp"
+  [ -z "$leaked" ] || {
+    echo "FAIL: fixture watcher processes survived cleanup: $leaked" >&2
+    exit 1
+  }
 }
 trap cleanup EXIT
 mkdir -p "$tmp/home"
@@ -29,6 +42,10 @@ fi
 
 cd "$tmp"
 "$SP" init --name seat-keeper >/dev/null
+# Init starts the product watcher. This test exercises keeper admission, not
+# live fswatch delivery, so stop it before the bulk join phase and remove an
+# unrelated source of mutation scheduling noise.
+"$SP" daemon stop >/dev/null 2>&1 || true
 for spec in \
   'alice sid-alice' \
   'historical sid-historical' \
@@ -46,7 +63,6 @@ for spec in \
   "$SP" join "$1" ocean push "$2" >/dev/null
   "$SP" heartbeat --stop "$1" >/dev/null 2>&1 || true
 done
-"$SP" daemon stop >/dev/null 2>&1 || true
 
 new_task() {
   # This helper is called through command substitution; do not let the
@@ -201,8 +217,8 @@ done
     exec "$SP" keeper "$tmp"
 ) > "$tmp/concurrent-2.out" 2>&1 &
 keeper_two=$!
-wait "$keeper_one" || fail "first concurrent keeper failed"
-wait "$keeper_two" || fail "second concurrent keeper failed"
+if wait "$keeper_one"; then keeper_one=""; else keeper_one=""; fail "first concurrent keeper failed"; fi
+if wait "$keeper_two"; then keeper_two=""; else keeper_two=""; fail "second concurrent keeper failed"; fi
 [ "$(wc -l < "$calls" | tr -d ' ')" = "1" ] || fail "concurrent keepers sent duplicate external wakes"
 [ -f "$tmp/.stitchpad/.state/keeper-last.alice" ] || fail "accepted concurrent wake was not persisted"
 [ ! -d "$tmp/.stitchpad/.state/keeper.alice.lock.d" ] || fail "successful keeper left its reservation behind"

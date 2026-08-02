@@ -37,6 +37,7 @@ STITCHPAD_NAME=beta "$SP" say '@agent second exact recovery target' >/dev/null
 "$SP" wake agent >/dev/null
 
 state="$tmp/.stitchpad/.state"
+pad_canon="$(cd -P "$tmp/.stitchpad" && pwd)"
 [ "$(cat "$state/seen.agent")" = "2" ] || fail "setup did not advance seen to 2"
 touch "$state/dnd.agent"
 STITCHPAD_PAD_DIR="$tmp" "$SP" bind-session reset-session agent >/dev/null
@@ -189,7 +190,7 @@ foreign_pid=$!
 mkdir -p "$state/heartbeat.racer.lock"
 printf '%s' "$foreign_pid" > "$state/heartbeat.racer.lock/pid"
 foreign_command="$(ps -p "$foreign_pid" -o command= | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')"
-python3 - "$state/heartbeat.racer.lock/owner" "$foreign_pid" "$foreign_command" "$tmp/.stitchpad" <<'PY'
+python3 - "$state/heartbeat.racer.lock/owner" "$foreign_pid" "$foreign_command" "$pad_canon" <<'PY'
 import json, sys
 path, pid, command, pad = sys.argv[1:]
 json.dump({"pid": int(pid), "processStart": "mismatched-start", "command": command,
@@ -215,10 +216,13 @@ rm -rf "$state/heartbeat.racer.lock"
 "$SP" join genuine codex push genuine-target >/dev/null
 "$SP" heartbeat start genuine >/dev/null
 for _ in 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19 20; do
-  [ -s "$state/heartbeat.genuine.lock/owner" ] && break
+  [ -s "$state/heartbeat.genuine.lock/owner" ] \
+    && [ -s "$state/heartbeat.genuine.lock/pid" ] && break
   sleep 0.05
 done
-[ -s "$state/heartbeat.genuine.lock/owner" ] || fail "genuine ticker omitted owner metadata"
+[ -s "$state/heartbeat.genuine.lock/owner" ] \
+  && [ -s "$state/heartbeat.genuine.lock/pid" ] \
+  || fail "genuine ticker omitted owner metadata"
 genuine_old="$(cat "$state/heartbeat.genuine.lock/pid")"
 "$SP" reset genuine >/dev/null
 for _ in 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19 20; do
@@ -229,12 +233,13 @@ done
 [ -n "${genuine_new:-}" ] && [ "$genuine_new" != "$genuine_old" ] || fail "reset did not restart the proven ticker"
 kill -0 "$genuine_old" 2>/dev/null && fail "reset left the proven old ticker running"
 kill -0 "$genuine_new" 2>/dev/null || fail "reset replacement ticker is not live"
-python3 - "$state/heartbeat.genuine.lock/owner" "$genuine_new" "$tmp/.stitchpad" <<'PY' || fail "replacement owner metadata is not exact"
+python3 - "$state/heartbeat.genuine.lock/owner" "$genuine_new" "$pad_canon" <<'PY' || fail "replacement owner metadata is not exact"
 import json, sys
 owner = json.load(open(sys.argv[1]))
 assert owner["pid"] == int(sys.argv[2])
 assert owner["pad"] == sys.argv[3]
 assert owner["name"] == "genuine"
+assert owner["generation"]
 assert owner["processStart"]
 assert owner["command"].endswith(" heartbeat start genuine")
 PY

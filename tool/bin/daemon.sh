@@ -19,10 +19,7 @@ LOG="$PAD_STATE/watch.log"
 # alive iff the lock exists AND its pid is a live process. A stale lock (process
 # gone) is auto-cleared so a crash can't wedge the pad forever.
 is_running() {
-  [ -d "$LOCKDIR" ] || return 1
-  local p; p="$(cat "$PIDFILE" 2>/dev/null)"
-  if [ -n "$p" ] && kill -0 "$p" 2>/dev/null; then return 0; fi
-  rm -rf "$LOCKDIR"; return 1   # stale → clear
+  sp_watcher_alive
 }
 
 case "${1:-status}" in
@@ -33,44 +30,86 @@ case "${1:-status}" in
     if ! mkdir "$LOCKDIR" 2>/dev/null; then
       # someone else won the race; if it's alive, defer to it
       is_running && { echo "running (pid $(cat "$PIDFILE"))"; exit 0; }
-      rm -rf "$LOCKDIR"; mkdir "$LOCKDIR" 2>/dev/null || { echo "could not acquire watcher lock"; exit 1; }
+      mkdir "$LOCKDIR" 2>/dev/null || { echo "could not acquire watcher lock"; exit 1; }
     fi
+    watch_generation="$(date +%s).$$.${RANDOM:-0}"
+    printf '%s' "$watch_generation" > "$LOCKDIR/generation" || {
+      rmdir "$LOCKDIR" 2>/dev/null || true
+      echo "could not publish watcher generation"
+      exit 1
+    }
+    sp_watch_launcher_write "$LOCKDIR" "$watch_generation" || {
+      sp_watch_lock_remove_generation "$LOCKDIR" "$watch_generation" 2>/dev/null || true
+      echo "could not publish watcher launcher ownership"
+      exit 1
+    }
     # Supervisor: own process group (setsid-ish via subshell), restarts watch.sh if
     # it dies, and CLEARS THE LOCK on exit so stop/crash leaves no stale gate.
     # KEEP-ALIVE: only respawn while at least one agent heartbeat is fresh.
-    ( trap 'rm -rf "$LOCKDIR"' EXIT
+    ( trap 'sp_watch_lock_remove_generation "$LOCKDIR" "$watch_generation" 2>/dev/null || true' EXIT
+      trap 'exit 130' INT
+      trap 'exit 143' TERM
       # Bash 3.2 (the macOS system bash) has no $BASHPID. Wait for the
       # parent to record this background subshell's real pid via $!.
-      while [ ! -s "$PIDFILE" ]; do sleep 0.01; done
+      while [ ! -s "$PIDFILE" ]; do
+        [ -d "$LOCKDIR" ] \
+          && [ "$(cat "$LOCKDIR/generation" 2>/dev/null || true)" = "$watch_generation" ] \
+          || exit 0
+        sleep 0.01
+      done
+      watch_supervisor_pid="$(cat "$PIDFILE" 2>/dev/null || true)"
+      supervisor_owns_generation() {
+        [ -d "$LOCKDIR" ] \
+          && [ "$(cat "$LOCKDIR/generation" 2>/dev/null || true)" = "$watch_generation" ] \
+          && [ "$(cat "$LOCKDIR/cancel" 2>/dev/null || true)" != "$watch_generation" ] \
+          && sp_watch_launcher_matches_pid "$LOCKDIR" "$watch_generation" "$watch_supervisor_pid"
+      }
       while true; do
+        supervisor_owns_generation || exit 0
         date +%s > "$LOCKDIR/heartbeat"
-        STITCHPAD_PAD_DIR="$PAD_DIR" bash "$STITCHPAD_HOME/bin/watch.sh" >>"$LOG" 2>&1
-        # if the lock was removed (stop requested), exit instead of respawning
-        [ -d "$LOCKDIR" ] || exit 0
+        supervisor_owns_generation || exit 0
+        STITCHPAD_PAD_DIR="$PAD_DIR" STITCHPAD_WATCH_GENERATION="$watch_generation" \
+          bash "$STITCHPAD_HOME/bin/watch.sh" >>"$LOG" 2>&1
+        watcher_rc=$?
+        supervisor_owns_generation || exit 0
+        date +%s > "$LOCKDIR/heartbeat"
+        if [ -n "${STITCHPAD_DAEMON_TEST_BEFORE_RESTART_BARRIER:-}" ]; then
+          daemon_restart_barrier="$STITCHPAD_DAEMON_TEST_BEFORE_RESTART_BARRIER"
+          printf '%s' ready > "$daemon_restart_barrier.ready"
+          while [ ! -f "$daemon_restart_barrier.release" ]; do
+            supervisor_owns_generation || exit 0
+            sleep 0.01
+          done
+        fi
         # check agent heartbeats before respawning
         if ! sp_any_alive; then
           echo "[stitchpad] no fresh agent heartbeats — supervisor exiting" >>"$LOG"
           sp_reap_dead   # session's over: physically sweep the dead presences/claims
           exit 0
         fi
-        echo "[stitchpad] watcher exited (code $?), restarting in 2s..." >>"$LOG"
+        echo "[stitchpad] watcher exited (code $watcher_rc), restarting in 2s..." >>"$LOG"
         sleep 2
+        supervisor_owns_generation || exit 0
       done
     ) &
     supervisor_pid=$!
+    if ! sp_watch_launcher_transfer_to_pid "$LOCKDIR" "$watch_generation" "$supervisor_pid"; then
+      kill "$supervisor_pid" 2>/dev/null || true
+      wait "$supervisor_pid" 2>/dev/null || true
+      sp_watch_lock_remove_generation "$LOCKDIR" "$watch_generation" 2>/dev/null || true
+      echo "could not transfer watcher launcher ownership"
+      exit 1
+    fi
     echo "$supervisor_pid" > "$PIDFILE"
     disown
     sleep 0.3
     echo "started stitchpad watcher (pid $(cat "$PIDFILE" 2>/dev/null)); log: $LOG" ;;
   stop)
-    if [ -d "$LOCKDIR" ]; then
-      p="$(cat "$PIDFILE" 2>/dev/null)"
-      rm -rf "$LOCKDIR"            # signal the supervisor loop to exit (it checks)
-      # kill the supervisor process group so watch.sh + fswatch children die too
-      [ -n "$p" ] && kill -- "-$p" 2>/dev/null; [ -n "$p" ] && kill "$p" 2>/dev/null
-      # belt+suspenders: reap any watch.sh/fswatch still bound to THIS pad
-      pkill -f "STITCHPAD_PAD_DIR=$PAD_DIR" 2>/dev/null || true
-      pkill -f "fswatch.*$PAD_MD" 2>/dev/null || true
+    # Always scan the exact pad path: a supervisor can die and remove its lock
+    # while leaving fswatch orphaned under PID 1. The helper excludes PID 1 and
+    # signals only the recorded supervisor and processes bound to this PAD_MD.
+    if [ -d "$LOCKDIR" ] || [ -n "$(sp_watch_processes_for_pad)" ]; then
+      sp_stop_watchers_for_pad
       echo "stopped"
     else echo "not running"; fi ;;
   restart) "$0" stop; sleep 1; "$0" start ;;

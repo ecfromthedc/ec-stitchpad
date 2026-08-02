@@ -73,6 +73,8 @@ sp_init_paths() {
   # Without #2, a watcher/daemon launched from the wrong cwd silently watched the
   # wrong pad (ocean-os's watcher latched onto stitchpad-live). Honor the pin.
   PAD_DIR="$(sp_find_pad "${1:-${STITCHPAD_PAD_DIR:-$PWD}}")" || { echo "no pasture found (run: pasture init)" >&2; return 1; }
+  PAD_DIR="$(cd -P "$PAD_DIR" 2>/dev/null && pwd)" \
+    || { echo "stitchpad: could not canonicalize pad directory" >&2; return 1; }
   # migrated pads carry pasture.md/pasture-git; legacy names accepted until stage 4
   if [ -f "$PAD_DIR/pasture.md" ]; then PAD_MD="$PAD_DIR/pasture.md"; else PAD_MD="$PAD_DIR/stitchpad.md"; fi
   if [ -d "$PAD_DIR/pasture-git" ]; then PAD_GIT="$PAD_DIR/pasture-git"; else PAD_GIT="$PAD_DIR/stitchpad-git"; fi
@@ -83,9 +85,9 @@ sp_init_paths() {
   PAD_TASKS="$PAD_DIR/tasks.md"
   PAD_ARCHIVE_DIR="$PAD_DIR/archive"
   mkdir -p "$PAD_STATE/sessions"
-  # Replay an in-place rewrite that was interrupted between truncate and write.
-  sp_recover_inplace "$PAD_MD"
-  sp_recover_inplace "$PAD_TASKS"
+  # Recovery is intentionally NOT performed here. sp_init_paths is used by
+  # passive/read-only commands and runs outside the pad mutation lock. Only
+  # sp_lock may reconcile a promoted write generation.
   sp_ensure_outer_git_ignore
   # Pad git is load-bearing (read --new deltas, say auto-commits, compaction
   # audit trail) but NOTHING ever initialized it — sp_commit just no-ops when
@@ -178,17 +180,52 @@ sp_process_command() {
   ps -p "$1" -o command= 2>/dev/null | sed 's/^[[:space:]]*//;s/[[:space:]]*$//'
 }
 
-sp_ticker_owner_write() {
-  local lockd="$1" pid="$2" who="$3" started command tmp
-  [ "${STITCHPAD_HEARTBEAT_TEST_OWNER_WRITE_FAIL:-0}" != "1" ] || return 1
+sp_process_identity_matches() {
+  local pid="$1" expected_start="$2" expected_command="$3" started command
+  case "$pid" in ''|*[!0-9]*) return 1;; esac
+  kill -0 "$pid" 2>/dev/null || return 1
   started="$(sp_process_start "$pid")"
   command="$(sp_process_command "$pid")"
-  [ -n "$started" ] && [ -n "$command" ] || return 1
-  tmp="$lockd/.owner.$$"
-  python3 - "$pid" "$started" "$command" "$PAD_DIR" "$who" > "$tmp" <<'PY'
+  [ -n "$expected_start" ] && [ -n "$expected_command" ] \
+    && [ "$started" = "$expected_start" ] && [ "$command" = "$expected_command" ]
+}
+
+sp_b64_encode() {
+  python3 - "$1" <<'PY'
+import base64, sys
+print(base64.b64encode(sys.argv[1].encode()).decode())
+PY
+}
+
+sp_b64_decode() {
+  python3 - "$1" <<'PY'
+import base64, sys
+try:
+    print(base64.b64decode(sys.argv[1], validate=True).decode(), end="")
+except Exception:
+    raise SystemExit(1)
+PY
+}
+
+sp_generation_is_safe() {
+  case "$1" in
+    ''|*[!A-Za-z0-9._-]* ) return 1 ;;
+    * ) [ "${#1}" -le 128 ] ;;
+  esac
+}
+
+sp_ticker_launcher_claim() {
+  local lockd="$1" generation="$2" who="$3" pid started command tmp
+  pid="$$"
+  started="$(sp_process_start "$pid")"
+  command="$(sp_process_command "$pid")"
+  [ -n "$generation" ] && [ -n "$started" ] && [ -n "$command" ] || return 1
+  tmp="$PAD_STATE/.heartbeat-launcher.$$.$RANDOM"
+  python3 - "$generation" "$pid" "$started" "$command" "$PAD_DIR" "$who" > "$tmp" <<'PY'
 import json, sys
-pid, started, command, pad, name = sys.argv[1:]
+generation, pid, started, command, pad, name = sys.argv[1:]
 print(json.dumps({
+    "generation": generation,
     "pid": int(pid),
     "processStart": started,
     "command": command,
@@ -196,37 +233,224 @@ print(json.dumps({
     "name": name,
 }, separators=(",", ":")))
 PY
-  [ -s "$tmp" ] && mv "$tmp" "$lockd/owner" || {
+  [ -d "$lockd" ] && [ "$(cat "$lockd/generation" 2>/dev/null || true)" = "$generation" ] \
+    && [ -s "$tmp" ] && ln "$tmp" "$lockd/launcher" 2>/dev/null || {
     rm -f "$tmp" 2>/dev/null || true
     return 1
   }
+  rm -f "$tmp" 2>/dev/null || true
 }
 
-sp_ticker_owner_matches() {
-  local lockd="$1" pid="$2" who="$3" started command
-  [ -f "$lockd/owner" ] || return 1
-  case "$pid" in ''|*[!0-9]*) return 1;; esac
-  kill -0 "$pid" 2>/dev/null || return 1
-  started="$(sp_process_start "$pid")"
-  command="$(sp_process_command "$pid")"
-  [ -n "$started" ] && [ -n "$command" ] || return 1
-  python3 - "$lockd/owner" "$pid" "$started" "$command" "$PAD_DIR" "$who" <<'PY'
+sp_ticker_manifest_is_valid() {
+  local path="$1" generation="$2" who="$3"
+  [ -f "$path" ] || return 1
+  python3 - "$path" "$generation" "$PAD_DIR" "$who" <<'PY'
 import json, sys
-path, pid, started, command, pad, name = sys.argv[1:]
+path, generation, pad, name = sys.argv[1:]
 try:
     with open(path, encoding="utf-8") as handle:
         owner = json.load(handle)
+    assert set(owner) == {"generation", "pid", "processStart", "command", "pad", "name"}
+    assert owner["generation"] == generation and owner["pad"] == pad and owner["name"] == name
+    assert isinstance(owner["pid"], int) and owner["pid"] > 0
+    assert all(isinstance(owner[k], str) and owner[k]
+               for k in ("processStart", "command"))
 except Exception:
     raise SystemExit(1)
-expected = {
+PY
+}
+
+sp_ticker_manifest_is_live() {
+  local path="$1" generation="$2" who="$3" pid started command
+  sp_ticker_manifest_is_valid "$path" "$generation" "$who" || return 1
+  pid="$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["pid"])' "$path" 2>/dev/null || true)"
+  started="$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["processStart"])' "$path" 2>/dev/null || true)"
+  command="$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["command"])' "$path" 2>/dev/null || true)"
+  sp_process_identity_matches "$pid" "$started" "$command"
+}
+
+sp_ticker_owner_claim() {
+  local lockd="$1" generation="$2" pid="$3" who="$4" started command tmp
+  [ "${STITCHPAD_HEARTBEAT_TEST_OWNER_WRITE_FAIL:-0}" != "1" ] || return 1
+  started="$(sp_process_start "$pid")"
+  command="$(sp_process_command "$pid")"
+  [ -n "$generation" ] && [ -n "$started" ] && [ -n "$command" ] || return 1
+  tmp="$PAD_STATE/.heartbeat-owner.$pid.$RANDOM"
+  python3 - "$generation" "$pid" "$started" "$command" "$PAD_DIR" "$who" > "$tmp" <<'PY'
+import json, sys
+generation, pid, started, command, pad, name = sys.argv[1:]
+print(json.dumps({
+    "generation": generation,
     "pid": int(pid),
     "processStart": started,
     "command": command,
     "pad": pad,
     "name": name,
-}
-raise SystemExit(0 if owner == expected else 1)
+}, separators=(",", ":")))
 PY
+  [ -d "$lockd" ] && [ "$(cat "$lockd/generation" 2>/dev/null || true)" = "$generation" ] \
+    && [ -s "$tmp" ] && ln "$tmp" "$lockd/owner" 2>/dev/null || {
+      rm -f "$tmp" 2>/dev/null || true
+      return 1
+    }
+  rm -f "$tmp" 2>/dev/null || true
+  sp_ticker_owner_matches "$lockd" "$generation" "$pid" "$who"
+}
+
+sp_ticker_owner_matches() {
+  local lockd="$1" generation="$2" pid="$3" who="$4" started command
+  [ "$(cat "$lockd/generation" 2>/dev/null || true)" = "$generation" ] || return 1
+  sp_ticker_manifest_is_valid "$lockd/owner" "$generation" "$who" || return 1
+  started="$(sp_process_start "$pid")"
+  command="$(sp_process_command "$pid")"
+  [ -n "$started" ] && [ -n "$command" ] || return 1
+  python3 - "$lockd/owner" "$pid" "$started" "$command" <<'PY'
+import json, sys
+path, pid, started, command = sys.argv[1:]
+try:
+    with open(path, encoding="utf-8") as handle:
+        owner = json.load(handle)
+except Exception:
+    raise SystemExit(1)
+raise SystemExit(0 if owner["pid"] == int(pid)
+                 and owner["processStart"] == started
+                 and owner["command"] == command else 1)
+PY
+}
+
+sp_ticker_retire_generation() {
+  local lockd="$1" generation="$2" retired="$1.retired.$2"
+  sp_generation_is_safe "$generation" \
+    && [ "$(cat "$lockd/generation" 2>/dev/null || true)" = "$generation" ] || return 1
+  [ ! -e "$retired" ] || return 1
+  mv "$lockd" "$retired" 2>/dev/null || return 1
+  printf '%s\n' "$retired"
+}
+
+sp_ticker_retired_cleanup() {
+  local retired="$1"
+  rm -f "$retired/owner" "$retired/launcher" "$retired/pid" "$retired/cancel" \
+    "$retired/generation" 2>/dev/null || true
+  rmdir "$retired" 2>/dev/null
+}
+
+sp_ticker_cancel_generation() {
+  local lockd="$1" generation="$2" tmp="$PAD_STATE/.heartbeat-cancel.$$.$RANDOM"
+  sp_generation_is_safe "$generation" \
+    && [ "$(cat "$lockd/generation" 2>/dev/null || true)" = "$generation" ] || return 1
+  if [ -f "$lockd/cancel" ]; then
+    [ "$(cat "$lockd/cancel" 2>/dev/null || true)" = "$generation" ]
+    return
+  fi
+  printf '%s' "$generation" > "$tmp" || return 1
+  [ "$(cat "$lockd/generation" 2>/dev/null || true)" = "$generation" ] \
+    && ln "$tmp" "$lockd/cancel" 2>/dev/null || {
+      rm -f "$tmp" 2>/dev/null || true
+      [ "$(cat "$lockd/cancel" 2>/dev/null || true)" = "$generation" ]
+      return
+    }
+  rm -f "$tmp" 2>/dev/null || true
+}
+
+sp_ticker_generation_cleanup() {
+  local lockd="$1" generation="$2"
+  sp_generation_is_safe "$generation" \
+    && [ "$(cat "$lockd/generation" 2>/dev/null || true)" = "$generation" ] || return 1
+  rm -f "$lockd/owner" "$lockd/launcher" "$lockd/pid" "$lockd/cancel" "$lockd/generation" 2>/dev/null || true
+  rmdir "$lockd" 2>/dev/null
+}
+
+sp_ticker_alive_remove_generation() {
+  local who="$1" generation="$2" alive="$PAD_STATE/alive.$1" observed actual
+  [ -f "$alive" ] || return 0
+  actual="$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1])).get("generation",""))' "$alive" 2>/dev/null || true)"
+  [ "$actual" = "$generation" ] || return 0
+  observed="$(cat "$alive" 2>/dev/null || true)"
+  [ -n "$observed" ] && [ "$(cat "$alive" 2>/dev/null || true)" = "$observed" ] \
+    && rm -f "$alive" 2>/dev/null || true
+}
+
+sp_ticker_alive_remove_snapshot() {
+  local who="$1" alive="$PAD_STATE/alive.$1" observed
+  [ -f "$alive" ] || return 0
+  observed="$(cat "$alive" 2>/dev/null || true)"
+  [ -n "$observed" ] && [ "$(cat "$alive" 2>/dev/null || true)" = "$observed" ] \
+    && rm -f "$alive" 2>/dev/null || true
+}
+
+sp_ticker_stop_owned() {
+  local who="$1" lockd="$PAD_STATE/heartbeat.$1.lock" generation pid started command launcher_pid launcher_start launcher_command i=0 legacy_pid
+  if [ ! -d "$lockd" ]; then
+    sp_ticker_alive_remove_snapshot "$who"
+    return 0
+  fi
+  generation="$(cat "$lockd/generation" 2>/dev/null || true)"
+  if [ -z "$generation" ] || ! sp_ticker_manifest_is_valid "$lockd/launcher" "$generation" "$who"; then
+    # Legacy/unknown state is removable only when its bare PID is not live.
+    # A live numeric PID without a valid exact manifest is never signal authority.
+    legacy_pid="$(cat "$lockd/pid" 2>/dev/null || true)"
+    if [ -n "$legacy_pid" ] && kill -0 "$legacy_pid" 2>/dev/null; then
+      echo "stitchpad: heartbeat @$who has live but unverified pid $legacy_pid; refusing to signal or remove its state" >&2
+      return 1
+    fi
+    # Only the exact legacy pid-only shape is understood. Malformed manifests
+    # and unknown files are preserved byte-for-byte for operator repair.
+    if [ -n "$(find "$lockd" -mindepth 1 -maxdepth 1 ! -name pid -print -quit 2>/dev/null)" ]; then
+      echo "stitchpad: malformed heartbeat @$who lock left untouched" >&2
+      return 1
+    fi
+    rm -f "$lockd/pid" 2>/dev/null || true
+    rmdir "$lockd" 2>/dev/null || return 1
+    return 0
+  fi
+  if [ -f "$lockd/owner" ]; then
+    if ! sp_ticker_manifest_is_valid "$lockd/owner" "$generation" "$who"; then
+      echo "stitchpad: malformed heartbeat @$who owner left untouched" >&2
+      return 1
+    fi
+    pid="$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["pid"])' "$lockd/owner" 2>/dev/null || true)"
+    started="$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["processStart"])' "$lockd/owner" 2>/dev/null || true)"
+    command="$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["command"])' "$lockd/owner" 2>/dev/null || true)"
+  else
+    pid=""; started=""; command=""
+  fi
+  launcher_pid="$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["pid"])' "$lockd/launcher" 2>/dev/null || true)"
+  launcher_start="$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["processStart"])' "$lockd/launcher" 2>/dev/null || true)"
+  launcher_command="$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["command"])' "$lockd/launcher" 2>/dev/null || true)"
+  # Keep the canonical name occupied while cancellation drains publishers. This
+  # prevents an old check-then-link/write from landing in a successor's lock.
+  sp_ticker_cancel_generation "$lockd" "$generation" || return 1
+  if [ -n "${STITCHPAD_HEARTBEAT_TEST_STOP_AFTER_CANCEL_BARRIER:-}" ]; then
+    local stop_barrier="$STITCHPAD_HEARTBEAT_TEST_STOP_AFTER_CANCEL_BARRIER"
+    printf '%s' ready > "$stop_barrier.ready"
+    while [ ! -f "$stop_barrier.release" ]; do sleep 0.01; done
+  fi
+  if [ -n "$pid" ] && sp_process_identity_matches "$pid" "$started" "$command"; then
+    kill "$pid" 2>/dev/null || true
+  fi
+  while [ "$i" -lt 20 ]; do
+    # A child may publish owner just after cancellation was recorded. It cannot
+    # write a heartbeat, and once visible it is stopped using exact identity.
+    if [ -f "$lockd/owner" ] && sp_ticker_manifest_is_valid "$lockd/owner" "$generation" "$who"; then
+      pid="$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["pid"])' "$lockd/owner" 2>/dev/null || true)"
+      started="$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["processStart"])' "$lockd/owner" 2>/dev/null || true)"
+      command="$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["command"])' "$lockd/owner" 2>/dev/null || true)"
+      sp_process_identity_matches "$pid" "$started" "$command" && kill "$pid" 2>/dev/null || true
+    fi
+    if ! sp_process_identity_matches "$pid" "$started" "$command" \
+      && ! sp_process_identity_matches "$launcher_pid" "$launcher_start" "$launcher_command"; then
+      break
+    fi
+    sleep 0.1; i=$((i + 1))
+  done
+  sp_process_identity_matches "$pid" "$started" "$command" && kill -KILL "$pid" 2>/dev/null || true
+  if sp_process_identity_matches "$launcher_pid" "$launcher_start" "$launcher_command"; then
+    echo "stitchpad: heartbeat @$who launcher did not observe cancellation; state preserved" >&2
+    return 1
+  fi
+  sp_ticker_alive_remove_generation "$who" "$generation"
+  # A child's exact cleanup may already have removed the generation.
+  [ ! -d "$lockd" ] || sp_ticker_generation_cleanup "$lockd" "$generation"
 }
 
 # ── Atomic pad mutation lock ─────────────────────────────────────────
@@ -238,31 +462,178 @@ PY
 SP_LOCK_TIMEOUT="${SP_LOCK_TIMEOUT:-5}"   # seconds to wait for the lock
 SP_LOCK_STALE="${SP_LOCK_STALE:-30}"      # seconds before a held lock is "stale"
 _SP_LOCK_DIR=""
+_SP_LOCK_GENERATION=""
+_SP_LOCK_PID=""
+_SP_LOCK_SUBSHELL=""
+
+sp_lock_owner_write() {
+  local lock="$1" generation="$2" pid="$3" started command tmp
+  started="$(sp_process_start "$pid")"
+  command="$(sp_process_command "$pid")"
+  [ -n "$started" ] && [ -n "$command" ] || return 1
+  # Build outside the canonical lock directory. A SIGKILL during publication
+  # can leave only an empty reclaimable lock, never a non-empty ownerless wedge.
+  tmp="$PAD_STATE/.lock-owner.$$.$RANDOM"
+  python3 - "$generation" "$pid" "$started" "$command" > "$tmp" <<'PY'
+import json, sys
+generation, pid, started, command = sys.argv[1:]
+print(json.dumps({
+    "generation": generation,
+    "pid": int(pid),
+    "processStart": started,
+    "command": command,
+}, separators=(",", ":")))
+PY
+  [ -s "$tmp" ] && mv "$tmp" "$lock/owner" || {
+    rm -f "$tmp" 2>/dev/null || true
+    return 1
+  }
+}
+
+sp_lock_owner_matches() {
+  local lock="$1" generation="$2" pid="$3" started command
+  [ -f "$lock/owner" ] || return 1
+  started="$(sp_process_start "$pid")"
+  command="$(sp_process_command "$pid")"
+  [ -n "$started" ] && [ -n "$command" ] || return 1
+  python3 - "$lock/owner" "$generation" "$pid" "$started" "$command" <<'PY'
+import json, sys
+path, generation, pid, started, command = sys.argv[1:]
+try:
+    with open(path, encoding="utf-8") as handle:
+        owner = json.load(handle)
+except Exception:
+    raise SystemExit(1)
+expected = {
+    "generation": generation,
+    "pid": int(pid),
+    "processStart": started,
+    "command": command,
+}
+raise SystemExit(0 if owner == expected else 1)
+PY
+}
+
+sp_lock_owner_is_live() {
+  local lock="$1" pid started command expected_start expected_command
+  [ -f "$lock/owner" ] || return 1
+  pid="$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1])).get("pid",""))' "$lock/owner" 2>/dev/null || true)"
+  expected_start="$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1])).get("processStart",""))' "$lock/owner" 2>/dev/null || true)"
+  expected_command="$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1])).get("command",""))' "$lock/owner" 2>/dev/null || true)"
+  case "$pid" in ''|*[!0-9]*) return 1;; esac
+  kill -0 "$pid" 2>/dev/null || return 1
+  started="$(sp_process_start "$pid")"
+  command="$(sp_process_command "$pid")"
+  [ -n "$expected_start" ] && [ -n "$expected_command" ] \
+    && [ "$started" = "$expected_start" ] && [ "$command" = "$expected_command" ]
+}
+
+sp_lock_owner_is_valid() {
+  local lock="$1"
+  [ -f "$lock/owner" ] || return 1
+  python3 - "$lock/owner" <<'PY'
+import json, sys
+try:
+    with open(sys.argv[1], encoding="utf-8") as handle:
+        owner = json.load(handle)
+    assert set(owner) == {"generation", "pid", "processStart", "command"}
+    assert isinstance(owner["pid"], int) and owner["pid"] > 0
+    assert all(isinstance(owner[k], str) and owner[k]
+               for k in ("generation", "processStart", "command"))
+except Exception:
+    raise SystemExit(1)
+PY
+}
 
 sp_lock() {
-  local lock="$PAD_STATE/.lock" waited=0
+  local lock="$PAD_STATE/.lock" waited=0 age now mtime observed pid_capture
   while ! mkdir "$lock" 2>/dev/null; do
-    # Break a stale lock (holder died without releasing).
+    # Break a stale lock only when its exact recorded owner is no longer live.
+    # A long-running but live writer is never evicted merely because the lock's
+    # directory mtime is old.
     if [ -d "$lock" ]; then
-      local age now mtime
       now=$(date +%s)
       mtime=$(stat -f %m "$lock" 2>/dev/null || stat -c %Y "$lock" 2>/dev/null || echo "$now")
       age=$(( now - mtime ))
-      if [ "$age" -ge "$SP_LOCK_STALE" ]; then rmdir "$lock" 2>/dev/null || true; continue; fi
+      if [ "$age" -ge "$SP_LOCK_STALE" ]; then
+        if [ -f "$lock/owner" ]; then
+          if sp_lock_owner_is_valid "$lock" && ! sp_lock_owner_is_live "$lock"; then
+            observed="$(cat "$lock/owner" 2>/dev/null || true)"
+            [ -n "$observed" ] && [ "$(cat "$lock/owner" 2>/dev/null || true)" = "$observed" ] \
+              && rm -f "$lock/owner" 2>/dev/null || true
+            rmdir "$lock" 2>/dev/null || true
+            [ -d "$lock" ] || continue
+          fi
+        else
+          # Compatibility for an empty pre-generation lock. Non-empty unknown
+          # locks fail closed because their contents are not ownership proof.
+          rmdir "$lock" 2>/dev/null || true
+          [ -d "$lock" ] || continue
+        fi
+      fi
     fi
     waited=$(( waited + 1 ))
     [ "$waited" -ge $(( SP_LOCK_TIMEOUT * 10 )) ] && { echo "stitchpad: pad busy (lock timeout)" >&2; return 1; }
     sleep 0.1
   done
   _SP_LOCK_DIR="$lock"
-  # Release on any exit so a killed writer doesn't wedge the pad.
-  trap 'sp_unlock' EXIT INT TERM
+  # `$$` does not change in a Bash 3.2 subshell. Ask a direct child for its
+  # parent PID so the lock records the shell that actually owns this execution
+  # context, not an ancestor whose EXIT trap may be inherited.
+  if [ -n "${STITCHPAD_LOCK_TEST_BEFORE_OWNER_BARRIER:-}" ]; then
+    local barrier="$STITCHPAD_LOCK_TEST_BEFORE_OWNER_BARRIER" barrier_i=0
+    printf '%s' ready > "$barrier.ready"
+    while [ ! -f "$barrier.release" ] && [ "$barrier_i" -lt 500 ]; do
+      sleep 0.01; barrier_i=$((barrier_i + 1))
+    done
+    [ -f "$barrier.release" ] || return 1
+  fi
+  pid_capture="$PAD_STATE/.pid-capture.$$.$RANDOM"
+  /bin/sh -c 'printf "%s" "$PPID"' > "$pid_capture" || true
+  _SP_LOCK_PID="$(cat "$pid_capture" 2>/dev/null || true)"
+  rm -f "$pid_capture" 2>/dev/null || true
+  case "$_SP_LOCK_PID" in ''|*[!0-9]*)
+    rmdir "$lock" 2>/dev/null || true
+    _SP_LOCK_DIR=""; _SP_LOCK_PID=""
+    echo "stitchpad: could not resolve pad-lock owner pid" >&2
+    return 1
+    ;;
+  esac
+  _SP_LOCK_SUBSHELL="${BASH_SUBSHELL:-0}"
+  _SP_LOCK_GENERATION="$(date +%s).${_SP_LOCK_PID}.${RANDOM:-0}"
+  if ! sp_lock_owner_write "$lock" "$_SP_LOCK_GENERATION" "$_SP_LOCK_PID"; then
+    rmdir "$lock" 2>/dev/null || true
+    _SP_LOCK_DIR=""; _SP_LOCK_GENERATION=""; _SP_LOCK_PID=""; _SP_LOCK_SUBSHELL=""
+    echo "stitchpad: could not publish pad-lock ownership" >&2
+    return 1
+  fi
+  # Signals exit first; the EXIT trap then releases only this exact generation.
+  # An INT/TERM handler that merely unlocked and returned could let mutation
+  # continue after forfeiting ownership.
+  trap 'sp_unlock' EXIT
+  trap 'exit 130' INT
+  trap 'exit 143' TERM
+  # Reconcile only after acquiring the same generation-owned mutation lock
+  # used by writers. A passive sp_init_paths call can never consume .ready.
+  if ! sp_recover_inplace "$PAD_MD" || ! sp_recover_inplace "$PAD_TASKS"; then
+    sp_unlock
+    return 1
+  fi
+  sp_reap_applied_generations "$PAD_MD"
+  sp_reap_applied_generations "$PAD_TASKS"
   return 0
 }
 
 sp_unlock() {
-  [ -n "$_SP_LOCK_DIR" ] && rmdir "$_SP_LOCK_DIR" 2>/dev/null || true
-  _SP_LOCK_DIR=""
+  # An EXIT trap inherited by command substitution must not release its
+  # parent's live lock. Bash 3.2 exposes the nesting level via BASH_SUBSHELL.
+  if [ "${BASH_SUBSHELL:-0}" = "${_SP_LOCK_SUBSHELL:-}" ] \
+    && [ -n "$_SP_LOCK_DIR" ] && [ -n "$_SP_LOCK_GENERATION" ] && [ -n "$_SP_LOCK_PID" ] \
+    && sp_lock_owner_matches "$_SP_LOCK_DIR" "$_SP_LOCK_GENERATION" "$_SP_LOCK_PID"; then
+    rm -f "$_SP_LOCK_DIR/owner" 2>/dev/null || true
+    rmdir "$_SP_LOCK_DIR" 2>/dev/null || true
+  fi
+  _SP_LOCK_DIR=""; _SP_LOCK_GENERATION=""; _SP_LOCK_PID=""; _SP_LOCK_SUBSHELL=""
 }
 
 # ── Inode-stable rewrites ────────────────────────────────────────────
@@ -284,21 +655,132 @@ sp_unlock() {
 #   sp_stage <target>            → path to a staging file next to <target>
 #   sp_write_inplace <staged> <target>
 #       0 = written · 2 = identical, nothing written · 1 = failed, target intact
-#   sp_recover_inplace <target>  → replay an interrupted write
+#   sp_recover_inplace <target>  → replay an interrupted, proven generation
 #
 # Crash-safety is preserved WITHOUT a rename over the pad. The staged file is a
-# complete copy on disk; it is promoted to "<target>.ready" (a rename between
-# two TEMP files — the pad is never the destination) and only then copied over
-# the target. If the process dies mid-copy, "<target>.ready" survives with the
-# full intended content and sp_recover_inplace() replays it on the next command.
-# A half-written staging file is never promoted, so it can never be replayed.
+# complete copy on disk; a generation directory containing the content plus an
+# exact owner/checksum manifest is promoted to "<target>.ready" (the pad is never
+# the rename destination) and only then copied over the target. If the process
+# dies mid-copy, the proven generation survives and the next mutation recovers
+# it while holding the same pad lock. A passive command never performs recovery.
 sp_stage() {
   local target="${1:-$PAD_MD}"
   mktemp "$(dirname "$target")/.sp-stage.XXXXXX"
 }
 
+sp_ready_generation_validate() {
+  local ready="$1" target="$2" expected="${3:-}"
+  [ -d "$ready" ] || return 1
+  python3 - "$ready" "$target" "$expected" <<'PY'
+import hashlib, json, os, stat, sys
+ready, target, expected = sys.argv[1:]
+try:
+    if not stat.S_ISDIR(os.lstat(ready).st_mode):
+        raise ValueError("generation path is not a real directory")
+    if os.path.islink(target):
+        raise ValueError("target is a symlink")
+    if set(os.listdir(ready)) != {"content", "owner"}:
+        raise ValueError("unexpected generation contents")
+    owner_path = os.path.join(ready, "owner")
+    content = os.path.join(ready, "content")
+    if not stat.S_ISREG(os.lstat(owner_path).st_mode) or not stat.S_ISREG(os.lstat(content).st_mode):
+        raise ValueError("generation files are not regular files")
+    with open(owner_path, encoding="utf-8") as handle:
+        owner = json.load(handle)
+    if set(owner) != {"generation", "pid", "processStart", "command", "target", "size", "sha256"}:
+        raise ValueError("unexpected manifest schema")
+    if owner["target"] != target or not isinstance(owner["pid"], int):
+        raise ValueError("wrong target or pid")
+    if not all(isinstance(owner[k], str) and owner[k] for k in ("generation", "processStart", "command", "sha256")):
+        raise ValueError("incomplete manifest")
+    if expected and owner["generation"] != expected:
+        raise ValueError("wrong generation")
+    stat = os.stat(content)
+    if stat.st_size != owner["size"]:
+        raise ValueError("wrong size")
+    digest = hashlib.sha256()
+    with open(content, "rb") as handle:
+        for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+            digest.update(chunk)
+    if digest.hexdigest() != owner["sha256"]:
+        raise ValueError("wrong digest")
+except Exception:
+    raise SystemExit(1)
+print(owner["generation"])
+PY
+}
+
+sp_ready_owner_is_live() {
+  local ready="$1" pid expected_start expected_command started command
+  pid="$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1])).get("pid",""))' "$ready/owner" 2>/dev/null || true)"
+  expected_start="$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1])).get("processStart",""))' "$ready/owner" 2>/dev/null || true)"
+  expected_command="$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1])).get("command",""))' "$ready/owner" 2>/dev/null || true)"
+  case "$pid" in ''|*[!0-9]*) return 1;; esac
+  kill -0 "$pid" 2>/dev/null || return 1
+  started="$(sp_process_start "$pid")"
+  command="$(sp_process_command "$pid")"
+  [ -n "$expected_start" ] && [ -n "$expected_command" ] \
+    && [ "$started" = "$expected_start" ] && [ "$command" = "$expected_command" ]
+}
+
+sp_reap_applied_generations() {
+  local target="$1" applied generation
+  for applied in "$target.ready.applied."*; do
+    [ -d "$applied" ] || continue
+    generation="$(sp_ready_generation_validate "$applied" "$target" 2>/dev/null || true)"
+    [ -n "$generation" ] || continue
+    rm -f "$applied/content" "$applied/owner" 2>/dev/null || true
+    rmdir "$applied" 2>/dev/null || true
+  done
+}
+
+sp_apply_ready_generation() {
+  local ready="$1" target="$2" generation="$3" content="$1/content" newsize oldsize applied
+  sp_ready_generation_validate "$ready" "$target" "$generation" >/dev/null || return 1
+  newsize="$(wc -c < "$content" | tr -d ' ')"
+  oldsize="$(wc -c < "$target" 2>/dev/null | tr -d ' ')"; oldsize="${oldsize:-0}"
+  if dd if="$content" of="$target" conv=notrunc bs=65536 2>/dev/null; then
+    if [ "$newsize" -lt "$oldsize" ]; then
+      perl -e 'truncate($ARGV[0], $ARGV[1]) or exit 1' "$target" "$newsize" 2>/dev/null \
+        || return 1
+    fi
+    # Retire the canonical generation atomically before cleanup. A crash before
+    # rename leaves a valid replayable generation; a crash after rename leaves
+    # only non-blocking applied-generation litter, never malformed `.ready`.
+    sp_ready_generation_validate "$ready" "$target" "$generation" >/dev/null || return 1
+    applied="$ready.applied.$generation"
+    [ ! -e "$applied" ] || return 1
+    mv "$ready" "$applied" 2>/dev/null || return 1
+    if [ -n "${STITCHPAD_WRITE_TEST_AFTER_RETIRE_BARRIER:-}" ]; then
+      local retire_barrier="$STITCHPAD_WRITE_TEST_AFTER_RETIRE_BARRIER" retire_i=0
+      printf '%s' ready > "$retire_barrier.ready"
+      while [ ! -f "$retire_barrier.release" ] && [ "$retire_i" -lt 500 ]; do
+        sleep 0.01; retire_i=$((retire_i + 1))
+      done
+      [ -f "$retire_barrier.release" ] || return 1
+    fi
+    rm -f "$applied/content" "$applied/owner" 2>/dev/null || return 1
+    rmdir "$applied" 2>/dev/null || return 1
+    return 0
+  fi
+  return 1
+}
+
 sp_write_inplace() {
-  local staged="$1" target="$2" ready="$2.ready"
+  local staged="$1" target="$2" ready="$2.ready" generation_dir generation owner_tmp
+  if [ "${_SP_LOCK_DIR:-}" != "$PAD_STATE/.lock" ] \
+    || [ -z "${_SP_LOCK_GENERATION:-}" ] \
+    || [ -z "${_SP_LOCK_PID:-}" ] \
+    || ! sp_lock_owner_matches "$_SP_LOCK_DIR" "$_SP_LOCK_GENERATION" "$_SP_LOCK_PID"; then
+    echo "stitchpad: refusing unlocked in-place write of $(basename "$target")" >&2
+    rm -f "$staged" 2>/dev/null || true
+    return 1
+  fi
+  if [ -L "$target" ] || [ -L "$ready" ]; then
+    echo "stitchpad: refusing symlinked in-place write path for $(basename "$target")" >&2
+    rm -f "$staged" 2>/dev/null || true
+    return 1
+  fi
   # Never let a broken awk/sed pipeline truncate a live pad to nothing.
   if [ ! -s "$staged" ]; then
     echo "stitchpad: refusing to write an empty $(basename "$target") — staged write produced no content" >&2
@@ -311,42 +793,95 @@ sp_write_inplace() {
     rm -f "$staged" 2>/dev/null
     return 2
   fi
-  mv -f "$staged" "$ready" 2>/dev/null || { rm -f "$staged" 2>/dev/null; return 1; }
-  local newsize oldsize
-  newsize="$(wc -c < "$ready" | tr -d ' ')"
-  oldsize="$(wc -c < "$target" 2>/dev/null | tr -d ' ')"; oldsize="${oldsize:-0}"
-  # THE fix: same inode, and no truncation — so no watcher rewinds.
-  if dd if="$ready" of="$target" conv=notrunc bs=65536 2>/dev/null; then
-    if [ "$newsize" -lt "$oldsize" ]; then
-      # genuinely shorter (clear/compact/archive): drop the stale tail bytes.
-      # The cat fallback MUST be guarded: if .ready is gone (a concurrent
-      # recovery consumed it), `cat missing > target` would truncate the pad
-      # to nothing before failing. Stale tail bytes beat a blanked pad.
-      perl -e 'truncate($ARGV[0], $ARGV[1]) or exit 1' "$target" "$newsize" 2>/dev/null \
-        || { [ -s "$ready" ] && cat "$ready" > "$target"; }
-    fi
-    rm -f "$ready" 2>/dev/null
-    return 0
+  [ ! -e "$ready" ] || {
+    echo "stitchpad: unresolved write generation already exists for $(basename "$target")" >&2
+    rm -f "$staged" 2>/dev/null || true
+    return 1
+  }
+  generation_dir="$(mktemp -d "$(dirname "$target")/.sp-ready.$(basename "$target").XXXXXX")" || return 1
+  generation="$(basename "$generation_dir").$(date +%s).${_SP_LOCK_PID}.${RANDOM:-0}"
+  mv "$staged" "$generation_dir/content" 2>/dev/null || {
+    rmdir "$generation_dir" 2>/dev/null || true
+    return 1
+  }
+  owner_tmp="$generation_dir/.owner"
+  python3 - "$generation_dir/content" "$owner_tmp" "$generation" "$_SP_LOCK_PID" \
+    "$(sp_process_start "$_SP_LOCK_PID")" "$(sp_process_command "$_SP_LOCK_PID")" "$target" <<'PY' || {
+import hashlib, json, os, sys
+content, output, generation, pid, started, command, target = sys.argv[1:]
+digest = hashlib.sha256()
+with open(content, "rb") as handle:
+    for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+        digest.update(chunk)
+with open(output, "w", encoding="utf-8") as handle:
+    json.dump({
+        "generation": generation,
+        "pid": int(pid),
+        "processStart": started,
+        "command": command,
+        "target": target,
+        "size": os.stat(content).st_size,
+        "sha256": digest.hexdigest(),
+    }, handle, separators=(",", ":"))
+PY
+    rm -f "$generation_dir/content" "$owner_tmp" 2>/dev/null || true
+    rmdir "$generation_dir" 2>/dev/null || true
+    return 1
+  }
+  if ! mv "$owner_tmp" "$generation_dir/owner"; then
+    rm -f "$generation_dir/content" "$owner_tmp" 2>/dev/null || true
+    rmdir "$generation_dir" 2>/dev/null || true
+    return 1
   fi
-  echo "stitchpad: in-place write of $(basename "$target") failed — content preserved in $ready" >&2
+  mv -n "$generation_dir" "$ready" 2>/dev/null || true
+  if [ -d "$generation_dir" ] \
+    || ! sp_ready_generation_validate "$ready" "$target" "$generation" >/dev/null; then
+    rm -f "$generation_dir/content" "$generation_dir/owner" 2>/dev/null || true
+    rmdir "$generation_dir" 2>/dev/null || true
+    echo "stitchpad: could not promote owned write generation for $(basename "$target")" >&2
+    return 1
+  fi
+  if [ -n "${STITCHPAD_WRITE_TEST_AFTER_PROMOTION_BARRIER:-}" ]; then
+    local barrier="$STITCHPAD_WRITE_TEST_AFTER_PROMOTION_BARRIER" i=0
+    printf '%s' ready > "$barrier.ready"
+    while [ ! -f "$barrier.release" ] && [ "$i" -lt 500 ]; do sleep 0.01; i=$((i+1)); done
+    [ -f "$barrier.release" ] || {
+      echo "stitchpad: write test barrier timed out" >&2
+      return 1
+    }
+  fi
+  if sp_apply_ready_generation "$ready" "$target" "$generation"; then return 0; fi
+  echo "stitchpad: in-place write of $(basename "$target") failed — proven content preserved in $ready" >&2
   return 1
 }
 
 sp_recover_inplace() {
-  local target="${1:-$PAD_MD}" ready now mt
+  local target="${1:-$PAD_MD}" ready generation
   [ -n "$target" ] || return 0
   ready="$target.ready"
-  [ -s "$ready" ] || { rm -f "$ready" 2>/dev/null; return 0; }
-  # A LIVE writer's .ready exists only for the instant between promotion and
-  # copy — recovery runs in sp_init_paths, OUTSIDE the lock, so replaying (and
-  # deleting) a fresh .ready would race the writer that owns it. Only a .ready
-  # that has sat around (its writer is genuinely dead) is recovered.
-  now="$(date +%s)"
-  mt="$(stat -f %m "$ready" 2>/dev/null || stat -c %Y "$ready" 2>/dev/null || echo 0)"
-  [ $(( now - mt )) -lt 5 ] && return 0
+  [ -e "$ready" ] || return 0
+  if [ "${_SP_LOCK_DIR:-}" != "$PAD_STATE/.lock" ] \
+    || [ -z "${_SP_LOCK_GENERATION:-}" ] \
+    || [ -z "${_SP_LOCK_PID:-}" ] \
+    || ! sp_lock_owner_matches "$_SP_LOCK_DIR" "$_SP_LOCK_GENERATION" "$_SP_LOCK_PID"; then
+    echo "stitchpad: refusing unlocked recovery of $(basename "$target")" >&2
+    return 1
+  fi
+  if [ ! -d "$ready" ]; then
+    echo "stitchpad: unowned legacy recovery file for $(basename "$target") left untouched" >&2
+    return 1
+  fi
+  generation="$(sp_ready_generation_validate "$ready" "$target" 2>/dev/null || true)"
+  [ -n "$generation" ] || {
+    echo "stitchpad: malformed recovery generation for $(basename "$target") left untouched" >&2
+    return 1
+  }
+  if sp_ready_owner_is_live "$ready"; then
+    echo "stitchpad: live writer still owns recovery generation for $(basename "$target")" >&2
+    return 1
+  fi
   echo "stitchpad: recovering interrupted write of $(basename "$target")" >&2
-  cat "$ready" > "$target" && rm -f "$ready" 2>/dev/null
-  return 0
+  sp_apply_ready_generation "$ready" "$target" "$generation"
 }
 
 # Append a small italic system/presence line to the pad (join/leave, etc.).
@@ -856,7 +1391,9 @@ sp_reap_dead() {
     [ $(( now - ts )) -lt 90 ] && continue
     local pid; pid=$(grep -o '"pid":[0-9]*' "$f" 2>/dev/null | head -1 | cut -d: -f2)
     [ -z "$pid" ] || [ "$pid" = "0" ] && continue   # unknown/operator → keep
-    kill -0 "$pid" 2>/dev/null || rm -rf "$f" "$PAD_STATE/heartbeat.${f##*/alive.}.lock" 2>/dev/null
+    # Presence metadata is disposable; a ticker lock is not. Its generation
+    # protocol alone decides whether an owner/publisher may be stopped.
+    kill -0 "$pid" 2>/dev/null || rm -f "$f" 2>/dev/null
   done
   # 3. file-claims whose holder pid is gone (holder line: "<name> <ts> <path>";
   #    no pid recorded, so fall back to staleness — claims older than 1h are dead).
@@ -869,43 +1406,359 @@ sp_reap_dead() {
 }
 
 # Is the watcher running? (lock dir exists AND PID alive)
+sp_watch_owner_claim() {
+  local lock="$1" generation="$2" pid="$3" started command tmp
+  started="$(sp_process_start "$pid")"
+  command="$(sp_process_command "$pid")"
+  [ -n "$generation" ] && [ -n "$started" ] && [ -n "$command" ] || return 1
+  tmp="$PAD_STATE/.watch-owner.$pid.$RANDOM"
+  python3 - "$generation" "$pid" "$started" "$command" "$PAD_MD" > "$tmp" <<'PY'
+import json, sys
+generation, pid, started, command, pad = sys.argv[1:]
+print(json.dumps({
+    "generation": generation,
+    "pid": int(pid),
+    "processStart": started,
+    "command": command,
+    "pad": pad,
+}, separators=(",", ":")))
+PY
+  # Hard-link publication is atomic and non-overwriting. A contender can never
+  # replace a live owner's manifest between validation and fswatch startup.
+  [ -d "$lock" ] && [ "$(cat "$lock/generation" 2>/dev/null || true)" = "$generation" ] \
+    && [ -s "$tmp" ] && ln "$tmp" "$lock/owner" 2>/dev/null || {
+      rm -f "$tmp" 2>/dev/null || true
+      return 1
+    }
+  rm -f "$tmp" 2>/dev/null || true
+  sp_watch_owner_matches "$lock" "$generation" "$pid"
+}
+
+sp_watch_launcher_write() {
+  local lock="$1" generation="$2" tmp="$PAD_STATE/.watch-launcher.$$.$RANDOM"
+  python3 - "$generation" "$PAD_MD" > "$tmp" <<'PY'
+import json, os, subprocess, sys
+generation, pad = sys.argv[1:]
+pid = os.getppid()
+def ps(field):
+    return subprocess.check_output(
+        ["ps", "-p", str(pid), "-o", field + "="], text=True
+    ).strip()
+print(json.dumps({
+    "generation": generation,
+    "pid": pid,
+    "processStart": ps("lstart"),
+    "command": ps("command"),
+    "pad": pad,
+}, separators=(",", ":")))
+PY
+  [ -d "$lock" ] && [ "$(cat "$lock/generation" 2>/dev/null || true)" = "$generation" ] \
+    && [ -s "$tmp" ] && ln "$tmp" "$lock/launcher" 2>/dev/null || {
+      rm -f "$tmp" 2>/dev/null || true
+      return 1
+    }
+  rm -f "$tmp" 2>/dev/null || true
+}
+
+sp_watch_launcher_is_valid() {
+  local lock="$1" generation="$2"
+  [ -f "$lock/launcher" ] || return 1
+  python3 - "$lock/launcher" "$generation" "$PAD_MD" <<'PY'
+import json, sys
+path, generation, pad = sys.argv[1:]
+try:
+    with open(path, encoding="utf-8") as handle:
+        owner = json.load(handle)
+    assert set(owner) == {"generation", "pid", "processStart", "command", "pad"}
+    assert owner["generation"] == generation and owner["pad"] == pad
+    assert isinstance(owner["pid"], int) and owner["pid"] > 0
+    assert all(isinstance(owner[k], str) and owner[k]
+               for k in ("processStart", "command"))
+except Exception:
+    raise SystemExit(1)
+PY
+}
+
+sp_watch_launcher_is_live() {
+  local lock="$1" pid started command
+  sp_watch_launcher_is_valid "$lock" "$(cat "$lock/generation" 2>/dev/null || true)" || return 1
+  pid="$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["pid"])' "$lock/launcher" 2>/dev/null || true)"
+  started="$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["processStart"])' "$lock/launcher" 2>/dev/null || true)"
+  command="$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["command"])' "$lock/launcher" 2>/dev/null || true)"
+  sp_process_identity_matches "$pid" "$started" "$command"
+}
+
+sp_watch_launcher_transfer_to_pid() {
+  local lock="$1" generation="$2" pid="$3" started command tmp
+  sp_watch_launcher_is_valid "$lock" "$generation" || return 1
+  # Only the exact process recorded as the current launcher may transfer its
+  # lease to the just-spawned supervisor.
+  python3 - "$lock/launcher" <<'PY' || return 1
+import json, os, sys
+with open(sys.argv[1], encoding="utf-8") as handle:
+    owner = json.load(handle)
+raise SystemExit(0 if owner.get("pid") == os.getppid() else 1)
+PY
+  started="$(sp_process_start "$pid")"
+  command="$(sp_process_command "$pid")"
+  [ -n "$started" ] && [ -n "$command" ] || return 1
+  tmp="$PAD_STATE/.watch-launcher-transfer.$$.$RANDOM"
+  python3 - "$generation" "$pid" "$started" "$command" "$PAD_MD" > "$tmp" <<'PY'
+import json, sys
+generation, pid, started, command, pad = sys.argv[1:]
+print(json.dumps({
+    "generation": generation,
+    "pid": int(pid),
+    "processStart": started,
+    "command": command,
+    "pad": pad,
+}, separators=(",", ":")))
+PY
+  [ -d "$lock" ] && [ "$(cat "$lock/generation" 2>/dev/null || true)" = "$generation" ] \
+    && mv "$tmp" "$lock/launcher" || {
+      rm -f "$tmp" 2>/dev/null || true
+      return 1
+    }
+}
+
+sp_watch_owner_matches() {
+  local lock="$1" generation="$2" pid="$3" started command
+  [ -f "$lock/owner" ] || return 1
+  [ "$(cat "$lock/generation" 2>/dev/null || true)" = "$generation" ] || return 1
+  started="$(sp_process_start "$pid")"
+  command="$(sp_process_command "$pid")"
+  [ -n "$started" ] && [ -n "$command" ] || return 1
+  python3 - "$lock/owner" "$generation" "$pid" "$started" "$command" "$PAD_MD" <<'PY'
+import json, sys
+path, generation, pid, started, command, pad = sys.argv[1:]
+try:
+    with open(path, encoding="utf-8") as handle:
+        owner = json.load(handle)
+except Exception:
+    raise SystemExit(1)
+expected = {
+    "generation": generation,
+    "pid": int(pid),
+    "processStart": started,
+    "command": command,
+    "pad": pad,
+}
+raise SystemExit(0 if owner == expected else 1)
+PY
+}
+
+sp_watch_owner_is_valid() {
+  local lock="$1" generation="$2"
+  [ -f "$lock/owner" ] || return 1
+  [ "$(cat "$lock/generation" 2>/dev/null || true)" = "$generation" ] || return 1
+  python3 - "$lock/owner" "$generation" "$PAD_MD" <<'PY'
+import json, sys
+path, generation, pad = sys.argv[1:]
+try:
+    with open(path, encoding="utf-8") as handle:
+        owner = json.load(handle)
+    assert set(owner) == {"generation", "pid", "processStart", "command", "pad"}
+    assert owner["generation"] == generation and owner["pad"] == pad
+    assert isinstance(owner["pid"], int) and owner["pid"] > 0
+    assert all(isinstance(owner[k], str) and owner[k]
+               for k in ("processStart", "command"))
+except Exception:
+    raise SystemExit(1)
+PY
+}
+
+sp_watch_lock_remove_generation() {
+  local lock="$1" generation="$2" retired
+  retired="$(sp_watch_lock_retire_generation "$lock" "$generation")" || return 1
+  sp_watch_retired_cleanup "$retired"
+}
+
+sp_watch_lock_retire_generation() {
+  local lock="$1" generation="$2" retired="$1.retired.$2"
+  sp_generation_is_safe "$generation" \
+    && [ "$(cat "$lock/generation" 2>/dev/null || true)" = "$generation" ] || return 1
+  [ ! -e "$retired" ] || return 1
+  mv "$lock" "$retired" 2>/dev/null || return 1
+  printf '%s\n' "$retired"
+}
+
+sp_watch_retired_cleanup() {
+  local retired="$1"
+  rm -f "$retired/owner" "$retired/launcher" "$retired/pid" "$retired/ts" \
+    "$retired/heartbeat" "$retired/cancel" "$retired/generation" 2>/dev/null || true
+  rmdir "$retired" 2>/dev/null
+}
+
+sp_watch_cancel_generation() {
+  local lock="$1" generation="$2" tmp="$PAD_STATE/.watch-cancel.$$.$RANDOM"
+  sp_generation_is_safe "$generation" \
+    && [ "$(cat "$lock/generation" 2>/dev/null || true)" = "$generation" ] || return 1
+  if [ -f "$lock/cancel" ]; then
+    [ "$(cat "$lock/cancel" 2>/dev/null || true)" = "$generation" ]
+    return
+  fi
+  printf '%s' "$generation" > "$tmp" || return 1
+  [ "$(cat "$lock/generation" 2>/dev/null || true)" = "$generation" ] \
+    && ln "$tmp" "$lock/cancel" 2>/dev/null || {
+      rm -f "$tmp" 2>/dev/null || true
+      [ "$(cat "$lock/cancel" 2>/dev/null || true)" = "$generation" ]
+      return
+    }
+  rm -f "$tmp" 2>/dev/null || true
+}
+
+sp_watch_generation_cleanup() {
+  local lock="$1" generation="$2"
+  sp_generation_is_safe "$generation" \
+    && [ "$(cat "$lock/generation" 2>/dev/null || true)" = "$generation" ] || return 1
+  rm -f "$lock/owner" "$lock/launcher" "$lock/pid" "$lock/ts" "$lock/heartbeat" \
+    "$lock/cancel" "$lock/generation" 2>/dev/null || true
+  rmdir "$lock" 2>/dev/null
+}
+
+sp_watch_launcher_matches_pid() {
+  local lock="$1" generation="$2" pid="$3" recorded
+  sp_watch_launcher_is_valid "$lock" "$generation" || return 1
+  recorded="$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["pid"])' "$lock/launcher" 2>/dev/null || true)"
+  [ "$recorded" = "$pid" ] && sp_watch_launcher_is_live "$lock"
+}
+
+sp_watch_launcher_lease_is_fresh() {
+  local lock="$1" generation="$2" stamp now age
+  sp_watch_launcher_is_valid "$lock" "$generation" \
+    && sp_watch_launcher_is_live "$lock" || return 1
+  stamp="$(cat "$lock/heartbeat" 2>/dev/null || true)"
+  case "$stamp" in ''|*[!0-9]*)
+    stamp="$(stat -f %m "$lock" 2>/dev/null || stat -c %Y "$lock" 2>/dev/null || echo 0)"
+    ;;
+  esac
+  now="$(date +%s)"; age=$((now - stamp))
+  [ "$age" -ge 0 ] && [ "$age" -lt "${STITCHPAD_WATCH_RESTART_GRACE:-5}" ]
+}
+
+sp_watch_empty_lock_reclaim() {
+  local lock="$1" now mtime age
+  [ -d "$lock" ] || return 1
+  [ -z "$(find "$lock" -mindepth 1 -maxdepth 1 -print -quit 2>/dev/null)" ] || return 1
+  now="$(date +%s)"
+  mtime="$(stat -f %m "$lock" 2>/dev/null || stat -c %Y "$lock" 2>/dev/null || echo "$now")"
+  age=$((now - mtime))
+  [ "$age" -ge "${STITCHPAD_WATCH_START_GRACE:-5}" ] || return 1
+  rmdir "$lock" 2>/dev/null
+}
+
 sp_watcher_alive() {
   local watch_lock="$PAD_STATE/watch.lock.d"
   [ -d "$watch_lock" ] || return 1
-  local ts now age
-  ts=$(cat "$watch_lock/ts" 2>/dev/null)
-  [ -n "$ts" ] && ts=$(date -ju -f '%Y-%m-%dT%H:%M:%SZ' "$ts" +%s 2>/dev/null || echo 0)
-  [ "$ts" = "0" ] && ts=$(stat -f %m "$watch_lock" 2>/dev/null || stat -c %Y "$watch_lock" 2>/dev/null || echo 0)
-  now=$(date +%s)
-  age=$(( now - ts ))
-  # Grace period (< 5s): trust the lock even if PID not registered yet.
-  # The watcher writes its real PID within 100ms of startup.
-  [ "$age" -lt 5 ] && return 0
-  # Older lock: check PID liveness.
-  local p; p="$(cat "$watch_lock/pid" 2>/dev/null)"
-  [ -n "$p" ] && kill -0 "$p" 2>/dev/null && return 0
-  # Dead or stale — clean so we can re-acquire.
-  rm -rf "$watch_lock" 2>/dev/null || true
+  local generation pid observed
+  generation="$(cat "$watch_lock/generation" 2>/dev/null || true)"
+  if [ -z "$generation" ]; then
+    sp_watch_empty_lock_reclaim "$watch_lock" 2>/dev/null || true
+    return 1
+  fi
+  if ! sp_watch_launcher_is_valid "$watch_lock" "$generation"; then
+    echo "stitchpad: malformed or unknown watcher lock left untouched" >&2
+    return 1
+  fi
+  if [ -f "$watch_lock/owner" ]; then
+    if ! sp_watch_owner_is_valid "$watch_lock" "$generation"; then
+      echo "stitchpad: malformed watcher owner left untouched" >&2
+      return 1
+    fi
+    pid="$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["pid"])' "$watch_lock/owner" 2>/dev/null || true)"
+    if sp_watch_owner_matches "$watch_lock" "$generation" "$pid"; then return 0; fi
+    # A daemon's exact live launcher may be between child generations. Remove
+    # only the stale child proof and preserve that fresh supervisor lease.
+    if sp_watch_launcher_lease_is_fresh "$watch_lock" "$generation"; then
+      observed="$(cat "$watch_lock/owner" 2>/dev/null || true)"
+      [ -n "$observed" ] && [ "$(cat "$watch_lock/owner" 2>/dev/null || true)" = "$observed" ] \
+        && rm -f "$watch_lock/owner" "$watch_lock/pid" "$watch_lock/ts" 2>/dev/null || true
+      return 0
+    fi
+    sp_watch_lock_remove_generation "$watch_lock" "$generation" 2>/dev/null || true
+    return 1
+  fi
+  # A valid launcher owns the bounded pre-owner startup or daemon restart gap.
+  if sp_watch_launcher_lease_is_fresh "$watch_lock" "$generation"; then return 0; fi
+  if ! sp_watch_launcher_is_live "$watch_lock"; then
+    sp_watch_lock_remove_generation "$watch_lock" "$generation" 2>/dev/null || true
+  else
+    echo "stitchpad: live launcher has not published a watcher owner" >&2
+  fi
   return 1
 }
 
-sp_watch_processes_for_pad() {
+sp_watch_pairs_for_pad() {
   [ -n "${PAD_MD:-}" ] || return 0
-  ps -axo pid=,ppid=,command= | awk -v pad="$PAD_MD" '
-    index($0, "fswatch -0 " pad) && $0 !~ /awk/ {
-      print $1
-      print $2
-    }
-  ' | sort -nu
+  local pid parent comm command exe args parent_command parent_exe parent_args proven_parent
+  # Filter by the kernel-reported executable name first, then require the full
+  # command to be exactly `fswatch -0 $PAD_MD`. A process merely containing
+  # that text in another argv can never enter the signal candidate set.
+  ps -axo pid=,ppid=,comm= | while read -r pid parent comm; do
+    [ "${comm##*/}" = "fswatch" ] || continue
+    command="$(sp_process_command "$pid")"
+    exe="${command%% *}"; args="${command#"$exe"}"; args="${args# }"
+    [ "${exe##*/}" = "fswatch" ] && [ "$args" = "-0 $PAD_MD" ] || continue
+    proven_parent=0
+    if [ "$parent" -gt 1 ] 2>/dev/null; then
+      parent_command="$(sp_process_command "$parent")"
+      parent_exe="${parent_command%% *}"
+      parent_args="${parent_command#"$parent_exe"}"; parent_args="${parent_args# }"
+      # Signal a non-PID1 parent only when it is this checkout's exact watch.sh
+      # invocation. An unrelated parent never inherits the child's authority.
+      if [ "${parent_exe##*/}" = "bash" ] \
+        && [ "$parent_args" = "$STITCHPAD_HOME/bin/watch.sh" ]; then
+        proven_parent="$parent"
+      fi
+    fi
+    printf '%s %s\n' "$pid" "$proven_parent"
+  done
+}
+
+sp_watch_processes_for_pad() {
+  local child parent
+  while read -r child parent; do
+    [ -n "$child" ] && printf '%s\n' "$child"
+    [ "${parent:-0}" -gt 1 ] 2>/dev/null && printf '%s\n' "$parent"
+  done < <(sp_watch_pairs_for_pad)
+}
+
+sp_watcher_identity_sha256() {
+  local pid="$1" command="$2" exe args comm artifact
+  exe="${command%% *}"; args="${command#"$exe"}"; args="${args# }"
+  if [ "${exe##*/}" = "fswatch" ] && [ "$args" = "-0 $PAD_MD" ]; then
+    comm="$(ps -p "$pid" -o comm= 2>/dev/null | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')"
+    case "$comm" in /*) artifact="$comm" ;; *) artifact="$(command -v "$exe" 2>/dev/null || true)" ;; esac
+  elif [ "${exe##*/}" = "bash" ] && [ "$args" = "$STITCHPAD_HOME/bin/watch.sh" ]; then
+    artifact="$STITCHPAD_HOME/bin/watch.sh"
+  elif [ "${exe##*/}" = "bash" ] && [ "$args" = "$STITCHPAD_HOME/bin/daemon.sh start" ]; then
+    artifact="$STITCHPAD_HOME/bin/daemon.sh"
+  else
+    return 1
+  fi
+  [ -f "$artifact" ] || return 1
+  python3 - "$artifact" <<'PY'
+import hashlib, sys
+digest = hashlib.sha256()
+with open(sys.argv[1], "rb") as handle:
+    for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+        digest.update(chunk)
+print(digest.hexdigest())
+PY
+}
+
+sp_watcher_identity_matches() {
+  local pid="$1" expected_start="$2" expected_command="$3" expected_sha="$4" current_sha
+  sp_process_identity_matches "$pid" "$expected_start" "$expected_command" || return 1
+  current_sha="$(sp_watcher_identity_sha256 "$pid" "$expected_command" 2>/dev/null || true)"
+  [ -n "$expected_sha" ] && [ "$current_sha" = "$expected_sha" ]
 }
 
 sp_watch_fswatch_parents_for_pad() {
-  [ -n "${PAD_MD:-}" ] || return 0
-  ps -axo pid=,ppid=,command= | awk -v pad="$PAD_MD" '
-    index($0, "fswatch -0 " pad) && $0 !~ /awk/ {
-      print $2
-    }
-  ' | sort -nu
+  local child parent
+  while read -r child parent; do
+    [ "${parent:-0}" -gt 1 ] 2>/dev/null && printf '%s\n' "$parent"
+  done < <(sp_watch_pairs_for_pad)
 }
 
 sp_stop_watchers_for_pad() {
@@ -913,40 +1766,113 @@ sp_stop_watchers_for_pad() {
   local watch_lock="$PAD_STATE/watch.lock.d"
   # A scalar list avoids macOS Bash 3.2 treating an empty declared array as an
   # unbound variable under `set -u`.
-  local p pids=""
-  p="$(cat "$watch_lock/pid" 2>/dev/null || true)"
-  [ -n "$p" ] && pids="$pids $p"
+  local p pids="" records="" started command sha start64 command64 remaining i=0 generation owner_pid launcher_pid
+  # Do not trust a bare PID file: the PID may have been reused. The exact
+  # fswatch command path below proves both the fixture child and its live
+  # parent relationship before either PID enters the signal list.
   while IFS= read -r p; do
     [ -n "$p" ] && pids="$pids $p"
   done < <(sp_watch_processes_for_pad)
+  generation="$(cat "$watch_lock/generation" 2>/dev/null || true)"
+  if [ -d "$watch_lock" ] && [ -z "$generation" ]; then
+    sp_watch_empty_lock_reclaim "$watch_lock" 2>/dev/null && return 0
+    echo "stitchpad: fresh or unknown ownerless watcher lock left untouched for $PAD_MD" >&2
+    return 1
+  fi
+  if [ -d "$watch_lock" ] && ! sp_watch_launcher_is_valid "$watch_lock" "$generation"; then
+    echo "stitchpad: malformed or unknown watcher lock left untouched for $PAD_MD" >&2
+    return 1
+  fi
+  if [ -f "$watch_lock/owner" ]; then
+    if ! sp_watch_owner_is_valid "$watch_lock" "$generation"; then
+      echo "stitchpad: malformed watcher ownership left untouched for $PAD_MD" >&2
+      return 1
+    fi
+    owner_pid="$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["pid"])' "$watch_lock/owner" 2>/dev/null || true)"
+    if sp_watch_owner_matches "$watch_lock" "$generation" "$owner_pid"; then
+      pids="$pids $owner_pid"
+    else
+      # Valid manifest + identity mismatch proves the recorded watcher is gone.
+      # Reclaim its generation below without signaling the reused PID.
+      :
+    fi
+  fi
+  if [ -d "$watch_lock" ]; then
+    launcher_pid="$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["pid"])' "$watch_lock/launcher" 2>/dev/null || true)"
+    sp_watch_launcher_is_live "$watch_lock" && pids="$pids $launcher_pid"
+  fi
 
-  rm -rf "$watch_lock" 2>/dev/null || true
+  # Snapshot a full process identity while the exact fswatch child/parent
+  # relationship is observable. Numeric PIDs alone are never retained as
+  # signal authority across the TERM→KILL window.
   for p in $pids; do
-    kill "$p" 2>/dev/null || true
+    started="$(sp_process_start "$p")"
+    command="$(sp_process_command "$p")"
+    sha="$(sp_watcher_identity_sha256 "$p" "$command" 2>/dev/null || true)"
+    start64="$(sp_b64_encode "$started")"
+    command64="$(sp_b64_encode "$command")"
+    [ -n "$started" ] && [ -n "$command" ] && [ -n "$sha" ] \
+      && records="${records}${p}|${sha}|${start64}|${command64}"$'\n'
   done
+
+  if [ -n "$generation" ]; then
+    # Keep canonical occupied until every exact old-generation process is dead;
+    # otherwise a delayed owner link can land in a successor generation.
+    sp_watch_cancel_generation "$watch_lock" "$generation" || return 1
+  else
+    # Only an empty pre-generation startup lock is safe to remove without
+    # ownership evidence.
+    rmdir "$watch_lock" 2>/dev/null || true
+  fi
+  while IFS='|' read -r p sha start64 command64; do
+    [ -n "$p" ] || continue
+    started="$(sp_b64_decode "$start64" 2>/dev/null || true)"
+    command="$(sp_b64_decode "$command64" 2>/dev/null || true)"
+    sp_watcher_identity_matches "$p" "$started" "$command" "$sha" \
+      && kill "$p" 2>/dev/null || true
+  done <<< "$records"
   sleep 0.2
-  for p in $pids; do
-    kill -0 "$p" 2>/dev/null && kill -KILL "$p" 2>/dev/null || true
+  while IFS='|' read -r p sha start64 command64; do
+    [ -n "$p" ] || continue
+    started="$(sp_b64_decode "$start64" 2>/dev/null || true)"
+    command="$(sp_b64_decode "$command64" 2>/dev/null || true)"
+    sp_watcher_identity_matches "$p" "$started" "$command" "$sha" \
+      && kill -KILL "$p" 2>/dev/null || true
+  done <<< "$records"
+  # Do not report teardown complete while an exact fixture process is still
+  # visible. This also lets init reap a just-killed fswatch child before tests
+  # assert zero process residue.
+  while [ "$i" -lt 20 ]; do
+    remaining="$(sp_watch_processes_for_pad)"
+    [ -z "$remaining" ] && break
+    sleep 0.05
+    i=$((i + 1))
   done
+  if [ -n "$generation" ]; then
+    sp_watch_generation_cleanup "$watch_lock" "$generation" 2>/dev/null || true
+  else
+    rmdir "$watch_lock" 2>/dev/null || true
+  fi
+  [ -z "${remaining:-}" ] && [ ! -d "$watch_lock" ]
 }
 
 sp_reap_duplicate_watchers_for_pad() {
   [ -n "${PAD_STATE:-}" ] || return 0
   local watch_lock="$PAD_STATE/watch.lock.d"
-  local keep parent parents=()
-  keep="$(cat "$watch_lock/pid" 2>/dev/null || true)"
-  if [ -z "$keep" ] || ! kill -0 "$keep" 2>/dev/null; then
-    sp_stop_watchers_for_pad
-    return 1
+  local generation keep="" parent only="" count=0
+  generation="$(cat "$watch_lock/generation" 2>/dev/null || true)"
+  if [ -f "$watch_lock/owner" ] && sp_watch_owner_is_valid "$watch_lock" "$generation"; then
+    keep="$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["pid"])' "$watch_lock/owner" 2>/dev/null || true)"
+    sp_watch_owner_matches "$watch_lock" "$generation" "$keep" || keep=""
   fi
-
   while IFS= read -r parent; do
-    [ -n "$parent" ] && parents+=( "$parent" )
+    [ -n "$parent" ] || continue
+    only="$parent"; count=$((count + 1))
   done < <(sp_watch_fswatch_parents_for_pad)
-
-  if [ "${#parents[@]}" -eq 1 ] && [ "${parents[0]}" = "$keep" ]; then
-    return 0
-  fi
+  [ "$count" -eq 1 ] && [ -n "$keep" ] && [ "$only" = "$keep" ] && return 0
+  # No fswatch during the bounded startup/restart phase is healthy when the
+  # exact supervisor lease is fresh; do not cancel it based on a missing pid.
+  [ "$count" -eq 0 ] && sp_watch_launcher_lease_is_fresh "$watch_lock" "$generation" && return 0
 
   sp_stop_watchers_for_pad
   return 1
@@ -955,7 +1881,7 @@ sp_reap_duplicate_watchers_for_pad() {
 ensure_watcher() {
   [ -n "${PAD_DIR:-}" ] || sp_init_paths || return 0
   local watch_lock="$PAD_STATE/watch.lock.d"
-  local watch_log="$PAD_STATE/watch.log"
+  local watch_log="$PAD_STATE/watch.log" watch_generation
   # Only spawn if someone is alive and listening
   sp_any_alive || return 0
   # Already running? Nothing to do.
@@ -971,16 +1897,30 @@ ensure_watcher() {
     # Lost the race. Brief sleep lets winner write its PID, then re-check.
     sleep 0.3
     sp_watcher_alive && return 0
-    # Stale lock. Clean and retry once.
-    rm -rf "$watch_lock" 2>/dev/null || true
-    mkdir "$watch_lock" 2>/dev/null || return 0
+    # Unknown/ownerless contention fails closed; a later ensure can retry after
+    # the exact stop path reconciles it.
+    return 0
   fi
-  # Spawn the watcher. No trap — the watcher removes the lock on exit.
-  ( STITCHPAD_PAD_DIR="$PAD_DIR" bash "$STITCHPAD_HOME/bin/watch.sh" >>"$watch_log" 2>&1 ) &
-  # Placeholder PID+ts so concurrent callers see a fresh lock during the grace
-  # period. The watcher overwrites both with its real PID on startup.
-  echo $$ > "$watch_lock/pid"
+  if [ -n "${STITCHPAD_WATCH_TEST_AFTER_MKDIR_BARRIER:-}" ]; then
+    local watch_mkdir_barrier="$STITCHPAD_WATCH_TEST_AFTER_MKDIR_BARRIER"
+    printf '%s' ready > "$watch_mkdir_barrier.ready"
+    while [ ! -f "$watch_mkdir_barrier.release" ]; do sleep 0.01; done
+  fi
+  watch_generation="$(date +%s).$$.${RANDOM:-0}"
+  printf '%s' "$watch_generation" > "$watch_lock/generation" || {
+    rmdir "$watch_lock" 2>/dev/null || true
+    return 0
+  }
+  sp_watch_launcher_write "$watch_lock" "$watch_generation" || {
+    sp_watch_lock_remove_generation "$watch_lock" "$watch_generation" 2>/dev/null || true
+    return 0
+  }
   date -u +%Y-%m-%dT%H:%M:%SZ > "$watch_lock/ts"
+  # Spawn the watcher. No trap — the watcher removes the lock on exit.
+  ( STITCHPAD_PAD_DIR="$PAD_DIR" STITCHPAD_WATCH_GENERATION="$watch_generation" \
+      bash "$STITCHPAD_HOME/bin/watch.sh" >>"$watch_log" 2>&1 ) &
+  # The watcher atomically claims owner and publishes its own PID. Until then,
+  # ts supplies only a brief startup grace—never signal authority.
   disown %-
   return 0
 }

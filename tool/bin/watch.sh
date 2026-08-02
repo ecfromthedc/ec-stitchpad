@@ -22,22 +22,82 @@ BIN_DIR="$(cd -P "$(dirname "$_src")" && pwd)"
 source "$BIN_DIR/lib.sh"
 sp_init_paths || { echo "no stitchpad"; exit 1; }
 
-# Self-register: overwrite the lock pid file with MY real PID. The spawner
-# writes $! (subshell PID) as a placeholder, but the actual watcher process has
-# a different PID after exec. This is the authoritative registration.
-if [ -d "$PAD_STATE/watch.lock.d" ]; then
-  echo $$ > "$PAD_STATE/watch.lock.d/pid"
-  echo "$(date -u +%Y-%m-%dT%H:%M:%SZ)" > "$PAD_STATE/watch.lock.d/ts"
+# Register an exact watcher generation before any startup work. Direct
+# foreground `stitchpad watch` acquires its own lock; daemon-launched watchers
+# inherit the generation published by daemon.sh. A second contender may write
+# an owner, but only the final exact generation/PID/start/command owner is
+# allowed to reach fswatch.
+WATCH_LOCK="$PAD_STATE/watch.lock.d"
+WATCH_LAUNCHED=0
+if [ ! -d "$WATCH_LOCK" ]; then
+  # A daemon child is never allowed to recreate a cancelled supervisor
+  # generation. Only an explicitly direct watcher may acquire a fresh lock.
+  [ -z "${STITCHPAD_WATCH_GENERATION:-}" ] || exit 1
+  mkdir "$WATCH_LOCK" 2>/dev/null || exit 1
+  WATCH_GENERATION="$(date +%s).$$.${RANDOM:-0}"
+  printf '%s' "$WATCH_GENERATION" > "$WATCH_LOCK/generation" || exit 1
+  sp_watch_launcher_write "$WATCH_LOCK" "$WATCH_GENERATION" || exit 1
+else
+  WATCH_LAUNCHED=1
+  # Only a launcher that knows the exact pre-published generation may claim an
+  # existing ownerless lock. An unrelated foreground contender exits without
+  # modifying owner state.
+  WATCH_GENERATION="${STITCHPAD_WATCH_GENERATION:-}"
+  [ -n "$WATCH_GENERATION" ] \
+    && [ "$(cat "$WATCH_LOCK/generation" 2>/dev/null || true)" = "$WATCH_GENERATION" ] \
+    || exit 1
 fi
-# Ensure lock cleanup on ANY exit (normal, crash, heartbeat timeout).
-trap 'rm -rf "$PAD_STATE/watch.lock.d" 2>/dev/null' EXIT INT TERM
+[ -n "$WATCH_GENERATION" ] || exit 1
+sp_watch_launcher_is_valid "$WATCH_LOCK" "$WATCH_GENERATION" || exit 1
+[ "$(cat "$WATCH_LOCK/cancel" 2>/dev/null || true)" != "$WATCH_GENERATION" ] || exit 1
+sp_watch_owner_claim "$WATCH_LOCK" "$WATCH_GENERATION" "$$" || exit 1
+[ "$(cat "$WATCH_LOCK/cancel" 2>/dev/null || true)" != "$WATCH_GENERATION" ] || exit 1
+printf '%s' "$$" > "$WATCH_LOCK/pid" || exit 1
+printf '%s' "$(date -u +%Y-%m-%dT%H:%M:%SZ)" > "$WATCH_LOCK/ts" || exit 1
+watcher_cleanup() {
+  if sp_watch_owner_matches "$WATCH_LOCK" "$WATCH_GENERATION" "$$" 2>/dev/null; then
+    if [ "$WATCH_LAUNCHED" -eq 1 ]; then
+      # The daemon supervisor retains generation+launcher across a child crash
+      # so it can restart. Remove only this exact child's ownership record.
+      date +%s > "$WATCH_LOCK/heartbeat" 2>/dev/null || true
+      _watch_owner_observed="$(cat "$WATCH_LOCK/owner" 2>/dev/null || true)"
+      [ -n "$_watch_owner_observed" ] \
+        && [ "$(cat "$WATCH_LOCK/owner" 2>/dev/null || true)" = "$_watch_owner_observed" ] \
+        && rm -f "$WATCH_LOCK/owner" 2>/dev/null || true
+      [ "$(cat "$WATCH_LOCK/pid" 2>/dev/null || true)" != "$$" ] \
+        || rm -f "$WATCH_LOCK/pid" "$WATCH_LOCK/ts" 2>/dev/null || true
+    else
+      sp_watch_lock_remove_generation "$WATCH_LOCK" "$WATCH_GENERATION" 2>/dev/null || true
+    fi
+  fi
+}
+trap 'watcher_cleanup' EXIT
+trap 'exit 130' INT
+trap 'exit 143' TERM
+
+# Deterministic startup/stop race seam. Production is unchanged unless this
+# explicit test path is set.
+if [ -n "${STITCHPAD_WATCH_TEST_BEFORE_FSWATCH_BARRIER:-}" ]; then
+  _watch_barrier="$STITCHPAD_WATCH_TEST_BEFORE_FSWATCH_BARRIER"
+  _watch_i=0
+  printf '%s' ready > "$_watch_barrier.ready"
+  while [ ! -f "$_watch_barrier.release" ] && [ "$_watch_i" -lt 500 ]; do
+    sleep 0.01
+    _watch_i=$((_watch_i + 1))
+  done
+  [ -f "$_watch_barrier.release" ] || exit 1
+fi
+
+[ "$(cat "$WATCH_LOCK/cancel" 2>/dev/null || true)" != "$WATCH_GENERATION" ] || exit 1
 
 # Per-user mention counters live in state.
 count_file() { echo "$PAD_STATE/count.$1"; }
 
 # Seed baselines so we only react to NEW mentions. Snapshot the roster first so
 # this loop doesn't hold a process-substitution fd open across the body.
-declare -a SEED=()
+# Bash 3.2 + `set -u` treats an expanded empty array as unbound. A skipped
+# sentinel keeps empty-roster foreground watches well-defined.
+declare -a SEED=( "" )
 while IFS= read -r _l; do SEED+=("$_l"); done < <(sp_roster)
 for _m in "${SEED[@]}"; do
   IFS='|' read -r _name _ _ _ <<< "$_m"
@@ -102,7 +162,6 @@ react() {
     done
     if [ "$_any_alive" -eq 0 ]; then
       echo "[stitchpad] all heartbeats stale — watcher exiting"
-      rm -rf "$PAD_STATE/watch.lock.d" 2>/dev/null || true
       exit 0
     fi
   fi
@@ -118,7 +177,7 @@ react() {
   fi
 
   sp_commit "update ($(date '+%H:%M:%S'))"
-  local -a members=()
+  local -a members=( "" )
   local rline
   while IFS= read -r rline; do members+=("$rline"); done < <(sp_roster)
   local m name adapter wake target
@@ -205,4 +264,8 @@ react() {
 # Trap errors in the main loop so the watcher doesn't die on a single adapter failure.
 trap 'echo "[stitchpad] watcher error at line $LINENO — continuing" >&2' ERR
 
+# Stop may have removed or replaced the generation at any point during startup.
+# Re-prove ownership immediately before spawning fswatch; the signal traps above
+# exit rather than merely cleaning and continuing.
+sp_watch_owner_matches "$WATCH_LOCK" "$WATCH_GENERATION" "$$" || exit 1
 fswatch -0 "$PAD_MD" | while read -r -d "" _ev; do react </dev/null; done

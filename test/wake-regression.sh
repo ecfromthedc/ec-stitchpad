@@ -32,15 +32,7 @@ stop_watcher() {
     _name="$(basename "$_lock")"; _name="${_name#heartbeat.}"; _name="${_name%.lock}"
     STITCHPAD_PAD_DIR="$d/.stitchpad" "$SP" heartbeat --stop "$_name" >/dev/null 2>&1 || true
   done
-  for _pidfile in "$d"/.stitchpad/.state/alive-ticker.*.pid; do
-    [ -f "$_pidfile" ] || continue
-    # PID files are tiny regular files; a direct read is portable to macOS
-    # (which does not ship GNU `timeout`) and cannot block on a pipe/device.
-    _pid="$(cat "$_pidfile" 2>/dev/null || true)"
-    [ -n "$_pid" ] && kill -9 "$_pid" 2>/dev/null || true
-  done
   "$SP" daemon stop >/dev/null 2>&1 || true
-  pkill -9 -f "fswatch.*$d" 2>/dev/null || true
   sleep 0.2
 }
 
@@ -48,38 +40,157 @@ HOST_HOME="$HOME"
 tmp="$(mktemp -d /tmp/stitchpad-wake-regression.XXXXXX)"
 mkdir -p "$tmp/home"
 export HOME="$tmp/home"
-WATCH_PIDS=""
 
-cleanup() {
-  # Stop only fixture-owned watcher parents, heartbeat PIDs, and fswatch children.
+cleanup_fixture_registry() {
+  local registry claim value
+  for registry in "$HOST_HOME/.stitchpad-terminals" "$HOST_HOME/.pasture-terminals"; do
+    [ -d "$registry" ] || continue
+    for claim in "$registry"/*; do
+      [ -f "$claim" ] || continue
+      value="$(cat "$claim" 2>/dev/null || true)"
+      case "$value" in "$tmp"/*) rm -f "$claim" ;; esac
+    done
+  done
+}
+
+fixture_registry_is_clean() {
+  local registry claim value
+  for registry in "$HOST_HOME/.stitchpad-terminals" "$HOST_HOME/.pasture-terminals"; do
+    [ -d "$registry" ] || continue
+    for claim in "$registry"/*; do
+      [ -f "$claim" ] || continue
+      value="$(cat "$claim" 2>/dev/null || true)"
+      case "$value" in "$tmp"/*) return 1 ;; esac
+    done
+  done
+  return 0
+}
+
+fixture_watchers_are_clean() {
+  local case_dir found
+  for case_dir in "$tmp"/*; do
+    [ -d "$case_dir/.stitchpad" ] || continue
+    found="$(
+      STITCHPAD_PAD_DIR="$case_dir/.stitchpad" bash -c \
+        'BIN_DIR="$1/tool/bin"; source "$BIN_DIR/lib.sh"; sp_init_paths >/dev/null 2>&1; sp_watch_processes_for_pad' \
+        _ "$ROOT" 2>/dev/null || true
+    )"
+    if [ -n "$found" ]; then
+      echo "fixture watcher leak under $case_dir: $found" >&2
+      return 1
+    fi
+  done
+  return 0
+}
+
+stop_all_fixture_runtime() {
+  local lock name case_dir
   for lock in "$tmp"/*/.stitchpad/.state/heartbeat.*.lock; do
     [ -d "$lock" ] || continue
     name="$(basename "$lock")"; name="${name#heartbeat.}"; name="${name%.lock}"
     STITCHPAD_PAD_DIR="$(dirname "$(dirname "$lock")")" "$SP" heartbeat --stop "$name" >/dev/null 2>&1 || true
   done
-  for pidfile in "$tmp"/*/.stitchpad/.state/alive-ticker.*.pid; do
-    [ -f "$pidfile" ] || continue
-    pid="$(cat "$pidfile" 2>/dev/null || true)"
-    [ -n "$pid" ] && kill -TERM "$pid" 2>/dev/null || true
+  for case_dir in "$tmp"/*; do
+    [ -d "$case_dir/.stitchpad" ] || continue
+    STITCHPAD_PAD_DIR="$case_dir/.stitchpad" "$SP" daemon stop >/dev/null 2>&1 || true
   done
-  for pid in $WATCH_PIDS; do kill -TERM "$pid" 2>/dev/null || true; done
-  pkill -TERM -f "fswatch.*$tmp" 2>/dev/null || true
-  sleep 0.1
-  for pid in $WATCH_PIDS; do kill -KILL "$pid" 2>/dev/null || true; done
-  pkill -KILL -f "fswatch.*$tmp" 2>/dev/null || true
-  # Ocean join claims its fake session in the machine registry on some nested
-  # runner paths despite fixture HOME. Remove only this fixture's exact claim.
-  host_registry="$HOST_HOME/.stitchpad-terminals"
-  [ ! -d "$HOST_HOME/.pasture-terminals" ] || host_registry="$HOST_HOME/.pasture-terminals"
-  ocean_claim="$host_registry/ocean-session"
-  case "$(cat "$ocean_claim" 2>/dev/null || true)" in
-    "$tmp"/*) rm -f "$ocean_claim" ;;
-  esac
+}
+
+cleanup() {
+  cleanup_rc=$?
+  set +e
+  # Stop only fixture-owned watcher parents, heartbeat PIDs, and fswatch children.
+  stop_all_fixture_runtime
+  fixture_watchers_are_clean || cleanup_rc=1
+  # A nested runtime may restore the host HOME and claim any fixture surface,
+  # not only ocean-session. Remove every exact claim whose pad is under this
+  # fixture root, then prove none remains before deleting the fixture itself.
+  cleanup_fixture_registry
+  fixture_registry_is_clean || cleanup_rc=1
   rm -rf "$tmp"
+  trap - EXIT
+  exit "$cleanup_rc"
 }
 trap cleanup EXIT
 
 export STITCHPAD_HOME="$ROOT/tool"
+
+# Startup/stop race: pause a foreground watcher after exact owner publication
+# but before fswatch. Stop must remove that generation, make the signal handler
+# exit (not continue), and leave neither a lock nor an orphan process.
+startup_case="$tmp/startup-race"
+mkdir "$startup_case"
+cd "$startup_case"
+"$SP" init --name startup-race >/dev/null
+stop_watcher "$startup_case"
+startup_barrier="$tmp/startup-barrier"
+(
+  trap - EXIT
+  STITCHPAD_WATCH_TEST_BEFORE_FSWATCH_BARRIER="$startup_barrier" exec "$SP" watch
+) > "$startup_case/watcher.out" 2>&1 &
+startup_pid=$!
+for _ in 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19 20 21 22 23 24 25 26 27 28 29 30 31 32 33 34 35 36 37 38 39 40; do
+  [ -f "$startup_barrier.ready" ] && break
+  sleep 0.05
+done
+[ -f "$startup_barrier.ready" ] || fail 'paused watcher never published startup ownership'
+[ -s "$startup_case/.stitchpad/.state/watch.lock.d/owner" ] \
+  || fail 'paused watcher omitted exact owner metadata'
+STITCHPAD_PAD_DIR="$startup_case/.stitchpad" "$SP" daemon stop >/dev/null 2>&1 || true
+touch "$startup_barrier.release"
+wait "$startup_pid" 2>/dev/null || true
+[ ! -d "$startup_case/.stitchpad/.state/watch.lock.d" ] \
+  || fail 'paused watcher stop left its generation lock'
+startup_left="$(
+  STITCHPAD_PAD_DIR="$startup_case/.stitchpad" bash -c \
+    'BIN_DIR="$1/tool/bin"; source "$BIN_DIR/lib.sh"; sp_init_paths >/dev/null 2>&1; sp_watch_processes_for_pad' \
+    _ "$ROOT" 2>/dev/null || true
+)"
+[ -z "$startup_left" ] || fail "paused watcher stop left fixture processes: $startup_left"
+
+# Normal ensure_watcher/CLI start publishes the same contract and remains a
+# singleton. A concurrent foreground contender must exit without replacing the
+# live owner's generation or starting a second fswatch.
+singleton_case="$tmp/start-singleton"
+mkdir "$singleton_case"
+cd "$singleton_case"
+"$SP" init --name start-singleton >/dev/null
+"$SP" join agent codex pull - >/dev/null
+stop_watcher "$singleton_case"
+printf '{}' > "$singleton_case/.stitchpad/.state/alive.agent"
+"$SP" start >/dev/null
+singleton_pairs=""
+for _ in 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19 20 21 22 23 24 25 26 27 28 29 30 31 32 33 34 35 36 37 38 39 40; do
+  singleton_pairs="$(
+    STITCHPAD_PAD_DIR="$singleton_case/.stitchpad" bash -c \
+      'BIN_DIR="$1/tool/bin"; source "$BIN_DIR/lib.sh"; sp_init_paths >/dev/null 2>&1; sp_watch_pairs_for_pad' \
+      _ "$ROOT" 2>/dev/null || true
+  )"
+  [ "$(printf '%s\n' "$singleton_pairs" | grep -c .)" -eq 1 ] && break
+  sleep 0.05
+done
+if [ "$(printf '%s\n' "$singleton_pairs" | grep -c .)" -ne 1 ]; then
+  sed -n '1,120p' "$singleton_case/.stitchpad/.state/watch.log" >&2 2>/dev/null || true
+  ls -la "$singleton_case/.stitchpad/.state/watch.lock.d" >&2 2>/dev/null || true
+  fail 'normal CLI start did not produce exactly one fswatch pair'
+fi
+singleton_owner="$singleton_case/.stitchpad/.state/watch.lock.d/owner"
+[ -s "$singleton_owner" ] || fail 'normal CLI start omitted owner manifest'
+owner_before="$(cksum < "$singleton_owner")"
+"$SP" start >/dev/null
+if "$SP" watch > "$singleton_case/contender.out" 2>&1; then
+  fail 'foreground contender stole a live watcher generation'
+fi
+owner_after="$(cksum < "$singleton_owner")"
+[ "$owner_after" = "$owner_before" ] || fail 'foreground contender replaced live owner manifest'
+singleton_pairs="$(
+  STITCHPAD_PAD_DIR="$singleton_case/.stitchpad" bash -c \
+    'BIN_DIR="$1/tool/bin"; source "$BIN_DIR/lib.sh"; sp_init_paths >/dev/null 2>&1; sp_watch_pairs_for_pad' \
+    _ "$ROOT" 2>/dev/null || true
+)"
+[ "$(printf '%s\n' "$singleton_pairs" | grep -c .)" -eq 1 ] \
+  || fail 'repeated CLI start/contender created duplicate fswatch processes'
+stop_watcher "$singleton_case"
 
 # Regression 1: an addressed block should not sweep later replies into the wake
 # prompt. The hook prompt should contain only the addressed message block.
@@ -348,16 +459,13 @@ fi
 	# Start watcher backgrounded, CAPTURE output, trigger fswatch.
 	( trap - EXIT; exec "$SP" watch ) > "$case10/watcher.out" 2>&1 &
 	WATCH_PID=$!
-	WATCH_PIDS="$WATCH_PIDS $WATCH_PID"
 	for _ in 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19 20; do
 	  printf '\n' >> "$case10/.stitchpad/stitchpad.md"
 	  grep -q 'deferring.*pending recovery target.*ordinal 2' "$case10/watcher.out" 2>/dev/null && break
 	  sleep 0.25
 	done
-	kill -9 $WATCH_PID 2>/dev/null || true
-	wait $WATCH_PID 2>/dev/null || true
-	pkill -9 -f "fswatch.*$case10" 2>/dev/null || true
-	rm -rf "$case10/.stitchpad/.state/watch.lock.d" 2>/dev/null || true
+		stop_watcher "$case10"
+		wait $WATCH_PID 2>/dev/null || true
 
 	# Assert: the DEFER branch actually RAN (deferring line present).
 	if ! grep -q 'deferring.*pending recovery target.*ordinal 2' "$case10/watcher.out"; then
@@ -425,7 +533,6 @@ fi
 	# both cycles ran (adapter failure -> clear -> retry -> clear again).
 	( trap - EXIT; exec "$SP" watch ) > "$case12/watcher.out" 2>&1 &
 	WATCH_PID=$!
-	WATCH_PIDS="$WATCH_PIDS $WATCH_PID"
 
 	# EVENT 1: trigger fswatch, adapter fails, pending cleared.
 	for _ in 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19 20; do
@@ -452,10 +559,8 @@ fi
 	[ "${_s12_2:-0}" -eq 0 ] \
 	  || fail "invariant5: seen advanced after event-2 failure; seen=$_s12_2"
 
-	kill -9 $WATCH_PID 2>/dev/null || true
-	wait $WATCH_PID 2>/dev/null || true
-	pkill -9 -f "fswatch.*$case12" 2>/dev/null || true
-	rm -rf "$case12/.stitchpad/.state/watch.lock.d" 2>/dev/null || true
+		stop_watcher "$case12"
+		wait $WATCH_PID 2>/dev/null || true
 
 	# Assert: TWO adapter failure calls (branch ran twice, not once,
 	# not zero — proves event 2 retried instead of deferring forever).
@@ -495,17 +600,14 @@ EOF
 	STITCHPAD_NAME=sender "$SP" say '@agent exactly once over ocean push' >/dev/null
 	( trap - EXIT; PATH="$mockbin:$PATH" exec "$SP" watch ) > "$case13/watcher.out" 2>&1 &
 	WATCH_PID=$!
-	WATCH_PIDS="$WATCH_PIDS $WATCH_PID"
 	sleep 0.5
 	printf '\n' >> "$case13/.stitchpad/stitchpad.md"
 	for _ in 1 2 3 4 5 6 7 8 9 10; do
 	  [ "$(cat "$case13/.stitchpad/.state/seen.agent" 2>/dev/null || echo 0)" -eq 1 ] && break
 	  sleep 0.5
 	done
-	kill -9 $WATCH_PID 2>/dev/null || true
+	stop_watcher "$case13"
 	wait $WATCH_PID 2>/dev/null || true
-	pkill -9 -f "fswatch.*$case13" 2>/dev/null || true
-	rm -rf "$case13/.stitchpad/.state/watch.lock.d" 2>/dev/null || true
 
 	grep -q 'unanswered @agent -> firing ocean (push)' "$case13/watcher.out" \
 	  || fail 'ocean exactly-once branch did not fire adapter'
@@ -514,4 +616,10 @@ EOF
 	[ ! -f "$case13/.stitchpad/.state/pending.agent" ] \
 	  || fail 'ocean successful delivery left replay-causing pending stamp'
 
+	stop_all_fixture_runtime
+	cleanup_fixture_registry
+	fixture_registry_is_clean \
+	  || fail 'fixture path leaked into the machine-global terminal registry'
+	fixture_watchers_are_clean \
+	  || fail 'fixture watcher process survived exact teardown'
 	printf 'wake regression ok\n'

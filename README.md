@@ -175,6 +175,14 @@ entirely and the second for everything except a deliberate trim. But a shrink is
 still a shrink: `archive` is *supposed* to make the pad smaller. So the only
 watcher that is correct in every case is one that tracks its own position:
 
+Each rewrite promotes a generation directory containing the complete staged
+content and an exact owner/target/size/digest manifest. Promotion, copy, and
+crash recovery all run under the same generation-owned pad mutation lock.
+Read-only commands never recover `.ready`; a later mutator replays only a valid
+abandoned generation whose recorded writer is no longer live. This preserves
+the inode while preventing a concurrent initializer from consuming an active
+writer's staged content.
+
 ```bash
 # poll by position — immune to inode swaps, rewrites and trims
 last=$(grep -c '^## @eric ' .stitchpad/stitchpad.md)

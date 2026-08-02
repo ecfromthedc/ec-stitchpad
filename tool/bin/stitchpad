@@ -299,7 +299,9 @@ EOF
     # remember whether it was live so we don't fake liveness for a dead agent.
     _hb_live=0
     _hlck="$PAD_STATE/heartbeat.$old.lock"
-    [ -d "$_hlck" ] && kill -0 "$(cat "$_hlck/pid" 2>/dev/null)" 2>/dev/null && _hb_live=1
+    _hgen="$(cat "$_hlck/generation" 2>/dev/null || true)"
+    _hpid="$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["pid"])' "$_hlck/owner" 2>/dev/null || true)"
+    [ -n "$_hgen" ] && sp_ticker_owner_matches "$_hlck" "$_hgen" "$_hpid" "$old" && _hb_live=1
     "$BIN_DIR/stitchpad" heartbeat --stop "$old" >/dev/null 2>&1 || true
     sp_lock || exit 1
     tmp="$(sp_stage "$PAD_MD")"
@@ -364,46 +366,8 @@ EOF
     sp_init_paths || exit 1
 
     _reset_kill_ticker() {   # signal only a live process with exact durable ownership proof
-      local who="$1" lockd pid="" alive_pid="" i=0
-      lockd="$PAD_STATE/heartbeat.$who.lock"
-      pid="$(cat "$lockd/pid" 2>/dev/null || true)"
-      alive_pid="$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1])).get("pid",""))' "$PAD_STATE/alive.$who" 2>/dev/null || true)"
-
-      if [ -n "$alive_pid" ] && [ "$alive_pid" != "$pid" ] && kill -0 "$alive_pid" 2>/dev/null; then
-        echo "stitchpad: @$who alive metadata points at unverified live pid $alive_pid; refusing to discard or replace it" >&2
-        return 1
-      fi
-      if [ -n "$pid" ] && kill -0 "$pid" 2>/dev/null; then
-        if ! sp_ticker_owner_matches "$lockd" "$pid" "$who"; then
-          echo "stitchpad: @$who has live but unverified ticker pid $pid; refusing to signal or replace it" >&2
-          return 1
-        fi
-        if ! kill "$pid" 2>/dev/null; then
-          echo "stitchpad: could not signal verified ticker pid $pid for @$who" >&2
-          return 1
-        fi
-        echo "  · signaled verified ticker pid $pid (@$who)"
-        # Wait for its exit trap before replacement. If escalation is needed,
-        # re-prove the same PID/start/command identity immediately beforehand.
-        while kill -0 "$pid" 2>/dev/null && [ "$i" -lt 20 ]; do sleep 0.1; i=$((i+1)); done
-        if kill -0 "$pid" 2>/dev/null; then
-          if sp_ticker_owner_matches "$lockd" "$pid" "$who"; then
-            kill -KILL "$pid" 2>/dev/null || true
-          else
-            echo "stitchpad: @$who ticker ownership changed while stopping pid $pid; refusing escalation" >&2
-            return 1
-          fi
-        fi
-      elif [ -n "$alive_pid" ] && kill -0 "$alive_pid" 2>/dev/null; then
-        # A live alive.* PID without the matching verified lock may be a reused
-        # PID or a one-shot touch. It is metadata to report, never authority to
-        # signal or discard.
-        echo "stitchpad: @$who has live but unverified alive pid $alive_pid; refusing to signal or replace it" >&2
-        return 1
-      fi
-      rm -rf "$lockd" 2>/dev/null
-      rm -f "$PAD_STATE/alive.$who" 2>/dev/null
-      return 0
+      local who="$1"
+      sp_ticker_stop_owned "$who" || return 1
     }
     _reset_scrub_ghost() {   # remove every trace of a name no longer in the roster
       local who="$1" _pfx _f
@@ -924,7 +888,7 @@ PY
     # AUTO-WATCHER: stop watcher if roster is empty (no members = no heartbeats).
     _remaining="$(sp_roster | grep -cv '^[[:space:]]*$' 2>/dev/null || echo 0)"
     if [ "${_remaining:-0}" -le 0 ]; then
-      rm -rf "$PAD_STATE/watch.lock.d" 2>/dev/null \
+      sp_stop_watchers_for_pad 2>/dev/null \
         && echo "── last member left — wake watcher stopped ──"
     fi
     ;;
@@ -1184,11 +1148,11 @@ PY
     sub="${1:-start}"; shift || true
 
     heartbeat_write() {
-      local who="$1" pid="$2" parent="$3" session="$4" surface="$5" target="$6"
+      local who="$1" pid="$2" parent="$3" session="$4" surface="$5" target="$6" generation="${7:-}"
       local alive="$PAD_STATE/alive.$who" tmp="$PAD_STATE/.alive.$who.$$"
-      python3 - "$who" "$pid" "$parent" "$session" "$surface" "$target" > "$tmp" <<'PY'
+      python3 - "$who" "$pid" "$parent" "$session" "$surface" "$target" "$generation" > "$tmp" <<'PY'
 import json, sys, time
-name, pid, parent, session, surface, target = sys.argv[1:7]
+name, pid, parent, session, surface, target, generation = sys.argv[1:8]
 def num(v):
     try:
         return int(v)
@@ -1202,6 +1166,7 @@ print(json.dumps({
     "session": session,
     "surface": surface,
     "target": target,
+    "generation": generation,
 }, separators=(",", ":")))
 PY
       mv "$tmp" "$alive"
@@ -1224,30 +1189,98 @@ PY
         lockd="$PAD_STATE/heartbeat.$who.lock"
         mkdir -p "$PAD_STATE"
         if [ -d "$lockd" ]; then
-          oldpid="$(cat "$lockd/pid" 2>/dev/null || true)"
-          if [ -n "$oldpid" ] && kill -0 "$oldpid" 2>/dev/null; then
-            if sp_ticker_owner_matches "$lockd" "$oldpid" "$who"; then
-              "$BIN_DIR/stitchpad" heartbeat --touch "$who" "$oldpid" >/dev/null 2>&1 || true
-              echo "heartbeat already running for @$who (pid $oldpid)"
+          generation="$(cat "$lockd/generation" 2>/dev/null || true)"
+          if [ -z "$generation" ]; then
+            _hb_now="$(date +%s)"
+            _hb_mtime="$(stat -f %m "$lockd" 2>/dev/null || stat -c %Y "$lockd" 2>/dev/null || echo "$_hb_now")"
+            if [ -z "$(find "$lockd" -mindepth 1 -maxdepth 1 -print -quit 2>/dev/null)" ]; then
+              if [ $((_hb_now - _hb_mtime)) -lt "${STITCHPAD_HEARTBEAT_START_GRACE:-5}" ]; then
+                echo "heartbeat already starting for @$who"
+                exit 0
+              fi
+              rmdir "$lockd" 2>/dev/null || exit 1
+            else
+              sp_ticker_stop_owned "$who" || exit 1
+            fi
+          elif sp_generation_is_safe "$generation" \
+            && [ ! -e "$lockd/launcher" ] \
+            && [ -z "$(find "$lockd" -mindepth 1 -maxdepth 1 ! -name generation -print -quit 2>/dev/null)" ]; then
+            _hb_now="$(date +%s)"
+            _hb_mtime="$(stat -f %m "$lockd" 2>/dev/null || stat -c %Y "$lockd" 2>/dev/null || echo "$_hb_now")"
+            if [ $((_hb_now - _hb_mtime)) -lt "${STITCHPAD_HEARTBEAT_START_GRACE:-5}" ]; then
+              echo "heartbeat already starting for @$who"
               exit 0
             fi
-            echo "stitchpad: heartbeat @$who has live but unverified pid $oldpid; refusing to signal, replace, or duplicate it" >&2
-            exit 1
+            rm -f "$lockd/generation" 2>/dev/null || true
+            rmdir "$lockd" 2>/dev/null || exit 1
           fi
-          rm -rf "$lockd"
+        fi
+        if [ -d "$lockd" ]; then
+          generation="$(cat "$lockd/generation" 2>/dev/null || true)"
+          if [ -n "$generation" ] && sp_ticker_manifest_is_valid "$lockd/launcher" "$generation" "$who"; then
+            if [ "$(cat "$lockd/cancel" 2>/dev/null || true)" = "$generation" ]; then
+              echo "stitchpad: heartbeat @$who is stopping; retry shortly" >&2
+              exit 1
+            fi
+            if [ -f "$lockd/owner" ]; then
+              if ! sp_ticker_manifest_is_valid "$lockd/owner" "$generation" "$who"; then
+                echo "stitchpad: malformed heartbeat @$who owner left untouched" >&2
+                exit 1
+              fi
+              oldpid="$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["pid"])' "$lockd/owner" 2>/dev/null || true)"
+              if sp_ticker_owner_matches "$lockd" "$generation" "$oldpid" "$who"; then
+                echo "heartbeat already running for @$who (pid $oldpid)"
+                exit 0
+              fi
+              # A valid manifest whose exact identity no longer matches is a
+              # dead generation, even if the numeric PID has been reused.
+            elif sp_ticker_manifest_is_live "$lockd/launcher" "$generation" "$who"; then
+              echo "heartbeat already starting for @$who"
+              exit 0
+            fi
+            retired="$(sp_ticker_retire_generation "$lockd" "$generation")" || exit 1
+            sp_ticker_alive_remove_generation "$who" "$generation"
+            sp_ticker_retired_cleanup "$retired" || true
+          else
+            # Preserve unknown live legacy evidence; reclaim only a dead,
+            # known-shape predecessor through the same stop helper.
+            sp_ticker_stop_owned "$who" || exit 1
+          fi
         fi
         if ! mkdir "$lockd" 2>/dev/null; then
-          oldpid="$(cat "$lockd/pid" 2>/dev/null || true)"
-          if [ -n "$oldpid" ] && kill -0 "$oldpid" 2>/dev/null; then
-            if sp_ticker_owner_matches "$lockd" "$oldpid" "$who"; then
-              echo "heartbeat already running for @$who (pid $oldpid)"
-              exit 0
-            fi
-            echo "stitchpad: heartbeat @$who has live but unverified pid $oldpid; refusing to signal, replace, or duplicate it" >&2
-            exit 1
-          fi
-          rm -rf "$lockd"; mkdir "$lockd" 2>/dev/null || exit 1
+          # A concurrent winner owns the canonical name. Re-enter once so its
+          # durable launcher/owner decides the result; never delete it here.
+          sleep 0.05
+          exec "$BIN_DIR/stitchpad" heartbeat start "$who"
         fi
+        if [ -n "${STITCHPAD_HEARTBEAT_TEST_AFTER_MKDIR_BARRIER:-}" ]; then
+          _hb_mkdir_barrier="$STITCHPAD_HEARTBEAT_TEST_AFTER_MKDIR_BARRIER"
+          printf '%s' ready > "$_hb_mkdir_barrier.ready"
+          while [ ! -f "$_hb_mkdir_barrier.release" ]; do sleep 0.01; done
+        fi
+        generation="$(date +%s).$$.${RANDOM:-0}"
+        generation_tmp="$PAD_STATE/.heartbeat-generation.$$.$RANDOM"
+        printf '%s' "$generation" > "$generation_tmp" \
+          && mv "$generation_tmp" "$lockd/generation" || {
+            rm -f "$generation_tmp" 2>/dev/null || true
+            rmdir "$lockd" 2>/dev/null || true
+            exit 1
+          }
+        if ! sp_ticker_launcher_claim "$lockd" "$generation" "$who"; then
+          retired="$(sp_ticker_retire_generation "$lockd" "$generation" 2>/dev/null || true)"
+          [ -z "$retired" ] || sp_ticker_retired_cleanup "$retired" 2>/dev/null || true
+          echo "stitchpad: could not publish heartbeat launcher for @$who" >&2
+          exit 1
+        fi
+        if [ -n "${STITCHPAD_HEARTBEAT_TEST_AFTER_LAUNCHER_BARRIER:-}" ]; then
+          _hb_barrier="$STITCHPAD_HEARTBEAT_TEST_AFTER_LAUNCHER_BARRIER"
+          printf '%s' ready > "$_hb_barrier.ready"
+          while [ ! -f "$_hb_barrier.release" ]; do
+            [ "$(cat "$lockd/cancel" 2>/dev/null || true)" != "$generation" ] || exit 1
+            sleep 0.01
+          done
+        fi
+        [ "$(cat "$lockd/cancel" 2>/dev/null || true)" != "$generation" ] || exit 1
         parent="${STITCHPAD_HEARTBEAT_PARENT_PID:-$PPID}"
         session="${STITCHPAD_SESSION:-}"
         # SURFACE PRIORITY: the ROSTER TARGET is authoritative — it says where
@@ -1268,27 +1301,58 @@ PY
           [ -n "$surface" ] && target="$surface"
         fi
         (
-          # Bash 3.2 (the macOS system bash) has no $BASHPID. The parent
-          # records the background subshell's real pid via $!, then the child
-          # reads it before publishing its first heartbeat.
-          while [ ! -s "$lockd/pid" ]; do sleep 0.01; done
-          ticker_pid="$(cat "$lockd/pid" 2>/dev/null || true)"
-          [ -n "$ticker_pid" ] || exit 1
-          ticker_owner="$(cat "$lockd/owner" 2>/dev/null || true)"
+          # Bash 3.2 has no BASHPID. A direct child reports this background
+          # shell as its PPID, giving the ticker its real process identity.
+          ticker_pid="$(python3 -c 'import os; print(os.getppid())')"
           heartbeat_child_cleanup() {
-            # Delete only the generation this child started with. A delayed
-            # EXIT trap must never erase a replacement lock/alive record.
-            [ -n "$ticker_owner" ] \
-              && [ "$(cat "$lockd/owner" 2>/dev/null || true)" = "$ticker_owner" ] || return 0
-            alive_pid="$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1])).get("pid",""))' "$PAD_STATE/alive.$STITCHPAD_NAME" 2>/dev/null || true)"
-            [ "$alive_pid" != "$ticker_pid" ] || rm -f "$PAD_STATE/alive.$STITCHPAD_NAME" 2>/dev/null || true
-            rm -f "$lockd/pid" "$lockd/owner" 2>/dev/null || true
-            rmdir "$lockd" 2>/dev/null || true
+            if sp_ticker_owner_matches "$lockd" "$generation" "$ticker_pid" "$STITCHPAD_NAME"; then
+              sp_ticker_alive_remove_generation "$STITCHPAD_NAME" "$generation"
+              _hb_owner_observed="$(cat "$lockd/owner" 2>/dev/null || true)"
+              [ -n "$_hb_owner_observed" ] \
+                && [ "$(cat "$lockd/owner" 2>/dev/null || true)" = "$_hb_owner_observed" ] \
+                && rm -f "$lockd/owner" "$lockd/pid" 2>/dev/null || true
+              if [ "$(cat "$lockd/cancel" 2>/dev/null || true)" != "$generation" ] \
+                && ! sp_ticker_manifest_is_live "$lockd/launcher" "$generation" "$STITCHPAD_NAME"; then
+                sp_ticker_generation_cleanup "$lockd" "$generation" 2>/dev/null || true
+              fi
+            fi
           }
           trap 'heartbeat_child_cleanup' EXIT
           trap 'exit 0' HUP INT TERM
+          if [ -n "${STITCHPAD_HEARTBEAT_TEST_BEFORE_OWNER_BARRIER:-}" ]; then
+            _hb_child_barrier="$STITCHPAD_HEARTBEAT_TEST_BEFORE_OWNER_BARRIER"
+            printf '%s' ready > "$_hb_child_barrier.ready"
+            while [ ! -f "$_hb_child_barrier.release" ]; do
+              [ "$(cat "$lockd/generation" 2>/dev/null || true)" = "$generation" ] || exit 1
+              [ "$(cat "$lockd/cancel" 2>/dev/null || true)" != "$generation" ] || exit 1
+              sleep 0.01
+            done
+          fi
+          [ "$(cat "$lockd/cancel" 2>/dev/null || true)" != "$generation" ] || exit 1
+          sp_ticker_owner_claim "$lockd" "$generation" "$ticker_pid" "$STITCHPAD_NAME" || exit 1
+          [ "$(cat "$lockd/cancel" 2>/dev/null || true)" != "$generation" ] || exit 1
+          if [ -n "${STITCHPAD_HEARTBEAT_TEST_AFTER_OWNER_BARRIER:-}" ]; then
+            _hb_owner_barrier="$STITCHPAD_HEARTBEAT_TEST_AFTER_OWNER_BARRIER"
+            printf '%s' ready > "$_hb_owner_barrier.ready"
+            while [ ! -f "$_hb_owner_barrier.release" ]; do
+              sp_ticker_owner_matches "$lockd" "$generation" "$ticker_pid" "$STITCHPAD_NAME" || exit 1
+              [ "$(cat "$lockd/cancel" 2>/dev/null || true)" != "$generation" ] || exit 1
+              sleep 0.01
+            done
+          fi
+          _hb_pid_tmp="$PAD_STATE/.heartbeat-pid.$ticker_pid.$RANDOM"
+          printf '%s' "$ticker_pid" > "$_hb_pid_tmp"
+          if sp_ticker_owner_matches "$lockd" "$generation" "$ticker_pid" "$STITCHPAD_NAME" \
+            && [ "$(cat "$lockd/cancel" 2>/dev/null || true)" != "$generation" ]; then
+            mv "$_hb_pid_tmp" "$lockd/pid"
+          else
+            rm -f "$_hb_pid_tmp" 2>/dev/null || true
+            exit 1
+          fi
           while :; do
-            heartbeat_write "$STITCHPAD_NAME" "$ticker_pid" "$parent" "$session" "$surface" "$target"
+            sp_ticker_owner_matches "$lockd" "$generation" "$ticker_pid" "$STITCHPAD_NAME" || exit 0
+            [ "$(cat "$lockd/cancel" 2>/dev/null || true)" != "$generation" ] || exit 0
+            heartbeat_write "$STITCHPAD_NAME" "$ticker_pid" "$parent" "$session" "$surface" "$target" "$generation"
             sp_term_lock_touch "$surface" "$STITCHPAD_NAME" 2>/dev/null || true
             "$BIN_DIR/stitchpad" ensure-watcher >/dev/null 2>&1 || true
             sleep "$interval" &
@@ -1297,14 +1361,22 @@ PY
           done
         ) &
         ticker_pid=$!
-        if ! sp_ticker_owner_write "$lockd" "$ticker_pid" "$who"; then
+        _hb_wait=0
+        while ! sp_ticker_owner_matches "$lockd" "$generation" "$ticker_pid" "$who"; do
+          kill -0 "$ticker_pid" 2>/dev/null || break
+          [ "$_hb_wait" -lt 200 ] || break
+          sleep 0.01; _hb_wait=$((_hb_wait + 1))
+        done
+        if ! sp_ticker_owner_matches "$lockd" "$generation" "$ticker_pid" "$who"; then
           kill "$ticker_pid" 2>/dev/null || true
           wait "$ticker_pid" 2>/dev/null || true
-          rm -rf "$lockd"
+          if [ "$(cat "$lockd/cancel" 2>/dev/null || true)" != "$generation" ]; then
+            retired="$(sp_ticker_retire_generation "$lockd" "$generation" 2>/dev/null || true)"
+            [ -z "$retired" ] || sp_ticker_retired_cleanup "$retired" 2>/dev/null || true
+          fi
           echo "stitchpad: could not record verified heartbeat ownership for @$who" >&2
           exit 1
         fi
-        echo "$ticker_pid" > "$lockd/pid"
         disown
         echo "heartbeat started for @$who"
         ;;
@@ -1326,30 +1398,22 @@ PY
           _surface="$(sp_this_surface)"
           [ -n "$_surface" ] && _target="$_surface"
         fi
-        heartbeat_write "$who" "$pid" "${STITCHPAD_HEARTBEAT_PARENT_PID:-$PPID}" "${STITCHPAD_SESSION:-}" "$_surface" "$_target"
+        _touch_generation=""
+        _touch_lock="$PAD_STATE/heartbeat.$who.lock"
+        if [ -d "$_touch_lock" ]; then
+          _touch_generation="$(cat "$_touch_lock/generation" 2>/dev/null || true)"
+          _touch_owner_pid="$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["pid"])' "$_touch_lock/owner" 2>/dev/null || true)"
+          [ "$pid" = "$_touch_owner_pid" ] \
+            && sp_ticker_owner_matches "$_touch_lock" "$_touch_generation" "$pid" "$who" \
+            && [ "$(cat "$_touch_lock/cancel" 2>/dev/null || true)" != "$_touch_generation" ] \
+            || exit 1
+        fi
+        heartbeat_write "$who" "$pid" "${STITCHPAD_HEARTBEAT_PARENT_PID:-$PPID}" "${STITCHPAD_SESSION:-}" "$_surface" "$_target" "$_touch_generation"
         ;;
       --stop|stop)
         who="${1:-$(sp_me)}"
         [ -n "$who" ] || exit 0
-        lockd="$PAD_STATE/heartbeat.$who.lock"
-        pid="$(cat "$lockd/pid" 2>/dev/null || true)"
-        if [ -n "$pid" ] && kill -0 "$pid" 2>/dev/null; then
-          if ! sp_ticker_owner_matches "$lockd" "$pid" "$who"; then
-            echo "stitchpad: heartbeat @$who has live but unverified pid $pid; refusing to signal or remove its state" >&2
-            exit 1
-          fi
-          kill "$pid" 2>/dev/null || true
-          for _i in 1 2 3 4 5 6 7 8 9 10; do
-            kill -0 "$pid" 2>/dev/null || break
-            sleep 0.1
-          done
-          if kill -0 "$pid" 2>/dev/null; then
-            sp_ticker_owner_matches "$lockd" "$pid" "$who" \
-              && kill -KILL "$pid" 2>/dev/null || true
-          fi
-        fi
-        rm -rf "$lockd"
-        rm -f "$PAD_STATE/alive.$who"
+        sp_ticker_stop_owned "$who" || exit 1
         echo "heartbeat stopped for @$who"
         ;;
       *)
@@ -1869,9 +1933,9 @@ except: print("")' 2>/dev/null)"
     ;;
 
   start)  sp_init_paths || exit 1; ensure_watcher; echo "→ watcher ensured"; ;;
-  stop)   sp_init_paths || exit 1; if [ -f "$PAD_STATE/watch.lock.d/pid" ]; then kill "$(cat "$PAD_STATE/watch.lock.d/pid")" 2>/dev/null || true; fi; rm -rf "$PAD_STATE/watch.lock.d" 2>/dev/null; echo "→ watcher stopped"; ;;
+  stop)   sp_init_paths || exit 1; sp_stop_watchers_for_pad; echo "→ watcher stopped"; ;;
   status) sp_init_paths || exit 1; sp_watcher_alive && echo "running (pid $(cat "$PAD_STATE/watch.lock.d/pid" 2>/dev/null))" || echo "stopped"; ;;
-  restart) sp_init_paths || exit 1; if [ -f "$PAD_STATE/watch.lock.d/pid" ]; then kill "$(cat "$PAD_STATE/watch.lock.d/pid")" 2>/dev/null || true; fi; rm -rf "$PAD_STATE/watch.lock.d" 2>/dev/null; ensure_watcher; echo "→ watcher restarted"; ;;
+  restart) sp_init_paths || exit 1; sp_stop_watchers_for_pad; ensure_watcher; echo "→ watcher restarted"; ;;
   watch)   exec "$STITCHPAD_HOME/bin/watch.sh" ;;
   daemon)  exec "$STITCHPAD_HOME/bin/daemon.sh" "${@}" ;;
 
@@ -2348,6 +2412,11 @@ except: print("")' 2>/dev/null)"
           esac
         done
         sp_lock || exit 1
+        if [ -L "$PAD_TASKS" ] || [ -L "$PAD_MD" ]; then
+          sp_unlock
+          echo "stitchpad: refusing symlinked task mutation path" >&2
+          exit 1
+        fi
         # Next ID computed UNDER the lock — two agents creating concurrently
         # used to read the same max and mint colliding ids
         existing=$(sp_tasks | awk -F'|' '{print $1}' | sed 's/TASK-//' | sort -n | tail -1)
