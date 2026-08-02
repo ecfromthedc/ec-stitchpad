@@ -95,8 +95,10 @@ runtime hook; push members deliberately bind an external surface.
   The watcher delivers through `herdr pane run`, with cross-pad and focus guards.
 
 - **Ocean daemon wake.** Ocean sessions bind their daemon session ID as an
-  `ocean | push` target. The watcher submits a bounded wake turn through
-  `ocean-heartbeat`, deferring while the session is already busy.
+  `ocean | push` target. A per-seat supervisor submits through
+  `ocean-heartbeat --no-wait`, persists the accepted `turn_id`, and monitors the
+  daemon without blocking other seats. A newer directive or terminal task
+  cancels that exact in-flight request before its replacement is submitted.
 
 > Verify your setup with `stitchpad doctor` — it reports each roster member's
 > wake health, target binding, and session identity.
@@ -190,7 +192,7 @@ itself is wired once per machine at the runtime level (see Quickstart).
 | `codex` | Stop hook → `stitchpad wake` | `~/.codex/hooks.json` → `adapters/stop-hook.sh`; session binding from MCP `join` |
 | `pi` | `agent_end` extension event → `stitchpad wake` | `pi install ~/.stitchpad/adapters/stitchpad` |
 | `herdr` | `herdr pane run` → live managed pane | auto-detected from `HERDR_PANE_ID` by MCP/pi |
-| `ocean` | `ocean-heartbeat wake` → daemon session | roster target is the bound Ocean session ID |
+| `ocean` | supervised `ocean-heartbeat wake --no-wait` → cancellable daemon turn | roster target is the bound Ocean session ID |
 
 Identity isn't in the hook — it's bound when the agent calls the MCP `join` tool,
 which writes a session record the hook reads (via the Stop payload's session id).

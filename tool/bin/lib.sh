@@ -542,6 +542,103 @@ sp_latest_to() {
   ' "$PAD_MD"
 }
 
+# Print one authored message block by its authored-block ordinal.  Delivery
+# state uses this ordinal rather than a byte offset so an append-only pad can be
+# re-read after a watcher/worker restart without persisting untrusted body text
+# in .state.  Anonymous headings do not consume an ordinal, matching
+# sp_engagement.
+sp_message_ordinal() {
+  local want="$1"
+  awk -v want="$want" '
+    /^## / {
+      if (emit) exit
+      if ($2 ~ /^@/) {
+        n++
+        if (n == want) emit=1
+      }
+    }
+    emit { print }
+  ' "$PAD_MD"
+}
+
+# Return the newest currently-unanswered directive for <who> after <since> as:
+#   ordinal|sender|stable-message-id|first-TASK-N-or--
+#
+# Push delivery intentionally coalesces to current work instead of replaying an
+# unbounded FIFO after a worker was offline.  Per-sender reply tracking keeps a
+# reply to Alice from hiding Bob's newer unresolved directive.  Silent acks,
+# fenced/code mentions, self-mentions and handle-boundary rules mirror the
+# engagement gate.  The stable id binds the ordinal to the exact message bytes,
+# so compaction/rewrite drift is rejected before adapter submission.
+sp_current_to_meta() {
+  local who="$1" since="${2:-0}" agents raw ordinal sender block checksum task
+  agents="$(sp_roster 2>/dev/null | cut -d'|' -f1 | tr 'A-Z' 'a-z' | paste -sd, -)"
+  raw="$(awk -v who="$(printf '%s' "$who" | tr 'A-Z' 'a-z')" -v agents="$agents" -v since="$since" '
+    function body_mentions(name,   re) {
+      re="(^|[ \t])@(" name "|all)([^a-z0-9_-]|$)"
+      return (buf ~ re)
+    }
+    function record_replies(   count,tokens,i,t,name) {
+      count=split(buf, tokens, /[ \t\n]+/)
+      for (i=1; i<=count; i++) {
+        t=tolower(tokens[i])
+        if (t ~ /^@[a-z0-9_-]+/) {
+          name=substr(t, 2)
+          sub(/[^a-z0-9_-].*$/, "", name)
+          if (name != "" && name != "all" && name != who) reply[name]=n
+        }
+      }
+    }
+    function flush() {
+      if (author == "") return
+      n++
+      if (author == who) {
+        if (silent || buf ~ /(^|[ \t])@[a-z0-9_-]/) record_replies()
+      } else if (!silent && n > since && body_mentions(who)) {
+        mention[author]=n
+      }
+    }
+    /^## @/ {
+      flush()
+      a=$2; sub(/^@/, "", a); author=tolower(a)
+      buf=""; silent=0; seen_body=0; infence=0
+      next
+    }
+    /^[[:space:]]*```/ { infence=!infence; next }
+    infence { next }
+    !seen_body && /[^[:space:]]/ {
+      seen_body=1
+      b=tolower($0); sub(/^[ \t]*/, "", b)
+      n_at=0; tmp=b
+      while (match(tmp, /@[a-z0-9_-]+/)) { n_at++; tmp=substr(tmp, RSTART+RLENGTH) }
+      sub(/^(@[a-z0-9_-]+[ \t]*)+/, "", b); sub(/[ \t]+$/, "", b)
+      if (n_at < 2) {
+        if (b ~ /^(\.|\[ack\])/) silent=1
+        if (index("," agents ",", "," author ",") > 0 && b ~ /^(ack|read|noted|got it|standing down|standing by|stand by|will do|understood|done here|copy|sounds good)[. !]*$/) silent=1
+      }
+    }
+    { line=tolower($0); gsub(/`[^`]*`/, " ", line); buf=buf " " line }
+    END {
+      flush()
+      best=0; best_sender=""
+      for (s in mention) {
+        if (mention[s] > reply[s] && mention[s] > best) {
+          best=mention[s]; best_sender=s
+        }
+      }
+      if (best > 0) print best "|" best_sender
+    }
+  ' "$PAD_MD")"
+  [ -n "$raw" ] || return 1
+  IFS='|' read -r ordinal sender <<< "$raw"
+  block="$(sp_message_ordinal "$ordinal")"
+  [ -n "$block" ] || return 1
+  checksum="$(printf '%s' "$block" | cksum | awk '{print $1}')"
+  task="$(printf '%s\n' "$block" | grep -oE 'TASK-[0-9]+' | head -1 || true)"
+  [ -n "$task" ] || task="-"
+  printf '%s|%s|m%s-%s|%s\n' "$ordinal" "$sender" "$ordinal" "$checksum" "$task"
+}
+
 # Engagement gate derived from pad CONTENT, not git commit subjects. The watch.sh
 # daemon auto-commits the pad as "update (HH:MM:SS)", which clobbers the authored
 # "<name>: <text>" subject the old gate relied on — so git subjects are unreliable.

@@ -281,9 +281,9 @@ fi
 	#
 	# Regression 11: Hook preserves pending when DND suppresses --force.
 	#
-	# Regression 12: Adapter FAILURE clears pending — no delivery means
-	# no crash recovery target, so the stamp must be cleared to prevent
-	# the next watcher cycle from deferring forever (the deadlock bug).
+	# Regression 12: Adapter FAILURE remains durable in the per-seat supervisor.
+	# The accepted generation stays pending with state=error, and a later watcher
+	# event restarts that same generation instead of losing it or advancing seen.
 
 	# --- Regression 10: Watcher defer-or-queue (production) ---
 	case10="$tmp/case10"
@@ -360,7 +360,7 @@ fi
 	# Assert: delivered_no_reply was NOT created (never recovered the message).
 	[ ! -f "$case11/.stitchpad/.state/delivered_no_reply.agent" ] || fail 'invariant5: hook wrote delivered_no_reply under DND without recovering'
 
-	# --- Regression 12: Adapter failure clears pending (production) ---
+	# --- Regression 12: Adapter failure preserves supervised pending (production) ---
 	case12="$tmp/case12"
 	mkdir "$case12"
 	cd "$case12"
@@ -369,8 +369,7 @@ fi
 	stop_watcher "$case12"
 
 	# Post a mention and start the watcher — the test-fail adapter exits 1,
-	# so fire_adapter returns failure. The watcher must create then CLEAR
-	# the pending stamp (no delivery = nothing to recover from crash).
+	# so the seat worker records a durable error and keeps its accepted generation.
 	STITCHPAD_NAME=fable "$SP" say '@agent delivery test' >/dev/null
 
 	# Watcher captures output; trigger TWO fswatch events to prove
@@ -379,21 +378,26 @@ fi
 	WATCH_PID=$!
 	sleep 0.5
 
-	# EVENT 1: trigger fswatch, adapter fails, pending cleared.
+	# EVENT 1: trigger fswatch; adapter fails and supervised pending survives.
 	printf '\n' >> "$case12/.stitchpad/stitchpad.md"
 	sleep 1.5
-	[ ! -f "$case12/.stitchpad/.state/pending.agent" ] \
-	  || fail 'invariant5: pending not cleared after event-1 adapter failure'
+	[ -f "$case12/.stitchpad/.state/delivery.agent.pending" ] \
+	  || fail 'supervision: adapter failure discarded accepted generation'
+	grep -q '^state=error$' "$case12/.stitchpad/.state/delivery.agent.state" \
+	  || fail 'supervision: adapter failure did not persist error state'
 	_s12_1="$(cat "$case12/.stitchpad/.state/seen.agent" 2>/dev/null || echo 0)"
 	[ "${_s12_1:-0}" -eq 0 ] \
 	  || fail "invariant5: seen advanced after event-1 failure; seen=$_s12_1"
 
-	# EVENT 2: trigger fswatch again — same mention is still unanswered,
-	# watcher must fire adapter again (no deadlock from stale pending).
+	# EVENT 2: same mention is still current; watcher restarts the failed
+	# generation without creating a duplicate generation or consuming seen.
+	_gen12="$(cat "$case12/.stitchpad/.state/delivery.agent.generation")"
 	printf '\n' >> "$case12/.stitchpad/stitchpad.md"
 	sleep 1.5
-	[ ! -f "$case12/.stitchpad/.state/pending.agent" ] \
-	  || fail 'invariant5: pending not cleared after event-2 adapter failure'
+	[ "$(cat "$case12/.stitchpad/.state/delivery.agent.generation")" = "$_gen12" ] \
+	  || fail 'supervision: retry created a duplicate generation'
+	[ -f "$case12/.stitchpad/.state/delivery.agent.pending" ] \
+	  || fail 'supervision: retry discarded failed generation'
 	_s12_2="$(cat "$case12/.stitchpad/.state/seen.agent" 2>/dev/null || echo 0)"
 	[ "${_s12_2:-0}" -eq 0 ] \
 	  || fail "invariant5: seen advanced after event-2 failure; seen=$_s12_2"
@@ -403,9 +407,10 @@ fi
 	pkill -9 -f "fswatch.*$case12" 2>/dev/null || true
 	rm -rf "$case12/.stitchpad/.state/watch.lock.d" 2>/dev/null || true
 
-	# Assert: TWO adapter failure calls (branch ran twice, not once,
-	# not zero — proves event 2 retried instead of deferring forever).
-	_failcount="$(grep -c 'exit 1 (not consuming gate)' "$case12/watcher.out" 2>/dev/null || echo 0)"
+	# Assert: TWO adapter failure calls in the independent seat log (branch ran
+	# twice, proving event 2 supervised the error instead of wedging forever).
+	_failcount="$(grep -c 'exit 1 (not consuming gate)' "$case12/.stitchpad/.state/delivery.agent.log" 2>/dev/null || true)"
+	_failcount="${_failcount:-0}"
 	[ "${_failcount:-0}" -ge 2 ] \
 	  || fail "invariant5: expected >=2 adapter-failure calls, got $_failcount"
 
@@ -434,6 +439,7 @@ printf '{"session":{"active_turn":null}}\n'
 EOF
 	cat > "$mockbin/ocean-heartbeat" <<'EOF'
 #!/usr/bin/env bash
+printf '{"ok":true,"session_id":"ocean-session","turn_id":"turn-13"}\n'
 exit 0
 EOF
 	chmod +x "$mockbin/curl" "$mockbin/ocean-heartbeat"
@@ -452,10 +458,12 @@ EOF
 	pkill -9 -f "fswatch.*$case13" 2>/dev/null || true
 	rm -rf "$case13/.stitchpad/.state/watch.lock.d" 2>/dev/null || true
 
-	grep -q 'unanswered @agent -> firing ocean (push)' "$case13/watcher.out" \
-	  || fail 'ocean exactly-once branch did not fire adapter'
+	grep -q '^state=completed$' "$case13/.stitchpad/.state/delivery.agent.state" \
+	  || fail 'ocean exactly-once branch did not complete supervised delivery'
 	[ "$(cat "$case13/.stitchpad/.state/seen.agent" 2>/dev/null || echo 0)" -eq 1 ] \
 	  || fail 'ocean successful delivery did not consume seen cursor'
+	[ ! -f "$case13/.stitchpad/.state/delivery.agent.pending" ] \
+	  || fail 'ocean successful delivery left supervised pending state'
 	[ ! -f "$case13/.stitchpad/.state/pending.agent" ] \
 	  || fail 'ocean successful delivery left replay-causing pending stamp'
 

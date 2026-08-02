@@ -7,8 +7,10 @@
 # The roster target (the session id) arrives as $SP_TARGET.
 #
 # Delivery = `ocean-heartbeat wake`: POST the nudge as a turn on that exact
-# session and wait for the turn to finish. Exit contract:
-#   0 delivered (turn completed) · 3 deferred (busy/timeout) · 1 failed.
+# session. Standalone callers wait for completion. The per-seat supervisor sets
+# SP_DELIVERY_ACK_FILE, uses --no-wait, persists the returned turn_id, monitors
+# it, and can cancel that exact request if work is superseded. Exit contract:
+#   0 accepted/delivered · 3 deferred (busy/timeout) · 1 failed.
 # The Stop hook (stitchpad hook via [[hooks.Stop]] in ocean.toml) then keeps
 # the agent engaged at turn boundaries; bind the session once with:
 #   stitchpad bind-session <session-id> <name>
@@ -45,12 +47,7 @@ if [ "$active" = "busy" ]; then
   exit 3
 fi
 
-"$bin" wake \
-  --session-id "$session_id" \
-  --cwd "$pad_dir" \
-  --client-type "stitchpad" \
-  --timeout-seconds 600 \
-  --prompt "stitchpad: new @${name} mention on the pad at ${pad}.
+prompt="stitchpad: new @${name} mention on the pad at ${pad}.
 
 ${msg}
 
@@ -58,4 +55,17 @@ You are @${name} on this pad. Read the recent conversation with:
   cd ${pad_dir} && ~/.stitchpad/bin/stitchpad read -n 30
 then reply with:
   cd ${pad_dir} && STITCHPAD_NAME=${name} ~/.stitchpad/bin/stitchpad say '<your reply>'"
-exit $?
+
+wake_args=(wake --session-id "$session_id" --cwd "$pad_dir" --client-type stitchpad \
+  --timeout-seconds 600 --prompt "$prompt")
+[ -n "${SP_DELIVERY_ACK_FILE:-}" ] && wake_args+=(--no-wait)
+
+out="$("$bin" "${wake_args[@]}")" || exit $?
+if [ -n "${SP_DELIVERY_ACK_FILE:-}" ]; then
+  turn_id="$(printf '%s' "$out" | python3 -c 'import json,sys
+try: print(json.load(sys.stdin).get("turn_id", ""))
+except Exception: print("")' 2>/dev/null)"
+  [ -n "$turn_id" ] || { echo '[ocean.sh] accepted wake omitted turn_id' >&2; exit 1; }
+  printf '%s\n' "$out" > "$SP_DELIVERY_ACK_FILE"
+fi
+printf '%s\n' "$out"
