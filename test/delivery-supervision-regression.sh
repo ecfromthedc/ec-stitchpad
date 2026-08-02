@@ -5,6 +5,11 @@ ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 TMP="$(mktemp -d "${TMPDIR:-/tmp}/stitchpad-delivery.XXXXXX")"
 TEST_TOOL="$TMP/tool"
 pass=0
+TEST_RUNNER_PID="$$"
+TEST_RUNNER_PARENT_PID="$PPID"
+TEST_PID_REGISTRY="$TMP/owned-processes"
+: > "$TEST_PID_REGISTRY"
+export STITCHPAD_TEST_PID_REGISTRY="$TEST_PID_REGISTRY"
 
 fail() {
   printf 'FAIL: %s\n' "$1" >&2
@@ -16,19 +21,144 @@ ok() {
   pass=$((pass + 1))
 }
 
-cleanup() {
-  local pid_file pid
-  for pid_file in "$TMP"/case-*/.stitchpad/.state/delivery.*.worker.lock.d/pid; do
-    [ -f "$pid_file" ] || continue
-    pid="$(cat "$pid_file" 2>/dev/null || true)"
-    [ -n "$pid" ] && kill "$pid" 2>/dev/null || true
-  done
-  pkill -TERM -f "$TMP" 2>/dev/null || true
-  sleep 0.1
-  pkill -KILL -f "$TMP" 2>/dev/null || true
-  rm -rf "$TMP"
+test_process_start() {
+  ps -p "$1" -o lstart= 2>/dev/null | sed 's/^[[:space:]]*//;s/[[:space:]]*$//' || true
 }
-trap cleanup EXIT
+
+test_command_proof() {
+  printf '%s' "$1" | shasum -a 256 | awk '{print $1}'
+}
+
+register_fixture_pid() {
+  local pid="$1" kind="$2" proof="$3" start command command_proof
+  [ -n "$pid" ] || return 1
+  start="$(test_process_start "$pid")"; [ -n "$start" ] || return 1
+  command="$(ps -p "$pid" -o command= 2>/dev/null || true)"
+  case "$kind" in
+    descendant) ;;
+    *) [[ "$command" == *"$proof"* ]] || return 1 ;;
+  esac
+  command_proof="$(test_command_proof "$command")"
+  printf '%s|%s|%s|%s|%s\n' "$pid" "$start" "$kind" "$proof" "$command_proof" \
+    >> "$TEST_PID_REGISTRY"
+}
+
+register_fixture_descendants() {
+  local parent="$1" root="$2" child
+  for child in $(pgrep -P "$parent" 2>/dev/null || true); do
+    register_fixture_pid "$child" descendant "$root" || continue
+    register_fixture_descendants "$child" "$root"
+  done
+}
+
+register_live_fixture_workers() {
+  local owner_file pid start token pad name current command
+  local -a owner_files
+  shopt -s nullglob
+  owner_files=("$TMP"/case-*/.stitchpad/.state/delivery.*.worker.lock.d/owner)
+  shopt -u nullglob
+  [ "${#owner_files[@]}" -gt 0 ] || return 0
+  for owner_file in "${owner_files[@]}"; do
+    IFS='|' read -r pid start token pad name < "$owner_file" || continue
+    case "$pad" in "$TMP"/case-*/.stitchpad) ;; *) continue ;; esac
+    [ "$owner_file" = "$pad/.state/delivery.$name.worker.lock.d/owner" ] || continue
+    current="$(test_process_start "$pid")"; [ -n "$current" ] && [ "$current" = "$start" ] || continue
+    command="$(ps -p "$pid" -o command= 2>/dev/null || true)"
+    [[ "$command" == *"$ROOT/tool/bin/watch.sh --delivery-worker $name $token"* ]] || continue
+    printf '%s|%s|worker|%s|%s\n' "$pid" "$start" "$ROOT/tool/bin/watch.sh" \
+      "$(test_command_proof "$command")" >> "$TEST_PID_REGISTRY"
+  done
+}
+
+registered_pid_is_live() {
+  local pid="$1" start="$2" kind="$3" proof="$4" recorded_command_proof="$5"
+  local current command process_state command_proof
+  [ "$pid" != "$TEST_RUNNER_PID" ] && [ "$pid" != "$TEST_RUNNER_PARENT_PID" ] || return 1
+  current="$(test_process_start "$pid")"; [ -n "$current" ] && [ "$current" = "$start" ] || return 1
+  process_state="$(ps -p "$pid" -o stat= 2>/dev/null || true)"
+  case "$process_state" in *Z*) return 1 ;; esac
+  command="$(ps -p "$pid" -o command= 2>/dev/null || true)"
+  command_proof="$(test_command_proof "$command")"
+  [ "$command_proof" = "$recorded_command_proof" ] || return 1
+  case "$kind" in
+    descendant) return 0 ;;
+    *) [[ "$command" == *"$proof"* ]] ;;
+  esac
+}
+
+stop_fixture_processes() {
+  local pid start kind proof command_proof seen=" " tries live=0
+  register_live_fixture_workers
+  # Snapshot every verified root's process tree before sending signals. Child
+  # records retain PID + process-start identity even if their parent exits and
+  # they are reparented during teardown.
+  while IFS='|' read -r pid start kind proof command_proof; do
+    [ "$kind" = descendant ] && continue
+    registered_pid_is_live "$pid" "$start" "$kind" "$proof" "$command_proof" || continue
+    register_fixture_descendants "$pid" "$pid"
+  done < "$TEST_PID_REGISTRY"
+  while IFS='|' read -r pid start kind proof command_proof; do
+    case "$seen" in *" $pid "*) continue ;; esac
+    seen="$seen$pid "
+    registered_pid_is_live "$pid" "$start" "$kind" "$proof" "$command_proof" || continue
+    kill -TERM "$pid" 2>/dev/null || true
+  done < "$TEST_PID_REGISTRY"
+  tries=40
+  while [ "$tries" -gt 0 ]; do
+    live=0
+    while IFS='|' read -r pid start kind proof command_proof; do
+      registered_pid_is_live "$pid" "$start" "$kind" "$proof" "$command_proof" && { live=1; break; }
+    done < "$TEST_PID_REGISTRY"
+    [ "$live" -eq 0 ] && break
+    tries=$((tries - 1)); sleep 0.05
+  done
+  seen=" "
+  while IFS='|' read -r pid start kind proof command_proof; do
+    case "$seen" in *" $pid "*) continue ;; esac
+    seen="$seen$pid "
+    registered_pid_is_live "$pid" "$start" "$kind" "$proof" "$command_proof" || continue
+    kill -KILL "$pid" 2>/dev/null || true
+  done < "$TEST_PID_REGISTRY"
+  sleep 0.05
+  while IFS='|' read -r pid start kind proof command_proof; do
+    if registered_pid_is_live "$pid" "$start" "$kind" "$proof" "$command_proof"; then
+      printf 'FAIL: fixture-owned process survived cleanup: %s %s %s\n' "$pid" "$kind" "$proof" >&2
+      return 1
+    fi
+  done < "$TEST_PID_REGISTRY"
+}
+
+cleanup_on_exit() {
+  local rc=$?
+  [ "${BASH_SUBSHELL:-0}" -eq 0 ] || return "$rc"
+  [ "$$" = "$TEST_RUNNER_PID" ] || return "$rc"
+  trap - EXIT
+  stop_fixture_processes || rc=1
+  rm -rf "$TMP"
+  exit "$rc"
+}
+trap cleanup_on_exit EXIT
+
+if [ "${STITCHPAD_DELIVERY_CLEANUP_CHILD:-0}" = 1 ]; then
+  [ -n "${STITCHPAD_CLEANUP_CHILD_REPORT:-}" ] || exit 97
+  cat > "$TMP/failure-cleanup-probe.sh" <<'FAILURE_CLEANUP_PROBE'
+#!/usr/bin/env bash
+sleep 30
+FAILURE_CLEANUP_PROBE
+  chmod +x "$TMP/failure-cleanup-probe.sh"
+  bash "$TMP/failure-cleanup-probe.sh" & failure_cleanup_probe=$!
+  register_fixture_pid "$failure_cleanup_probe" test-helper "$TMP/failure-cleanup-probe.sh" || exit 98
+  failure_cleanup_child=""
+  for _ in $(seq 1 100); do
+    failure_cleanup_child="$(pgrep -P "$failure_cleanup_probe" 2>/dev/null | head -1 || true)"
+    [ -n "$failure_cleanup_child" ] && break
+    sleep 0.01
+  done
+  [ -n "$failure_cleanup_child" ] || exit 99
+  printf '%s|%s|%s\n' "$TMP" "$failure_cleanup_probe" "$failure_cleanup_child" \
+    > "$STITCHPAD_CLEANUP_CHILD_REPORT"
+  exit 23
+fi
 
 mkdir -p "$TEST_TOOL/adapters"
 ln -s "$ROOT/tool/bin" "$TEST_TOOL/bin"
@@ -39,6 +169,13 @@ ln -s "$ROOT/tool/bin" "$TEST_TOOL/bin"
 cat > "$TEST_TOOL/adapters/mock.sh" <<'MOCK'
 #!/usr/bin/env bash
 set -u
+if [ -n "${STITCHPAD_TEST_PID_REGISTRY:-}" ]; then
+  start="$(ps -p "$$" -o lstart= 2>/dev/null | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')"
+  command="$(ps -p "$$" -o command= 2>/dev/null || true)"
+  command_proof="$(printf '%s' "$command" | shasum -a 256 | awk '{print $1}')"
+  [ -n "$start" ] && printf '%s|%s|adapter|%s|%s\n' "$$" "$start" "$0" "$command_proof" \
+    >> "$STITCHPAD_TEST_PID_REGISTRY"
+fi
 name="$2"
 state="$SP_PAD_DIR/.state"
 mode="$(cat "$state/mock.$name.mode" 2>/dev/null || printf success)"
@@ -130,6 +267,60 @@ unset STITCHPAD_WATCH_LIB_ONLY
 export SP_DELIVERY_RETRY_SECONDS=0.05
 
 printf 'delivery supervision regressions\n'
+
+# Prove teardown is scoped to registered fixture ownership. The registered
+# helper and its child must stop; an unregistered control and the runner/parent
+# must survive. A failing subshell must also be unable to run root teardown.
+cat > "$TMP/owned-cleanup-probe.sh" <<'CLEANUP_PROBE'
+#!/usr/bin/env bash
+sleep 30
+CLEANUP_PROBE
+chmod +x "$TMP/owned-cleanup-probe.sh"
+bash "$TMP/owned-cleanup-probe.sh" & owned_cleanup_probe=$!
+register_fixture_pid "$owned_cleanup_probe" test-helper "$TMP/owned-cleanup-probe.sh" \
+  || fail 'cleanup probe could not be registered with process identity'
+owned_cleanup_child=""
+for _ in $(seq 1 100); do
+  owned_cleanup_child="$(pgrep -P "$owned_cleanup_probe" 2>/dev/null | head -1 || true)"
+  [ -n "$owned_cleanup_child" ] && break
+  sleep 0.01
+done
+[ -n "$owned_cleanup_child" ] || fail 'cleanup probe child did not start'
+sleep 30 & unrelated_cleanup_control=$!
+if ! stop_fixture_processes 2> "$TMP/cleanup-probe.stderr"; then
+  cat "$TMP/cleanup-probe.stderr" >&2
+  fail 'exact fixture cleanup failed'
+fi
+wait "$owned_cleanup_probe" 2>> "$TMP/cleanup-probe.stderr" || true
+kill -0 "$owned_cleanup_probe" 2>/dev/null && fail 'registered fixture process survived exact cleanup'
+kill -0 "$owned_cleanup_child" 2>/dev/null && fail 'registered fixture descendant survived exact cleanup'
+kill -0 "$unrelated_cleanup_control" 2>/dev/null || fail 'exact cleanup killed an unregistered process'
+kill -0 "$TEST_RUNNER_PID" 2>/dev/null || fail 'exact cleanup killed the test runner'
+kill -0 "$TEST_RUNNER_PARENT_PID" 2>/dev/null || fail 'exact cleanup killed the test parent'
+subshell_rc=0
+( exit 23 ) || subshell_rc=$?
+[ "$subshell_rc" -eq 23 ] && [ -d "$TMP" ] \
+  || fail 'inherited EXIT handling let a failing subshell tear down the root fixture'
+kill "$unrelated_cleanup_control" 2>/dev/null || true
+wait "$unrelated_cleanup_control" 2>/dev/null || true
+grep -Eq "^$owned_cleanup_probe\|.*\|test-helper\|$TMP/owned-cleanup-probe.sh\|[0-9a-f]{64}$" "$TEST_PID_REGISTRY" \
+  || fail 'cleanup registry omitted exact PID/start/command/path evidence'
+grep -Eq "^$owned_cleanup_child\|.*\|descendant\|$owned_cleanup_probe\|[0-9a-f]{64}$" "$TEST_PID_REGISTRY" \
+  || fail 'cleanup registry omitted descendant command identity proof'
+failure_cleanup_report="$TMP/failure-cleanup-report"
+failure_cleanup_rc=0
+STITCHPAD_DELIVERY_CLEANUP_CHILD=1 STITCHPAD_CLEANUP_CHILD_REPORT="$failure_cleanup_report" \
+  /bin/bash "$0" > "$TMP/failure-cleanup-child.log" 2>&1 || failure_cleanup_rc=$?
+[ "$failure_cleanup_rc" -eq 23 ] || {
+  cat "$TMP/failure-cleanup-child.log" >&2
+  fail 'failure-path cleanup child lost the original exit status'
+}
+IFS='|' read -r failure_cleanup_tmp failure_cleanup_pid failure_cleanup_child < "$failure_cleanup_report"
+[ ! -e "$failure_cleanup_tmp" ] || fail 'failure-path cleanup retained its fixture directory'
+kill -0 "$failure_cleanup_pid" 2>/dev/null && fail 'failure-path cleanup retained a registered process'
+kill -0 "$failure_cleanup_child" 2>/dev/null && fail 'failure-path cleanup retained a registered descendant'
+kill -0 "$TEST_RUNNER_PID" 2>/dev/null || fail 'failure-path cleanup killed the parent test runner'
+ok 'cleanup registry stops only exact fixture-owned processes'
 
 # A blocking seat must not serialize other seats behind it.
 new_case parallel $'slowseat | mock | push | slow-target\nfastseat | mock | push | fast-target'
@@ -232,6 +423,13 @@ ocean_bin="$TMP/ocean-bin"
 mkdir -p "$ocean_bin"
 cat > "$ocean_bin/ocean-heartbeat" <<'HEARTBEAT'
 #!/usr/bin/env bash
+if [ -n "${STITCHPAD_TEST_PID_REGISTRY:-}" ]; then
+  start="$(ps -p "$$" -o lstart= 2>/dev/null | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')"
+  command="$(ps -p "$$" -o command= 2>/dev/null || true)"
+  command_proof="$(printf '%s' "$command" | shasum -a 256 | awk '{print $1}')"
+  [ -n "$start" ] && printf '%s|%s|adapter|%s|%s\n' "$$" "$start" "$0" "$command_proof" \
+    >> "$STITCHPAD_TEST_PID_REGISTRY"
+fi
 state="$STITCHPAD_PAD_DIR/.state"
 count=$(( $(cat "$state/ocean.count" 2>/dev/null || printf 0) + 1 ))
 printf '%s' "$count" > "$state/ocean.count"
@@ -526,6 +724,32 @@ delivery_cancel_ocean_turn pathseat turn-file-link hostile_file_symlink \
 delivery_cancel_ocean_turn pathseat '../turn-traversal' hostile_traversal \
   && fail 'path-traversal turn id was accepted'
 [ "$(cat "$outside/sentinel")" = unchanged ] || fail 'path containment changed external sentinel'
+
+new_case ocean_not_submitted 'nosubmit | ocean | push | ocean-session'
+export STITCHPAD_PAD_DIR="$PAD_DIR"
+cat > "$PAD_TASKS" <<'NOSUBMIT_TASK'
+# tasks
+
+```task TASK-18
+title: never submitted Ocean work
+status: open
+assignee: nosubmit
+---
+must remain distinguishable from a daemon cancellation
+```
+NOSUBMIT_TASK
+hold_worker nosubmit
+append_message operator '@nosubmit prepare TASK-18'
+delivery_enqueue nosubmit ocean push ocean-session
+sed -i.bak 's/status: open/status: done/' "$PAD_TASKS"
+rm -f "$PAD_TASKS.bak"
+delivery_enqueue nosubmit ocean push ocean-session
+wait_state nosubmit tombstoned || fail 'unsubmitted terminal Ocean task was not tombstoned'
+[ "$(state_value nosubmit turn_status)" = not_submitted ] \
+  || fail 'unsubmitted Ocean task was mislabeled as cancelled'
+[ -z "$(state_value nosubmit turn_id)" ] || fail 'unsubmitted Ocean task invented a turn id'
+[ ! -f "$PAD_STATE/ocean.cancels" ] || fail 'unsubmitted Ocean task called the daemon cancel endpoint'
+release_worker nosubmit
 
 new_case cancel_lock 'lockseat | ocean | push | ocean-session'
 export STITCHPAD_PAD_DIR="$PAD_DIR"
