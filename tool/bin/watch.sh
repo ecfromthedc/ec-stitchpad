@@ -95,7 +95,36 @@ delivery_turn_file() { echo "$PAD_STATE/delivery.$1.turn.$2"; }
 delivery_ack_file() { echo "$PAD_STATE/delivery.$1.ack.$2.json"; }
 delivery_submit_file() { echo "$PAD_STATE/delivery.$1.submit.$2"; }
 delivery_keeper_reservation() { echo "$PAD_STATE/delivery.$1.keeper-reservation"; }
+delivery_keeper_invalid() { echo "$PAD_STATE/delivery.$1.keeper-reservation.invalid"; }
 delivery_now() { date -u +%Y-%m-%dT%H:%M:%SZ; }
+
+delivery_process_start() {
+  ps -p "$1" -o lstart= 2>/dev/null | sed 's/^[[:space:]]*//;s/[[:space:]]*$//' || true
+}
+
+delivery_parse_ocean_ack() {
+  local file="$1" target="$2"
+  python3 -c 'import json,sys
+try:
+ d=json.load(open(sys.argv[1])); turn=d.get("turn_id", ""); sid=d.get("session_id")
+ valid=d.get("ok") is True and isinstance(turn,str) and bool(turn.strip())
+ valid=valid and (sid is None or str(sid)==sys.argv[2])
+ print(turn.strip() if valid else "")
+except Exception: print("")' "$file" "$target" 2>/dev/null
+}
+
+delivery_report_invalid_keeper() {
+  local name="$1" reason="$2" raw="$3" file tmp digest
+  file="$(delivery_keeper_invalid "$name")"
+  digest="$(printf '%s' "$raw" | cksum | awk '{print $1 ":" $2}')"
+  tmp="$(mktemp "$PAD_STATE/.delivery-keeper-invalid.XXXXXX")" || return 1
+  {
+    printf 'detected_at=%s\n' "$(delivery_now)"
+    printf 'reason=%s\n' "$reason"
+    printf 'record_cksum=%s\n' "$digest"
+  } > "$tmp" && mv "$tmp" "$file"
+  echo "[stitchpad] refusing watcher admission for @$name — malformed keeper reservation ($reason)" >&2
+}
 
 delivery_write_state() {
   local name="$1" state="$2" generation="$3" ordinal="$4" message_id="$5"
@@ -122,23 +151,66 @@ delivery_write_state() {
 
 delivery_cancel_ocean_turn() {
   local name="$1" turn_id="$2" reason="$3" dir response http daemon_url lock attempts=0 rc=1
-  local cancel_state terminal
+  local cancel_state terminal token epoch claim claim_base nested owner pid pstart live_start born age
+  local poll_attempts poll_seconds poll_deadline cancel_deadline_seconds lock_attempts lock_sleep stale_path
   [ -n "$turn_id" ] || return 0
   dir="$(delivery_cancel_dir "$name" "$turn_id")"
   mkdir -p "$dir"
   lock="$dir/attempt.lock.d"
-  while ! mkdir "$lock" 2>/dev/null; do
-    case "$(cat "$dir/result" 2>/dev/null || true)" in canceled|completed|errored|cancelled) return 0;; esac
-    attempts=$((attempts + 1)); [ "$attempts" -lt 100 ] || return 1
-    sleep 0.01
+  token="$(date +%s)-$$-$RANDOM-$RANDOM"; epoch="$(date +%s)"
+  lock_attempts="${SP_DELIVERY_CANCEL_LOCK_ATTEMPTS:-500}"
+  case "$lock_attempts" in ''|*[!0-9]*) lock_attempts=500;; esac
+  lock_sleep="${SP_DELIVERY_CANCEL_LOCK_SLEEP_SECONDS:-0.01}"
+  claim="$dir/attempt.claim.$token.d"; claim_base="${claim##*/}"
+  mkdir "$claim" || return 1
+  pstart="$(delivery_process_start "$$")"
+  [ -n "$pstart" ] || { rm -rf "$claim"; return 1; }
+  printf '%s|%s|%s|%s\n' "$$" "$pstart" "$token" "$epoch" > "$claim/owner"
+  while :; do
+    if mv "$claim" "$lock" 2>/dev/null; then
+      if [ "$(cut -d'|' -f3 "$lock/owner" 2>/dev/null || true)" = "$token" ]; then break; fi
+      # Another owner won between our inspection and rename; mv placed our
+      # complete candidate inside its directory. Remove only our tokened child,
+      # rebuild it, and keep waiting.
+      nested="$lock/$claim_base"
+      [ "$(cut -d'|' -f3 "$nested/owner" 2>/dev/null || true)" = "$token" ] && rm -rf "$nested"
+      mkdir "$claim" || return 1
+      printf '%s|%s|%s|%s\n' "$$" "$pstart" "$token" "$epoch" > "$claim/owner"
+    fi
+    case "$(cat "$dir/result" 2>/dev/null || true)" in canceled|completed|errored|cancelled)
+      rm -rf "$claim"; return 0;; esac
+    owner="$(cat "$lock/owner" 2>/dev/null || true)"
+    born="$(cat "$lock/born" 2>/dev/null || stat -f %m "$lock" 2>/dev/null || stat -c %Y "$lock" 2>/dev/null || echo 0)"
+    IFS='|' read -r pid pstart _ _ <<< "$owner"
+    live_start="$(delivery_process_start "$pid")"
+    if [ -n "$pid" ] && kill -0 "$pid" 2>/dev/null && [ -n "$pstart" ] && [ "$live_start" = "$pstart" ]; then
+      attempts=$((attempts + 1)); [ "$attempts" -lt "$lock_attempts" ] || { rm -rf "$claim"; return 1; }
+      sleep "$lock_sleep"; continue
+    fi
+    age=$(( $(date +%s) - ${born:-0} ))
+    if [ -z "$owner" ] && [ "$age" -lt 5 ]; then
+      attempts=$((attempts + 1)); [ "$attempts" -lt "$lock_attempts" ] || { rm -rf "$claim"; return 1; }
+      sleep "$lock_sleep"; continue
+    fi
+    stale_path="$dir/attempt.stale.$token"
+    if mv "$lock" "$stale_path" 2>/dev/null; then
+      # Claims are renamed only after their complete immutable owner record is
+      # written, so an invalid identity cannot become live after this check.
+      rm -rf "$stale_path"
+    fi
   done
   case "$(cat "$dir/result" 2>/dev/null || true)" in
-    canceled|completed|errored|cancelled) rmdir "$lock"; return 0;;
+    canceled|completed|errored|cancelled)
+      [ "$(cut -d'|' -f3 "$lock/owner" 2>/dev/null || true)" = "$token" ] && rm -rf "$lock"
+      return 0;;
   esac
   [ -f "$dir/reason" ] || printf '%s\n' "$reason" > "$dir/reason"
   printf '%s|%s\n' "$(delivery_now)" "$reason" >> "$dir/attempts"
   [ -f "$dir/requested_at" ] || printf '%s\n' "$(delivery_now)" > "$dir/requested_at"
   response="$dir/response"; daemon_url="${OCEAN_DAEMON_URL:-http://127.0.0.1:4780}"
+  cancel_deadline_seconds="${SP_DELIVERY_CANCEL_DEADLINE_SECONDS:-8}"
+  case "$cancel_deadline_seconds" in ''|*[!0-9]*) cancel_deadline_seconds=8;; esac
+  poll_deadline=$(( $(date +%s) + cancel_deadline_seconds ))
   http="$(curl -sS --connect-timeout 2 --max-time 5 -o "$response" -w '%{http_code}' -X POST \
     -H 'content-type: application/json' -d '{}' \
     "$daemon_url/v1/requests/$turn_id/cancel" 2>"$dir/error" || true)"
@@ -148,16 +220,26 @@ try:
  d=json.load(open(sys.argv[1])); print(str(d.get("state", "")).lower() if d.get("ok") is True else "rejected")
 except Exception: print("invalid")' "$response" 2>/dev/null)"
   case "$http:$cancel_state" in
-    2??:cancelling|2??:cancelled) printf 'canceled\n' > "$dir/result"; rc=0 ;;
-    *)
-      terminal="$(delivery_ocean_turn_status "" "$turn_id")"
-      case "$terminal" in
-        completed|errored|cancelled) printf '%s\n' "$terminal" > "$dir/result"; rc=0 ;;
-        *) printf 'cancel_error\n' > "$dir/result"; rc=1 ;;
-      esac
-      ;;
+    2??:cancelled) terminal=cancelled ;;
+    2??:cancelling) terminal=cancelling ;;
+    *) terminal="$(delivery_ocean_turn_status "" "$turn_id")" ;;
   esac
-  rmdir "$lock"
+  poll_attempts="${SP_DELIVERY_CANCEL_POLL_ATTEMPTS:-100}"
+  poll_seconds="${SP_DELIVERY_CANCEL_POLL_SECONDS:-0.05}"
+  attempts=0
+  while :; do
+    case "$terminal" in
+      completed|errored|cancelled)
+        printf '%s\n' "$terminal" > "$dir/result"; rc=0; break ;;
+    esac
+    attempts=$((attempts + 1))
+    if [ "$attempts" -ge "$poll_attempts" ] || [ "$(date +%s)" -ge "$poll_deadline" ]; then
+      printf 'cancel_pending\n' > "$dir/result"; rc=1; break
+    fi
+    sleep "$poll_seconds"
+    terminal="$(delivery_ocean_turn_status "" "$turn_id")"
+  done
+  [ "$(cut -d'|' -f3 "$lock/owner" 2>/dev/null || true)" = "$token" ] && rm -rf "$lock"
   return "$rc"
 }
 
@@ -307,11 +389,17 @@ delivery_worker() {
   local name="$1" token="$2" lock pending generation ordinal message_id task_id accepted_at adapter wake target
   local started rc retry_seconds="${SP_DELIVERY_RETRY_SECONDS:-2}"
   local turn_id turn_status meta current_ordinal current_sender current_id current_task ack_file tmp_turn
-  local attempt_at reconcile
+  local attempt_at reconcile acked_turn owner_tmp process_start
   lock="$(delivery_worker_lock "$name")"
   [ "$(cat "$lock/token" 2>/dev/null || true)" = "$token" ] || exit 0
+  [ ! -f "$lock/stop-requested" ] || exit 0
+  process_start="$(delivery_process_start "$$")"
+  [ -n "$process_start" ] || { delivery_worker_cleanup "$name" "$token"; exit 1; }
+  owner_tmp="$(mktemp "$PAD_STATE/.delivery-worker-owner.XXXXXX")"
+  printf '%s|%s|%s|%s|%s\n' "$$" "$process_start" "$token" "$PAD_DIR" "$name" > "$owner_tmp"
+  [ "$(cat "$lock/token" 2>/dev/null || true)" = "$token" ] && [ ! -f "$lock/stop-requested" ] \
+    && mv "$owner_tmp" "$lock/owner" || { rm -f "$owner_tmp"; exit 0; }
   printf '%s' "$$" > "$lock/pid"
-  printf '%s|%s|%s|%s\n' "$$" "$token" "$PAD_DIR" "$name" > "$lock/owner"
   # EXIT runs after this function's locals have gone out of scope, so retain the
   # seat name explicitly. Referring to local `$name` from the trap leaves every
   # successful/error worker lock behind and permanently wedges that seat.
@@ -327,11 +415,10 @@ delivery_worker() {
     DELIVERY_ACTIVE_ADAPTER="$adapter"; DELIVERY_ACTIVE_TURN="$turn_id"
     DELIVERY_ACTIVE_GENERATION="$generation"
     if [ "$adapter" = ocean ] && [ -z "$turn_id" ] && [ -s "$(delivery_ack_file "$name" "$generation")" ]; then
-      turn_id="$(python3 -c 'import json,sys
-try: print(json.load(open(sys.argv[1])).get("turn_id", ""))
-except Exception: print("")' "$(delivery_ack_file "$name" "$generation")" 2>/dev/null)"
+      turn_id="$(delivery_parse_ocean_ack "$(delivery_ack_file "$name" "$generation")" "$target")"
       if [ -n "$turn_id" ]; then
         printf '%s' "$turn_id" > "$(delivery_turn_file "$name" "$generation")"
+        rm -f "$(delivery_submit_file "$name" "$generation")"
         continue
       fi
     fi
@@ -456,29 +543,39 @@ except Exception: print("")' "$(delivery_ack_file "$name" "$generation")" 2>/dev
       printf '%s|%s\n' "$(delivery_now)" "$message_id" > "$(delivery_submit_file "$name" "$generation")"
     fi
     fire_adapter "$name" "$adapter" "$wake" "$target" "$ordinal" "$ack_file" || rc=$?
-    if [ "$rc" -eq 0 ]; then
-      if [ "$adapter" = ocean ]; then
-        turn_id="$(python3 -c 'import json,sys
-try: print(json.load(open(sys.argv[1])).get("turn_id", ""))
-except Exception: print("")' "$ack_file" 2>/dev/null)"
-        if [ -z "$turn_id" ]; then
-          delivery_write_state "$name" error "$generation" "$ordinal" "$message_id" "$task_id" \
-            "$accepted_at" "$started" "" "$(delivery_now)" missing_turn_id
+    acked_turn=""
+    [ "$adapter" = ocean ] && acked_turn="$(delivery_parse_ocean_ack "$ack_file" "$target")"
+    # A generation-bound valid daemon acknowledgement is stronger evidence than
+    # the wrapper's process status. The child can write the ack and then exit
+    # nonzero (or be terminated) after admission; persist and supervise that
+    # exact turn instead of ever replaying it.
+    if [ "$adapter" = ocean ] && [ -n "$acked_turn" ]; then
+      turn_id="$acked_turn"; DELIVERY_ACTIVE_TURN="$turn_id"
+      tmp_turn="$(mktemp "$PAD_STATE/.delivery-turn.XXXXXX")"
+      printf '%s' "$turn_id" > "$tmp_turn" && mv "$tmp_turn" "$(delivery_turn_file "$name" "$generation")"
+      rm -f "$(delivery_submit_file "$name" "$generation")"
+      if ! delivery_pending_matches "$name" "$generation" "$ordinal" "$message_id"; then
+        if ! delivery_cancel_ocean_turn "$name" "$turn_id" superseded_after_accept; then
+          delivery_write_state "$name" cancel_pending "$generation" "$ordinal" "$message_id" "$task_id" \
+            "$accepted_at" "$started" "" "$(delivery_now)" cancel_failed "$turn_id" cancelling
           break
         fi
-        DELIVERY_ACTIVE_TURN="$turn_id"
-        tmp_turn="$(mktemp "$PAD_STATE/.delivery-turn.XXXXXX")"
-        printf '%s' "$turn_id" > "$tmp_turn" && mv "$tmp_turn" "$(delivery_turn_file "$name" "$generation")"
-        rm -f "$(delivery_submit_file "$name" "$generation")"
-        if ! delivery_pending_matches "$name" "$generation" "$ordinal" "$message_id"; then
-          until delivery_cancel_ocean_turn "$name" "$turn_id" superseded_after_accept; do
-            sleep "$retry_seconds"
-          done
-          continue
-        fi
+        continue
+      fi
+      if [ "$rc" -eq 0 ]; then
         delivery_write_state "$name" in_flight "$generation" "$ordinal" "$message_id" "$task_id" \
           "$accepted_at" "$started" "" "" "" "$turn_id" accepted
-        continue
+      else
+        delivery_write_state "$name" in_flight "$generation" "$ordinal" "$message_id" "$task_id" \
+          "$accepted_at" "$started" "" "" "adapter_exit_${rc}_after_ack" "$turn_id" accepted
+      fi
+      continue
+    fi
+    if [ "$rc" -eq 0 ]; then
+      if [ "$adapter" = ocean ]; then
+        delivery_write_state "$name" acceptance_unknown "$generation" "$ordinal" "$message_id" "$task_id" \
+          "$accepted_at" "$started" "" "$(delivery_now)" invalid_or_missing_ack
+        break
       fi
       # A newer generation or terminal task may have landed while the adapter
       # was running. Never let the old completion consume the newer directive.
@@ -534,13 +631,21 @@ except Exception: print("")' "$ack_file" 2>/dev/null)"
 }
 
 delivery_start_worker() {
-  local name="$1" lock pid token age now born command
+  local name="$1" lock pid token age now born command process_start owner_tmp owner owner_start owner_token owner_pad owner_name
   lock="$(delivery_worker_lock "$name")"
   if [ -d "$lock" ]; then
-    pid="$(cat "$lock/pid" 2>/dev/null || true)"
     token="$(cat "$lock/token" 2>/dev/null || true)"
+    owner="$(cat "$lock/owner" 2>/dev/null || true)"
+    IFS='|' read -r pid owner_start owner_token owner_pad owner_name <<< "$owner"
+    process_start="$(delivery_process_start "$pid")"
+    if [ -z "$owner_name" ] && [ "$owner_start" = "$token" ] \
+       && [ "$owner_token" = "$PAD_DIR" ] && [ "$owner_pad" = "$name" ]; then
+      # Rolling-upgrade compatibility with pid|token|pad|name owners.
+      owner_start="$process_start"; owner_token="$token"; owner_pad="$PAD_DIR"; owner_name="$name"
+    fi
     command="$(ps -p "$pid" -o command= 2>/dev/null || true)"
-    if [ -n "$pid" ] && kill -0 "$pid" 2>/dev/null \
+    if [ -n "$pid" ] && [ "$owner_start" = "$process_start" ] && [ "$owner_token" = "$token" ] \
+       && [ "$owner_pad" = "$PAD_DIR" ] && [ "$owner_name" = "$name" ] && kill -0 "$pid" 2>/dev/null \
        && [[ "$command" == *"--delivery-worker $name $token"* ]]; then return 0; fi
     born="$(cat "$lock/born" 2>/dev/null || stat -f %m "$lock" 2>/dev/null || stat -c %Y "$lock" 2>/dev/null || date +%s)"
     now="$(date +%s)"; age=$((now-born))
@@ -550,11 +655,26 @@ delivery_start_worker() {
   mkdir "$lock" 2>/dev/null || return 0
   token="$(date +%s)-$$-$RANDOM-$RANDOM"
   printf '%s' "$token" > "$lock/token"; date +%s > "$lock/born"
+  [ -n "${SP_DELIVERY_TEST_PRE_SPAWN_DELAY:-}" ] && sleep "$SP_DELIVERY_TEST_PRE_SPAWN_DELAY"
+  [ ! -f "$lock/stop-requested" ] || { delivery_worker_cleanup "$name" "$token"; return 0; }
   STITCHPAD_PAD_DIR="$PAD_DIR" SP_DELIVERY_RETRY_SECONDS="${SP_DELIVERY_RETRY_SECONDS:-2}" \
     bash "$BIN_DIR/watch.sh" --delivery-worker "$name" "$token" </dev/null \
       >> "$PAD_STATE/delivery.$name.log" 2>&1 &
-  pid=$!; printf '%s' "$pid" > "$lock/pid"
-  printf '%s|%s|%s|%s\n' "$pid" "$token" "$PAD_DIR" "$name" > "$lock/owner"
+  pid=$!; process_start="$(delivery_process_start "$pid")"
+  owner_tmp="$(mktemp "$PAD_STATE/.delivery-worker-owner.XXXXXX")"
+  printf '%s|%s|%s|%s|%s\n' "$pid" "$process_start" "$token" "$PAD_DIR" "$name" > "$owner_tmp"
+  if [ "$(cat "$lock/token" 2>/dev/null || true)" = "$token" ] && [ ! -f "$lock/stop-requested" ]; then
+    if [ -n "$process_start" ]; then
+      mv "$owner_tmp" "$lock/owner"
+      printf '%s' "$pid" > "$lock/pid"
+    else
+      # The child publishes its own complete identity before doing any work.
+      # Never overwrite that record with a transiently empty parent-side ps read.
+      rm -f "$owner_tmp"
+    fi
+  else
+    rm -f "$owner_tmp"; kill "$pid" 2>/dev/null || true
+  fi
 }
 
 delivery_enqueue() {
@@ -586,7 +706,7 @@ delivery_enqueue_locked() {
   local name="$1" adapter="$2" wake="$3" target="$4" seen=0 meta ordinal sender message_id task_id
   local pending old_generation old_ordinal old_message old_task old_accepted old_adapter old_wake old_target
   local old_turn old_state generation accepted tmp successor successor_message
-  local keeper_ordinal keeper_message keeper_state
+  local keeper_ordinal keeper_message keeper_state keeper_attempt keeper_extra keeper_raw keeper_reason
   # Preserve an unresolved pre-supervisor terminal-delivery recovery stamp during
   # rolling upgrades. Its Stop hook still owns that accepted turn; enqueueing a
   # newer generation here could present work over a turn that may already have
@@ -611,10 +731,29 @@ delivery_enqueue_locked() {
   fi
   IFS='|' read -r ordinal sender message_id task_id <<< "$meta"
   if [ -f "$(delivery_keeper_reservation "$name")" ]; then
-    IFS='|' read -r keeper_ordinal keeper_message keeper_state _ < "$(delivery_keeper_reservation "$name")"
-    if [ "$keeper_ordinal" = "$ordinal" ] && [ "$keeper_message" = "$message_id" ]; then
-      case "$keeper_state" in accepted|in_flight|completed|acceptance_unknown) return 0;; esac
+    keeper_raw="$(cat "$(delivery_keeper_reservation "$name")" 2>/dev/null || true)"
+    keeper_reason=""
+    case "$keeper_raw" in *$'\n'*) keeper_reason=multiline;; esac
+    IFS='|' read -r keeper_ordinal keeper_message keeper_state keeper_attempt keeper_extra <<< "$keeper_raw"
+    [ -n "$keeper_reason" ] || case "$keeper_ordinal" in ''|*[!0-9]*) keeper_reason=bad_ordinal;; esac
+    [ -n "$keeper_reason" ] || [ -n "$keeper_message" ] || keeper_reason=missing_message
+    [ -n "$keeper_reason" ] || [ -n "$keeper_attempt" ] || keeper_reason=missing_attempt
+    [ -n "$keeper_reason" ] || [ -z "$keeper_extra" ] || keeper_reason=extra_fields
+    if [ -z "$keeper_reason" ]; then
+      case "$keeper_state" in accepted|in_flight|completed|acceptance_unknown) ;;
+        *) keeper_reason=bad_state;; esac
     fi
+    [ -n "$keeper_reason" ] || [ "$keeper_ordinal" != 0 ] || case "$keeper_message" in
+      keeper-task-*) ;;
+      *) keeper_reason=bad_task_id;;
+    esac
+    if [ -n "$keeper_reason" ]; then
+      delivery_report_invalid_keeper "$name" "$keeper_reason" "$keeper_raw" || true
+      return 0
+    fi
+    rm -f "$(delivery_keeper_invalid "$name")"
+    [ "$keeper_ordinal" = 0 ] && return 0
+    [ "$keeper_ordinal" = "$ordinal" ] && [ "$keeper_message" = "$message_id" ] && return 0
   fi
   if [ ! -f "$pending" ] && [ -f "$(delivery_state_file "$name")" ] \
      && [ "$(sed -n 's/^state=//p' "$(delivery_state_file "$name")")" = tombstoned ] \

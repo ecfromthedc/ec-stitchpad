@@ -938,11 +938,35 @@ sp_stop_watchers_for_pad() {
 
 sp_stop_delivery_worker() {
   local name="$1" lock="$PAD_STATE/delivery.$1.worker.lock.d" pid token owner command
+  local owner_start owner_token owner_pad owner_name live_start born age tries=0
   [ -d "$lock" ] || return 0
-  pid="$(cat "$lock/pid" 2>/dev/null || true)"; token="$(cat "$lock/token" 2>/dev/null || true)"
-  owner="$(cat "$lock/owner" 2>/dev/null || true)"; command="$(ps -p "$pid" -o command= 2>/dev/null || true)"
-  if [ -n "$pid" ] && [ "$(printf '%s' "$owner" | cut -d'|' -f3)" = "$PAD_DIR" ] \
-     && [ "$(printf '%s' "$owner" | cut -d'|' -f4)" = "$name" ] \
+  token="$(cat "$lock/token" 2>/dev/null || true)"
+  # Mark intent first. A launcher that has created the lock but not yet spawned
+  # must observe this and abort; an already-starting worker checks it before and
+  # during atomic owner publication.
+  : > "$lock/stop-requested" 2>/dev/null || true
+  while :; do
+    [ -d "$lock" ] || return 0
+    owner="$(cat "$lock/owner" 2>/dev/null || true)"
+    IFS='|' read -r pid owner_start owner_token owner_pad owner_name <<< "$owner"
+    if [ -z "$owner_name" ] && [ "$owner_token" = "$PAD_DIR" ] && [ "$owner_pad" = "$name" ]; then
+      # Rolling-upgrade compatibility with pid|token|pad|name owners.
+      owner_name="$name"; owner_pad="$PAD_DIR"; owner_token="$owner_start"
+      owner_start="$(ps -p "$pid" -o lstart= 2>/dev/null | sed 's/^[[:space:]]*//;s/[[:space:]]*$//' || true)"
+    fi
+    if [ -n "$pid" ] && [ -n "$owner_start" ] && [ "$owner_token" = "$token" ] \
+       && [ "$owner_pad" = "$PAD_DIR" ] && [ "$owner_name" = "$name" ]; then
+      break
+    fi
+    born="$(cat "$lock/born" 2>/dev/null || stat -f %m "$lock" 2>/dev/null || stat -c %Y "$lock" 2>/dev/null || echo 0)"
+    age=$(( $(date +%s) - ${born:-0} ))
+    tries=$((tries + 1))
+    [ "$tries" -lt 200 ] && [ "$age" -lt 5 ] || { pid=""; break; }
+    sleep 0.01
+  done
+  live_start="$(ps -p "$pid" -o lstart= 2>/dev/null | sed 's/^[[:space:]]*//;s/[[:space:]]*$//' || true)"
+  command="$(ps -p "$pid" -o command= 2>/dev/null || true)"
+  if [ -n "$pid" ] && kill -0 "$pid" 2>/dev/null && [ "$live_start" = "$owner_start" ] \
      && [[ "$command" == *"--delivery-worker $name $token"* ]]; then
     kill "$pid" 2>/dev/null || true
     # The worker's TERM trap may spend up to five seconds completing one bounded
@@ -950,7 +974,7 @@ sp_stop_delivery_worker() {
     for _ in $(seq 1 120); do kill -0 "$pid" 2>/dev/null || break; sleep 0.05; done
     kill -0 "$pid" 2>/dev/null && kill -KILL "$pid" 2>/dev/null || true
   fi
-  rm -rf "$lock"
+  [ "$(cat "$lock/token" 2>/dev/null || true)" = "$token" ] && rm -rf "$lock"
 }
 
 sp_delivery_ocean_unresolved_after_stop() {

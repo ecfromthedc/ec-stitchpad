@@ -98,7 +98,9 @@ runtime hook; push members deliberately bind an external surface.
   `ocean | push` target. A per-seat supervisor submits through
   `ocean-heartbeat --no-wait`, persists the accepted `turn_id`, and monitors the
   daemon without blocking other seats. A newer directive or terminal task
-  cancels that exact in-flight request before its replacement is submitted.
+  cancels that exact in-flight request before its replacement is submitted. A
+  `cancelling` response only acknowledges the cancellation request; replacement
+  waits until the exact request registry row is terminal.
   Completion is reconciled against the exact request row from `/v1/requests`;
   canceled, errored, missing, or ambiguous turns never consume the mention.
   DND leaves accepted work pending without submission and resumes it when DND
@@ -112,6 +114,14 @@ owns mention delivery. A fallback keeper may reserve a mention only while that
 worker is absent by atomically writing `delivery.<name>.keeper-reservation` as
 `ordinal|message_id|state|attempt_id`; the supervisor will not duplicate a
 matching accepted, in-flight, completed, or unknown-outcome reservation.
+An ordinal-zero `keeper-task-*` reservation owns the whole seat while that task
+admission is unresolved. Malformed reservations fail closed and leave a durable
+`keeper-reservation.invalid` diagnostic instead of risking a second admission.
+
+Ocean model selection is currently operator-owned runtime state at
+`.state/seat-model.<name>`. Roster columns are not a second model authority; any
+future roster-annotation implementation must explicitly migrate or reconcile
+that file rather than silently choosing one source over the other.
 
 > Verify your setup with `stitchpad doctor` — it reports each roster member's
 > wake health, target binding, and session identity.
