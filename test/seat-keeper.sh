@@ -49,6 +49,9 @@ done
 "$SP" daemon stop >/dev/null 2>&1 || true
 
 new_task() {
+  # This helper is called through command substitution; do not let the
+  # inherited parent EXIT trap delete the shared fixture when it returns.
+  trap - EXIT
   local who="$1" title="$2" status="$3" id
   id="$(STITCHPAD_NAME=operator "$SP" task new "$title" --to "$who" | awk 'NR==1{print $1}')"
   "$SP" wake "$who" >/dev/null 2>&1 || true
@@ -179,18 +182,24 @@ fi
 # attempted acquisition; exactly one accepted wake and one timestamp may result.
 rm -f "$tmp/.stitchpad/.state/keeper-last.alice"
 : > "$calls"
-PATH="$mockbin:$PATH" KEEPER_CALLS="$calls" KEEPER_MOCK_SLEEP=1 \
-  OCEAN_HEARTBEAT_BIN="$mockbin/ocean-heartbeat" STITCHPAD_KEEPER_MIN_SECONDS=600 \
-  "$SP" keeper "$tmp" > "$tmp/concurrent-1.out" 2>&1 &
+(
+  trap - EXIT
+  PATH="$mockbin:$PATH" KEEPER_CALLS="$calls" KEEPER_MOCK_SLEEP=1 \
+    OCEAN_HEARTBEAT_BIN="$mockbin/ocean-heartbeat" STITCHPAD_KEEPER_MIN_SECONDS=600 \
+    exec "$SP" keeper "$tmp"
+) > "$tmp/concurrent-1.out" 2>&1 &
 keeper_one=$!
 for _ in 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19 20; do
   [ -d "$tmp/.stitchpad/.state/keeper.alice.lock.d" ] && break
   sleep 0.05
 done
 [ -d "$tmp/.stitchpad/.state/keeper.alice.lock.d" ] || fail "first keeper never acquired its reservation"
-PATH="$mockbin:$PATH" KEEPER_CALLS="$calls" KEEPER_MOCK_SLEEP=1 \
-  OCEAN_HEARTBEAT_BIN="$mockbin/ocean-heartbeat" STITCHPAD_KEEPER_MIN_SECONDS=600 \
-  "$SP" keeper "$tmp" > "$tmp/concurrent-2.out" 2>&1 &
+(
+  trap - EXIT
+  PATH="$mockbin:$PATH" KEEPER_CALLS="$calls" KEEPER_MOCK_SLEEP=1 \
+    OCEAN_HEARTBEAT_BIN="$mockbin/ocean-heartbeat" STITCHPAD_KEEPER_MIN_SECONDS=600 \
+    exec "$SP" keeper "$tmp"
+) > "$tmp/concurrent-2.out" 2>&1 &
 keeper_two=$!
 wait "$keeper_one" || fail "first concurrent keeper failed"
 wait "$keeper_two" || fail "second concurrent keeper failed"
@@ -256,9 +265,12 @@ ambiguity_task="$(new_task ambiguity 'crash-window task' in_progress)"
 : > "$calls"
 release="$tmp/release-ambiguity"
 ambiguity_seen_before="$(cat "$tmp/.stitchpad/.state/seen.ambiguity" 2>/dev/null || echo 0)"
-PATH="$mockbin:$PATH" KEEPER_CALLS="$calls" KEEPER_MOCK_BLOCK=1 KEEPER_MOCK_RELEASE="$release" \
-  OCEAN_HEARTBEAT_BIN="$mockbin/ocean-heartbeat" STITCHPAD_KEEPER_MIN_SECONDS=0 \
-  "$SP" keeper "$tmp" > "$tmp/ambiguity-1.out" 2>&1 &
+(
+  trap - EXIT
+  PATH="$mockbin:$PATH" KEEPER_CALLS="$calls" KEEPER_MOCK_BLOCK=1 KEEPER_MOCK_RELEASE="$release" \
+    OCEAN_HEARTBEAT_BIN="$mockbin/ocean-heartbeat" STITCHPAD_KEEPER_MIN_SECONDS=0 \
+    exec "$SP" keeper "$tmp"
+) > "$tmp/ambiguity-1.out" 2>&1 &
 keeper_one=$!
 for _ in 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19 20 21 22 23 24 25 26 27 28 29 30 31 32 33 34 35 36 37 38 39 40; do
   [ -f "$tmp/.stitchpad/.state/delivery.ambiguity.keeper-reservation" ] && break

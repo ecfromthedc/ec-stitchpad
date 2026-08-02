@@ -6,6 +6,10 @@ ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 SP="$ROOT/tool/bin/stitchpad"
 FIXTURE_DIR="$(mktemp -d)"
 cleanup() {
+  for name in alice legacy; do
+    STITCHPAD_PAD_DIR="$FIXTURE_DIR/.stitchpad" "$SP" heartbeat --stop "$name" >/dev/null 2>&1 || true
+  done
+  STITCHPAD_PAD_DIR="$FIXTURE_DIR/.stitchpad" "$SP" daemon stop >/dev/null 2>&1 || true
   rm -rf "$FIXTURE_DIR"
 }
 trap cleanup EXIT
@@ -27,11 +31,17 @@ export STITCHPAD_HEARTBEAT_PARENT_PID="$$"
 "$SP" heartbeat start >/dev/null
 
 alive="$FIXTURE_DIR/.stitchpad/.state/alive.alice"
-for _ in 1 2 3 4 5; do
+for _ in 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19 20; do
   [ -f "$alive" ] && break
   sleep 0.2
 done
 [ -f "$alive" ]
+
+owner="$FIXTURE_DIR/.stitchpad/.state/heartbeat.alice.lock/owner"
+[ -s "$owner" ]
+jq -e --arg pad "$FIXTURE_DIR/.stitchpad" \
+  '.name == "alice" and .pad == $pad and (.pid | type == "number") and (.processStart | length > 0) and (.command | contains(" heartbeat start"))' \
+  "$owner" >/dev/null
 
 jq -e '.name == "alice" and .session == "session-test" and .surface == "term-alice" and .target == "term-alice" and (.pid | type == "number") and (.ts | type == "number")' "$alive" >/dev/null
 pid="$(jq -r '.pid' "$alive")"
@@ -71,7 +81,7 @@ legacy_alive="$FIXTURE_DIR/.stitchpad/.state/alive.legacy"
   "$SP" read -n 1 >/dev/null
 )
 
-for _ in 1 2 3 4 5; do
+for _ in 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19 20; do
   [ -f "$legacy_alive" ] && break
   sleep 0.2
 done

@@ -41,6 +41,7 @@ cleanup() {
   for name in regtest-alpha regtest-bravo; do
     STITCHPAD_PAD_DIR="$pad_dir/.stitchpad" "$SP" heartbeat --stop "$name" >/dev/null 2>&1 || true
   done
+  STITCHPAD_PAD_DIR="$pad_dir/.stitchpad" "$SP" daemon stop >/dev/null 2>&1 || true
   [ "$owns_fixture" -eq 0 ] || rm -rf "$pad_dir"
 }
 trap cleanup EXIT

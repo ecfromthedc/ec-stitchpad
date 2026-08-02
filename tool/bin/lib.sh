@@ -163,6 +163,72 @@ sp_session_name() {
 sp_dnd_file() { printf '%s/dnd.%s\n' "$PAD_STATE" "$1"; }
 sp_dnd_is_on() { [ -f "$(sp_dnd_file "$1")" ]; }
 
+# ── Heartbeat ticker ownership ────────────────────────────────────────
+# A PID alone is never ownership proof: after a crash the kernel may reuse it
+# for an unrelated process.  New ticker locks therefore carry the process start
+# identity, exact command line, pad, and seat that the spawning parent observed.
+# Stop/reset callers must match every field against the live process before
+# sending any signal.  Legacy locks without this record deliberately fail
+# closed while their recorded PID is live.
+sp_process_start() {
+  ps -p "$1" -o lstart= 2>/dev/null | sed 's/^[[:space:]]*//;s/[[:space:]]*$//'
+}
+
+sp_process_command() {
+  ps -p "$1" -o command= 2>/dev/null | sed 's/^[[:space:]]*//;s/[[:space:]]*$//'
+}
+
+sp_ticker_owner_write() {
+  local lockd="$1" pid="$2" who="$3" started command tmp
+  [ "${STITCHPAD_HEARTBEAT_TEST_OWNER_WRITE_FAIL:-0}" != "1" ] || return 1
+  started="$(sp_process_start "$pid")"
+  command="$(sp_process_command "$pid")"
+  [ -n "$started" ] && [ -n "$command" ] || return 1
+  tmp="$lockd/.owner.$$"
+  python3 - "$pid" "$started" "$command" "$PAD_DIR" "$who" > "$tmp" <<'PY'
+import json, sys
+pid, started, command, pad, name = sys.argv[1:]
+print(json.dumps({
+    "pid": int(pid),
+    "processStart": started,
+    "command": command,
+    "pad": pad,
+    "name": name,
+}, separators=(",", ":")))
+PY
+  [ -s "$tmp" ] && mv "$tmp" "$lockd/owner" || {
+    rm -f "$tmp" 2>/dev/null || true
+    return 1
+  }
+}
+
+sp_ticker_owner_matches() {
+  local lockd="$1" pid="$2" who="$3" started command
+  [ -f "$lockd/owner" ] || return 1
+  case "$pid" in ''|*[!0-9]*) return 1;; esac
+  kill -0 "$pid" 2>/dev/null || return 1
+  started="$(sp_process_start "$pid")"
+  command="$(sp_process_command "$pid")"
+  [ -n "$started" ] && [ -n "$command" ] || return 1
+  python3 - "$lockd/owner" "$pid" "$started" "$command" "$PAD_DIR" "$who" <<'PY'
+import json, sys
+path, pid, started, command, pad, name = sys.argv[1:]
+try:
+    with open(path, encoding="utf-8") as handle:
+        owner = json.load(handle)
+except Exception:
+    raise SystemExit(1)
+expected = {
+    "pid": int(pid),
+    "processStart": started,
+    "command": command,
+    "pad": pad,
+    "name": name,
+}
+raise SystemExit(0 if owner == expected else 1)
+PY
+}
+
 # ── Atomic pad mutation lock ─────────────────────────────────────────
 # Multiple agents may say/join the same pad concurrently. stitchpad.md is mutated
 # by bare appends (say) and read-rewrite (join); without serialization those race
@@ -627,6 +693,28 @@ sp_engagement() {
   ' "$PAD_MD"
 }
 
+# Return a stable identity for one exact, currently-open mention ordinal.
+# Empty/nonzero means the ordinal is absent, already answered by the same
+# sender, or malformed.  The digest binds reset recovery provenance to the
+# exact authored block rather than merely to a reusable numeric cursor.
+sp_open_mention_identity() {
+  local who="$1" ordinal="$2" engagement open sender last_reply reply_target block digest
+  case "$ordinal" in ''|0|0[0-9]*|*[!0-9]*) return 1;; esac
+  [ "${#ordinal}" -le 9 ] || return 1
+  engagement="$(sp_engagement "$who" "$((ordinal - 1))")"
+  read -r open sender last_reply reply_target <<<"$engagement"
+  [ "${open:-0}" = "$ordinal" ] || return 1
+  if [ "${last_reply:-0}" -gt "$ordinal" ] 2>/dev/null \
+    && [ -n "${sender:-}" ] && [ "${reply_target:-}" = "$sender" ]; then
+    return 1
+  fi
+  block="$(sp_latest_to "$who" "$((ordinal - 1))")"
+  [ -n "$block" ] || return 1
+  digest="$(printf '%s' "$block" | cksum | awk '{print $1 "-" $2}')"
+  [ -n "$digest" ] || return 1
+  printf '%s\n' "$digest"
+}
+
 # ── Terminal-identity locks (machine-global) ─────────────────────────
 # ONE TERMINAL = ONE (pad, name). ~/.stitchpad-terminals/<surface_id> holds
 # "pad_dir|name|epoch" (pad_dir = the .stitchpad dir). join/set-wake CLAIM the
@@ -823,19 +911,21 @@ sp_watch_fswatch_parents_for_pad() {
 sp_stop_watchers_for_pad() {
   [ -n "${PAD_STATE:-}" ] || return 0
   local watch_lock="$PAD_STATE/watch.lock.d"
-  local p pids=()
+  # A scalar list avoids macOS Bash 3.2 treating an empty declared array as an
+  # unbound variable under `set -u`.
+  local p pids=""
   p="$(cat "$watch_lock/pid" 2>/dev/null || true)"
-  [ -n "$p" ] && pids+=( "$p" )
+  [ -n "$p" ] && pids="$pids $p"
   while IFS= read -r p; do
-    [ -n "$p" ] && pids+=( "$p" )
+    [ -n "$p" ] && pids="$pids $p"
   done < <(sp_watch_processes_for_pad)
 
   rm -rf "$watch_lock" 2>/dev/null || true
-  for p in "${pids[@]}"; do
+  for p in $pids; do
     kill "$p" 2>/dev/null || true
   done
   sleep 0.2
-  for p in "${pids[@]}"; do
+  for p in $pids; do
     kill -0 "$p" 2>/dev/null && kill -KILL "$p" 2>/dev/null || true
   done
 }

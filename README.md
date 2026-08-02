@@ -126,6 +126,17 @@ runtime hook; push members deliberately bind an external surface.
 > `pull` members completely; their configured runtime hooks remain the sole wake
 > path, so the visible interactive session stays authoritative.
 
+Heartbeat ticker locks record the PID, process-start identity, exact command,
+pad, and seat before publishing the PID. `heartbeat --stop` and `reset` signal a
+live process only when every field still matches; legacy or mismatched live PID
+records are reported and left untouched rather than risking PID-reuse damage.
+Explicit reset redelivery is likewise message-bound: the open gate is checked
+before repair and again under the shared pad lock immediately before an atomic
+`pending.<seat>` plus `pending.<seat>.reset` queue. The hook clears that
+provenance after successful recovery, or self-heals it without replay when the
+exact reset-owned message was answered or changed. Unrelated legacy pending
+state is never inferred to be reset-owned.
+
 The optional keeper is also deliberately narrow. It considers only `ocean |
 push | <session>` roster rows whose `sessions/<session>` binding names the same
 seat. DND, active turns, and unresolved delivery markers are skipped. The

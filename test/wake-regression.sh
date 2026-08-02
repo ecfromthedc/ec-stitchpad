@@ -4,7 +4,7 @@ set -euo pipefail
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 SP="$ROOT/tool/bin/stitchpad"
 export STITCHPAD_STEAL=1   # allow each case to claim the TTY from the prior case
-export STITCHPAD_HEARTBEAT_AUTOSTART=1
+export STITCHPAD_HEARTBEAT_AUTOSTART=0
 # Unset herdr context: in a managed pane, sp_this_surface returns a terminal id
 # that activates the one-terminal-one-pad lock, which blocks multi-sender test
 # scenarios. The test suite doesn't run inside herdr, but manual runs might.
@@ -24,15 +24,23 @@ contains() {
 
 stop_watcher() {
   local d="$1"
-  "$SP" daemon stop >/dev/null 2>&1 || true
-  pkill -9 -f "fswatch.*$d" 2>/dev/null || true
-  for _pidfile in "$d"/.stitchpad/.state/alive-ticker.*.pid "$d"/.stitchpad/.state/heartbeat.*.lock/pid; do
+  # Stop heartbeat producers first: a ticker may already be inside its
+  # ensure-watcher call and can otherwise recreate the watcher after an
+  # initial daemon stop.
+  for _lock in "$d"/.stitchpad/.state/heartbeat.*.lock; do
+    [ -d "$_lock" ] || continue
+    _name="$(basename "$_lock")"; _name="${_name#heartbeat.}"; _name="${_name%.lock}"
+    STITCHPAD_PAD_DIR="$d/.stitchpad" "$SP" heartbeat --stop "$_name" >/dev/null 2>&1 || true
+  done
+  for _pidfile in "$d"/.stitchpad/.state/alive-ticker.*.pid; do
     [ -f "$_pidfile" ] || continue
     # PID files are tiny regular files; a direct read is portable to macOS
     # (which does not ship GNU `timeout`) and cannot block on a pipe/device.
     _pid="$(cat "$_pidfile" 2>/dev/null || true)"
     [ -n "$_pid" ] && kill -9 "$_pid" 2>/dev/null || true
   done
+  "$SP" daemon stop >/dev/null 2>&1 || true
+  pkill -9 -f "fswatch.*$d" 2>/dev/null || true
   sleep 0.2
 }
 
@@ -44,12 +52,17 @@ WATCH_PIDS=""
 
 cleanup() {
   # Stop only fixture-owned watcher parents, heartbeat PIDs, and fswatch children.
-  for pid in $WATCH_PIDS; do kill -TERM "$pid" 2>/dev/null || true; done
-  for pidfile in "$tmp"/*/.stitchpad/.state/alive-ticker.*.pid "$tmp"/*/.stitchpad/.state/heartbeat.*.lock/pid; do
+  for lock in "$tmp"/*/.stitchpad/.state/heartbeat.*.lock; do
+    [ -d "$lock" ] || continue
+    name="$(basename "$lock")"; name="${name#heartbeat.}"; name="${name%.lock}"
+    STITCHPAD_PAD_DIR="$(dirname "$(dirname "$lock")")" "$SP" heartbeat --stop "$name" >/dev/null 2>&1 || true
+  done
+  for pidfile in "$tmp"/*/.stitchpad/.state/alive-ticker.*.pid; do
     [ -f "$pidfile" ] || continue
     pid="$(cat "$pidfile" 2>/dev/null || true)"
     [ -n "$pid" ] && kill -TERM "$pid" 2>/dev/null || true
   done
+  for pid in $WATCH_PIDS; do kill -TERM "$pid" 2>/dev/null || true; done
   pkill -TERM -f "fswatch.*$tmp" 2>/dev/null || true
   sleep 0.1
   for pid in $WATCH_PIDS; do kill -KILL "$pid" 2>/dev/null || true; done
@@ -333,7 +346,7 @@ fi
 	STITCHPAD_NAME=other "$SP" say '@agent third mention' >/dev/null
 
 	# Start watcher backgrounded, CAPTURE output, trigger fswatch.
-	"$SP" watch > "$case10/watcher.out" 2>&1 &
+	( trap - EXIT; exec "$SP" watch ) > "$case10/watcher.out" 2>&1 &
 	WATCH_PID=$!
 	WATCH_PIDS="$WATCH_PIDS $WATCH_PID"
 	for _ in 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19 20; do
@@ -410,7 +423,7 @@ fi
 
 	# Watcher captures output; trigger TWO fswatch events to prove
 	# both cycles ran (adapter failure -> clear -> retry -> clear again).
-	"$SP" watch > "$case12/watcher.out" 2>&1 &
+	( trap - EXIT; exec "$SP" watch ) > "$case12/watcher.out" 2>&1 &
 	WATCH_PID=$!
 	WATCH_PIDS="$WATCH_PIDS $WATCH_PID"
 
@@ -480,7 +493,7 @@ EOF
 	chmod +x "$mockbin/curl" "$mockbin/ocean-heartbeat"
 
 	STITCHPAD_NAME=sender "$SP" say '@agent exactly once over ocean push' >/dev/null
-	PATH="$mockbin:$PATH" "$SP" watch > "$case13/watcher.out" 2>&1 &
+	( trap - EXIT; PATH="$mockbin:$PATH" exec "$SP" watch ) > "$case13/watcher.out" 2>&1 &
 	WATCH_PID=$!
 	WATCH_PIDS="$WATCH_PIDS $WATCH_PID"
 	sleep 0.5

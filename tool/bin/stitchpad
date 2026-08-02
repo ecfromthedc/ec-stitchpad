@@ -227,9 +227,11 @@ EOF
     echo "── house rule: to acknowledge/wind down, start the line with \".\" (e.g. \".ack ok\") — never @-reply a goodbye; an @-mention wakes that agent. ──"
     # KEEP-ALIVE + AUTO-WATCHER: joining a pad starts a per-agent heartbeat
     # ticker. Watchers consume .state/alive.<name>; Stop hooks only supplement it.
-    if STITCHPAD_NAME="$who" STITCHPAD_HEARTBEAT_PARENT_PID="${STITCHPAD_HEARTBEAT_PARENT_PID:-$PPID}" \
-      "$BIN_DIR/stitchpad" heartbeat start "$who" >/dev/null 2>&1; then
-      echo "── heartbeat started for @$who ──"
+    if [ "${STITCHPAD_HEARTBEAT_AUTOSTART:-1}" != "0" ]; then
+      if STITCHPAD_NAME="$who" STITCHPAD_HEARTBEAT_PARENT_PID="${STITCHPAD_HEARTBEAT_PARENT_PID:-$PPID}" \
+        "$BIN_DIR/stitchpad" heartbeat start "$who" >/dev/null 2>&1; then
+        echo "── heartbeat started for @$who ──"
+      fi
     fi
     # The heartbeat ticker ensures the watcher immediately and on every tick.
     # Do not race it with a second join-time ensure against the same PID lock.
@@ -361,20 +363,47 @@ EOF
     #   stitchpad reset <name> --redeliver <positive-ordinal>
     sp_init_paths || exit 1
 
-    _reset_kill_ticker() {   # kill only pids THIS pad recorded for <name> (cross-pad safe)
-      local who="$1" pid=""
-      local pids="" p i
-      pid="$(cat "$PAD_STATE/heartbeat.$who.lock/pid" 2>/dev/null || true)"
-      [ -n "$pid" ] && kill "$pid" 2>/dev/null && { pids="$pids $pid"; echo "  · killed ticker pid $pid (@$who)"; }
-      pid="$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1])).get("pid",""))' "$PAD_STATE/alive.$who" 2>/dev/null || true)"
-      [ -n "$pid" ] && kill "$pid" 2>/dev/null && { pids="$pids $pid"; echo "  · killed alive pid $pid (@$who)"; }
-      # wait for exit traps to finish so a dying ticker can't delete the
-      # replacement's alive file after we restart
-      for p in $pids; do
-        i=0; while kill -0 "$p" 2>/dev/null && [ "$i" -lt 20 ]; do sleep 0.1; i=$((i+1)); done
-      done
-      rm -rf "$PAD_STATE/heartbeat.$who.lock" 2>/dev/null
+    _reset_kill_ticker() {   # signal only a live process with exact durable ownership proof
+      local who="$1" lockd pid="" alive_pid="" i=0
+      lockd="$PAD_STATE/heartbeat.$who.lock"
+      pid="$(cat "$lockd/pid" 2>/dev/null || true)"
+      alive_pid="$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1])).get("pid",""))' "$PAD_STATE/alive.$who" 2>/dev/null || true)"
+
+      if [ -n "$alive_pid" ] && [ "$alive_pid" != "$pid" ] && kill -0 "$alive_pid" 2>/dev/null; then
+        echo "stitchpad: @$who alive metadata points at unverified live pid $alive_pid; refusing to discard or replace it" >&2
+        return 1
+      fi
+      if [ -n "$pid" ] && kill -0 "$pid" 2>/dev/null; then
+        if ! sp_ticker_owner_matches "$lockd" "$pid" "$who"; then
+          echo "stitchpad: @$who has live but unverified ticker pid $pid; refusing to signal or replace it" >&2
+          return 1
+        fi
+        if ! kill "$pid" 2>/dev/null; then
+          echo "stitchpad: could not signal verified ticker pid $pid for @$who" >&2
+          return 1
+        fi
+        echo "  · signaled verified ticker pid $pid (@$who)"
+        # Wait for its exit trap before replacement. If escalation is needed,
+        # re-prove the same PID/start/command identity immediately beforehand.
+        while kill -0 "$pid" 2>/dev/null && [ "$i" -lt 20 ]; do sleep 0.1; i=$((i+1)); done
+        if kill -0 "$pid" 2>/dev/null; then
+          if sp_ticker_owner_matches "$lockd" "$pid" "$who"; then
+            kill -KILL "$pid" 2>/dev/null || true
+          else
+            echo "stitchpad: @$who ticker ownership changed while stopping pid $pid; refusing escalation" >&2
+            return 1
+          fi
+        fi
+      elif [ -n "$alive_pid" ] && kill -0 "$alive_pid" 2>/dev/null; then
+        # A live alive.* PID without the matching verified lock may be a reused
+        # PID or a one-shot touch. It is metadata to report, never authority to
+        # signal or discard.
+        echo "stitchpad: @$who has live but unverified alive pid $alive_pid; refusing to signal or replace it" >&2
+        return 1
+      fi
+      rm -rf "$lockd" 2>/dev/null
       rm -f "$PAD_STATE/alive.$who" 2>/dev/null
+      return 0
     }
     _reset_scrub_ghost() {   # remove every trace of a name no longer in the roster
       local who="$1" _pfx _f
@@ -388,12 +417,15 @@ EOF
     }
     _reset_seat() {          # roster member: fresh ticker, durable state intact
       local who="$1" target seen="0"
-      _reset_kill_ticker "$who"
+      _reset_kill_ticker "$who" || return 1
       [ -f "$PAD_STATE/seen.$who" ] && seen="$(cat "$PAD_STATE/seen.$who" 2>/dev/null || echo 0)"
       target="$(sp_user_field "$who" target)"
       if [ -n "$target" ] && [ "$target" != "-" ]; then
-        STITCHPAD_NAME="$who" STITCHPAD_HEARTBEAT_PARENT_PID=0 \
-          "$BIN_DIR/stitchpad" heartbeat start "$who" >/dev/null 2>&1 || true
+        if ! STITCHPAD_NAME="$who" STITCHPAD_HEARTBEAT_PARENT_PID=0 \
+          "$BIN_DIR/stitchpad" heartbeat start "$who" >/dev/null 2>&1; then
+          echo "stitchpad: could not start a verified replacement ticker for @$who" >&2
+          return 1
+        fi
         echo "  · @$who: cursor preserved at ${seen:-0}, heartbeat restarted (target $target)"
       else
         echo "  · @$who: cursor preserved at ${seen:-0} (pull seat, no ticker)"
@@ -401,13 +433,17 @@ EOF
     }
 
     _reset_validate_redelivery() {
-      local who="$1" ordinal="$2" engagement open sender last_reply reply_target wake_mode binding="" sf
+      local who="$1" ordinal="$2" wake_mode binding="" sf identity engagement open sender last_reply reply_target
       case "$ordinal" in
-        ''|0|*[!0-9]*)
+        ''|0|0[0-9]*|*[!0-9]*)
           echo "stitchpad: --redeliver requires a positive mention ordinal (never 0)" >&2
           return 1
           ;;
       esac
+      [ "${#ordinal}" -le 9 ] || {
+        echo "stitchpad: --redeliver ordinal is out of range" >&2
+        return 1
+      }
       wake_mode="$(sp_user_field "$who" wake)"
       if [ "$wake_mode" != "pull" ]; then
         echo "stitchpad: --redeliver is only supported for pull/hook seats; @$who uses ${wake_mode:-unknown} delivery supervision" >&2
@@ -424,26 +460,70 @@ EOF
         echo "stitchpad: --redeliver requires a canonical sessions/<id> binding for @$who" >&2
         return 1
       fi
+      if [ -f "$PAD_STATE/pending.$who" ] || [ -f "$PAD_STATE/pending.$who.reset" ]; then
+        echo "stitchpad: @$who already has unresolved recovery state; refusing to overwrite it" >&2
+        return 1
+      fi
       engagement="$(sp_engagement "$who" "$((ordinal - 1))")"
       read -r open sender last_reply reply_target <<<"$engagement"
       if [ "${open:-0}" != "$ordinal" ]; then
         echo "stitchpad: mention ordinal $ordinal is not currently open for @$who" >&2
         return 1
       fi
-      if [ "${last_reply:-0}" -gt "$ordinal" ] \
+      if [ "${last_reply:-0}" -gt "$ordinal" ] 2>/dev/null \
         && [ -n "${sender:-}" ] && [ "${reply_target:-}" = "$sender" ]; then
         echo "stitchpad: mention ordinal $ordinal is already answered by @$who" >&2
         return 1
       fi
+      identity="$(sp_open_mention_identity "$who" "$ordinal" 2>/dev/null || true)"
+      if [ -z "$identity" ]; then
+        echo "stitchpad: could not bind mention ordinal $ordinal to an exact message for @$who" >&2
+        return 1
+      fi
+      RESET_REDELIVERY_ID="$identity"
     }
 
     _reset_queue_redelivery() {
-      local who="$1" ordinal="$2"
-      printf '%s' "$ordinal" > "$PAD_STATE/pending.$who"
+      local who="$1" ordinal="$2" marker pending marker_tmp pending_tmp barrier i=0
+      marker="$PAD_STATE/pending.$who.reset"
+      pending="$PAD_STATE/pending.$who"
+      # Deterministic test seam for the validate/mutate race. No production
+      # behavior changes unless the explicit test-only path is supplied.
+      barrier="${STITCHPAD_RESET_TEST_BEFORE_QUEUE_BARRIER:-}"
+      if [ -n "$barrier" ]; then
+        printf '%s' ready > "$barrier.ready"
+        while [ ! -f "$barrier.release" ] && [ "$i" -lt 500 ]; do sleep 0.01; i=$((i+1)); done
+        [ -f "$barrier.release" ] || {
+          echo "stitchpad: reset test barrier timed out" >&2
+          return 1
+        }
+      fi
+      sp_lock || return 1
+      # say/join/set-wake share this lock. Revalidate immediately before the
+      # atomic queue so a reply or rebinding during ticker repair cannot wedge a
+      # stale pending ordinal.
+      if ! _reset_validate_redelivery "$who" "$ordinal"; then
+        sp_unlock
+        echo "stitchpad: redelivery state changed during reset; nothing queued" >&2
+        return 1
+      fi
+      marker_tmp="$marker.tmp.$$"
+      pending_tmp="$pending.tmp.$$"
+      if ! printf '%s|%s' "$ordinal" "$RESET_REDELIVERY_ID" > "$marker_tmp" \
+        || ! mv "$marker_tmp" "$marker" \
+        || ! printf '%s' "$ordinal" > "$pending_tmp" \
+        || ! mv "$pending_tmp" "$pending"; then
+        rm -f "$marker_tmp" "$pending_tmp" "$marker" 2>/dev/null || true
+        sp_unlock
+        echo "stitchpad: could not persist exact redelivery for @$who" >&2
+        return 1
+      fi
+      sp_unlock
       echo "  · @$who: queued exact redelivery ordinal $ordinal (seen cursor unchanged)"
     }
 
     who=""; redeliver=""
+    reset_failures=0
     while [ $# -gt 0 ]; do
       case "$1" in
         --redeliver)
@@ -461,15 +541,15 @@ EOF
       || { echo "stitchpad: --redeliver requires exactly one roster name" >&2; exit 1; }
     if [ -n "$redeliver" ]; then
       case "$redeliver" in
-        0|*[!0-9]*) echo "stitchpad: --redeliver requires a positive mention ordinal (never 0)" >&2; exit 1;;
+        0|0[0-9]*|*[!0-9]*) echo "stitchpad: --redeliver requires a positive mention ordinal (never 0)" >&2; exit 1;;
       esac
     fi
     if [ -n "$who" ]; then
       sp_user_exists "$who" || { echo "stitchpad: @$who not in roster" >&2; exit 1; }
       [ -z "$redeliver" ] || _reset_validate_redelivery "$who" "$redeliver" || exit 1
       echo "reset @$who:"
-      _reset_seat "$who"
-      [ -z "$redeliver" ] || _reset_queue_redelivery "$who" "$redeliver"
+      _reset_seat "$who" || exit 1
+      [ -z "$redeliver" ] || _reset_queue_redelivery "$who" "$redeliver" || exit 1
     else
       echo "reset pad ($PAD_DIR):"
       names="$(sp_roster | cut -d'|' -f1 | awk '{gsub(/^[ \t]+|[ \t]+$/,"");print}')"
@@ -479,7 +559,11 @@ EOF
         g="$(basename "$f")"; g="${g#alive.}"; g="${g#heartbeat.}"; g="${g%.lock}"
         printf '%s\n' "$names" | grep -qx "$g" && continue
         echo "  ghost @$g:"
-        _reset_kill_ticker "$g"; _reset_scrub_ghost "$g"
+        if _reset_kill_ticker "$g"; then
+          _reset_scrub_ghost "$g"
+        else
+          reset_failures=$((reset_failures + 1))
+        fi
       done
       # 1.5) session/autoname bindings pointing at names not in the roster
       for f in "$PAD_STATE"/sessions/* "$PAD_STATE"/autoname.*; do
@@ -498,10 +582,16 @@ EOF
         rm -f "$f" && echo "  · dropped stale lock $(basename "$f") (@$_ln)"
       done
       # 3) every roster seat gets a fresh ticker + cleared cursor
-      for n in $names; do _reset_seat "$n"; done
+      for n in $names; do
+        _reset_seat "$n" || reset_failures=$((reset_failures + 1))
+      done
       # 4) watcher
       ensure_watcher
       echo "  · watcher ensured"
+    fi
+    if [ "$reset_failures" -gt 0 ]; then
+      echo "stitchpad: reset left $reset_failures unverified live ticker record(s) untouched" >&2
+      exit 1
     fi
     echo "✓ reset done"
     ;;
@@ -1136,15 +1226,26 @@ PY
         if [ -d "$lockd" ]; then
           oldpid="$(cat "$lockd/pid" 2>/dev/null || true)"
           if [ -n "$oldpid" ] && kill -0 "$oldpid" 2>/dev/null; then
-            "$BIN_DIR/stitchpad" heartbeat --touch "$who" "$oldpid" >/dev/null 2>&1 || true
-            echo "heartbeat already running for @$who (pid $oldpid)"
-            exit 0
+            if sp_ticker_owner_matches "$lockd" "$oldpid" "$who"; then
+              "$BIN_DIR/stitchpad" heartbeat --touch "$who" "$oldpid" >/dev/null 2>&1 || true
+              echo "heartbeat already running for @$who (pid $oldpid)"
+              exit 0
+            fi
+            echo "stitchpad: heartbeat @$who has live but unverified pid $oldpid; refusing to signal, replace, or duplicate it" >&2
+            exit 1
           fi
           rm -rf "$lockd"
         fi
         if ! mkdir "$lockd" 2>/dev/null; then
           oldpid="$(cat "$lockd/pid" 2>/dev/null || true)"
-          [ -n "$oldpid" ] && kill -0 "$oldpid" 2>/dev/null && { echo "heartbeat already running for @$who (pid $oldpid)"; exit 0; }
+          if [ -n "$oldpid" ] && kill -0 "$oldpid" 2>/dev/null; then
+            if sp_ticker_owner_matches "$lockd" "$oldpid" "$who"; then
+              echo "heartbeat already running for @$who (pid $oldpid)"
+              exit 0
+            fi
+            echo "stitchpad: heartbeat @$who has live but unverified pid $oldpid; refusing to signal, replace, or duplicate it" >&2
+            exit 1
+          fi
           rm -rf "$lockd"; mkdir "$lockd" 2>/dev/null || exit 1
         fi
         parent="${STITCHPAD_HEARTBEAT_PARENT_PID:-$PPID}"
@@ -1173,7 +1274,19 @@ PY
           while [ ! -s "$lockd/pid" ]; do sleep 0.01; done
           ticker_pid="$(cat "$lockd/pid" 2>/dev/null || true)"
           [ -n "$ticker_pid" ] || exit 1
-          trap 'rm -rf "$lockd"; rm -f "$PAD_STATE/alive.$STITCHPAD_NAME"' EXIT INT TERM
+          ticker_owner="$(cat "$lockd/owner" 2>/dev/null || true)"
+          heartbeat_child_cleanup() {
+            # Delete only the generation this child started with. A delayed
+            # EXIT trap must never erase a replacement lock/alive record.
+            [ -n "$ticker_owner" ] \
+              && [ "$(cat "$lockd/owner" 2>/dev/null || true)" = "$ticker_owner" ] || return 0
+            alive_pid="$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1])).get("pid",""))' "$PAD_STATE/alive.$STITCHPAD_NAME" 2>/dev/null || true)"
+            [ "$alive_pid" != "$ticker_pid" ] || rm -f "$PAD_STATE/alive.$STITCHPAD_NAME" 2>/dev/null || true
+            rm -f "$lockd/pid" "$lockd/owner" 2>/dev/null || true
+            rmdir "$lockd" 2>/dev/null || true
+          }
+          trap 'heartbeat_child_cleanup' EXIT
+          trap 'exit 0' HUP INT TERM
           while :; do
             heartbeat_write "$STITCHPAD_NAME" "$ticker_pid" "$parent" "$session" "$surface" "$target"
             sp_term_lock_touch "$surface" "$STITCHPAD_NAME" 2>/dev/null || true
@@ -1184,6 +1297,13 @@ PY
           done
         ) &
         ticker_pid=$!
+        if ! sp_ticker_owner_write "$lockd" "$ticker_pid" "$who"; then
+          kill "$ticker_pid" 2>/dev/null || true
+          wait "$ticker_pid" 2>/dev/null || true
+          rm -rf "$lockd"
+          echo "stitchpad: could not record verified heartbeat ownership for @$who" >&2
+          exit 1
+        fi
         echo "$ticker_pid" > "$lockd/pid"
         disown
         echo "heartbeat started for @$who"
@@ -1213,13 +1333,20 @@ PY
         [ -n "$who" ] || exit 0
         lockd="$PAD_STATE/heartbeat.$who.lock"
         pid="$(cat "$lockd/pid" 2>/dev/null || true)"
-        [ -n "$pid" ] && kill "$pid" 2>/dev/null || true
-        if [ -n "$pid" ]; then
+        if [ -n "$pid" ] && kill -0 "$pid" 2>/dev/null; then
+          if ! sp_ticker_owner_matches "$lockd" "$pid" "$who"; then
+            echo "stitchpad: heartbeat @$who has live but unverified pid $pid; refusing to signal or remove its state" >&2
+            exit 1
+          fi
+          kill "$pid" 2>/dev/null || true
           for _i in 1 2 3 4 5 6 7 8 9 10; do
             kill -0 "$pid" 2>/dev/null || break
             sleep 0.1
           done
-          kill -0 "$pid" 2>/dev/null && kill -KILL "$pid" 2>/dev/null || true
+          if kill -0 "$pid" 2>/dev/null; then
+            sp_ticker_owner_matches "$lockd" "$pid" "$who" \
+              && kill -KILL "$pid" 2>/dev/null || true
+          fi
         fi
         rm -rf "$lockd"
         rm -f "$PAD_STATE/alive.$who"
@@ -1658,7 +1785,49 @@ except: print("")' 2>/dev/null)"
       # wrong agent. If the session cannot be resolved, fail closed.
       who="$(sp_session_name)"
       [ -z "$who" ] && exit 0
-      msgs="$("$0" wake ${who:+"$who"} 2>/dev/null || true)"
+      msgs=""
+      # Reset-created exact redelivery has its own provenance record. Reconcile
+      # it under the pad mutation lock before normal FIFO wake delivery so a
+      # concurrent reply cannot leave a permanent pending marker or cause an
+      # older exact request to be skipped behind a newer unread mention.
+      _reset_marker="$PAD_STATE/pending.$who.reset"
+      _pend="$PAD_STATE/pending.$who"
+      if [ -f "$_reset_marker" ]; then
+        if sp_lock; then
+          _reset_line="$(cat "$_reset_marker" 2>/dev/null || true)"
+          IFS='|' read -r _reset_ord _reset_id _reset_extra <<<"$_reset_line"
+          _reset_pipes="${_reset_line//[^|]/}"
+          _pending_ord="$(cat "$_pend" 2>/dev/null || true)"
+          if [ "${#_reset_pipes}" -ne 1 ] || [ -n "${_reset_extra:-}" ] \
+            || [ -z "${_reset_id:-}" ]; then
+            # Malformed provenance is not authority to delete a possibly legacy
+            # pending marker. Leave both visible for health/manual repair.
+            :
+          elif [ ! -f "$_pend" ]; then
+            rm -f "$_reset_marker" 2>/dev/null || true
+          elif [ "$_pending_ord" != "$_reset_ord" ]; then
+            # The pending marker is unrelated; remove only our orphaned reset
+            # provenance and never consume the legacy/supervisor state.
+            rm -f "$_reset_marker" 2>/dev/null || true
+          else
+            _current_id="$(sp_open_mention_identity "$who" "$_reset_ord" 2>/dev/null || true)"
+            if [ -z "$_current_id" ] || [ "$_current_id" != "$_reset_id" ]; then
+              # A reply, rewrite, or different ordinal closed the exact request.
+              # Both files are proven reset-owned and can be self-healed.
+              rm -f "$_pend" "$_reset_marker" 2>/dev/null || true
+            else
+              _recovered="$("$0" wake "$who" --force "$_reset_ord" 2>/dev/null || true)"
+              if [ -n "$_recovered" ]; then
+                rm -f "$_pend" "$_reset_marker" 2>/dev/null || true
+                printf '%s' "$_reset_ord" > "$PAD_STATE/delivered_no_reply.$who" 2>/dev/null || true
+                msgs="$_recovered"
+              fi
+            fi
+          fi
+          sp_unlock
+        fi
+      fi
+      [ -n "$msgs" ] || msgs="$("$0" wake ${who:+"$who"} 2>/dev/null || true)"
       # DROPPED-TURN RECOVERY (local mode only). The normal wake above respects the
       # seen cursor, so a mention already consumed by the watcher returns nothing —
       # correct for a legitimately-silent turn, WRONG for a turn that died mid-tool
@@ -1673,7 +1842,7 @@ except: print("")' 2>/dev/null)"
       # hook cycle can retry. This is the defer-not-destroy property: a suppressed
       # recovery attempt must not consume the one-shot re-block bound.
       _pend="$PAD_STATE/pending.$who"
-      if [ -z "$msgs" ] && [ -f "$_pend" ]; then
+      if [ -z "$msgs" ] && [ -f "$_pend" ] && [ ! -f "$_reset_marker" ]; then
         _pend_ord="$(cat "$_pend" 2>/dev/null || echo 0)"
         # Validate independently of seen via sp_engagement(since=_pend_ord-1).
         if [ "$_pend_ord" -gt 0 ] 2>/dev/null; then
