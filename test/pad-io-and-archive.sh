@@ -412,6 +412,29 @@ fi
 check "symlinked target remains byte-exact" "$(cksum < "$WORK/outside-tasks")" "$outside_sum"
 rm -f "$TASKS" "$WORK/outside-tasks"; mv "$TASKS.real" "$TASKS"
 
+mv "$PAD" "$WORK/outside-pad"
+ln -s "$WORK/outside-pad" "$PAD"
+outside_sum="$(cksum < "$WORK/outside-pad")"
+if sp say 'must not follow pad target' >/dev/null 2>&1; then
+  bad "symlinked pad target should be rejected"
+else
+  ok "symlinked pad target is rejected"
+fi
+check "symlinked pad target remains byte-exact" "$(cksum < "$WORK/outside-pad")" "$outside_sum"
+rm -f "$PAD"; mv "$WORK/outside-pad" "$PAD"
+
+mv "$TASKS" "$TASKS.real"
+ln -s "$WORK/outside-tasks-missing" "$TASKS"
+if sp task new 'must not create broken task target' >/dev/null 2>&1; then
+  bad "broken tasks symlink should be rejected"
+else
+  ok "broken tasks symlink is rejected"
+fi
+[ ! -e "$WORK/outside-tasks-missing" ] \
+  && ok "broken tasks symlink target is not created" \
+  || bad "broken tasks symlink target is not created"
+rm -f "$TASKS"; mv "$TASKS.real" "$TASKS"
+
 # Legacy or malformed state lacks sufficient authority. Even with an immediate
 # stale threshold, neither an unowned regular .ready nor an unknown lock owner
 # may be consumed, replaced, or silently broken.

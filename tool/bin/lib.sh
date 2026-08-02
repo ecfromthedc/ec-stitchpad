@@ -545,6 +545,26 @@ except Exception:
 PY
 }
 
+# Every mutation lock protects the two canonical content paths.  Recovery
+# already refuses symlinked targets, but append-only writers do not pass through
+# recovery when no .ready generation exists.  Validate with lstat before any
+# locked recovery, create, rewrite, or append so neither an existing symlink nor
+# a broken tasks.md symlink can redirect a write outside the pad.
+sp_mutation_targets_are_safe() {
+  [ -n "${PAD_MD:-}" ] && [ -n "${PAD_TASKS:-}" ] || return 1
+  python3 - "$PAD_MD" "$PAD_TASKS" <<'PY'
+import os, stat, sys
+pad, tasks = sys.argv[1:]
+try:
+    if os.path.lexists(pad) and not stat.S_ISREG(os.lstat(pad).st_mode):
+        raise ValueError("pad is not a regular file")
+    if os.path.lexists(tasks) and not stat.S_ISREG(os.lstat(tasks).st_mode):
+        raise ValueError("tasks is not a regular file")
+except Exception:
+    raise SystemExit(1)
+PY
+}
+
 sp_lock() {
   local lock="$PAD_STATE/.lock" waited=0 age now mtime observed pid_capture
   while ! mkdir "$lock" 2>/dev/null; do
@@ -613,6 +633,11 @@ sp_lock() {
   trap 'sp_unlock' EXIT
   trap 'exit 130' INT
   trap 'exit 143' TERM
+  if ! sp_mutation_targets_are_safe; then
+    echo "stitchpad: refusing non-regular or symlinked mutation target" >&2
+    sp_unlock
+    return 1
+  fi
   # Reconcile only after acquiring the same generation-owned mutation lock
   # used by writers. A passive sp_init_paths call can never consume .ready.
   if ! sp_recover_inplace "$PAD_MD" || ! sp_recover_inplace "$PAD_TASKS"; then
@@ -1861,17 +1886,20 @@ sp_stop_watchers_for_pad() {
 sp_reap_duplicate_watchers_for_pad() {
   [ -n "${PAD_STATE:-}" ] || return 0
   local watch_lock="$PAD_STATE/watch.lock.d"
-  local generation keep="" parent only="" count=0
+  local generation keep="" child parent only_parent="" count=0
   generation="$(cat "$watch_lock/generation" 2>/dev/null || true)"
   if [ -f "$watch_lock/owner" ] && sp_watch_owner_is_valid "$watch_lock" "$generation"; then
     keep="$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["pid"])' "$watch_lock/owner" 2>/dev/null || true)"
     sp_watch_owner_matches "$watch_lock" "$generation" "$keep" || keep=""
   fi
-  while IFS= read -r parent; do
-    [ -n "$parent" ] || continue
-    only="$parent"; count=$((count + 1))
-  done < <(sp_watch_fswatch_parents_for_pad)
-  [ "$count" -eq 1 ] && [ -n "$keep" ] && [ "$only" = "$keep" ] && return 0
+  # Count exact fswatch children, not merely their proven watch.sh parents.
+  # A watch.sh SIGKILL can leave an exact orphan (reported as parent 0); that
+  # child is still a duplicate and must force exact teardown/restart.
+  while read -r child parent; do
+    [ -n "$child" ] || continue
+    only_parent="${parent:-0}"; count=$((count + 1))
+  done < <(sp_watch_pairs_for_pad)
+  [ "$count" -eq 1 ] && [ -n "$keep" ] && [ "$only_parent" = "$keep" ] && return 0
   # No fswatch during the bounded startup/restart phase is healthy when the
   # exact supervisor lease is fresh; do not cancel it based on a missing pid.
   [ "$count" -eq 0 ] && sp_watch_launcher_lease_is_fresh "$watch_lock" "$generation" && return 0

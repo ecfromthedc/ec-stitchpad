@@ -6,11 +6,18 @@ SP="$ROOT/tool/bin/stitchpad"
 base="$(mktemp -d /tmp/stitchpad-watcher-races.XXXXXX)"
 tmp="$base/pipe | restart"
 ensure_pid=""
+orphan_pid=""
 cleanup() {
   [ -z "$ensure_pid" ] || { kill "$ensure_pid" 2>/dev/null || true; wait "$ensure_pid" 2>/dev/null || true; }
   if [ -d "$tmp/.stitchpad" ]; then
     STITCHPAD_PAD_DIR="$tmp/.stitchpad" "$SP" daemon stop >/dev/null 2>&1 || true
     STITCHPAD_PAD_DIR="$tmp/.stitchpad" "$SP" heartbeat --stop watcher >/dev/null 2>&1 || true
+  fi
+  if [ -n "$orphan_pid" ] && kill -0 "$orphan_pid" 2>/dev/null; then
+    orphan_command="$(ps -p "$orphan_pid" -o command= 2>/dev/null | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')"
+    [ "$orphan_command" = "$real_fswatch -0 ${pad_md:-}" ] \
+      && kill "$orphan_pid" 2>/dev/null || true
+    wait "$orphan_pid" 2>/dev/null || true
   fi
   rm -rf "$base"
 }
@@ -25,6 +32,10 @@ watch_processes() {
   STITCHPAD_PAD_DIR="$tmp/.stitchpad" bash -c \
     'source "$1"; sp_init_paths >/dev/null; sp_watch_processes_for_pad' _ "$ROOT/tool/bin/lib.sh"
 }
+watch_pairs() {
+  STITCHPAD_PAD_DIR="$tmp/.stitchpad" bash -c \
+    'source "$1"; sp_init_paths >/dev/null; sp_watch_pairs_for_pad' _ "$ROOT/tool/bin/lib.sh"
+}
 
 mkdir -p "$tmp/home" "$base/mockbin"
 export HOME="$tmp/home"
@@ -36,6 +47,8 @@ STITCHPAD_NAME=watcher "$SP" heartbeat --touch watcher "$$" >/dev/null
 state="$tmp/.stitchpad/.state"
 lock="$state/watch.lock.d"
 real_fswatch="$(command -v fswatch)"
+pad_md="$(STITCHPAD_PAD_DIR="$tmp/.stitchpad" bash -c \
+  'source "$1"; sp_init_paths >/dev/null; printf "%s" "$PAD_MD"' _ "$ROOT/tool/bin/lib.sh")"
 count="$base/fswatch.count"
 
 cat > "$base/mockbin/fswatch" <<'EOF'
@@ -72,6 +85,30 @@ done
   || fail "daemon did not restart a real watcher"
 [ "$(cat "$lock/generation")" = "$generation" ] \
   || fail "daemon restart changed generation"
+
+# A killed watch.sh can leave its exact fswatch child orphaned.  A healthy
+# generation plus that residue is still a duplicate: ensure must tear down both
+# exact children and converge to one owned watcher.
+"$real_fswatch" -0 "$pad_md" >/dev/null 2>&1 &
+orphan_pid=$!
+for _ in $(seq 1 200); do
+  [ "$(watch_pairs | wc -l | tr -d ' ')" -ge 2 ] && break
+  sleep 0.01
+done
+[ "$(watch_pairs | wc -l | tr -d ' ')" -ge 2 ] \
+  || fail "exact orphan fswatch fixture was not observed"
+"$SP" ensure-watcher >/dev/null
+for _ in $(seq 1 500); do
+  [ "$(watch_pairs | wc -l | tr -d ' ')" = 1 ] && [ -s "$lock/owner" ] && break
+  sleep 0.01
+done
+[ "$(watch_pairs | wc -l | tr -d ' ')" = 1 ] && [ -s "$lock/owner" ] \
+  || fail "ensure-watcher did not reap orphan and restore one exact pair"
+wait "$orphan_pid" 2>/dev/null || true
+kill -0 "$orphan_pid" 2>/dev/null \
+  && fail "ensure-watcher left the exact orphan alive" \
+  || true
+orphan_pid=""
 "$SP" daemon stop >/dev/null
 [ -z "$(watch_processes)" ] && [ ! -d "$lock" ] \
   || fail "restart-gap stop left exact watcher processes"

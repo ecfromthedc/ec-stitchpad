@@ -2428,17 +2428,15 @@ except: print("")' 2>/dev/null)"
         # Tasks are written to the SIBLING tasks.md, not the conversation. A
         # ticket op no longer rewrites or re-commits the whole transcript.
         # (Legacy inline blocks in the pad are still read — see sp_tasks.)
-        sp_ensure_tasks_file
+        sp_ensure_tasks_file || { sp_unlock; exit 1; }
         printf '\n%s\n' "$block" >> "$PAD_TASKS"
         sp_ensure_tasks_pointer
+        if [ -n "$assignee" ] && sp_user_exists "$assignee"; then
+          printf '\n## @%s · %s\n\n**task %s assigned:** %s\n' "$assignee" "$(date -u '+%H:%M')" "$id" "$title" >> "$PAD_MD"
+        fi
         sp_commit "task $id: $title" "$(basename "$PAD_TASKS")" "$(basename "$PAD_MD")"
         sp_unlock
         echo "$id created"
-        # Wake assignee if set
-        if [ -n "$assignee" ] && sp_user_exists "$assignee"; then
-          printf '\n## @%s · %s\n\n**task %s assigned:** %s\n' "$assignee" "$(date -u '+%H:%M')" "$id" "$title" >> "$PAD_MD"
-          sp_commit "task $id assigned to @$assignee"
-        fi
         ;;
 
       list)
@@ -2520,7 +2518,7 @@ except: print("")' 2>/dev/null)"
         if [ "$dry" -eq 1 ]; then
           sp_unlock; echo "would move $n_inline inline task block(s) → $(basename "$PAD_TASKS")"; exit 0
         fi
-        sp_ensure_tasks_file
+        sp_ensure_tasks_file || { sp_unlock; exit 1; }
         moved="$(mktemp)"; kept="$(sp_stage "$PAD_MD")"
         awk -v out="$moved" '
           /^```task / { inblk=1; print > out; next }
