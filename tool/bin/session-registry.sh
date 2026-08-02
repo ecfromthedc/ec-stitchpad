@@ -528,6 +528,10 @@ reg_path = sys.argv[1]
 hist_max = int(sys.argv[2])
 hist_lines = int(sys.argv[3])
 
+# Scan the tail bounded by hist_max, newest-first, then reverse for display
+# order (oldest of the newest first). Iterating lines[-hist_max:] forward and
+# breaking after hist_lines returned the OLDEST events — inverted for a
+# "recent history" section. Reverse, collect, re-reverse.
 results = []
 try:
     with open(reg_path, 'r', encoding='utf-8') as f:
@@ -536,8 +540,7 @@ except Exception:
     print("[]")
     raise SystemExit(0)
 
-# Scan the tail bounded by hist_max
-for line in lines[-hist_max:]:
+for line in reversed(lines[-hist_max:]):
     line = line.strip()
     if not line:
         continue
@@ -550,6 +553,7 @@ for line in lines[-hist_max:]:
         results.append(e)
     if len(results) >= hist_lines:
         break
+results.reverse()
 
 print(json.dumps(results, separators=(',', ':')))
 PY
