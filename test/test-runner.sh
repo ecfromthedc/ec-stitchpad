@@ -3,7 +3,15 @@ set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 tmp="$(mktemp -d /tmp/stitchpad-test-runner.XXXXXX)"
-trap 'rm -rf "$tmp"' EXIT
+canary_pid=""
+cleanup() {
+  if [ -n "$canary_pid" ] && kill -0 "$canary_pid" 2>/dev/null; then
+    kill "$canary_pid" 2>/dev/null || true
+    wait "$canary_pid" 2>/dev/null || true
+  fi
+  rm -rf "$tmp"
+}
+trap cleanup EXIT
 
 fail() { echo "FAIL: $*" >&2; exit 1; }
 contains() { case "$1" in *"$2"*) return 0;; *) return 1;; esac; }
@@ -28,11 +36,12 @@ cat > "$tmp/test/leaky.sh" <<'EOF'
 #!/usr/bin/env bash
 printf 'leak\n' >> "$RUNNER_LOG"
 if [ "${RUNNER_LEAK:-0}" = "1" ]; then
-  bash "$STITCHPAD_HOME/bin/watch.sh" &
-  printf '%s' "$!" > "$RUNNER_LEAK_PID_FILE"
-  # Keep the fixture parent alive long enough for the runner's exact descendant
-  # registry to observe the child before this shell exits and it reparents.
-  sleep 0.2
+  # Orphan immediately, before a polling-only registry can observe the child.
+  # The isolated fixture process group must retain and expose it after PPID=1.
+  (
+    bash "$STITCHPAD_HOME/bin/watch.sh" &
+    printf '%s' "$!" > "$RUNNER_LEAK_PID_FILE"
+  )
 fi
 EOF
 cat > "$tmp/tool/bin/test-bin.sh" <<'EOF'
@@ -67,6 +76,10 @@ contains "$out" 'Results: 4 passed, 1 failed, 5 total' || fail "failure summary 
 # child, continue later fixtures, and report the residue honestly.
 : > "$runlog"
 leak_pid_file="$tmp/leak.pid"
+# Same command, outside the fixture process group: proves cleanup does not use
+# command matching or broad process discovery as signal authority.
+bash "$tmp/tool/bin/watch.sh" &
+canary_pid=$!
 if out="$(env -u STITCHPAD_HOME -u PASTURE_HOME RUNNER_LOG="$runlog" \
   RUNNER_LEAK=1 RUNNER_LEAK_PID_FILE="$leak_pid_file" \
   STITCHPAD_HEARTBEAT_AUTOSTART=0 "$tmp/tool/bin/stitchpad" test 2>&1)"; then
@@ -77,5 +90,9 @@ contains "$out" 'Results: 4 passed, 1 failed, 5 total' || fail "residue summary 
 [ "$(wc -l < "$runlog" | tr -d ' ')" = "5" ] || fail "runner stopped after process residue"
 leak_pid="$(cat "$leak_pid_file")"
 kill -0 "$leak_pid" 2>/dev/null && fail "runner left the registered fixture child alive" || true
+kill -0 "$canary_pid" 2>/dev/null || fail "runner killed a same-command foreign canary"
+kill "$canary_pid" 2>/dev/null || true
+wait "$canary_pid" 2>/dev/null || true
+canary_pid=""
 
 echo "test runner ok"

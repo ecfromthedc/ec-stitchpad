@@ -2190,10 +2190,23 @@ except: print("")' 2>/dev/null)"
       [ "$(sp_process_start "$_rp_pid")" = "$_rp_start" ] \
         && [ "$(_runner_command_sha256 "$_rp_command")" = "$_rp_command_sha" ]
     }
+    _runner_register_exact() {
+      local _rp_pid="$1" _rp_registry="$2" _rp_start _rp_command _rp_command_sha _rp_line
+      case "$_rp_pid" in ''|*[!0-9]*) return 0 ;; esac
+      [ "$_rp_pid" -gt 1 ] 2>/dev/null || return 0
+      _rp_start="$(sp_process_start "$_rp_pid")"
+      _rp_command="$(sp_process_command "$_rp_pid")"
+      [ -n "$_rp_start" ] && [ -n "$_rp_command" ] || return 0
+      _rp_command_sha="$(_runner_command_sha256 "$_rp_command")"
+      [ -n "$_rp_command_sha" ] || return 0
+      _rp_line="${_rp_pid}|$(sp_b64_encode "$_rp_start")|${_rp_command_sha}"
+      grep -Fqx "$_rp_line" "$_rp_registry" 2>/dev/null \
+        || printf '%s\n' "$_rp_line" >> "$_rp_registry"
+    }
     _runner_register_descendants() {
       local _rp_root="$1" _rp_registry="$2" _rp_scan
       _rp_scan="${_rp_registry}.scan"
-      local _rp_known=" $_rp_root " _rp_changed=1 _rp_pid _rp_ppid _rp_start _rp_command _rp_command_sha _rp_line
+      local _rp_known=" $_rp_root " _rp_changed=1 _rp_pid _rp_ppid
       ps -axo pid=,ppid= > "$_rp_scan" 2>/dev/null || return 0
       while [ "$_rp_changed" -eq 1 ]; do
         _rp_changed=0
@@ -2212,21 +2225,28 @@ except: print("")' 2>/dev/null)"
       rm -f "$_rp_scan"
       for _rp_pid in $_rp_known; do
         [ "$_rp_pid" = "$_rp_root" ] && continue
-        _rp_start="$(sp_process_start "$_rp_pid")"
-        _rp_command="$(sp_process_command "$_rp_pid")"
-        [ -n "$_rp_start" ] && [ -n "$_rp_command" ] || continue
-        _rp_command_sha="$(_runner_command_sha256 "$_rp_command")"
-        [ -n "$_rp_command_sha" ] || continue
-        _rp_line="${_rp_pid}|$(sp_b64_encode "$_rp_start")|${_rp_command_sha}"
-        grep -Fqx "$_rp_line" "$_rp_registry" 2>/dev/null || printf '%s\n' "$_rp_line" >> "$_rp_registry"
+        _runner_register_exact "$_rp_pid" "$_rp_registry"
       done
     }
+    _runner_register_group() {
+      local _rp_group="$1" _rp_root="$2" _rp_registry="$3" _rp_scan _rp_pid _rp_pgid
+      _rp_scan="${_rp_registry}.scan"
+      ps -axo pid=,pgid= > "$_rp_scan" 2>/dev/null || return 1
+      while read -r _rp_pid _rp_pgid; do
+        [ "$_rp_pgid" = "$_rp_group" ] || continue
+        [ "$_rp_pid" = "$_rp_root" ] && continue
+        _runner_register_exact "$_rp_pid" "$_rp_registry"
+      done < "$_rp_scan"
+      rm -f "$_rp_scan"
+    }
     _runner_reap_registered() {
-      local _rp_registry="$1" _rp_pid _rp_start64 _rp_command_sha _rp_start
+      local _rp_registry="$1" _rp_group="$2" _rp_root="$3"
+      local _rp_pid _rp_start64 _rp_command_sha _rp_start
       local _rp_i=0 _rp_any=0 _rp_found=0
       # Give well-behaved teardown a short bounded window before classifying a
       # surviving exact descendant as fixture residue.
       while [ "$_rp_i" -lt 10 ]; do
+        _runner_register_group "$_rp_group" "$_rp_root" "$_rp_registry" || return 1
         _rp_any=0
         while IFS='|' read -r _rp_pid _rp_start64 _rp_command_sha; do
           [ -n "$_rp_pid" ] || continue
@@ -2238,6 +2258,7 @@ except: print("")' 2>/dev/null)"
         sleep 0.05
         _rp_i=$((_rp_i + 1))
       done
+      _runner_register_group "$_rp_group" "$_rp_root" "$_rp_registry" || return 1
       while IFS='|' read -r _rp_pid _rp_start64 _rp_command_sha; do
         [ -n "$_rp_pid" ] || continue
         _rp_start="$(sp_b64_decode "$_rp_start64" 2>/dev/null || true)"
@@ -2249,6 +2270,7 @@ except: print("")' 2>/dev/null)"
       done < "$_rp_registry"
       [ "$_rp_found" -eq 0 ] && return 0
       sleep 0.2
+      _runner_register_group "$_rp_group" "$_rp_root" "$_rp_registry" || return 1
       while IFS='|' read -r _rp_pid _rp_start64 _rp_command_sha; do
         [ -n "$_rp_pid" ] || continue
         _rp_start="$(sp_b64_decode "$_rp_start64" 2>/dev/null || true)"
@@ -2257,6 +2279,13 @@ except: print("")' 2>/dev/null)"
       done < "$_rp_registry"
       return 1
     }
+    _runner_registry=""
+    _runner_output=""
+    _runner_cleanup_files() {
+      [ -z "${_runner_registry:-}" ] || rm -f "$_runner_registry" "${_runner_registry}.scan" 2>/dev/null || true
+      [ -z "${_runner_output:-}" ] || rm -f "$_runner_output" 2>/dev/null || true
+    }
+    trap '_runner_cleanup_files' EXIT
     # STITCHPAD_HOME is tool/; repo root is one level up
     REPO_ROOT="$(cd "$STITCHPAD_HOME/.." && pwd)"
     for dir in "$STITCHPAD_HOME/test" "$REPO_ROOT/test"; do
@@ -2283,11 +2312,17 @@ except: print("")' 2>/dev/null)"
       rc=0
       _runner_registry="$(mktemp "${TMPDIR:-/tmp}/stitchpad-test-processes.XXXXXX")"
       _runner_output="$(mktemp "${TMPDIR:-/tmp}/stitchpad-test-output.XXXXXX")"
+      # A new session/process group closes the polling gap: a child remains a
+      # member even after it reparents to PID 1, so the final group scan can
+      # register it before exact PID/start/command reaping. Python is already a
+      # stitchpad runtime dependency (health and watcher ownership parsing).
       STITCHPAD_HOME="$STITCHPAD_HOME" env \
         -u HERDR_PANE_ID -u HERDR_TAB_ID -u HERDR_ENV \
         -u HERDR_SOCKET_PATH -u HERDR_WORKSPACE_ID \
+        python3 -c 'import os,sys; os.setsid(); os.execvp(sys.argv[1], sys.argv[1:])' \
         bash "$t" > "$_runner_output" 2>&1 &
       _runner_test_pid=$!
+      _runner_test_group="$_runner_test_pid"
       while true; do
         _runner_stat="$(ps -p "$_runner_test_pid" -o stat= 2>/dev/null || true)"
         case "$_runner_stat" in ''|*Z*) break ;; esac
@@ -2296,10 +2331,12 @@ except: print("")' 2>/dev/null)"
       done
       wait "$_runner_test_pid" || rc=$?
       cat "$_runner_output"
-      if ! _runner_reap_registered "$_runner_registry"; then
+      if ! _runner_reap_registered "$_runner_registry" "$_runner_test_group" "$_runner_test_pid"; then
         [ "$rc" -ne 0 ] || rc=97
       fi
       rm -f "$_runner_registry" "$_runner_output"
+      _runner_registry=""
+      _runner_output=""
       if [ "$rc" -eq 0 ]; then
         echo "  PASS: $name"
         passed=$((passed + 1))

@@ -197,10 +197,12 @@ they are old enough, and the bounded regular file is re-proven immediately
 before unlink. Test-only generation barriers also time out boundedly and retire
 their own admission instead of wedging a lifecycle command.
 
-The aggregate test runner tracks each fixture's descendant PID, process-start
-identity, and command digest while it runs. Any exact survivor makes that test
-fail and is reaped with identity revalidation, so a passing aggregate cannot
-silently leave a `watch.sh` or `fswatch` child reparented under PID 1.
+The aggregate test runner gives each fixture an isolated process group and
+tracks both that group and the live descendant tree by PID, process-start
+identity, and command digest. Any exact survivor makes that test fail and is
+reaped with identity revalidation, so a passing aggregate cannot silently leave
+a `watch.sh` or `fswatch` child reparented under PID 1. Same-command processes
+outside the fixture group are never signal candidates.
 
 Heartbeat ticker locks record the PID, process-start identity, exact command,
 pad, and seat before publishing the PID. `heartbeat --stop` and `reset` signal a
