@@ -1,0 +1,3124 @@
+#!/usr/bin/env python3
+"""Stitchpad autonomous-build coordination helper (durability MVP core).
+
+This module owns every operation that must be exact: scrubbed Git invocation,
+native SHA-1/SHA-256 object identity, the validated external payload root, the
+retained directory-FD / ``O_NOFOLLOW`` root binding, safe archive extraction and
+inventory, the bounded Ocean ``GET /v1/requests`` observation boundary, off-argv
+FD capabilities, process-registration evidence, write-once report sealing, and
+verified/abandoned closure.
+
+``tool/bin/coordination.sh`` is Bash 3.2 front control only; it validates argument
+shape, never reads a capability, and forwards to this helper.
+
+Design of record: ``durability-pr-design-v5.md`` (PASS review
+``durability-pr-design-v5-review.md``).
+
+Deliberate non-goals: this is a *cooperative* same-user boundary. It detects
+protocol and integrity violations. It does not sandbox a deliberately hostile
+same-UID process and it does not prove which Unix process authored a commit.
+There is no signal, cleanup, deletion, retry, reassignment, provider mutation,
+scheduler, or reconciliation path anywhere in this file.
+
+Targets Apple system Python 3.9 (no 3.10+ syntax or library surface).
+"""
+
+from __future__ import annotations
+
+import argparse
+import errno
+import fcntl
+import hashlib
+import http.client
+import json
+import os
+import re
+import secrets
+import select
+import stat as statmod
+import subprocess
+import sys
+import time
+import unicodedata
+
+
+# ---------------------------------------------------------------------------
+# Section 0. Constants and fixed limits
+# ---------------------------------------------------------------------------
+
+PROTOCOL_VERSION = 1
+COORD_DIRNAME = "stitchpad-coordination"
+COORD_VERSION_DIR = "v1"
+
+DEFAULT_PAYLOAD_BASE_PARENT = "/private/tmp"
+DEFAULT_PAYLOAD_BASE_NAME = "stitchpad-review-payloads"
+DEFAULT_PAYLOAD_BASE = DEFAULT_PAYLOAD_BASE_PARENT + "/" + DEFAULT_PAYLOAD_BASE_NAME
+
+OCEAN_HOST = "127.0.0.1"
+OCEAN_PORT = 4780
+OCEAN_PATH = "/v1/requests"
+
+DIR_MODE = 0o700
+FILE_MODE = 0o600
+EXEC_MODE = 0o700
+
+MAX_RECORD_BYTES = 262144
+MAX_TREE_ENTRIES = 20000
+MAX_ARCHIVE_BYTES = 134217728
+MAX_MEMBER_BYTES = 16777216
+MAX_REPORT_BYTES = 262144
+MAX_HTTP_BYTES = 1048576
+MAX_HTTP_CHUNK = 65536
+MAX_PATH_BYTES = 1024
+MAX_COMPONENTS = 64
+MAX_PROCESSES = 64
+MAX_OBSERVATIONS = 4096
+MAX_CHECKPOINTS = 4096
+MAX_GIT_OUTPUT = 33554432
+MAX_DIR_ENTRIES = 20000
+MAX_CMD_DISPLAY = 160
+
+TOKEN_HEX_LEN = 64
+TOKEN_WIRE_LEN = TOKEN_HEX_LEN + 1  # exact 64 hex + one newline
+
+FD_DEADLINE_SECONDS = 5.0
+GIT_TIMEOUT_SECONDS = 120.0
+PS_TIMEOUT_SECONDS = 15.0
+HTTP_CONNECT_SECONDS = 2.0
+HTTP_TOTAL_SECONDS = 5.0
+
+TEST_ROOT_ENV = "STITCHPAD_COORD_TEST_ROOT"
+TEST_PORT_ENV = "STITCHPAD_COORD_TEST_PORT"
+TEST_PAYLOAD_BASE_ENV = "STITCHPAD_COORD_TEST_PAYLOAD_BASE"
+TEST_CRASH_ENV = "STITCHPAD_COORD_TEST_CRASH_AFTER"
+TEST_PS_FAKE_ENV = "STITCHPAD_COORD_TEST_PS_FAKE"
+TEST_MARKER_NAME = "TEST_MODE_V1"
+
+# Test-only determinism hooks (DeepSeek blueprint W3/W4). Both are honored
+# exclusively under a fully validated section-9 test root; in production the
+# environment variables are inert.
+_TEST_MODE = {"enabled": False, "root": None}
+
+
+def _enable_test_hooks(base):
+    if base.test_root is not None:
+        _TEST_MODE["enabled"] = True
+        _TEST_MODE["root"] = base.test_root["path"]
+
+
+def crash_hook(point):
+    """Deterministic kill-window crash point for gates 4/18 (test root only)."""
+    if not _TEST_MODE["enabled"]:
+        return
+    if os.environ.get(TEST_CRASH_ENV) == point:
+        os._exit(134)
+
+
+def _ps_fake(args):
+    """Deterministic ps substitution for gate 21 (test root only).
+
+    The hook value names a directory directly beneath the validated test root
+    holding up to three fixture files: ``lstart`` (for ``-o lstart=``),
+    ``detail`` (for ``-o ppid=,pgid=,command=``), and ``table`` (for the
+    ``-A`` process table). A missing key file classifies as ``unknown``.
+    """
+    if not _TEST_MODE["enabled"]:
+        return None
+    raw = os.environ.get(TEST_PS_FAKE_ENV) or ""
+    if not raw:
+        return None
+    root = _TEST_MODE["root"] + "/"
+    if not raw.startswith(root):
+        return None
+    rel = raw[len(root):]
+    if not rel or "/" in rel or rel in (".", ".."):
+        return None
+    if args and args[0] == "-A":
+        key = "table"
+    elif any("lstart=" in str(part) for part in args):
+        key = "lstart"
+    else:
+        key = "detail"
+    path = raw + "/" + key
+    try:
+        info = os.lstat(path)
+    except OSError:
+        return None
+    if not statmod.S_ISREG(info.st_mode) or info.st_size > 65536:
+        return None
+    try:
+        with open(path, "rb") as handle:
+            return handle.read().decode("utf-8", "replace")
+    except OSError:
+        return None
+
+HEX_RE = re.compile(r"\A[0-9a-f]+\Z")
+TOKEN_RE = re.compile(r"\A[0-9a-f]{64}\Z")
+UUID_RE = re.compile(
+    r"\A[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}\Z"
+)
+ACTOR_RE = re.compile(r"\A[A-Za-z0-9][A-Za-z0-9._-]{0,63}\Z")
+ROLE_RE = re.compile(r"\A[a-z][a-z0-9-]{0,31}\Z")
+ID_RE = re.compile(r"\A[0-9a-f]{32}\Z")
+ENTRY_NAME_RE = re.compile(r"\A[0-9a-f]{32}\.[0-9a-f]{16}\Z")
+REF_RE = re.compile(r"\Arefs/[A-Za-z0-9][A-Za-z0-9._/-]{0,255}\Z")
+
+VERDICTS = ("PASS", "HOLD", "FAIL")
+
+# Exact Ocean raw states and their projections (section 9 of the design).
+OCEAN_STATE_TABLE = {
+    "queued": ("accepted", False),
+    "running": ("running", False),
+    "waiting_for_permission": ("waiting", False),
+    "cancelling": ("cancel_pending", False),
+    "completed": ("completed", True),
+    "errored": ("failed", True),
+    "cancelled": ("canceled", True),
+}
+TERMINAL_COMPLETIONS = ("completed", "failed", "canceled")
+
+# Safe local Git overrides. Only built-in subcommands are ever invoked.
+GIT_SAFE_CONFIG = (
+    "-c", "core.fileMode=true",
+    "-c", "core.fsmonitor=false",
+    "-c", "core.untrackedCache=false",
+    "-c", "core.hooksPath=/dev/null",
+    "-c", "submodule.recurse=false",
+    "-c", "core.ignoreCase=false",
+    "-c", "core.precomposeUnicode=false",
+    "-c", "core.protectHFS=true",
+    "-c", "core.protectNTFS=true",
+)
+
+KIND_DIR = 1
+KIND_FILE = 2
+KIND_LINK = 3
+
+GIT_MODE_DIR = 0o40000
+GIT_MODE_FILE = 0o100644
+GIT_MODE_EXEC = 0o100755
+GIT_MODE_LINK = 0o120000
+
+
+class CoordError(Exception):
+    """Every refusal is an exact machine code plus bounded human detail."""
+
+    def __init__(self, code, detail="", extra=None):
+        Exception.__init__(self, "%s: %s" % (code, detail) if detail else code)
+        self.code = code
+        self.detail = detail
+        self.extra = extra or {}
+
+
+def fail(code, detail="", **extra):
+    raise CoordError(code, detail, extra)
+
+
+# ---------------------------------------------------------------------------
+# Section 1. Strict parsing, validators, digests
+# ---------------------------------------------------------------------------
+
+def _reject_duplicate_keys(pairs):
+    out = {}
+    for key, value in pairs:
+        if key in out:
+            fail("json_duplicate_key", "duplicate key %r" % (key,))
+        out[key] = value
+    return out
+
+
+def strict_json_loads(text):
+    if isinstance(text, bytes):
+        try:
+            text = text.decode("utf-8")
+        except UnicodeDecodeError:
+            fail("json_not_utf8", "payload is not valid UTF-8")
+    try:
+        return json.loads(text, object_pairs_hook=_reject_duplicate_keys)
+    except CoordError:
+        raise
+    except ValueError as exc:
+        fail("json_malformed", str(exc)[:200])
+
+
+def canonical_json_bytes(obj):
+    return json.dumps(
+        obj, sort_keys=True, separators=(",", ":"), ensure_ascii=True
+    ).encode("ascii") + b"\n"
+
+
+def sha256_hex(data):
+    return hashlib.sha256(data).hexdigest()
+
+
+def length_prefixed(*parts):
+    out = b""
+    for part in parts:
+        if isinstance(part, str):
+            part = part.encode("utf-8")
+        out += len(part).to_bytes(8, "big") + part
+    return out
+
+
+def hash_key(*parts):
+    return hashlib.sha256(length_prefixed(*parts)).hexdigest()
+
+
+def blob_hasher(algo):
+    if algo == "sha1":
+        return hashlib.sha1()
+    if algo == "sha256":
+        return hashlib.sha256()
+    fail("object_format_unsupported", "algorithm %r" % (algo,))
+
+
+def blob_oid_bytes(algo, data):
+    hasher = blob_hasher(algo)
+    hasher.update(("blob %d\0" % len(data)).encode("ascii"))
+    hasher.update(data)
+    return hasher.hexdigest()
+
+
+def oid_hex_len(algo):
+    return 40 if algo == "sha1" else 64
+
+
+def require_oid(value, algo, what="oid"):
+    if not isinstance(value, str) or len(value) != oid_hex_len(algo):
+        fail("oid_not_full", "%s must be exactly %d lowercase hex characters"
+             % (what, oid_hex_len(algo)))
+    if not HEX_RE.match(value):
+        fail("oid_not_full", "%s is not lowercase hex" % (what,))
+    return value
+
+
+def require_match(pattern, value, code, what):
+    if not isinstance(value, str) or not pattern.match(value):
+        fail(code, "invalid %s" % (what,))
+    return value
+
+
+def require_int(value, low, high, code, what):
+    if isinstance(value, bool) or not isinstance(value, int):
+        fail(code, "%s must be an integer" % (what,))
+    if value < low or value > high:
+        fail(code, "%s out of range" % (what,))
+    return value
+
+
+def bounded(text, limit):
+    if text is None:
+        return ""
+    if not isinstance(text, str):
+        text = str(text)
+    text = "".join(ch if ch.isprintable() else "." for ch in text)
+    return text[:limit]
+
+
+def nfd_casefold(text):
+    return unicodedata.normalize("NFD", text).casefold()
+
+
+# ---------------------------------------------------------------------------
+# Section 2. Off-argv FD capabilities
+# ---------------------------------------------------------------------------
+
+def _fd_flags(fd):
+    try:
+        return fcntl.fcntl(fd, fcntl.F_GETFL)
+    except OSError as exc:
+        fail("fd_unusable", "F_GETFL failed: %s" % (exc.strerror,))
+
+
+def _fd_stat(fd, what):
+    try:
+        return os.fstat(fd)
+    except OSError as exc:
+        fail("fd_unusable", "%s fstat failed: %s" % (what, exc.strerror))
+
+
+def _require_regular_capability_fd(fd, info, what):
+    if info.st_uid != os.getuid():
+        fail("fd_owner_mismatch", "%s is not owned by the current user" % (what,))
+    perm = statmod.S_IMODE(info.st_mode)
+    if perm & ~0o600:
+        fail("fd_mode_too_broad", "%s mode must be no broader than 0600" % (what,))
+    if info.st_nlink != 1:
+        fail("fd_extra_links", "%s has extra hard links" % (what,))
+    try:
+        offset = os.lseek(fd, 0, os.SEEK_CUR)
+    except OSError as exc:
+        fail("fd_unusable", "%s is not seekable: %s" % (what, exc.strerror))
+    if offset != 0:
+        fail("fd_offset_nonzero", "%s offset must be zero" % (what,))
+
+
+def write_capability_fd(fd, token):
+    """Write exactly 64 lowercase hex plus one newline. Never truncate."""
+    require_match(TOKEN_RE, token, "capability_malformed", "capability")
+    info = _fd_stat(fd, "capability output fd")
+    flags = _fd_flags(fd)
+    accmode = flags & os.O_ACCMODE
+    if accmode not in (os.O_WRONLY, os.O_RDWR):
+        fail("fd_not_writable", "capability output fd is not writable")
+    if flags & os.O_APPEND:
+        fail("fd_append_mode", "capability output fd must not be append-mode")
+    payload = (token + "\n").encode("ascii")
+    if statmod.S_ISREG(info.st_mode):
+        _require_regular_capability_fd(fd, info, "capability output fd")
+        if info.st_size != 0:
+            fail("fd_not_empty", "capability output fd must be empty")
+        written = 0
+        while written < len(payload):
+            written += os.write(fd, payload[written:])
+        os.fsync(fd)
+        return
+    if statmod.S_ISFIFO(info.st_mode):
+        _pipe_write_exact(fd, payload)
+        return
+    fail("fd_type_rejected", "capability output fd must be a regular file or pipe")
+
+
+def _pipe_write_exact(fd, payload):
+    deadline = time.monotonic() + FD_DEADLINE_SECONDS
+    old = fcntl.fcntl(fd, fcntl.F_GETFL)
+    fcntl.fcntl(fd, fcntl.F_SETFL, old | os.O_NONBLOCK)
+    try:
+        written = 0
+        while written < len(payload):
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                fail("fd_deadline", "capability pipe write deadline exceeded")
+            ready = select.select([], [fd], [], min(remaining, 0.25))[1]
+            if not ready:
+                continue
+            try:
+                written += os.write(fd, payload[written:])
+            except OSError as exc:
+                if exc.errno in (errno.EAGAIN, errno.EWOULDBLOCK):
+                    continue
+                fail("fd_unusable", "capability pipe write failed: %s" % (exc.strerror,))
+    finally:
+        fcntl.fcntl(fd, fcntl.F_SETFL, old)
+
+
+def read_capability_fd(fd):
+    """Read exactly 64 lowercase hex plus one newline, then require EOF."""
+    info = _fd_stat(fd, "capability input fd")
+    flags = _fd_flags(fd)
+    accmode = flags & os.O_ACCMODE
+    if accmode not in (os.O_RDONLY, os.O_RDWR):
+        fail("fd_not_readable", "capability input fd is not readable")
+    if statmod.S_ISREG(info.st_mode):
+        _require_regular_capability_fd(fd, info, "capability input fd")
+        if info.st_size != TOKEN_WIRE_LEN:
+            fail("fd_size_mismatch", "capability input fd must hold exactly %d bytes"
+                 % (TOKEN_WIRE_LEN,))
+        raw = b""
+        while len(raw) < TOKEN_WIRE_LEN:
+            chunk = os.read(fd, TOKEN_WIRE_LEN - len(raw))
+            if not chunk:
+                fail("fd_short_read", "capability input fd ended early")
+            raw += chunk
+        if os.read(fd, 1):
+            fail("fd_trailing_bytes", "capability input fd has trailing bytes")
+    elif statmod.S_ISFIFO(info.st_mode):
+        raw = _pipe_read_exact(fd, TOKEN_WIRE_LEN)
+    else:
+        fail("fd_type_rejected", "capability input fd must be a regular file or pipe")
+    if len(raw) != TOKEN_WIRE_LEN or raw[-1:] != b"\n":
+        fail("capability_malformed", "capability wire format mismatch")
+    try:
+        token = raw[:TOKEN_HEX_LEN].decode("ascii")
+    except UnicodeDecodeError:
+        fail("capability_malformed", "capability is not ASCII")
+    require_match(TOKEN_RE, token, "capability_malformed", "capability")
+    return token
+
+
+def _pipe_read_exact(fd, count):
+    deadline = time.monotonic() + FD_DEADLINE_SECONDS
+    old = fcntl.fcntl(fd, fcntl.F_GETFL)
+    fcntl.fcntl(fd, fcntl.F_SETFL, old | os.O_NONBLOCK)
+    try:
+        raw = b""
+        while len(raw) < count:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                fail("fd_deadline", "capability pipe read deadline exceeded")
+            ready = select.select([fd], [], [], min(remaining, 0.25))[0]
+            if not ready:
+                continue
+            try:
+                chunk = os.read(fd, count - len(raw))
+            except OSError as exc:
+                if exc.errno in (errno.EAGAIN, errno.EWOULDBLOCK):
+                    continue
+                fail("fd_unusable", "capability pipe read failed: %s" % (exc.strerror,))
+            if not chunk:
+                fail("fd_short_read", "capability pipe ended early")
+            raw += chunk
+        # Bounded EOF check: one nonblocking peek, never an unbounded drain.
+        remaining = deadline - time.monotonic()
+        if remaining > 0 and select.select([fd], [], [], min(remaining, 0.1))[0]:
+            try:
+                if os.read(fd, 1):
+                    fail("fd_trailing_bytes", "capability pipe has trailing bytes")
+            except OSError as exc:
+                if exc.errno not in (errno.EAGAIN, errno.EWOULDBLOCK):
+                    fail("fd_unusable", "capability pipe peek failed: %s" % (exc.strerror,))
+        return raw
+    finally:
+        fcntl.fcntl(fd, fcntl.F_SETFL, old)
+
+
+def mint_capability():
+    """Return (token, verifier-record). Only the verifier is ever stored."""
+    token = secrets.token_hex(32)
+    salt = secrets.token_hex(16)
+    return token, {
+        "salt": salt,
+        "verifier": hash_key(salt, token),
+        "algorithm": "sha256-length-prefixed-v1",
+    }
+
+
+def capability_matches(record, token):
+    if not isinstance(record, dict):
+        return False
+    salt = record.get("salt")
+    verifier = record.get("verifier")
+    if not isinstance(salt, str) or not isinstance(verifier, str):
+        return False
+    if record.get("algorithm") != "sha256-length-prefixed-v1":
+        return False
+    return secrets.compare_digest(hash_key(salt, token), verifier)
+
+
+# ---------------------------------------------------------------------------
+# Section 3. Retained-FD filesystem primitives
+# ---------------------------------------------------------------------------
+
+REQUIRED_DIR_FD_FUNCS = (
+    os.open, os.mkdir, os.stat, os.unlink, os.rmdir, os.rename, os.link,
+    os.symlink, os.readlink,
+)
+
+
+def assert_platform_support():
+    for func in REQUIRED_DIR_FD_FUNCS:
+        if func not in os.supports_dir_fd:
+            fail("platform_unsupported",
+                 "os.%s lacks dir_fd support" % (func.__name__,))
+    if os.stat not in os.supports_follow_symlinks:
+        fail("platform_unsupported", "os.stat lacks follow_symlinks support")
+
+
+class FDSet(object):
+    """Retains directory FDs for the whole duration of one operation."""
+
+    def __init__(self):
+        self._fds = []
+
+    def keep(self, fd):
+        self._fds.append(fd)
+        return fd
+
+    def close_all(self):
+        while self._fds:
+            fd = self._fds.pop()
+            try:
+                os.close(fd)
+            except OSError:
+                pass
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *_exc):
+        self.close_all()
+        return False
+
+
+def identity(info):
+    if statmod.S_ISDIR(info.st_mode):
+        kind = "directory"
+    elif statmod.S_ISREG(info.st_mode):
+        kind = "regular"
+    elif statmod.S_ISLNK(info.st_mode):
+        kind = "symlink"
+    else:
+        kind = "other"
+    return {"dev": info.st_dev, "ino": info.st_ino, "type": kind}
+
+
+def same_identity(left, right):
+    if not isinstance(left, dict) or not isinstance(right, dict):
+        return False
+    for key in ("dev", "ino", "type"):
+        if left.get(key) != right.get(key):
+            return False
+    return True
+
+
+def lstat_at(dir_fd, name, code="path_missing", what=None):
+    try:
+        return os.stat(name, dir_fd=dir_fd, follow_symlinks=False)
+    except OSError as exc:
+        fail(code, "%s: %s" % (what or name, exc.strerror))
+
+
+def try_lstat_at(dir_fd, name):
+    try:
+        return os.stat(name, dir_fd=dir_fd, follow_symlinks=False)
+    except OSError:
+        return None
+
+
+def open_dir_at(dir_fd, name, code="dir_open_failed", what=None):
+    flags = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW
+    if hasattr(os, "O_CLOEXEC"):
+        flags |= os.O_CLOEXEC
+    try:
+        return os.open(name, flags, dir_fd=dir_fd)
+    except OSError as exc:
+        fail(code, "%s: %s" % (what or name, exc.strerror))
+
+
+def open_file_at(dir_fd, name, code="file_open_failed", what=None):
+    flags = os.O_RDONLY | os.O_NOFOLLOW
+    if hasattr(os, "O_CLOEXEC"):
+        flags |= os.O_CLOEXEC
+    try:
+        return os.open(name, flags, dir_fd=dir_fd)
+    except OSError as exc:
+        fail(code, "%s: %s" % (what or name, exc.strerror))
+
+
+def bind_dir_at(fds, dir_fd, name, expect=None, what=None, code="root_replaced"):
+    """lstat -> O_NOFOLLOW open -> fstat, with optional stable-identity match."""
+    entry = lstat_at(dir_fd, name, code=code, what=what)
+    if not statmod.S_ISDIR(entry.st_mode):
+        fail(code, "%s is not a directory" % (what or name,))
+    fd = fds.keep(open_dir_at(dir_fd, name, code=code, what=what))
+    opened = os.fstat(fd)
+    if identity(entry) != identity(opened):
+        fail(code, "%s changed between lstat and open" % (what or name,))
+    if expect is not None and not same_identity(identity(opened), expect):
+        fail(code, "%s identity does not match the recorded root" % (what or name,))
+    return fd, identity(opened)
+
+
+def require_owned_dir(info, expect_mode, what, code="unsafe_mode"):
+    if info.st_uid != os.getuid():
+        fail("unsafe_owner", "%s is not owned by the current user" % (what,))
+    if statmod.S_IMODE(info.st_mode) != expect_mode:
+        fail(code, "%s mode is not %04o" % (what, expect_mode))
+
+
+def mkdir_owned(dir_fd, name, mode=DIR_MODE):
+    try:
+        os.mkdir(name, mode, dir_fd=dir_fd)
+    except FileExistsError:
+        return False
+    except OSError as exc:
+        fail("mkdir_failed", "%s: %s" % (name, exc.strerror))
+    return True
+
+
+def ensure_owned_dir(fds, dir_fd, name, what, mode=DIR_MODE):
+    """Create-if-absent then bind with exact owner/mode. Never follows a link.
+
+    An existing entry with a foreign owner, wrong mode, symlink type, or an
+    unstable identity fails closed; the helper never repairs foreign state.
+    """
+    created = False
+    old_mask = os.umask(0o077)
+    try:
+        created = mkdir_owned(dir_fd, name, mode)
+    finally:
+        os.umask(old_mask)
+    entry = lstat_at(dir_fd, name, code="unsafe_path", what=what)
+    if statmod.S_ISLNK(entry.st_mode) or not statmod.S_ISDIR(entry.st_mode):
+        fail("unsafe_path", "%s is not a real directory" % (what,))
+    fd = fds.keep(open_dir_at(dir_fd, name, code="unsafe_path", what=what))
+    opened = os.fstat(fd)
+    if identity(entry) != identity(opened):
+        fail("unsafe_path", "%s changed between lstat and open" % (what,))
+    if statmod.S_IMODE(opened.st_mode) != mode:
+        if not created:
+            fail("unsafe_mode", "%s mode is not %04o" % (what, mode))
+        os.fchmod(fd, mode)
+        opened = os.fstat(fd)
+    require_owned_dir(opened, mode, what)
+    return fd, identity(opened)
+
+
+def fsync_dir(fd):
+    try:
+        os.fsync(fd)
+    except OSError:
+        # Directory fsync is best-effort on some filesystems; publication
+        # ordering (temp -> rename -> READY) still holds.
+        pass
+
+
+def write_file_at(dir_fd, name, data, mode=FILE_MODE):
+    flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW
+    if hasattr(os, "O_CLOEXEC"):
+        flags |= os.O_CLOEXEC
+    try:
+        fd = os.open(name, flags, mode, dir_fd=dir_fd)
+    except OSError as exc:
+        fail("write_failed", "%s: %s" % (name, exc.strerror))
+    try:
+        written = 0
+        while written < len(data):
+            written += os.write(fd, data[written:])
+        os.fchmod(fd, mode)
+        os.fsync(fd)
+        info = os.fstat(fd)
+    finally:
+        os.close(fd)
+    if info.st_nlink != 1:
+        fail("write_failed", "%s gained hard links" % (name,))
+    return identity(info)
+
+
+def read_file_at(dir_fd, name, limit, what=None, require_mode=True):
+    fd = open_file_at(dir_fd, name, code="record_missing", what=what)
+    try:
+        info = os.fstat(fd)
+        if not statmod.S_ISREG(info.st_mode):
+            fail("record_invalid", "%s is not a regular file" % (what or name,))
+        if info.st_uid != os.getuid():
+            fail("record_invalid", "%s is not owned by the current user" % (what or name,))
+        if require_mode and statmod.S_IMODE(info.st_mode) & ~0o600:
+            fail("record_invalid", "%s mode is broader than 0600" % (what or name,))
+        if info.st_size > limit:
+            fail("record_invalid", "%s exceeds %d bytes" % (what or name, limit))
+        data = b""
+        while True:
+            chunk = os.read(fd, 65536)
+            if not chunk:
+                break
+            data += chunk
+            if len(data) > limit:
+                fail("record_invalid", "%s exceeds %d bytes" % (what or name, limit))
+        return data
+    finally:
+        os.close(fd)
+
+
+def atomic_publish(dir_fd, name, data, mode=FILE_MODE):
+    tmp = ".tmp.%s.%s" % (name, secrets.token_hex(8))
+    write_file_at(dir_fd, name=tmp, data=data, mode=mode)
+    try:
+        os.rename(tmp, name, src_dir_fd=dir_fd, dst_dir_fd=dir_fd)
+    except OSError as exc:
+        try:
+            os.unlink(tmp, dir_fd=dir_fd)
+        except OSError:
+            pass
+        fail("publish_failed", "%s: %s" % (name, exc.strerror))
+    fsync_dir(dir_fd)
+
+
+def list_dir_at(dir_fd, what="directory"):
+    dup = os.dup(dir_fd)
+    try:
+        names = os.listdir(dup)
+    except OSError as exc:
+        os.close(dup)
+        fail("dir_read_failed", "%s: %s" % (what, exc.strerror))
+    else:
+        os.close(dup)
+    if len(names) > MAX_DIR_ENTRIES:
+        fail("dir_too_large", "%s has too many entries" % (what,))
+    names.sort()
+    return names
+
+
+def remove_owned_scratch(parent_fd, name, depth=0):
+    """Bounded removal of a helper-created scratch tree.
+
+    This exists only for the per-invocation scrubbed-Git HOME/XDG root that this
+    helper itself creates. It never follows a symlink, never crosses into a
+    directory it did not just stat as a real owned directory, is depth- and
+    count-bounded, and is never reachable from any CLI verb. It is not a
+    cleanup/prune facility for coordination state or review payloads.
+    """
+    if depth > 4:
+        return
+    info = try_lstat_at(parent_fd, name)
+    if info is None:
+        return
+    if statmod.S_ISLNK(info.st_mode) or not statmod.S_ISDIR(info.st_mode):
+        try:
+            os.unlink(name, dir_fd=parent_fd)
+        except OSError:
+            pass
+        return
+    if info.st_uid != os.getuid():
+        return
+    try:
+        fd = open_dir_at(parent_fd, name)
+    except CoordError:
+        return
+    try:
+        dup = os.dup(fd)
+        try:
+            entries = os.listdir(dup)
+        finally:
+            os.close(dup)
+        if len(entries) > 512:
+            return
+        for entry in entries:
+            remove_owned_scratch(fd, entry, depth + 1)
+    except OSError:
+        return
+    finally:
+        os.close(fd)
+    try:
+        os.rmdir(name, dir_fd=parent_fd)
+    except OSError:
+        pass
+
+
+# ---------------------------------------------------------------------------
+# Section 4. Validated external payload root (exact component policy)
+# ---------------------------------------------------------------------------
+
+class PayloadBase(object):
+    def __init__(self, path, fd, ident, fds, test_root=None):
+        self.path = path
+        self.fd = fd
+        self.identity = ident
+        self.fds = fds
+        self.test_root = test_root
+
+
+def _bind_trusted_root_component(fds, parent_fd, name, path, allow_sticky=False):
+    """Root-owned ancestor: real directory, uid 0, never group/other writable."""
+    entry = lstat_at(parent_fd, name, code="unsafe_ancestor", what=path)
+    if statmod.S_ISLNK(entry.st_mode):
+        fail("unsafe_ancestor", "%s is a symlink" % (path,))
+    if not statmod.S_ISDIR(entry.st_mode):
+        fail("unsafe_ancestor", "%s is not a real directory" % (path,))
+    fd = fds.keep(open_dir_at(parent_fd, name, code="unsafe_ancestor", what=path))
+    opened = os.fstat(fd)
+    if identity(entry) != identity(opened):
+        fail("unsafe_ancestor", "%s changed between lstat and open" % (path,))
+    if opened.st_uid != 0:
+        fail("unsafe_ancestor", "%s is not root-owned" % (path,))
+    mode = statmod.S_IMODE(opened.st_mode)
+    if allow_sticky:
+        # The single narrow exception: the canonical sticky temporary directory.
+        if mode != 0o1777:
+            fail("unsafe_ancestor",
+                 "%s must be the canonical sticky 01777 temporary directory" % (path,))
+    else:
+        if mode & 0o022:
+            fail("unsafe_ancestor", "%s is group- or world-writable" % (path,))
+    return fd, identity(opened)
+
+
+def bind_private_tmp(fds):
+    """Bind / -> /private -> /private/tmp with exact component trust."""
+    root_fd = fds.keep(open_dir_at(None, "/", code="unsafe_ancestor", what="/"))
+    root_info = os.fstat(root_fd)
+    if root_info.st_uid != 0:
+        fail("unsafe_ancestor", "/ is not root-owned")
+    if statmod.S_IMODE(root_info.st_mode) & 0o022:
+        fail("unsafe_ancestor", "/ is group- or world-writable")
+    if not statmod.S_ISDIR(root_info.st_mode):
+        fail("unsafe_ancestor", "/ is not a directory")
+    private_fd, _ = _bind_trusted_root_component(fds, root_fd, "private", "/private")
+    tmp_fd, tmp_id = _bind_trusted_root_component(
+        fds, private_fd, "tmp", "/private/tmp", allow_sticky=True
+    )
+    return tmp_fd, tmp_id
+
+
+def _test_mode_root(fds, tmp_fd):
+    """Honor a test root only when every section-9 precondition holds."""
+    raw = os.environ.get(TEST_ROOT_ENV) or ""
+    if not raw:
+        return None
+    prefix = DEFAULT_PAYLOAD_BASE_PARENT + "/"
+    if not raw.startswith(prefix):
+        fail("test_root_rejected",
+             "%s must be directly beneath %s" % (TEST_ROOT_ENV, DEFAULT_PAYLOAD_BASE_PARENT))
+    name = raw[len(prefix):]
+    if not name or "/" in name or name in (".", ".."):
+        fail("test_root_rejected", "%s must be a single literal child name" % (TEST_ROOT_ENV,))
+    entry = lstat_at(tmp_fd, name, code="test_root_rejected", what=raw)
+    if statmod.S_ISLNK(entry.st_mode) or not statmod.S_ISDIR(entry.st_mode):
+        fail("test_root_rejected", "%s is not a real directory" % (raw,))
+    fd = fds.keep(open_dir_at(tmp_fd, name, code="test_root_rejected", what=raw))
+    opened = os.fstat(fd)
+    if identity(entry) != identity(opened):
+        fail("test_root_rejected", "%s changed between lstat and open" % (raw,))
+    require_owned_dir(opened, DIR_MODE, raw, code="test_root_rejected")
+    marker = lstat_at(fd, TEST_MARKER_NAME, code="test_root_rejected",
+                      what="%s/%s" % (raw, TEST_MARKER_NAME))
+    if not statmod.S_ISREG(marker.st_mode):
+        fail("test_root_rejected", "test-mode marker is not a regular file")
+    if marker.st_uid != os.getuid() or statmod.S_IMODE(marker.st_mode) != FILE_MODE:
+        fail("test_root_rejected", "test-mode marker must be a current-UID 0600 file")
+    return {"path": raw, "fd": fd, "identity": identity(opened)}
+
+
+def open_payload_base(fds):
+    """Return the validated payload base with retained ancestor FDs."""
+    assert_platform_support()
+    tmp_fd, _ = bind_private_tmp(fds)
+    test_root = _test_mode_root(fds, tmp_fd)
+
+    if test_root is not None:
+        raw = os.environ.get(TEST_PAYLOAD_BASE_ENV) or ""
+        if raw:
+            prefix = test_root["path"] + "/"
+            if not raw.startswith(prefix):
+                fail("payload_base_rejected",
+                     "%s must be a direct child of the test root" % (TEST_PAYLOAD_BASE_ENV,))
+            name = raw[len(prefix):]
+            if not name or "/" in name or name in (".", ".."):
+                fail("payload_base_rejected",
+                     "%s must be a single literal child name" % (TEST_PAYLOAD_BASE_ENV,))
+            parent_fd = test_root["fd"]
+            base_path = raw
+        else:
+            parent_fd = test_root["fd"]
+            name = DEFAULT_PAYLOAD_BASE_NAME
+            base_path = test_root["path"] + "/" + name
+    else:
+        if os.environ.get(TEST_PAYLOAD_BASE_ENV) or os.environ.get(TEST_PORT_ENV):
+            fail("test_override_rejected",
+                 "test overrides require a fully validated %s" % (TEST_ROOT_ENV,))
+        parent_fd = tmp_fd
+        name = DEFAULT_PAYLOAD_BASE_NAME
+        base_path = DEFAULT_PAYLOAD_BASE
+
+    fd, ident = ensure_owned_dir(fds, parent_fd, name, base_path, mode=DIR_MODE)
+    _reject_git_component_chain(base_path)
+    return PayloadBase(base_path, fd, ident, fds, test_root)
+
+
+def _reject_git_component_chain(path):
+    for component in path.split("/"):
+        if not component:
+            continue
+        if nfd_casefold(component) == ".git":
+            fail("unsafe_ancestor", "path component %r normalizes to .git" % (component,))
+
+
+def assert_payload_outside_repo(base_path, payload_path, repo):
+    """Payload must not equal, contain, or live inside any repository path."""
+    protected = [repo["top"], repo["common_dir"]] + list(repo.get("worktrees", []))
+    for candidate in (base_path, payload_path):
+        for guard in protected:
+            if not guard:
+                continue
+            if candidate == guard:
+                fail("payload_inside_repo", "payload path equals a repository path")
+            if candidate.startswith(guard.rstrip("/") + "/"):
+                fail("payload_inside_repo", "payload path is inside a repository path")
+            if guard.startswith(candidate.rstrip("/") + "/"):
+                fail("payload_inside_repo", "payload path contains a repository path")
+
+
+def assert_no_git_discovery(path, git_home):
+    """Scrubbed Git, without any ceiling, must not discover a repository here."""
+    result = git_raw(
+        ["-C", path, "rev-parse", "--show-toplevel"], git_home, check=False, ceiling=None
+    )
+    if result["rc"] == 0 and result["out"].strip():
+        fail("payload_git_discoverable",
+             "a Git worktree is discoverable at or above the payload base")
+    result = git_raw(
+        ["-C", path, "rev-parse", "--git-dir"], git_home, check=False, ceiling=None
+    )
+    if result["rc"] == 0 and result["out"].strip():
+        fail("payload_git_discoverable",
+             "a Git directory is discoverable at or above the payload base")
+
+
+def reviewer_ceiling(base):
+    """Helper-derived reviewer launch ceiling (DeepSeek blueprint P0/W1).
+
+    Probed against Apple Git 2.50.1: with the reviewer's cwd *equal* to the
+    ceiling, Git still walks upward and discovers an ancestor repository, so a
+    ceiling of ``src`` cannot protect gates 8/12. The ceiling is therefore the
+    canonical payload *base* — the root-most helper-owned directory, itself
+    proven ``.git``-free by base validation — never caller-provided, never the
+    src directory. The launch wrapper (deferred to the review-core increment)
+    sets ``GIT_CEILING_DIRECTORIES`` to exactly this value plus
+    ``GIT_DISCOVERY_ACROSS_FILESYSTEM=0``.
+    """
+    return base.path
+
+
+# ---------------------------------------------------------------------------
+# Section 5. Scrubbed Git, canonical identity, clean worktrees
+# ---------------------------------------------------------------------------
+
+class GitHome(object):
+    """A fresh helper-owned HOME/XDG root for every scrubbed Git subprocess."""
+
+    def __init__(self, base_fd, base_path, name):
+        self.base_fd = base_fd
+        self.base_path = base_path
+        self.name = name
+        self.path = base_path + "/" + name
+
+    def release(self):
+        remove_owned_scratch(self.base_fd, self.name)
+
+
+def make_git_home(fds, base):
+    name = "scrub.%s" % (secrets.token_hex(8),)
+    old_mask = os.umask(0o077)
+    try:
+        if not mkdir_owned(base.fd, name, DIR_MODE):
+            fail("scratch_exists", "scrubbed Git home collided")
+        fd = fds.keep(open_dir_at(base.fd, name, code="unsafe_path", what=name))
+        os.fchmod(fd, DIR_MODE)
+        for child in ("config", "cache", "data", "state"):
+            mkdir_owned(fd, child, DIR_MODE)
+    finally:
+        os.umask(old_mask)
+    return GitHome(base.fd, base.path, name)
+
+
+def git_env(git_home, ceiling=None):
+    env = {}
+    for key, value in os.environ.items():
+        if key.startswith("GIT_"):
+            continue
+        env[key] = value
+    home = git_home.path if git_home is not None else None
+    if home:
+        env["HOME"] = home
+        env["XDG_CONFIG_HOME"] = home + "/config"
+        env["XDG_CACHE_HOME"] = home + "/cache"
+        env["XDG_DATA_HOME"] = home + "/data"
+        env["XDG_STATE_HOME"] = home + "/state"
+        env["TMPDIR"] = home
+    env["GIT_CONFIG_NOSYSTEM"] = "1"
+    env["GIT_TERMINAL_PROMPT"] = "0"
+    env["GIT_ASKPASS"] = "/bin/false"
+    env["GIT_ATTR_NOSYSTEM"] = "1"
+    env["GIT_OPTIONAL_LOCKS"] = "0"
+    env["GIT_PAGER"] = "cat"
+    env["GIT_FLUSH"] = "1"
+    env["LC_ALL"] = "C"
+    env["LANG"] = "C"
+    if ceiling is not None:
+        env["GIT_CEILING_DIRECTORIES"] = ceiling
+        env["GIT_DISCOVERY_ACROSS_FILESYSTEM"] = "0"
+    return env
+
+
+def git_raw(args, git_home, check=True, ceiling=None, limit=MAX_GIT_OUTPUT,
+            binary=False):
+    argv = ["git"] + list(GIT_SAFE_CONFIG) + list(args)
+    try:
+        proc = subprocess.Popen(
+            argv, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+            stdin=subprocess.DEVNULL, env=git_env(git_home, ceiling), cwd="/",
+            close_fds=True,
+        )
+    except OSError as exc:
+        fail("git_unavailable", "cannot run git: %s" % (exc.strerror,))
+    try:
+        out, err = proc.communicate(timeout=GIT_TIMEOUT_SECONDS)
+    except subprocess.TimeoutExpired:
+        proc.kill()
+        proc.communicate()
+        fail("git_timeout", "git %s timed out" % (args[0] if args else "",))
+    if len(out) > limit:
+        fail("git_output_too_large", "git output exceeded %d bytes" % (limit,))
+    result = {
+        "rc": proc.returncode,
+        "raw": out,
+        "err": bounded(err.decode("utf-8", "replace"), 400),
+    }
+    if not binary:
+        result["out"] = out.decode("utf-8", "replace")
+    else:
+        result["out"] = ""
+    if check and proc.returncode != 0:
+        fail("git_failed", "git %s failed: %s"
+             % (" ".join(str(a) for a in args[:3]), result["err"]))
+    return result
+
+
+def git_line(args, git_home, ceiling=None, check=True):
+    result = git_raw(args, git_home, check=check, ceiling=ceiling)
+    if result["rc"] != 0:
+        return None
+    return result["out"].strip()
+
+
+def canonical_dir(path):
+    """cd -P / pwd -P equivalent, without realpath(1) or readlink -f."""
+    try:
+        fd = os.open(path, os.O_RDONLY | os.O_DIRECTORY)
+    except OSError as exc:
+        fail("path_unresolvable", "%s: %s" % (path, exc.strerror))
+    try:
+        saved = os.open(".", os.O_RDONLY | os.O_DIRECTORY)
+        try:
+            os.fchdir(fd)
+            resolved = os.getcwd()
+        finally:
+            os.fchdir(saved)
+            os.close(saved)
+    finally:
+        os.close(fd)
+    return resolved
+
+
+def resolve_repo(path, git_home):
+    """Canonical top-level is the worktree identity, never a subdirectory."""
+    if not isinstance(path, str) or not path:
+        fail("worktree_invalid", "worktree path is required")
+    if not os.path.isdir(path):
+        fail("worktree_invalid", "%s is not a directory" % (bounded(path, 200),))
+    top = git_line(["-C", path, "rev-parse", "--show-toplevel"], git_home, check=False)
+    if not top:
+        fail("not_a_worktree", "%s is not inside a Git worktree" % (bounded(path, 200),))
+    top = canonical_dir(top)
+
+    common = git_line(["-C", top, "rev-parse", "--git-common-dir"], git_home, check=False)
+    if not common:
+        fail("not_a_worktree", "cannot resolve the Git common directory")
+    if not common.startswith("/"):
+        common = top + "/" + common
+    common = canonical_dir(common)
+
+    algo = git_line(["-C", top, "rev-parse", "--show-object-format"], git_home, check=False)
+    if algo not in ("sha1", "sha256"):
+        fail("object_format_unsupported", "unsupported object format %r" % (algo,))
+
+    head = git_line(["-C", top, "rev-parse", "--verify", "--quiet", "HEAD"],
+                    git_home, check=False)
+    tree = git_line(["-C", top, "rev-parse", "--verify", "--quiet", "HEAD^{tree}"],
+                    git_home, check=False)
+    if not head or not tree:
+        fail("head_unborn", "worktree HEAD does not resolve to a commit")
+    require_oid(head, algo, "HEAD")
+    require_oid(tree, algo, "HEAD tree")
+
+    ref = git_line(["-C", top, "symbolic-ref", "-q", "HEAD"], git_home, check=False)
+    if ref:
+        require_match(REF_RE, ref, "ref_invalid", "HEAD ref")
+    else:
+        ref = None
+
+    worktrees = []
+    listing = git_raw(["-C", top, "worktree", "list", "--porcelain"],
+                      git_home, check=False)
+    if listing["rc"] == 0:
+        for line in listing["out"].splitlines():
+            if line.startswith("worktree "):
+                candidate = line[len("worktree "):].strip()
+                if candidate:
+                    worktrees.append(candidate)
+
+    repo_id = hash_key(common)
+    return {
+        "algo": algo,
+        "top": top,
+        "common_dir": common,
+        "repo_id": repo_id,
+        "head": head,
+        "tree": tree,
+        "ref": ref,
+        "detached": ref is None,
+        "worktrees": worktrees,
+        "worktree_key": hash_key(repo_id, top),
+        "ref_key": hash_key(repo_id, ref) if ref else None,
+    }
+
+
+def require_native_commit(repo, oid, git_home, what="commit"):
+    require_oid(oid, repo["algo"], what)
+    resolved = git_line(
+        ["-C", repo["top"], "rev-parse", "--verify", "--quiet",
+         "--end-of-options", oid + "^{commit}"], git_home, check=False
+    )
+    if resolved != oid:
+        fail("commit_not_native", "%s is not a commit object in this repository" % (what,))
+    kind = git_line(["-C", repo["top"], "cat-file", "-t", "--", oid],
+                    git_home, check=False)
+    if kind != "commit":
+        fail("commit_not_native", "%s does not name a commit" % (what,))
+    return oid
+
+
+DIRT_CATEGORIES = (
+    "staged", "unstaged", "unmerged", "deleted", "typechange", "modechange",
+    "untracked",
+)
+
+
+def clean_scan(repo, git_home):
+    """Refuse staged, unstaged, mode/type, deleted, untracked, ignored-looking dirt."""
+    counts = dict((name, 0) for name in DIRT_CATEGORIES)
+    digest_parts = []
+
+    def consume(raw, staged):
+        fields = raw.split(b"\0")
+        index = 0
+        while index < len(fields):
+            head = fields[index]
+            if not head:
+                index += 1
+                continue
+            if not head.startswith(b":"):
+                index += 1
+                continue
+            parts = head[1:].split(b" ")
+            if len(parts) < 5:
+                fail("scan_malformed", "unexpected git diff-index output")
+            src_mode = parts[0]
+            dst_mode = parts[1]
+            status = parts[4]
+            index += 1
+            if index >= len(fields):
+                fail("scan_malformed", "truncated git diff-index output")
+            path = fields[index]
+            index += 1
+            code = status[:1]
+            if code in (b"R", b"C"):
+                if index >= len(fields):
+                    fail("scan_malformed", "truncated rename record")
+                index += 1
+            digest_parts.append(length_prefixed(
+                b"staged" if staged else b"worktree", src_mode, dst_mode, status, path
+            ))
+            if code == b"U":
+                counts["unmerged"] += 1
+            elif code == b"D":
+                counts["deleted"] += 1
+            elif code == b"T":
+                counts["typechange"] += 1
+            elif src_mode != dst_mode and dst_mode != b"000000":
+                counts["modechange"] += 1
+            elif staged:
+                counts["staged"] += 1
+            else:
+                counts["unstaged"] += 1
+
+    staged_raw = git_raw(
+        ["-C", repo["top"], "diff-index", "--cached", "--raw", "-z",
+         "--no-textconv", "--no-ext-diff", repo["head"], "--"],
+        git_home, binary=True,
+    )["raw"]
+    worktree_raw = git_raw(
+        ["-C", repo["top"], "diff-index", "--raw", "-z",
+         "--no-textconv", "--no-ext-diff", repo["head"], "--"],
+        git_home, binary=True,
+    )["raw"]
+    consume(staged_raw, True)
+    consume(worktree_raw, False)
+
+    # No exclude-standard: an ignored-looking untracked path is dirt too.
+    others = git_raw(["-C", repo["top"], "ls-files", "--others", "-z"],
+                     git_home, binary=True)["raw"]
+    for path in others.split(b"\0"):
+        if not path:
+            continue
+        counts["untracked"] += 1
+        digest_parts.append(length_prefixed(b"other", path))
+
+    total = sum(counts.values())
+    digest = sha256_hex(b"".join(sorted(digest_parts)))
+    return {"clean": total == 0, "total": total, "counts": counts, "digest": digest}
+
+
+def require_clean(repo, git_home, operation):
+    scan = clean_scan(repo, git_home)
+    if not scan["clean"]:
+        raise CoordError(
+            "worktree_dirty",
+            "%s requires a clean worktree (%d dirty entries)" % (operation, scan["total"]),
+            {"scan": scan},
+        )
+    return scan
+
+
+# ---------------------------------------------------------------------------
+# Section 6. State root, records, transition mutex
+# ---------------------------------------------------------------------------
+
+RECORD_SCHEMAS = {
+    "lease": (
+        "version", "kind", "generation", "lease_id", "repo_id", "top", "common_dir",
+        "actor", "algo", "ref", "detached", "base_head", "expected_head",
+        "expected_tree", "capability", "worktree_key", "ref_key", "state",
+        "created_at", "updated_at", "released_at", "clean_digest", "checkpoint_count",
+    ),
+    "claim": (
+        "version", "kind", "generation", "lease_id", "repo_id", "top", "ref",
+        "actor", "created_at", "claim_key", "claim_type",
+    ),
+    "review": (
+        "version", "kind", "generation", "review_id", "repo_id", "top", "common_dir",
+        "algo", "commit", "tree", "author_actor", "reviewer_actor", "provider",
+        "state", "created_at", "updated_at", "lease_id", "process_capability",
+        "payload_name", "closure", "closure_reason",
+    ),
+    "pointer": (
+        "version", "kind", "generation", "review_id", "payload_base", "payload_path",
+        "payload_name", "payload_identity", "src_identity", "manifest_digest",
+        "inventory_digest", "created_at",
+    ),
+    "manifest": (
+        "version", "kind", "generation", "review_id", "algo", "commit", "tree",
+        "repo_id", "entry_count", "inventory_digest", "src_identity",
+        "payload_identity", "launch_digest", "created_at", "ceiling",
+    ),
+    "facts": (
+        "version", "kind", "generation", "review_id", "session_id", "request_id",
+        "bound_at", "cancel_requested", "cancel_requested_at", "terminal_observed",
+        "terminal_completion", "terminal_at", "report_sealed", "report_digest",
+        "report_verdict", "report_sealed_at", "artifact_verified", "verified_at",
+        "closure", "closure_reason", "closed_at", "conflict",
+    ),
+    "latest": (
+        "version", "kind", "generation", "review_id", "phase", "raw_state",
+        "observed_at", "diagnostic", "diagnostic_at", "observation_count",
+    ),
+    "observation": (
+        "version", "kind", "generation", "review_id", "raw_state", "phase",
+        "terminal", "observed_at", "evidence_digest", "diagnostic",
+    ),
+    "process": (
+        "version", "kind", "generation", "review_id", "role", "pid", "ppid", "pgid",
+        "lstart", "command_digest", "command_display", "registered_at",
+    ),
+    "checkpoint": (
+        "version", "kind", "generation", "lease_id", "old", "new", "tree", "actor",
+        "ref", "recorded_at",
+    ),
+}
+
+
+def new_record(kind, generation, fields):
+    if kind not in RECORD_SCHEMAS:
+        fail("record_kind_unknown", "unknown record kind %r" % (kind,))
+    record = {"version": PROTOCOL_VERSION, "kind": kind, "generation": generation}
+    record.update(fields)
+    allowed = RECORD_SCHEMAS[kind]
+    for key in record:
+        if key not in allowed:
+            fail("record_key_rejected", "%s record rejects key %r" % (kind, key))
+    return record
+
+
+def validate_record(record, kind, name):
+    if not isinstance(record, dict):
+        fail("record_invalid", "%s is not a JSON object" % (name,))
+    if record.get("version") != PROTOCOL_VERSION:
+        fail("record_version_mismatch", "%s has an unsupported version" % (name,))
+    if record.get("kind") != kind:
+        fail("record_kind_mismatch", "%s is not a %s record" % (name, kind))
+    generation = record.get("generation")
+    require_int(generation, 1, 2 ** 40, "record_invalid", "%s generation" % (name,))
+    allowed = RECORD_SCHEMAS[kind]
+    for key in record:
+        if key not in allowed:
+            fail("record_key_rejected", "%s record rejects key %r" % (name, key))
+    return record
+
+
+def publish_record(fds, parent_fd, entry_name, kind, record, what):
+    """temp -> fsync -> rename -> directory fsync -> READY last."""
+    validate_record(record, kind, what)
+    data = canonical_json_bytes(record)
+    if len(data) > MAX_RECORD_BYTES:
+        fail("record_too_large", "%s exceeds %d bytes" % (what, MAX_RECORD_BYTES))
+    entry_fd, _ = ensure_owned_dir(fds, parent_fd, entry_name, what)
+    # Retract READY first: a crash mid-update must read as incomplete, never free.
+    try:
+        os.unlink("READY", dir_fd=entry_fd)
+        fsync_dir(entry_fd)
+    except FileNotFoundError:
+        pass
+    except OSError as exc:
+        fail("publish_failed", "%s READY retract failed: %s" % (what, exc.strerror))
+    atomic_publish(entry_fd, "record.json", data)
+    crash_hook("record.published")
+    ready = canonical_json_bytes({
+        "version": PROTOCOL_VERSION,
+        "generation": record["generation"],
+        "digest": sha256_hex(data),
+    })
+    atomic_publish(entry_fd, "READY", ready)
+    return entry_fd
+
+
+def read_record(parent_fd, entry_name, kind, what, allow_missing=False):
+    entry = try_lstat_at(parent_fd, entry_name)
+    if entry is None:
+        if allow_missing:
+            return None
+        fail("record_missing", "%s is absent" % (what,))
+    if not statmod.S_ISDIR(entry.st_mode) or statmod.S_ISLNK(entry.st_mode):
+        fail("record_invalid", "%s is not a real directory" % (what,))
+    if entry.st_uid != os.getuid():
+        fail("record_invalid", "%s is not owned by the current user" % (what,))
+    if statmod.S_IMODE(entry.st_mode) != DIR_MODE:
+        fail("record_invalid", "%s mode is not 0700" % (what,))
+    entry_fd = open_dir_at(parent_fd, entry_name, code="record_invalid", what=what)
+    try:
+        ready_raw = try_lstat_at(entry_fd, "READY")
+        if ready_raw is None:
+            raise CoordError("transition_incomplete",
+                             "%s has no READY marker" % (what,),
+                             {"entry": entry_name})
+        ready = strict_json_loads(
+            read_file_at(entry_fd, "READY", 4096, what="%s READY" % (what,))
+        )
+        data = read_file_at(entry_fd, "record.json", MAX_RECORD_BYTES,
+                            what="%s record.json" % (what,))
+        record = strict_json_loads(data)
+        validate_record(record, kind, what)
+        if ready.get("generation") != record["generation"]:
+            raise CoordError("transition_incomplete",
+                             "%s READY generation mismatch" % (what,))
+        if ready.get("digest") != sha256_hex(data):
+            raise CoordError("transition_incomplete",
+                             "%s READY digest mismatch" % (what,))
+        return {"record": record, "entry": entry_name, "identity": identity(entry)}
+    finally:
+        os.close(entry_fd)
+
+
+class StateRoot(object):
+    """<common-dir>/stitchpad-coordination/v1 — metadata only, never payload."""
+
+    def __init__(self, fds, repo, create=True):
+        self.repo = repo
+        self.fds = fds
+        common_fd = fds.keep(open_dir_at(None, repo["common_dir"],
+                                         code="common_dir_missing",
+                                         what=repo["common_dir"]))
+        if create:
+            coord_fd, _ = ensure_owned_dir(fds, common_fd, COORD_DIRNAME,
+                                           "coordination root")
+            root_fd, _ = ensure_owned_dir(fds, coord_fd, COORD_VERSION_DIR,
+                                          "coordination v1 root")
+            self.fd = root_fd
+            self.leases = ensure_owned_dir(fds, root_fd, "leases", "leases")[0]
+            claims = ensure_owned_dir(fds, root_fd, "claims", "claims")[0]
+            self.claims = claims
+            self.claim_worktrees = ensure_owned_dir(
+                fds, claims, "worktrees", "worktree claims")[0]
+            self.claim_refs = ensure_owned_dir(fds, claims, "refs", "ref claims")[0]
+            self.reviews = ensure_owned_dir(fds, root_fd, "reviews", "reviews")[0]
+            self.incidents = ensure_owned_dir(fds, root_fd, "incidents", "incidents")[0]
+        else:
+            coord = try_lstat_at(common_fd, COORD_DIRNAME)
+            if coord is None:
+                self.fd = None
+                return
+            coord_fd = fds.keep(open_dir_at(common_fd, COORD_DIRNAME))
+            if try_lstat_at(coord_fd, COORD_VERSION_DIR) is None:
+                self.fd = None
+                return
+            root_fd = fds.keep(open_dir_at(coord_fd, COORD_VERSION_DIR))
+            self.fd = root_fd
+            self.leases = fds.keep(open_dir_at(root_fd, "leases"))
+            claims = fds.keep(open_dir_at(root_fd, "claims"))
+            self.claims = claims
+            self.claim_worktrees = fds.keep(open_dir_at(claims, "worktrees"))
+            self.claim_refs = fds.keep(open_dir_at(claims, "refs"))
+            self.reviews = fds.keep(open_dir_at(root_fd, "reviews"))
+            self.incidents = fds.keep(open_dir_at(root_fd, "incidents"))
+
+    @property
+    def present(self):
+        return self.fd is not None
+
+
+LOCK_NAME = "transition.lock.d"
+
+
+class TransitionMutex(object):
+    """Repository-wide atomic transition lock. Never age-reclaimed."""
+
+    def __init__(self, state):
+        self.state = state
+        self.held = False
+        self.nonce = None
+
+    def acquire(self):
+        old_mask = os.umask(0o077)
+        try:
+            try:
+                os.mkdir(LOCK_NAME, DIR_MODE, dir_fd=self.state.fd)
+            except FileExistsError:
+                raise CoordError(
+                    "transition_in_progress",
+                    "another coordination transition holds the repository mutex",
+                )
+            except OSError as exc:
+                fail("lock_failed", "cannot create the transition mutex: %s"
+                     % (exc.strerror,))
+        finally:
+            os.umask(old_mask)
+        self.held = True
+        self.nonce = secrets.token_hex(16)
+        lock_fd = open_dir_at(self.state.fd, LOCK_NAME)
+        try:
+            os.fchmod(lock_fd, DIR_MODE)
+            atomic_publish(lock_fd, "record.json", canonical_json_bytes({
+                "version": PROTOCOL_VERSION,
+                "nonce": self.nonce,
+                "pid": os.getpid(),
+                "acquired_at": int(time.time()),
+            }))
+            atomic_publish(lock_fd, "READY", canonical_json_bytes({
+                "version": PROTOCOL_VERSION, "nonce": self.nonce,
+            }))
+        finally:
+            os.close(lock_fd)
+        fsync_dir(self.state.fd)
+        return self
+
+    def release(self):
+        if not self.held:
+            return
+        try:
+            lock_fd = open_dir_at(self.state.fd, LOCK_NAME)
+        except CoordError:
+            self.held = False
+            return
+        try:
+            for name in ("READY", "record.json"):
+                try:
+                    os.unlink(name, dir_fd=lock_fd)
+                except FileNotFoundError:
+                    pass
+            for name in list_dir_at(lock_fd, "transition mutex"):
+                if name.startswith(".tmp."):
+                    try:
+                        os.unlink(name, dir_fd=lock_fd)
+                    except OSError:
+                        pass
+        finally:
+            os.close(lock_fd)
+        try:
+            os.rmdir(LOCK_NAME, dir_fd=self.state.fd)
+        except OSError as exc:
+            fail("lock_release_failed", "cannot release the transition mutex: %s"
+                 % (exc.strerror,))
+        fsync_dir(self.state.fd)
+        self.held = False
+
+    def __enter__(self):
+        return self.acquire()
+
+    def __exit__(self, *_exc):
+        self.release()
+        return False
+
+
+def sample_mutex(state):
+    if state.fd is None:
+        return None
+    info = try_lstat_at(state.fd, LOCK_NAME)
+    if info is None:
+        return None
+    sample = {"dev": info.st_dev, "ino": info.st_ino, "nonce": None}
+    try:
+        lock_fd = open_dir_at(state.fd, LOCK_NAME)
+    except CoordError:
+        return sample
+    try:
+        raw = try_lstat_at(lock_fd, "READY")
+        if raw is not None:
+            try:
+                ready = strict_json_loads(
+                    read_file_at(lock_fd, "READY", 4096, what="mutex READY"))
+                sample["nonce"] = ready.get("nonce")
+            except CoordError:
+                sample["nonce"] = None
+    finally:
+        os.close(lock_fd)
+    return sample
+
+
+def double_sampled(state, reader):
+    """Lock-free read: sample mutex, read, sample again. Never infer 'free'."""
+    before = sample_mutex(state)
+    if before is not None:
+        raise CoordError("transition_in_progress",
+                         "a coordination transition is in progress")
+    value = reader()
+    after = sample_mutex(state)
+    if after is not None:
+        raise CoordError("transition_in_progress",
+                         "a coordination transition started during the read")
+    return value
+
+
+# ---------------------------------------------------------------------------
+# Section 7. Path preflight, safe extraction, stable inventory
+# ---------------------------------------------------------------------------
+
+def _decode_tree_path(raw):
+    try:
+        text = raw.decode("utf-8")
+    except UnicodeDecodeError:
+        fail("path_not_utf8", "tree path is not valid UTF-8 (macOS MVP restriction)")
+    if not text:
+        fail("path_empty", "tree path is empty")
+    if len(raw) > MAX_PATH_BYTES:
+        fail("path_too_long", "tree path exceeds %d bytes" % (MAX_PATH_BYTES,))
+    if text.startswith("/"):
+        fail("path_absolute", "tree path is absolute")
+    if "\0" in text:
+        fail("path_invalid", "tree path contains NUL")
+    components = text.split("/")
+    if len(components) > MAX_COMPONENTS:
+        fail("path_too_deep", "tree path exceeds %d components" % (MAX_COMPONENTS,))
+    for component in components:
+        if component == "":
+            fail("path_invalid", "tree path has an empty component")
+        if component in (".", ".."):
+            fail("path_traversal", "tree path contains a dot or dot-dot component")
+        if nfd_casefold(component) == ".git":
+            fail("path_git_component", "tree path contains a normalized .git component")
+    return text, components
+
+
+def parse_tree(repo, commit, git_home):
+    """Strict `git ls-tree -r -z --full-tree` parse; only blobs and symlinks."""
+    raw = git_raw(
+        ["-C", repo["top"], "ls-tree", "-r", "-z", "--full-tree", commit],
+        git_home, binary=True,
+    )["raw"]
+    entries = []
+    seen_paths = set()
+    for chunk in raw.split(b"\0"):
+        if not chunk:
+            continue
+        if len(entries) >= MAX_TREE_ENTRIES:
+            fail("tree_too_large", "tree exceeds %d entries" % (MAX_TREE_ENTRIES,))
+        head, sep, path_raw = chunk.partition(b"\t")
+        if not sep:
+            fail("tree_malformed", "unexpected ls-tree record")
+        fields = head.split(b" ")
+        if len(fields) != 3:
+            fail("tree_malformed", "unexpected ls-tree fields")
+        mode_raw, type_raw, oid_raw = fields
+        try:
+            mode = int(mode_raw.decode("ascii"), 8)
+        except (UnicodeDecodeError, ValueError):
+            fail("tree_malformed", "unparseable tree mode")
+        kind_name = type_raw.decode("ascii", "replace")
+        if kind_name == "commit" or mode == 0o160000:
+            fail("tree_gitlink", "submodule gitlinks are rejected")
+        if kind_name != "blob":
+            fail("tree_unexpected_type", "unexpected tree entry type %r" % (kind_name,))
+        if mode not in (GIT_MODE_FILE, GIT_MODE_EXEC, GIT_MODE_LINK):
+            fail("tree_mode_rejected", "rejected tree mode %06o" % (mode,))
+        oid = oid_raw.decode("ascii", "replace")
+        require_oid(oid, repo["algo"], "tree entry oid")
+        text, components = _decode_tree_path(path_raw)
+        if path_raw in seen_paths:
+            fail("tree_duplicate_path", "duplicate tree path")
+        seen_paths.add(path_raw)
+        entries.append({
+            "path": text,
+            "raw": path_raw,
+            "components": components,
+            "mode": mode,
+            "oid": oid,
+            "kind": KIND_LINK if mode == GIT_MODE_LINK else KIND_FILE,
+        })
+    return entries
+
+
+def preflight_layout(entries):
+    """Implied directories, raw prefix conflicts, sibling NFD+casefold collisions."""
+    file_paths = set(entry["path"] for entry in entries)
+    dirs = set()
+    for entry in entries:
+        for depth in range(1, len(entry["components"])):
+            dirs.add("/".join(entry["components"][:depth]))
+    conflict = dirs & file_paths
+    if conflict:
+        fail("path_prefix_conflict",
+             "a blob path is also used as a directory path")
+
+    # Sibling-scoped collision keys: NFD+casefold per component, compared only
+    # against siblings under the same normalized parent.
+    siblings = {}
+    def register(parent_components, name, full):
+        parent_key = "/".join(nfd_casefold(part) for part in parent_components)
+        key = (parent_key, nfd_casefold(name))
+        existing = siblings.get(key)
+        if existing is not None and existing != full:
+            fail("path_collision",
+                 "sibling paths collide after NFD+casefold normalization")
+        siblings[key] = full
+
+    for path in sorted(dirs) + sorted(file_paths):
+        components = path.split("/")
+        register(components[:-1], components[-1], path)
+
+    return sorted(dirs, key=lambda value: (value.count("/"), value))
+
+
+TAR_BLOCK = 512
+
+
+def _parse_pax_records(records):
+    keys = {}
+    cursor = 0
+    while cursor < len(records):
+        space = records.find(b" ", cursor)
+        if space < 0:
+            fail("archive_pax_override", "malformed pax record")
+        try:
+            length = int(records[cursor:space].decode("ascii"), 10)
+        except (UnicodeDecodeError, ValueError):
+            fail("archive_pax_override", "malformed pax record length")
+        if length < 3 or cursor + length > len(records):
+            fail("archive_pax_override", "pax record overruns its header")
+        body = records[space + 1:cursor + length]
+        if not body.endswith(b"\n") or b"=" not in body:
+            fail("archive_pax_override", "malformed pax record body")
+        key, _, value = body[:-1].partition(b"=")
+        if key in keys:
+            fail("archive_pax_override", "duplicate pax record key")
+        keys[key] = value
+        cursor += length
+    return keys
+
+
+def _tar_octal(field, what):
+    text = field.split(b"\0")[0].split(b" ")[0]
+    if not text:
+        return 0
+    try:
+        return int(text.decode("ascii"), 8)
+    except (UnicodeDecodeError, ValueError):
+        fail("archive_malformed", "unparseable tar %s field" % (what,))
+
+
+def parse_tar(data):
+    """Minimal strict ustar reader with the match-only pax `x` rule (W2).
+
+    `git archive` legitimately emits a pax extended header (`x`) carrying
+    `path=` for names longer than the ustar name/prefix split. Accept such a
+    header only when it immediately precedes its entry, carries exactly one
+    `path=` record and no other override keys, and the resolved path is then
+    validated against the exact tree/implied-directory set by
+    `preflight_archive` — any override that changes the name fails there.
+    A single leading global (`g`) header is accepted only when its payload is
+    exactly `comment=<oid>` (the shape `git archive` always emits); every
+    other global header, GNU longname/longlink (`L`/`K`/`X`), and any override
+    key besides `path=` is rejected.
+    """
+    members = []
+    offset = 0
+    total = len(data)
+    pending_path = None
+    seen_global = False
+    while offset + TAR_BLOCK <= total:
+        header = data[offset:offset + TAR_BLOCK]
+        if header == b"\0" * TAR_BLOCK:
+            break
+        stored = header[148:156]
+        blanked = header[:148] + b" " * 8 + header[156:]
+        checksum = _tar_octal(stored, "checksum")
+        if checksum not in (sum(blanked), sum(bytearray(
+                (byte - 256 if byte > 127 else byte) for byte in blanked))):
+            fail("archive_checksum", "tar header checksum mismatch")
+        magic = header[257:263]
+        if magic not in (b"ustar\0", b"ustar "):
+            fail("archive_format", "unsupported tar header format")
+        typeflag = header[156:157]
+        size = _tar_octal(header[124:136], "size")
+        if size < 0 or size > MAX_MEMBER_BYTES:
+            fail("archive_member_too_large", "tar member exceeds %d bytes"
+                 % (MAX_MEMBER_BYTES,))
+        payload_offset = offset + TAR_BLOCK
+        padded = ((size + TAR_BLOCK - 1) // TAR_BLOCK) * TAR_BLOCK
+        if payload_offset + padded > total:
+            fail("archive_truncated", "tar member payload is truncated")
+        offset = payload_offset + padded
+
+        if typeflag == b"x":
+            if pending_path is not None:
+                fail("archive_pax_override", "consecutive pax extended headers")
+            records = data[payload_offset:payload_offset + size]
+            keys = _parse_pax_records(records)
+            if set(keys) != {b"path"}:
+                fail("archive_pax_override",
+                     "pax extended header carries keys other than path=")
+            pending_path = keys[b"path"]
+            continue
+        if typeflag == b"g":
+            # git archive always prepends one global header whose payload is
+            # exactly `comment=<commit-oid>`; it overrides no path. Accept only
+            # that exact shape, only in first position; every other global
+            # header (any other key, or any later position) is an override and
+            # is rejected. (Reconciles blueprint W2 with observed Apple Git
+            # 2.50.1 output.)
+            if members or pending_path is not None or seen_global:
+                fail("archive_pax_override",
+                     "unexpected pax global header position")
+            seen_global = True
+            records = data[payload_offset:payload_offset + size]
+            keys = _parse_pax_records(records)
+            if set(keys) != {b"comment"}:
+                fail("archive_pax_override",
+                     "pax global header carries keys other than comment=")
+            continue
+        if typeflag in (b"L", b"K", b"X"):
+            fail("archive_pax_override",
+                 "GNU longname/longlink override headers are rejected")
+        if typeflag == b"1":
+            fail("archive_hardlink", "tar hard links are rejected")
+        if typeflag in (b"3", b"4"):
+            fail("archive_device", "tar device nodes are rejected")
+        if typeflag == b"6":
+            fail("archive_fifo", "tar FIFOs are rejected")
+        if typeflag in (b"7", b"S", b"D", b"M", b"N", b"V"):
+            fail("archive_special", "tar sparse/contiguous/special members are rejected")
+        if typeflag not in (b"0", b"\0", b"2", b"5"):
+            fail("archive_special", "unsupported tar typeflag %r" % (typeflag,))
+
+        if pending_path is not None:
+            raw_path = pending_path
+            pending_path = None
+        else:
+            name = header[0:100].split(b"\0")[0]
+            prefix = header[345:500].split(b"\0")[0]
+            raw_path = (prefix + b"/" + name) if prefix else name
+        raw_path = raw_path.rstrip(b"/")
+        linkname = header[157:257].split(b"\0")[0]
+        mode = _tar_octal(header[100:108], "mode")
+
+        if typeflag == b"5":
+            kind = KIND_DIR
+        elif typeflag == b"2":
+            kind = KIND_LINK
+        else:
+            kind = KIND_FILE
+        if kind != KIND_LINK and linkname:
+            fail("archive_unexpected_link", "unexpected tar linkname")
+        if kind == KIND_LINK and not linkname:
+            fail("archive_unexpected_link", "tar symlink has no target")
+        if kind != KIND_FILE and size != 0:
+            fail("archive_malformed", "non-regular tar member has a payload")
+        text, components = _decode_tree_path(raw_path)
+        members.append({
+            "path": text,
+            "raw": raw_path,
+            "components": components,
+            "kind": kind,
+            "mode": mode,
+            "size": size,
+            "offset": payload_offset,
+            "link": linkname,
+        })
+        if len(members) > MAX_TREE_ENTRIES * 2 + 8:
+            fail("archive_too_many_members", "tar has too many members")
+    if pending_path is not None:
+        fail("archive_pax_override", "pax extended header has no following entry")
+    return members
+
+
+def preflight_archive(members, entries, implied_dirs):
+    """Every header must match the exact tree/implied-directory set."""
+    expected_files = {}
+    for entry in entries:
+        expected_files[entry["path"]] = entry
+    expected_dirs = set(implied_dirs)
+    seen = set()
+    for member in members:
+        if member["path"] in seen:
+            fail("archive_duplicate", "duplicate tar member")
+        seen.add(member["path"])
+        if member["kind"] == KIND_DIR:
+            if member["path"] not in expected_dirs:
+                fail("archive_unexpected_member",
+                     "tar directory member is not in the implied directory set")
+            continue
+        entry = expected_files.get(member["path"])
+        if entry is None:
+            fail("archive_unexpected_member", "tar member is not in the pinned tree")
+        if entry["kind"] != member["kind"]:
+            fail("archive_kind_mismatch", "tar member kind disagrees with the tree")
+        for depth in range(1, len(member["components"])):
+            parent = "/".join(member["components"][:depth])
+            if parent in expected_files:
+                fail("archive_parent_conflict", "tar member parent is not a directory")
+    for path in expected_files:
+        if path not in seen:
+            fail("archive_missing_member", "tar is missing a pinned tree entry")
+    for path in expected_dirs:
+        if path not in seen:
+            fail("archive_missing_member", "tar is missing an implied directory")
+
+
+def encode_inventory(records):
+    """u64be(path_len)|path|u8(kind)|u32be(git_mode)|u16be(oid_len)|oid"""
+    out = b""
+    for raw_path, kind, git_mode, oid_hex in sorted(records, key=lambda item: item[0]):
+        oid_bytes = bytes.fromhex(oid_hex) if oid_hex else b""
+        out += len(raw_path).to_bytes(8, "big")
+        out += raw_path
+        out += bytes([kind])
+        out += git_mode.to_bytes(4, "big")
+        out += len(oid_bytes).to_bytes(2, "big")
+        out += oid_bytes
+    return out
+
+
+class DirCache(object):
+    """Retained directory FDs for every extraction/inventory parent."""
+
+    def __init__(self, fds, root_fd):
+        self.fds = fds
+        self.cache = {"": root_fd}
+
+    def get(self, path):
+        fd = self.cache.get(path)
+        if fd is None:
+            fail("root_replaced", "extraction parent directory is missing")
+        return fd
+
+    def add(self, path, fd):
+        self.cache[path] = fd
+
+
+def extract_tree(fds, src_fd, data, members, entries, implied_dirs, algo):
+    """Create every member relative to retained directory FDs. No extractor."""
+    cache = DirCache(fds, src_fd)
+    inventory = []
+
+    for path in implied_dirs:
+        components = path.split("/")
+        parent_fd = cache.get("/".join(components[:-1]))
+        name = components[-1]
+        old_mask = os.umask(0o077)
+        try:
+            if not mkdir_owned(parent_fd, name, DIR_MODE):
+                fail("extract_exists", "extraction target already exists")
+        finally:
+            os.umask(old_mask)
+        entry_info = lstat_at(parent_fd, name, code="root_replaced", what=path)
+        if statmod.S_ISLNK(entry_info.st_mode) or not statmod.S_ISDIR(entry_info.st_mode):
+            fail("extract_parent_symlink", "extraction parent is not a real directory")
+        dir_fd = fds.keep(open_dir_at(parent_fd, name, code="root_replaced", what=path))
+        opened = os.fstat(dir_fd)
+        if identity(entry_info) != identity(opened):
+            fail("root_replaced", "extraction directory changed between lstat and open")
+        os.fchmod(dir_fd, DIR_MODE)
+        opened = os.fstat(dir_fd)
+        require_owned_dir(opened, DIR_MODE, path)
+        cache.add(path, dir_fd)
+        inventory.append((path.encode("utf-8"), KIND_DIR, GIT_MODE_DIR, ""))
+
+    by_path = dict((entry["path"], entry) for entry in entries)
+    for member in members:
+        if member["kind"] == KIND_DIR:
+            continue
+        entry = by_path[member["path"]]
+        components = member["components"]
+        parent_fd = cache.get("/".join(components[:-1]))
+        name = components[-1]
+        if member["kind"] == KIND_FILE:
+            payload = data[member["offset"]:member["offset"] + member["size"]]
+            if len(payload) != member["size"]:
+                fail("archive_truncated", "tar member payload is truncated")
+            mode = EXEC_MODE if entry["mode"] == GIT_MODE_EXEC else FILE_MODE
+            flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW
+            if hasattr(os, "O_CLOEXEC"):
+                flags |= os.O_CLOEXEC
+            try:
+                fd = os.open(name, flags, mode, dir_fd=parent_fd)
+            except OSError as exc:
+                fail("extract_failed", "%s: %s" % (member["path"], exc.strerror))
+            try:
+                written = 0
+                while written < len(payload):
+                    written += os.write(fd, payload[written:])
+                os.fchmod(fd, mode)
+                os.fsync(fd)
+                before = os.fstat(fd)
+            finally:
+                os.close(fd)
+            computed = blob_oid_bytes(algo, payload)
+            if computed != entry["oid"]:
+                fail("blob_oid_mismatch", "extracted blob does not match the pinned OID")
+            after = lstat_at(parent_fd, name, code="root_replaced", what=member["path"])
+            if identity(before) != identity(after):
+                fail("root_replaced", "extracted file identity changed")
+            if after.st_nlink != 1:
+                fail("extract_hardlink", "extracted file gained hard links")
+            if after.st_size != member["size"]:
+                fail("extract_unstable", "extracted file size changed")
+            if statmod.S_IMODE(after.st_mode) != mode:
+                fail("extract_unstable", "extracted file mode changed")
+            inventory.append((member["raw"], KIND_FILE, entry["mode"], entry["oid"]))
+        else:
+            target = member["link"]
+            computed = blob_oid_bytes(algo, target)
+            if computed != entry["oid"]:
+                fail("blob_oid_mismatch", "symlink target does not match the pinned OID")
+            try:
+                os.symlink(target.decode("utf-8"), name, dir_fd=parent_fd)
+            except UnicodeDecodeError:
+                fail("path_not_utf8", "symlink target is not valid UTF-8")
+            except OSError as exc:
+                fail("extract_failed", "%s: %s" % (member["path"], exc.strerror))
+            link_info = lstat_at(parent_fd, name, code="root_replaced",
+                                 what=member["path"])
+            if not statmod.S_ISLNK(link_info.st_mode):
+                fail("extract_failed", "symlink was not created as a symlink")
+            readback = os.readlink(name, dir_fd=parent_fd)
+            if readback.encode("utf-8") != target:
+                fail("extract_unstable", "symlink target changed after creation")
+            inventory.append((member["raw"], KIND_LINK, GIT_MODE_LINK, entry["oid"]))
+
+    return inventory, cache
+
+
+def walk_inventory(fds, src_fd, algo):
+    """Final inventory: retained FDs, O_NOFOLLOW, stable re-fstat, no outside bytes."""
+    records = []
+    pending = [("", src_fd)]
+    visited = 0
+    while pending:
+        prefix, dir_fd = pending.pop(0)
+        before = os.fstat(dir_fd)
+        names = list_dir_at(dir_fd, prefix or "src")
+        for name in names:
+            if name in (".", ".."):
+                continue
+            visited += 1
+            if visited > MAX_TREE_ENTRIES * 2:
+                fail("inventory_too_large", "source tree exceeds the inventory bound")
+            path = (prefix + "/" + name) if prefix else name
+            if nfd_casefold(name) == ".git":
+                fail("inventory_git_component", "a .git component appeared in src")
+            info = lstat_at(dir_fd, name, code="inventory_unstable", what=path)
+            raw_path = path.encode("utf-8")
+            if statmod.S_ISDIR(info.st_mode):
+                child = fds.keep(open_dir_at(dir_fd, name, code="inventory_unstable",
+                                             what=path))
+                opened = os.fstat(child)
+                if identity(info) != identity(opened):
+                    fail("inventory_unstable", "%s changed between lstat and open" % (path,))
+                records.append((raw_path, KIND_DIR, GIT_MODE_DIR, ""))
+                pending.append((path, child))
+            elif statmod.S_ISLNK(info.st_mode):
+                target = os.readlink(name, dir_fd=dir_fd)
+                again = lstat_at(dir_fd, name, code="inventory_unstable", what=path)
+                if identity(info) != identity(again):
+                    fail("inventory_unstable", "%s symlink identity changed" % (path,))
+                oid = blob_oid_bytes(algo, target.encode("utf-8"))
+                records.append((raw_path, KIND_LINK, GIT_MODE_LINK, oid))
+            elif statmod.S_ISREG(info.st_mode):
+                fd = open_file_at(dir_fd, name, code="inventory_unstable", what=path)
+                try:
+                    opened = os.fstat(fd)
+                    if identity(info) != identity(opened):
+                        fail("inventory_unstable", "%s changed between lstat and open"
+                             % (path,))
+                    if opened.st_nlink != 1:
+                        fail("inventory_hardlink", "%s has extra hard links" % (path,))
+                    if opened.st_size > MAX_MEMBER_BYTES:
+                        fail("inventory_too_large", "%s exceeds the member bound" % (path,))
+                    hasher = blob_hasher(algo)
+                    hasher.update(("blob %d\0" % opened.st_size).encode("ascii"))
+                    read_total = 0
+                    while True:
+                        chunk = os.read(fd, 65536)
+                        if not chunk:
+                            break
+                        read_total += len(chunk)
+                        if read_total > opened.st_size:
+                            fail("inventory_unstable", "%s grew during the walk" % (path,))
+                        hasher.update(chunk)
+                    if read_total != opened.st_size:
+                        fail("inventory_unstable", "%s shrank during the walk" % (path,))
+                    final = os.fstat(fd)
+                    if identity(opened) != identity(final) or final.st_size != opened.st_size:
+                        fail("inventory_unstable", "%s identity changed during read" % (path,))
+                    perm = statmod.S_IMODE(final.st_mode)
+                    if perm == EXEC_MODE:
+                        git_mode = GIT_MODE_EXEC
+                    elif perm == FILE_MODE:
+                        git_mode = GIT_MODE_FILE
+                    else:
+                        fail("inventory_mode_rejected",
+                             "%s has an unexpected mode %04o" % (path, perm))
+                    records.append((raw_path, KIND_FILE, git_mode, hasher.hexdigest()))
+                finally:
+                    os.close(fd)
+            else:
+                fail("inventory_special", "%s is not a regular file, directory, or symlink"
+                     % (path,))
+        after = os.fstat(dir_fd)
+        if identity(before) != identity(after):
+            fail("inventory_unstable", "%s directory identity changed" % (prefix or "src",))
+    return records
+
+
+# ---------------------------------------------------------------------------
+# Section 8. Payload root binding and flat paired records
+# ---------------------------------------------------------------------------
+
+def publish_flat_record(dir_fd, name, kind, record, what):
+    validate_record(record, kind, what)
+    data = canonical_json_bytes(record)
+    if len(data) > MAX_RECORD_BYTES:
+        fail("record_too_large", "%s exceeds %d bytes" % (what, MAX_RECORD_BYTES))
+    ready_name = name + ".READY"
+    try:
+        os.unlink(ready_name, dir_fd=dir_fd)
+        fsync_dir(dir_fd)
+    except FileNotFoundError:
+        pass
+    except OSError as exc:
+        fail("publish_failed", "%s READY retract failed: %s" % (what, exc.strerror))
+    atomic_publish(dir_fd, name, data)
+    crash_hook("record.published")
+    atomic_publish(dir_fd, ready_name, canonical_json_bytes({
+        "version": PROTOCOL_VERSION,
+        "generation": record["generation"],
+        "digest": sha256_hex(data),
+    }))
+
+
+def read_flat_record(dir_fd, name, kind, what, allow_missing=False):
+    if try_lstat_at(dir_fd, name) is None:
+        if allow_missing:
+            return None
+        fail("record_missing", "%s is absent" % (what,))
+    if try_lstat_at(dir_fd, name + ".READY") is None:
+        raise CoordError("transition_incomplete", "%s has no READY marker" % (what,))
+    ready = strict_json_loads(read_file_at(dir_fd, name + ".READY", 4096,
+                                           what="%s READY" % (what,)))
+    data = read_file_at(dir_fd, name, MAX_RECORD_BYTES, what=what)
+    record = strict_json_loads(data)
+    validate_record(record, kind, what)
+    if ready.get("generation") != record["generation"]:
+        raise CoordError("transition_incomplete", "%s READY generation mismatch" % (what,))
+    if ready.get("digest") != sha256_hex(data):
+        raise CoordError("transition_incomplete", "%s READY digest mismatch" % (what,))
+    return record
+
+
+class RootBinding(object):
+    """Section 5 protocol: base -> payload -> src, retained for the operation."""
+
+    def __init__(self, fds, base, payload_name, expect_payload=None, expect_src=None):
+        self.fds = fds
+        self.base = base
+        self.name = payload_name
+        self.expect_payload = expect_payload
+        self.expect_src = expect_src
+        self.payload_fd = None
+        self.src_fd = None
+        self.payload_identity = None
+        self.src_identity = None
+
+    def bind(self):
+        require_match(ENTRY_NAME_RE, self.name, "payload_name_invalid", "payload name")
+        self.payload_fd, self.payload_identity = bind_dir_at(
+            self.fds, self.base.fd, self.name,
+            expect=self.expect_payload, what="payload directory",
+        )
+        info = os.fstat(self.payload_fd)
+        require_owned_dir(info, DIR_MODE, "payload directory")
+        self.src_fd, self.src_identity = bind_dir_at(
+            self.fds, self.payload_fd, "src",
+            expect=self.expect_src, what="payload src directory",
+        )
+        src_info = os.fstat(self.src_fd)
+        require_owned_dir(src_info, DIR_MODE, "payload src directory")
+        return self
+
+    def recheck(self):
+        """Re-lstat the published entries and re-fstat the retained FDs."""
+        entry = lstat_at(self.base.fd, self.name, code="root_replaced",
+                         what="payload directory")
+        if not same_identity(identity(entry), self.payload_identity):
+            fail("root_replaced",
+                 "the published payload entry no longer names the bound directory")
+        retained = os.fstat(self.payload_fd)
+        if not same_identity(identity(retained), self.payload_identity):
+            fail("root_replaced", "the retained payload FD identity changed")
+        src_entry = lstat_at(self.payload_fd, "src", code="root_replaced",
+                             what="payload src directory")
+        if not same_identity(identity(src_entry), self.src_identity):
+            fail("root_replaced",
+                 "the published src entry no longer names the bound directory")
+        retained_src = os.fstat(self.src_fd)
+        if not same_identity(identity(retained_src), self.src_identity):
+            fail("root_replaced", "the retained src FD identity changed")
+        return True
+
+
+# ---------------------------------------------------------------------------
+# Section 9. Exact Ocean bind/refresh boundary
+# ---------------------------------------------------------------------------
+
+def resolve_ocean_port(base):
+    raw = os.environ.get(TEST_PORT_ENV)
+    if not raw:
+        return OCEAN_PORT
+    if base is None or base.test_root is None:
+        fail("test_override_rejected",
+             "%s requires a fully validated test root" % (TEST_PORT_ENV,))
+    if not re.match(r"\A[0-9]{1,5}\Z", raw):
+        fail("test_port_rejected", "test port must be decimal")
+    port = int(raw, 10)
+    if port < 1024 or port > 65535:
+        fail("test_port_rejected", "test port must be within 1024..65535")
+    return port
+
+
+def ocean_get_requests(port):
+    """Exact GET /v1/requests over numeric loopback. Bounded and nonterminal."""
+    if not re.match(r"\A127\.[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}\Z", OCEAN_HOST):
+        fail("provider_host_invalid", "provider host is not numeric loopback")
+    deadline = time.monotonic() + HTTP_TOTAL_SECONDS
+    conn = http.client.HTTPConnection(OCEAN_HOST, port, timeout=HTTP_CONNECT_SECONDS)
+    try:
+        conn.request("GET", OCEAN_PATH, headers={
+            "Host": "%s:%d" % (OCEAN_HOST, port),
+            "Accept": "application/json",
+            "Connection": "close",
+        })
+        response = conn.getresponse()
+        if response.status != 200:
+            return {"ok": False, "diagnostic": "provider_http_status_%d" % (response.status,)}
+        body = b""
+        while True:
+            if time.monotonic() > deadline:
+                return {"ok": False, "diagnostic": "provider_http_deadline"}
+            chunk = response.read(MAX_HTTP_CHUNK)
+            if not chunk:
+                break
+            body += chunk
+            if len(body) > MAX_HTTP_BYTES:
+                return {"ok": False, "diagnostic": "provider_http_oversize"}
+    except CoordError:
+        raise
+    except (OSError, http.client.HTTPException, ValueError) as exc:
+        return {"ok": False,
+                "diagnostic": "provider_http_error:%s" % (bounded(str(exc), 80),)}
+    finally:
+        try:
+            conn.close()
+        except Exception:
+            pass
+    try:
+        parsed = strict_json_loads(body)
+    except CoordError as exc:
+        return {"ok": False, "diagnostic": "provider_%s" % (exc.code,)}
+    if isinstance(parsed, dict):
+        rows = parsed.get("requests")
+    elif isinstance(parsed, list):
+        rows = parsed
+    else:
+        rows = None
+    if not isinstance(rows, list):
+        return {"ok": False, "diagnostic": "provider_payload_shape"}
+    return {"ok": True, "rows": rows, "digest": sha256_hex(body)}
+
+
+def select_request_row(rows, request_id, session_id):
+    matches = []
+    for row in rows:
+        if not isinstance(row, dict):
+            continue
+        row_request = row.get("id")
+        if not isinstance(row_request, str):
+            row_request = row.get("request_id")
+        row_session = row.get("session_id")
+        if not isinstance(row_session, str):
+            row_session = row.get("session")
+        if row_request == request_id and row_session == session_id:
+            matches.append(row)
+    if len(matches) > 1:
+        return None, "provider_row_ambiguous"
+    if not matches:
+        return None, "provider_row_missing"
+    return matches[0], None
+
+
+def project_state(raw_state):
+    if not isinstance(raw_state, str):
+        return None, None, False
+    mapped = OCEAN_STATE_TABLE.get(raw_state)
+    if mapped is None:
+        return None, None, False
+    return mapped[0], raw_state, mapped[1]
+
+
+# ---------------------------------------------------------------------------
+# Section 10. Process evidence (observation only, zero signals)
+# ---------------------------------------------------------------------------
+
+def _ps(args):
+    fake = _ps_fake(args)
+    if fake is not None:
+        return fake
+    try:
+        proc = subprocess.Popen(
+            ["ps"] + list(args), stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+            stdin=subprocess.DEVNULL,
+            env={"LC_ALL": "C", "LANG": "C", "PATH": "/bin:/usr/bin"},
+            close_fds=True,
+        )
+    except OSError:
+        return None
+    try:
+        out, _err = proc.communicate(timeout=PS_TIMEOUT_SECONDS)
+    except subprocess.TimeoutExpired:
+        proc.kill()
+        proc.communicate()
+        return None
+    if proc.returncode != 0:
+        return ""
+    return out.decode("utf-8", "replace")
+
+
+def sample_process(pid):
+    """Two matching `LC_ALL=C ps -o lstart=` samples plus PPID/PGID evidence."""
+    require_int(pid, 2, 2 ** 31 - 1, "pid_invalid", "pid")
+    first = _ps(["-o", "lstart=", "-p", str(pid)])
+    if first is None:
+        return {"state": "unknown"}
+    first = first.strip()
+    if not first:
+        return {"state": "exited"}
+    second = _ps(["-o", "lstart=", "-p", str(pid)])
+    if second is None:
+        return {"state": "unknown"}
+    second = second.strip()
+    if not second:
+        return {"state": "exited"}
+    if first != second:
+        return {"state": "unstable"}
+    detail = _ps(["-o", "ppid=,pgid=,command=", "-p", str(pid)])
+    if detail is None:
+        return {"state": "unknown"}
+    detail = detail.strip()
+    if not detail:
+        return {"state": "exited"}
+    fields = detail.split(None, 2)
+    if len(fields) < 3:
+        return {"state": "unknown"}
+    try:
+        ppid = int(fields[0], 10)
+        pgid = int(fields[1], 10)
+    except ValueError:
+        return {"state": "unknown"}
+    command = fields[2]
+    return {
+        "state": "alive",
+        "lstart": bounded(first, 64),
+        "ppid": ppid,
+        "pgid": pgid,
+        "command_digest": sha256_hex(command.encode("utf-8", "replace")),
+        "command_display": bounded(command, MAX_CMD_DISPLAY),
+    }
+
+
+def classify_process(record):
+    sample = sample_process(record["pid"])
+    state = sample.get("state")
+    if state == "exited":
+        return "exited"
+    if state in ("unknown", "unstable"):
+        return "unknown"
+    if sample.get("lstart") != record.get("lstart"):
+        return "reused"
+    return "alive"
+
+
+def _process_table():
+    raw = _ps(["-A", "-o", "pid=,ppid=,command="])
+    if raw is None:
+        return None
+    rows = []
+    for line in raw.splitlines():
+        fields = line.strip().split(None, 2)
+        if len(fields) < 3:
+            continue
+        try:
+            pid = int(fields[0], 10)
+            ppid = int(fields[1], 10)
+        except ValueError:
+            continue
+        rows.append({"pid": pid, "ppid": ppid, "command": fields[2]})
+        if len(rows) > 65536:
+            break
+    return rows
+
+
+def scan_unregistered(review_id, payload_path, registered_pids):
+    """Read-only discriminator scan. Never signals, never matches this process tree."""
+    rows = _process_table()
+    if rows is None:
+        return {"state": "unknown", "pids": []}
+    by_pid = dict((row["pid"], row) for row in rows)
+    ancestors = set()
+    cursor = os.getpid()
+    for _hop in range(64):
+        if cursor in ancestors or cursor <= 0:
+            break
+        ancestors.add(cursor)
+        row = by_pid.get(cursor)
+        if row is None:
+            break
+        cursor = row["ppid"]
+    found = []
+    for row in rows:
+        if row["pid"] in ancestors or row["pid"] in registered_pids:
+            continue
+        command = row["command"]
+        if review_id in command or (payload_path and payload_path in command):
+            found.append(row["pid"])
+        if len(found) >= MAX_PROCESSES:
+            break
+    return {"state": "clean" if not found else "unregistered", "pids": found}
+
+
+def process_evidence(fds, payload_fd, review_id, payload_path):
+    """Load every registered process record and classify it. No mutation."""
+    if try_lstat_at(payload_fd, "processes") is None:
+        return {"records": [], "classes": {}, "blockers": ["processes_missing"]}
+    dir_fd = fds.keep(open_dir_at(payload_fd, "processes"))
+    records = []
+    for name in list_dir_at(dir_fd, "processes"):
+        if not name.endswith(".json") or name.startswith(".tmp."):
+            continue
+        record = read_flat_record(dir_fd, name, "process", "process record %s" % (name,))
+        records.append(record)
+        if len(records) > MAX_PROCESSES:
+            fail("process_table_too_large", "too many registered processes")
+    classes = {}
+    blockers = []
+    registered = set()
+    for record in records:
+        registered.add(record["pid"])
+        state = classify_process(record)
+        classes["%s:%d" % (record["role"], record["pid"])] = state
+        if state != "exited":
+            blockers.append("process_%s" % (state,))
+    scan = scan_unregistered(review_id, payload_path, registered)
+    if scan["state"] == "unregistered":
+        blockers.append("process_unregistered_discriminator")
+    elif scan["state"] == "unknown":
+        blockers.append("process_scan_unknown")
+    return {
+        "records": records,
+        "classes": classes,
+        "blockers": sorted(set(blockers)),
+        "clean": not blockers,
+        "scan": scan["state"],
+    }
+
+
+# ---------------------------------------------------------------------------
+# Section 11. Write-once report sealing
+# ---------------------------------------------------------------------------
+
+REPORT_COMMIT_RE = re.compile(r"^Reviewed-Commit: ([0-9a-f]{40}|[0-9a-f]{64})$", re.M)
+REPORT_VERDICT_RE = re.compile(r"^Verdict: (PASS|HOLD|FAIL)$", re.M)
+REPORT_REVIEWER_RE = re.compile(r"^Reviewer: ([A-Za-z0-9][A-Za-z0-9._-]{0,63})$", re.M)
+
+
+def parse_report(data, commit, reviewer_actor):
+    try:
+        text = data.decode("utf-8")
+    except UnicodeDecodeError:
+        fail("report_not_utf8", "report is not valid UTF-8")
+    checks = (
+        ("Reviewed-Commit", REPORT_COMMIT_RE),
+        ("Verdict", REPORT_VERDICT_RE),
+        ("Reviewer", REPORT_REVIEWER_RE),
+    )
+    values = {}
+    for label, pattern in checks:
+        matches = pattern.findall(text)
+        if len(matches) != 1:
+            fail("report_header_invalid",
+                 "report must contain exactly one anchored %s header" % (label,))
+        values[label] = matches[0]
+    if values["Reviewed-Commit"] != commit:
+        fail("report_commit_mismatch", "report does not name the pinned commit")
+    if values["Reviewer"] != reviewer_actor:
+        fail("report_reviewer_mismatch", "report does not name the bound reviewer actor")
+    return {"verdict": values["Verdict"], "reviewed_commit": values["Reviewed-Commit"],
+            "reviewer": values["Reviewer"]}
+
+
+def seal_report(fds, binding, commit, reviewer_actor):
+    """Copy inbox -> 0600 O_EXCL temp -> hard link to absent sealed/report.txt."""
+    payload_fd = binding.payload_fd
+    if try_lstat_at(payload_fd, "inbox") is None:
+        fail("report_missing", "the payload has no inbox directory")
+    inbox_fd = fds.keep(open_dir_at(payload_fd, "inbox"))
+    sealed_fd = fds.keep(open_dir_at(payload_fd, "sealed"))
+
+    existing = try_lstat_at(sealed_fd, "report.txt")
+    if existing is not None:
+        fail("report_already_sealed", "a sealed report already exists")
+
+    pending = try_lstat_at(inbox_fd, "report.pending")
+    if pending is None:
+        fail("report_missing", "inbox/report.pending is absent")
+    if statmod.S_ISLNK(pending.st_mode):
+        fail("report_symlink", "inbox/report.pending is a symlink")
+    if not statmod.S_ISREG(pending.st_mode):
+        fail("report_not_regular", "inbox/report.pending is not a regular file")
+
+    fd = open_file_at(inbox_fd, "report.pending", code="report_missing",
+                      what="inbox/report.pending")
+    try:
+        info = os.fstat(fd)
+        if not statmod.S_ISREG(info.st_mode):
+            fail("report_not_regular", "inbox/report.pending is not a regular file")
+        if info.st_uid != os.getuid():
+            fail("report_owner", "inbox/report.pending is not owned by the current user")
+        if statmod.S_IMODE(info.st_mode) & ~0o600:
+            fail("report_mode", "inbox/report.pending mode is broader than 0600")
+        if info.st_size < 1 or info.st_size > MAX_REPORT_BYTES:
+            fail("report_size", "inbox/report.pending size must be 1..%d bytes"
+                 % (MAX_REPORT_BYTES,))
+        if not same_identity(identity(info), identity(pending)):
+            fail("report_unstable", "inbox/report.pending changed between lstat and open")
+        data = b""
+        while True:
+            chunk = os.read(fd, 65536)
+            if not chunk:
+                break
+            data += chunk
+            if len(data) > MAX_REPORT_BYTES:
+                fail("report_size", "inbox/report.pending grew past the bound")
+        final = os.fstat(fd)
+        if not same_identity(identity(final), identity(info)) or final.st_size != info.st_size:
+            fail("report_unstable", "inbox/report.pending changed during the read")
+        if len(data) != info.st_size:
+            fail("report_unstable", "inbox/report.pending size disagreed with its content")
+    finally:
+        os.close(fd)
+
+    parsed = parse_report(data, commit, reviewer_actor)
+    digest = sha256_hex(data)
+
+    tmp_name = ".report.%s" % (secrets.token_hex(8),)
+    write_file_at(sealed_fd, tmp_name, data, mode=FILE_MODE)
+    try:
+        try:
+            os.link(tmp_name, "report.txt", src_dir_fd=sealed_fd,
+                    dst_dir_fd=sealed_fd, follow_symlinks=False)
+        except FileExistsError:
+            fail("report_already_sealed", "a sealed report appeared concurrently")
+        except OSError as exc:
+            fail("report_publish_failed", "cannot publish the sealed report: %s"
+                 % (exc.strerror,))
+        temp_info = lstat_at(sealed_fd, tmp_name, code="report_unstable",
+                             what="sealed temp")
+        final_info = lstat_at(sealed_fd, "report.txt", code="report_unstable",
+                              what="sealed/report.txt")
+        if not same_identity(identity(temp_info), identity(final_info)):
+            raise CoordError("transition_incomplete_report",
+                             "sealed names do not reference the same inode")
+        if temp_info.st_nlink != 2 or final_info.st_nlink != 2:
+            raise CoordError("transition_incomplete_report",
+                             "sealed link count is not 2 before unlink")
+        if sha256_hex(read_file_at(sealed_fd, "report.txt", MAX_REPORT_BYTES,
+                                   what="sealed/report.txt")) != digest:
+            raise CoordError("transition_incomplete_report",
+                             "sealed report digest changed before unlink")
+        crash_hook("seal.linked")
+        os.unlink(tmp_name, dir_fd=sealed_fd)
+        fsync_dir(sealed_fd)
+    except CoordError:
+        raise
+    after = lstat_at(sealed_fd, "report.txt", code="report_unstable",
+                     what="sealed/report.txt")
+    if not same_identity(identity(after), identity(final_info)):
+        raise CoordError("transition_incomplete_report",
+                         "sealed report identity changed after unlink")
+    if after.st_nlink != 1:
+        raise CoordError("transition_incomplete_report",
+                         "sealed report link count is not 1 after unlink")
+    if sha256_hex(read_file_at(sealed_fd, "report.txt", MAX_REPORT_BYTES,
+                               what="sealed/report.txt")) != digest:
+        raise CoordError("transition_incomplete_report",
+                         "sealed report digest changed after unlink")
+    binding.recheck()
+    return {"digest": digest, "verdict": parsed["verdict"], "bytes": len(data)}
+
+
+def read_sealed_report(fds, binding, commit, reviewer_actor):
+    sealed_fd = fds.keep(open_dir_at(binding.payload_fd, "sealed"))
+    info = try_lstat_at(sealed_fd, "report.txt")
+    if info is None:
+        return None
+    if statmod.S_ISLNK(info.st_mode) or not statmod.S_ISREG(info.st_mode):
+        fail("report_not_regular", "sealed/report.txt is not a regular file")
+    if info.st_nlink != 1:
+        raise CoordError("transition_incomplete_report",
+                         "sealed report has an unexpected link count")
+    data = read_file_at(sealed_fd, "report.txt", MAX_REPORT_BYTES,
+                        what="sealed/report.txt")
+    parsed = parse_report(data, commit, reviewer_actor)
+    return {"digest": sha256_hex(data), "verdict": parsed["verdict"],
+            "bytes": len(data)}
+
+
+def detect_incomplete_report(fds, payload_fd):
+    """Crash residue: a stale sealed temp or nlink=2 final refuses every advance."""
+    if try_lstat_at(payload_fd, "sealed") is None:
+        return None
+    sealed_fd = fds.keep(open_dir_at(payload_fd, "sealed"))
+    stale = [name for name in list_dir_at(sealed_fd, "sealed")
+             if name.startswith(".report.")]
+    info = try_lstat_at(sealed_fd, "report.txt")
+    if stale:
+        return "transition_incomplete_report"
+    if info is not None and statmod.S_ISREG(info.st_mode) and info.st_nlink != 1:
+        return "transition_incomplete_report"
+    return None
+
+
+# ---------------------------------------------------------------------------
+# Section 12. Lease transaction commands
+# ---------------------------------------------------------------------------
+
+def precheck_capability_fd(fd, direction):
+    """Validate a capability FD before any state mutation; never write here."""
+    info = _fd_stat(fd, "capability %s fd" % (direction,))
+    flags = _fd_flags(fd)
+    if statmod.S_ISREG(info.st_mode):
+        _require_regular_capability_fd(fd, info, "capability %s fd" % (direction,))
+        if direction == "output":
+            if info.st_size != 0:
+                fail("fd_not_empty", "capability output fd must be empty")
+            if (flags & os.O_ACCMODE) not in (os.O_WRONLY, os.O_RDWR):
+                fail("fd_not_writable", "capability output fd is not writable")
+            if flags & os.O_APPEND:
+                fail("fd_append_mode", "capability output fd must not be append-mode")
+        return
+    if statmod.S_ISFIFO(info.st_mode):
+        return
+    fail("fd_type_rejected", "capability %s fd must be a regular file or pipe" % (direction,))
+
+
+def open_context(args, create_state=True, need_git_home=True):
+    """Common front matter: validated base, scrubbed Git home, canonical repo."""
+    fds = FDSet()
+    base = open_payload_base(fds)
+    _enable_test_hooks(base)
+    git_home = make_git_home(fds, base) if need_git_home else None
+    repo = resolve_repo(getattr(args, "worktree", None) or getattr(args, "repo", None)
+                        or os.getcwd(), git_home)
+    assert_payload_outside_repo(base.path, base.path, repo)
+    state = StateRoot(fds, repo, create=create_state)
+    return {"fds": fds, "base": base, "git_home": git_home, "repo": repo,
+            "state": state}
+
+
+def find_worktree_claim(state, repo, allow_missing=True):
+    if not state.present:
+        return None
+    return read_record(state.claim_worktrees, repo["worktree_key"], "claim",
+                       "worktree claim", allow_missing=allow_missing)
+
+
+def load_lease(state, lease_id, allow_missing=False):
+    require_match(ID_RE, lease_id, "lease_id_invalid", "lease id")
+    return read_record(state.leases, lease_id, "lease", "lease record",
+                       allow_missing=allow_missing)
+
+
+def lease_head_state(repo, lease, git_home):
+    if lease is None:
+        return "no_lease"
+    if lease.get("detached") != repo["detached"] or lease.get("ref") != repo["ref"]:
+        return "head_moved_conflicted"
+    expected = lease.get("expected_head")
+    if expected == repo["head"]:
+        return "matches"
+    if not isinstance(expected, str):
+        return "head_moved_conflicted"
+    result = git_raw(["-C", repo["top"], "merge-base", "--is-ancestor",
+                      expected, repo["head"]], git_home, check=False)
+    if result["rc"] == 0:
+        return "head_moved_pending_checkpoint"
+    return "head_moved_conflicted"
+
+
+def cmd_lease_acquire(args):
+    ctx = open_context(args)
+    fds, base, git_home, repo, state = (
+        ctx["fds"], ctx["base"], ctx["git_home"], ctx["repo"], ctx["state"])
+    require_match(ACTOR_RE, args.actor, "actor_invalid", "actor")
+    precheck_capability_fd(args.token_out_fd, "output")
+    require_native_commit(repo, args.base, git_home, "base")
+    if repo["head"] != args.base:
+        fail("base_mismatch", "--base does not match the current worktree HEAD")
+    scan = require_clean(repo, git_home, "lease acquire")
+
+    token, verifier = mint_capability()
+    now = int(time.time())
+    mutex = TransitionMutex(state)
+    with mutex:
+        if find_worktree_claim(state, repo) is not None:
+            fail("lease_conflict", "this worktree already has a coordination claim")
+        if repo["ref_key"] is not None:
+            existing = read_record(state.claim_refs, repo["ref_key"], "claim",
+                                   "ref claim", allow_missing=True)
+            if existing is not None:
+                fail("lease_conflict", "this ref already has a coordination claim")
+        lease_id = secrets.token_hex(16)
+        if try_lstat_at(state.leases, lease_id) is not None:
+            fail("lease_conflict", "lease identifier collision")
+        lease = new_record("lease", 1, {
+            "lease_id": lease_id,
+            "repo_id": repo["repo_id"],
+            "top": repo["top"],
+            "common_dir": repo["common_dir"],
+            "actor": args.actor,
+            "algo": repo["algo"],
+            "ref": repo["ref"],
+            "detached": repo["detached"],
+            "base_head": args.base,
+            "expected_head": args.base,
+            "expected_tree": repo["tree"],
+            "capability": verifier,
+            "worktree_key": repo["worktree_key"],
+            "ref_key": repo["ref_key"],
+            "state": "active",
+            "created_at": now,
+            "updated_at": now,
+            "released_at": None,
+            "clean_digest": scan["digest"],
+            "checkpoint_count": 0,
+        })
+        lease_fd = publish_record(fds, state.leases, lease_id, "lease", lease,
+                                  "lease record")
+        ensure_owned_dir(fds, lease_fd, "checkpoints", "lease checkpoints")
+        claim_fields = {
+            "lease_id": lease_id, "repo_id": repo["repo_id"], "top": repo["top"],
+            "ref": repo["ref"], "actor": args.actor, "created_at": now,
+        }
+        publish_record(fds, state.claim_worktrees, repo["worktree_key"], "claim",
+                       new_record("claim", 1, dict(claim_fields, **{
+                           "claim_key": repo["worktree_key"], "claim_type": "worktree"})),
+                       "worktree claim")
+        if repo["ref_key"] is not None:
+            publish_record(fds, state.claim_refs, repo["ref_key"], "claim",
+                           new_record("claim", 1, dict(claim_fields, **{
+                               "claim_key": repo["ref_key"], "claim_type": "ref"})),
+                           "ref claim")
+
+    write_capability_fd(args.token_out_fd, token)
+    result = {
+        "ok": True, "command": "lease-acquire", "lease_id": lease_id,
+        "repo_id": repo["repo_id"], "top": repo["top"], "actor": args.actor,
+        "ref": repo["ref"] or "DETACHED", "expected_head": args.base,
+        "algo": repo["algo"], "generation": 1, "clean_digest": scan["digest"],
+        "capability_delivered": "fd",
+    }
+    git_home.release()
+    fds.close_all()
+    return result
+
+
+def cmd_lease_status(args):
+    ctx = open_context(args, create_state=False)
+    fds, git_home, repo, state = ctx["fds"], ctx["git_home"], ctx["repo"], ctx["state"]
+    payload = {
+        "ok": True, "command": "lease-status", "repo_id": repo["repo_id"],
+        "top": repo["top"], "common_dir": repo["common_dir"], "algo": repo["algo"],
+        "head": repo["head"], "tree": repo["tree"],
+        "ref": repo["ref"] or "DETACHED", "detached": repo["detached"],
+    }
+    if not state.present:
+        payload.update({"lease_state": "none", "head_state": "no_lease",
+                        "transition": "none", "status": "green"})
+        git_home.release()
+        fds.close_all()
+        return payload
+
+    def reader():
+        claim = find_worktree_claim(state, repo)
+        if claim is None:
+            return {"claim": None, "lease": None}
+        lease = load_lease(state, claim["record"]["lease_id"])
+        return {"claim": claim["record"], "lease": lease["record"]}
+
+    try:
+        snapshot = double_sampled(state, reader)
+    except CoordError as exc:
+        payload.update({"lease_state": exc.code, "head_state": "unknown",
+                        "transition": "in_progress"
+                        if exc.code == "transition_in_progress" else "none",
+                        "status": "red", "detail": exc.detail})
+        git_home.release()
+        fds.close_all()
+        return payload
+
+    lease = snapshot["lease"]
+    if lease is None:
+        payload.update({"lease_state": "none", "head_state": "no_lease",
+                        "transition": "none", "status": "green"})
+    else:
+        payload.update({
+            "lease_state": lease["state"],
+            "lease_id": lease["lease_id"],
+            "lease_actor": lease["actor"],
+            "generation": lease["generation"],
+            "expected_head": lease["expected_head"],
+            "checkpoint_count": lease["checkpoint_count"],
+            "head_state": lease_head_state(repo, lease, git_home),
+            "transition": "none",
+        })
+        payload["status"] = "green" if payload["head_state"] in (
+            "matches", "head_moved_pending_checkpoint") else "red"
+    git_home.release()
+    fds.close_all()
+    return payload
+
+
+def _authorize_lease(state, repo, token, git_home):
+    claim = find_worktree_claim(state, repo, allow_missing=True)
+    if claim is None:
+        fail("lease_absent", "this worktree holds no coordination claim")
+    lease_entry = load_lease(state, claim["record"]["lease_id"])
+    lease = lease_entry["record"]
+    if lease["state"] != "active":
+        fail("lease_not_active", "the lease is not active")
+    if not capability_matches(lease.get("capability"), token):
+        fail("capability_rejected", "the supplied capability does not authorize this lease")
+    if lease["repo_id"] != repo["repo_id"] or lease["top"] != repo["top"]:
+        fail("identity_mismatch", "the lease does not describe this worktree")
+    if lease["generation"] != claim["record"]["generation"]:
+        raise CoordError("transition_incomplete", "lease and claim generations disagree")
+    if lease["ref"] != repo["ref"] or lease["detached"] != repo["detached"]:
+        fail("head_moved_conflicted", "the worktree ref or detached state changed")
+    return lease
+
+
+def cmd_lease_checkpoint(args):
+    ctx = open_context(args, create_state=False)
+    fds, git_home, repo, state = ctx["fds"], ctx["git_home"], ctx["repo"], ctx["state"]
+    if not state.present:
+        fail("lease_absent", "this repository has no coordination state")
+    token = read_capability_fd(args.token_fd)
+    require_native_commit(repo, args.old, git_home, "--old")
+    require_native_commit(repo, args.new, git_home, "--new")
+    if args.old == args.new:
+        fail("checkpoint_identical", "--old and --new are the same commit")
+
+    mutex = TransitionMutex(state)
+    with mutex:
+        lease = _authorize_lease(state, repo, token, git_home)
+        if lease["expected_head"] != args.old:
+            fail("head_moved_conflicted", "--old is not the recorded expected head")
+        if repo["head"] != args.new:
+            fail("head_moved_conflicted", "the worktree HEAD is not --new")
+        if repo["ref"] is not None:
+            tip = git_line(["-C", repo["top"], "rev-parse", "--verify", "--quiet",
+                            repo["ref"]], git_home, check=False)
+            if tip != args.new:
+                fail("head_moved_conflicted", "the attached ref tip is not --new")
+        ancestor = git_raw(["-C", repo["top"], "merge-base", "--is-ancestor",
+                            args.old, args.new], git_home, check=False)
+        if ancestor["rc"] != 0:
+            fail("head_moved_conflicted", "--new is not a fast-forward descendant of --old")
+        # Final immediate reread: a second movement during the transaction loses.
+        confirm = resolve_repo(repo["top"], git_home)
+        if confirm["head"] != args.new or confirm["ref"] != repo["ref"] \
+                or confirm["detached"] != repo["detached"]:
+            fail("head_moved_conflicted", "HEAD moved again during the checkpoint")
+        tree = confirm["tree"]
+
+        generation = lease["generation"] + 1
+        if lease["checkpoint_count"] >= MAX_CHECKPOINTS:
+            fail("checkpoint_limit", "the lease has too many checkpoints")
+        lease_fd = fds.keep(open_dir_at(state.leases, lease["lease_id"]))
+        checkpoints_fd, _ = ensure_owned_dir(fds, lease_fd, "checkpoints",
+                                             "lease checkpoints")
+        entry_name = "%06d.json" % (generation,)
+        if try_lstat_at(checkpoints_fd, entry_name) is not None:
+            fail("checkpoint_exists", "a checkpoint already exists for this generation")
+        publish_flat_record(checkpoints_fd, entry_name, "checkpoint",
+                            new_record("checkpoint", generation, {
+                                "lease_id": lease["lease_id"],
+                                "old": args.old, "new": args.new, "tree": tree,
+                                "actor": lease["actor"], "ref": repo["ref"],
+                                "recorded_at": int(time.time()),
+                            }), "checkpoint record")
+
+        updated = dict(lease)
+        updated["generation"] = generation
+        updated["expected_head"] = args.new
+        updated["expected_tree"] = tree
+        updated["updated_at"] = int(time.time())
+        updated["checkpoint_count"] = lease["checkpoint_count"] + 1
+        publish_record(fds, state.leases, lease["lease_id"], "lease", updated,
+                       "lease record")
+        claim = read_record(state.claim_worktrees, repo["worktree_key"], "claim",
+                            "worktree claim")["record"]
+        claim = dict(claim)
+        claim["generation"] = generation
+        publish_record(fds, state.claim_worktrees, repo["worktree_key"], "claim",
+                       claim, "worktree claim")
+        if repo["ref_key"] is not None:
+            ref_claim = read_record(state.claim_refs, repo["ref_key"], "claim",
+                                    "ref claim", allow_missing=True)
+            if ref_claim is not None:
+                ref_record = dict(ref_claim["record"])
+                ref_record["generation"] = generation
+                publish_record(fds, state.claim_refs, repo["ref_key"], "claim",
+                               ref_record, "ref claim")
+
+    result = {"ok": True, "command": "lease-checkpoint",
+              "lease_id": lease["lease_id"], "generation": generation,
+              "old": args.old, "new": args.new, "tree": tree,
+              "checkpoint_count": updated["checkpoint_count"]}
+    git_home.release()
+    fds.close_all()
+    return result
+
+
+def _remove_exact_claim(state, dir_fd, key, what):
+    """Remove exactly one manifest-backed claim entry. No glob, no recursion."""
+    require_match(re.compile(r"\A[0-9a-f]{64}\Z"), key, "claim_key_invalid", what)
+    info = try_lstat_at(dir_fd, key)
+    if info is None:
+        return False
+    if statmod.S_ISLNK(info.st_mode) or not statmod.S_ISDIR(info.st_mode):
+        fail("claim_invalid", "%s is not a real directory" % (what,))
+    entry_fd = open_dir_at(dir_fd, key, code="claim_invalid", what=what)
+    try:
+        names = list_dir_at(entry_fd, what)
+        for name in names:
+            if name not in ("record.json", "READY") and not name.startswith(".tmp."):
+                fail("claim_unexpected_entry",
+                     "%s contains an unexpected entry" % (what,))
+        for name in names:
+            try:
+                os.unlink(name, dir_fd=entry_fd)
+            except FileNotFoundError:
+                pass
+        fsync_dir(entry_fd)
+    finally:
+        os.close(entry_fd)
+    try:
+        os.rmdir(key, dir_fd=dir_fd)
+    except OSError as exc:
+        fail("claim_release_failed", "%s: %s" % (what, exc.strerror))
+    fsync_dir(dir_fd)
+    return True
+
+
+def cmd_lease_release(args):
+    ctx = open_context(args, create_state=False)
+    fds, git_home, repo, state = ctx["fds"], ctx["git_home"], ctx["repo"], ctx["state"]
+    if not state.present:
+        fail("lease_absent", "this repository has no coordination state")
+    token = read_capability_fd(args.token_fd)
+    require_native_commit(repo, args.head, git_home, "--head")
+    scan = require_clean(repo, git_home, "lease release")
+
+    mutex = TransitionMutex(state)
+    with mutex:
+        lease = _authorize_lease(state, repo, token, git_home)
+        if lease["expected_head"] != args.head:
+            fail("head_moved_conflicted", "--head is not the recorded expected head")
+        if repo["head"] != args.head:
+            fail("head_moved_conflicted", "the worktree HEAD is not --head")
+        if repo["ref"] is not None:
+            tip = git_line(["-C", repo["top"], "rev-parse", "--verify", "--quiet",
+                            repo["ref"]], git_home, check=False)
+            if tip != args.head:
+                fail("head_moved_conflicted", "the attached ref tip is not --head")
+        updated = dict(lease)
+        updated["generation"] = lease["generation"] + 1
+        updated["state"] = "released"
+        updated["released_at"] = int(time.time())
+        updated["updated_at"] = updated["released_at"]
+        updated["clean_digest"] = scan["digest"]
+        publish_record(fds, state.leases, lease["lease_id"], "lease", updated,
+                       "lease record")
+        removed = []
+        if _remove_exact_claim(state, state.claim_worktrees, lease["worktree_key"],
+                               "worktree claim"):
+            removed.append("worktree")
+        if lease["ref_key"]:
+            if _remove_exact_claim(state, state.claim_refs, lease["ref_key"],
+                                   "ref claim"):
+                removed.append("ref")
+
+    result = {"ok": True, "command": "lease-release", "lease_id": lease["lease_id"],
+              "generation": updated["generation"], "head": args.head,
+              "claims_removed": ",".join(removed) or "none",
+              "history_retained": True, "clean_digest": scan["digest"]}
+    git_home.release()
+    fds.close_all()
+    return result
+
+
+# ---------------------------------------------------------------------------
+# Section 13. CLI front matter (invoked only by tool/bin/coordination.sh)
+# ---------------------------------------------------------------------------
+
+def cmd_not_implemented(args):
+    fail("not_implemented",
+         "%s is deferred to the review-core increment; "
+         "see docs/AUTONOMOUS-BUILDS.md and the core checkpoint report"
+         % (args.verb,))
+
+
+def _fd_number(value):
+    try:
+        number = int(value, 10)
+    except (TypeError, ValueError):
+        raise argparse.ArgumentTypeError("fd must be a small non-negative integer")
+    if number < 0 or number > 255:
+        raise argparse.ArgumentTypeError("fd must be within 0..255")
+    return number
+
+
+def build_parser():
+    parser = argparse.ArgumentParser(
+        prog="coordination_verify.py",
+        description="Stitchpad coordination helper (invoked via coordination.sh)",
+    )
+    sub = parser.add_subparsers(dest="verb", required=True)
+
+    def common(target):
+        target.add_argument("--json", action="store_true",
+                            help="emit the redacted result as JSON")
+        return target
+
+    acquire = common(sub.add_parser("lease-acquire"))
+    acquire.add_argument("--worktree", required=True)
+    acquire.add_argument("--actor", required=True)
+    acquire.add_argument("--base", required=True)
+    acquire.add_argument("--token-out-fd", required=True, type=_fd_number)
+    acquire.set_defaults(func=cmd_lease_acquire)
+
+    status = common(sub.add_parser("lease-status"))
+    status.add_argument("--worktree", required=True)
+    status.set_defaults(func=cmd_lease_status)
+
+    checkpoint = common(sub.add_parser("lease-checkpoint"))
+    checkpoint.add_argument("--worktree", required=True)
+    checkpoint.add_argument("--token-fd", required=True, type=_fd_number)
+    checkpoint.add_argument("--old", required=True)
+    checkpoint.add_argument("--new", required=True)
+    checkpoint.set_defaults(func=cmd_lease_checkpoint)
+
+    release = common(sub.add_parser("lease-release"))
+    release.add_argument("--worktree", required=True)
+    release.add_argument("--token-fd", required=True, type=_fd_number)
+    release.add_argument("--head", required=True)
+    release.set_defaults(func=cmd_lease_release)
+
+    # Review-core verbs: the exact argument surface is fixed now (so the Bash
+    # front controller and stitchpad wiring cannot drift), but the verbs
+    # themselves fail closed with not_implemented until the review-core
+    # increment lands. Nothing here silently half-runs.
+    create = common(sub.add_parser("review-create"))
+    create.add_argument("--repo", required=True)
+    create.add_argument("--commit", required=True)
+    create.add_argument("--author-actor", required=True)
+    create.add_argument("--reviewer-actor", required=True)
+    create.add_argument("--provider", required=True)
+    create.add_argument("--process-token-out-fd", required=True, type=_fd_number)
+    create.set_defaults(func=cmd_not_implemented)
+
+    bind = common(sub.add_parser("review-bind"))
+    bind.add_argument("--id", required=True)
+    bind.add_argument("--session", required=True)
+    bind.add_argument("--request", required=True)
+    bind.set_defaults(func=cmd_not_implemented)
+
+    register = common(sub.add_parser("review-register-process"))
+    register.add_argument("--id", required=True)
+    register.add_argument("--role", required=True)
+    register.add_argument("--pid", required=True, type=int)
+    register.add_argument("--process-token-fd", required=True, type=_fd_number)
+    register.set_defaults(func=cmd_not_implemented)
+
+    cancel = common(sub.add_parser("review-cancel-requested"))
+    cancel.add_argument("--id", required=True)
+    cancel.set_defaults(func=cmd_not_implemented)
+
+    for verb in ("review-refresh", "review-status", "review-submit-report",
+                 "review-verify"):
+        command = common(sub.add_parser(verb))
+        command.add_argument("--id", required=True)
+        command.set_defaults(func=cmd_not_implemented)
+
+    close = common(sub.add_parser("review-close"))
+    close.add_argument("--id", required=True)
+    group = close.add_mutually_exclusive_group(required=True)
+    group.add_argument("--verified", action="store_true")
+    group.add_argument("--abandoned", action="store_true")
+    close.set_defaults(func=cmd_not_implemented)
+
+    return parser
+
+
+def emit_result(result, want_json):
+    if want_json:
+        sys.stdout.write(json.dumps(result, sort_keys=True,
+                                    separators=(",", ":")) + "\n")
+        return
+    for key in sorted(result):
+        value = result[key]
+        if isinstance(value, (dict, list)):
+            value = json.dumps(value, sort_keys=True, separators=(",", ":"))
+        sys.stdout.write("%s: %s\n" % (key, value))
+
+
+def main(argv):
+    parser = build_parser()
+    args = parser.parse_args(argv)
+    want_json = bool(getattr(args, "json", False))
+    try:
+        result = args.func(args)
+    except CoordError as exc:
+        if want_json:
+            sys.stdout.write(json.dumps({
+                "ok": False, "error": exc.code,
+                "detail": bounded(exc.detail, 300),
+            }, sort_keys=True, separators=(",", ":")) + "\n")
+        else:
+            sys.stderr.write("coordination refused: %s: %s\n"
+                             % (exc.code, bounded(exc.detail, 300)))
+        return 2
+    except BrokenPipeError:
+        return 2
+    emit_result(result, want_json)
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]))
