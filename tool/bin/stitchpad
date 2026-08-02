@@ -14,7 +14,8 @@
 #   stitchpad start|stop|status|restart   manage the daemon (background)
 #   stitchpad roster                      print parsed roster
 #   stitchpad rename <old> <new>          rename a member everywhere local state knows them
-#   stitchpad reset [name]                repair a wedged seat (or whole pad): zombie tickers, stale locks, wake cursors
+#   stitchpad reset [name] [--redeliver N] repair a wedged seat without rewinding its cursor
+#   stitchpad keeper [repo ...]           wake idle Ocean seats for real unread/open work
 #   stitchpad archive [--keep N]          move old messages to .stitchpad/archive/<date>-conversation.md (plain md, no deps)
 #   stitchpad compact [--keep N]          archive old transcript to sqlite, replace with rolling summary block
 #   stitchpad task migrate                move legacy inline ```task blocks out of the pad into tasks.md
@@ -61,7 +62,7 @@ sp_autostart_name() {
 sp_maybe_start_heartbeat() {
   [ "${STITCHPAD_HEARTBEAT_AUTOSTART:-1}" = "0" ] && return 0
   case "$cmd" in
-    init|heartbeat|hook|bind-session|whoami|leave|stop|daemon|watch|migration-check|reset|compact|restore-roster|help|-h|--help) return 0 ;;
+    init|heartbeat|hook|bind-session|whoami|leave|stop|daemon|watch|migration-check|reset|keeper|compact|restore-roster|help|-h|--help) return 0 ;;
   esac
   sp_init_paths >/dev/null 2>&1 || return 0
   local who
@@ -348,10 +349,16 @@ EOF
   reset)
     # Repair a wedged seat — or the whole pad. Kills zombie heartbeat tickers,
     # scrubs state left behind by renamed/evicted names, drops stale terminal
-    # locks, clears the wake-once cursor so the latest unanswered mention
-    # re-fires, and restarts heartbeats for roster seats with a live target.
+    # locks, and restarts heartbeats for roster seats with a live target. A
+    # normal repair preserves seen cursors, session bindings, DND, and recovery
+    # markers: infrastructure repair must not replay already-delivered history.
+    # Exact redelivery is an explicit, single-seat pull/hook operation that
+    # queues one positive open-mention ordinal for the bound stop hook. It never
+    # rewinds seen.* and never treats ordinal 0 as "replay everything". Push
+    # seats remain owned by their durable delivery supervisor.
     #   stitchpad reset            sweep the whole pad
     #   stitchpad reset <name>     reset one seat
+    #   stitchpad reset <name> --redeliver <positive-ordinal>
     sp_init_paths || exit 1
 
     _reset_kill_ticker() {   # kill only pids THIS pad recorded for <name> (cross-pad safe)
@@ -379,25 +386,73 @@ EOF
         [ "$(tr -d '[:space:]' < "$_f" 2>/dev/null)" = "$who" ] && rm -f "$_f"
       done
     }
-    _reset_seat() {          # roster member: fresh ticker + re-armable wake
-      local who="$1" target
+    _reset_seat() {          # roster member: fresh ticker, durable state intact
+      local who="$1" target seen="0"
       _reset_kill_ticker "$who"
-      rm -f "$PAD_STATE/seen.$who" "$PAD_STATE/forcewake.$who" "$PAD_STATE/delivered_no_reply.$who" 2>/dev/null
+      [ -f "$PAD_STATE/seen.$who" ] && seen="$(cat "$PAD_STATE/seen.$who" 2>/dev/null || echo 0)"
       target="$(sp_user_field "$who" target)"
       if [ -n "$target" ] && [ "$target" != "-" ]; then
         STITCHPAD_NAME="$who" STITCHPAD_HEARTBEAT_PARENT_PID=0 \
           "$BIN_DIR/stitchpad" heartbeat start "$who" >/dev/null 2>&1 || true
-        echo "  · @$who: wake cursor cleared, heartbeat restarted (target $target)"
+        echo "  · @$who: cursor preserved at ${seen:-0}, heartbeat restarted (target $target)"
       else
-        echo "  · @$who: wake cursor cleared (pull seat, no ticker)"
+        echo "  · @$who: cursor preserved at ${seen:-0} (pull seat, no ticker)"
       fi
     }
 
-    who="${1:-}"
+    _reset_queue_redelivery() {
+      local who="$1" ordinal="$2" engagement open wake_mode
+      case "$ordinal" in
+        ''|0|*[!0-9]*)
+          echo "stitchpad: --redeliver requires a positive mention ordinal (never 0)" >&2
+          return 1
+          ;;
+      esac
+      wake_mode="$(sp_user_field "$who" wake)"
+      if [ "$wake_mode" != "pull" ]; then
+        echo "stitchpad: --redeliver is only supported for pull/hook seats; @$who uses ${wake_mode:-unknown} delivery supervision" >&2
+        return 1
+      fi
+      engagement="$(sp_engagement "$who" "$((ordinal - 1))")"
+      open="$(printf '%s\n' "$engagement" | awk '{print $1}')"
+      if [ "${open:-0}" != "$ordinal" ]; then
+        echo "stitchpad: mention ordinal $ordinal is not currently open for @$who" >&2
+        return 1
+      fi
+      printf '%s' "$ordinal" > "$PAD_STATE/pending.$who"
+      echo "  · @$who: queued exact redelivery ordinal $ordinal (seen cursor unchanged)"
+    }
+
+    who=""; redeliver=""
+    while [ $# -gt 0 ]; do
+      case "$1" in
+        --redeliver)
+          [ $# -ge 2 ] || { echo "usage: stitchpad reset <name> --redeliver <positive-ordinal>" >&2; exit 1; }
+          redeliver="$2"; shift 2
+          ;;
+        --*) echo "stitchpad: unknown reset option: $1" >&2; exit 1 ;;
+        *)
+          [ -z "$who" ] || { echo "usage: stitchpad reset [name] [--redeliver N]" >&2; exit 1; }
+          who="$1"; shift
+          ;;
+      esac
+    done
+    [ -z "$redeliver" ] || [ -n "$who" ] \
+      || { echo "stitchpad: --redeliver requires exactly one roster name" >&2; exit 1; }
+    if [ -n "$redeliver" ]; then
+      case "$redeliver" in
+        0|*[!0-9]*) echo "stitchpad: --redeliver requires a positive mention ordinal (never 0)" >&2; exit 1;;
+      esac
+    fi
     if [ -n "$who" ]; then
       sp_user_exists "$who" || { echo "stitchpad: @$who not in roster" >&2; exit 1; }
+      if [ -n "$redeliver" ] && [ "$(sp_user_field "$who" wake)" != "pull" ]; then
+        echo "stitchpad: --redeliver is only supported for pull/hook seats; @$who uses $(sp_user_field "$who" wake) delivery supervision" >&2
+        exit 1
+      fi
       echo "reset @$who:"
       _reset_seat "$who"
+      [ -z "$redeliver" ] || _reset_queue_redelivery "$who" "$redeliver" || exit 1
     else
       echo "reset pad ($PAD_DIR):"
       names="$(sp_roster | cut -d'|' -f1 | awk '{gsub(/^[ \t]+|[ \t]+$/,"");print}')"
@@ -432,6 +487,10 @@ EOF
       echo "  · watcher ensured"
     fi
     echo "✓ reset done"
+    ;;
+
+  keeper)
+    exec "$BIN_DIR/seat-keeper.sh" "$@"
     ;;
 
   compact)
@@ -1744,12 +1803,17 @@ except: print("")' 2>/dev/null)"
     tests=()
     # STITCHPAD_HOME is tool/; repo root is one level up
     REPO_ROOT="$(cd "$STITCHPAD_HOME/.." && pwd)"
-    for dir in "$STITCHPAD_HOME/test" "$STITCHPAD_HOME/bin" "$REPO_ROOT/test"; do
+    for dir in "$STITCHPAD_HOME/test" "$REPO_ROOT/test"; do
       [ -d "$dir" ] || continue
       while IFS= read -r -d '' t; do
         tests+=("$t")
-      done < <(find "$dir" -maxdepth 1 \( -name 'test-*.sh' -o -name '*-regression.sh' -o -name 'identity-*.sh' \) -print0 2>/dev/null)
+      done < <(find "$dir" -maxdepth 1 -name '*.sh' -print0 2>/dev/null)
     done
+    if [ -d "$STITCHPAD_HOME/bin" ]; then
+      while IFS= read -r -d '' t; do
+        tests+=("$t")
+      done < <(find "$STITCHPAD_HOME/bin" -maxdepth 1 -name 'test-*.sh' -print0 2>/dev/null)
+    fi
     if [ ${#tests[@]} -eq 0 ]; then
       echo "No test scripts found."
       exit 1
@@ -1771,8 +1835,8 @@ except: print("")' 2>/dev/null)"
       fi
       echo ""
     done
-    echo "Results: $_mc_passed passed, $_mc_failed failed, $total total"
-    [ "$_mc_failed" -gt 0 ] && exit 1
+    echo "Results: $passed passed, $failed failed, $total total"
+    [ "$failed" -gt 0 ] && exit 1
     exit 0
     ;;
 

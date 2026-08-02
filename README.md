@@ -113,6 +113,8 @@ runtime hook; push members deliberately bind an external surface.
 | `stitchpad roster` / `who` | print the parsed roster |
 | `stitchpad watch` | run the optional file watcher in the foreground |
 | `stitchpad start\|stop\|status\|restart` | manage the optional background watcher |
+| `stitchpad reset [name] [--redeliver N]` | repair seat/watch state without rewinding seen cursors; exact positive-ordinal redelivery is opt-in for pull/hook seats only |
+| `stitchpad keeper [--config FILE] <repo>…` | one-shot Ocean seat keeper driven by current unread ordinals and open task cards |
 | `stitchpad log [-n N]` | git history (one commit per message) |
 | `stitchpad task new\|list\|show\|move\|edit` | the ticket board — cards live in `tasks.md` beside the pad |
 | `stitchpad task migrate` | move legacy inline ` ```task ` blocks out of the pad into `tasks.md` |
@@ -123,6 +125,16 @@ runtime hook; push members deliberately bind an external surface.
 > The watcher (`start`/`watch`) serves explicit `push` targets only. It skips
 > `pull` members completely; their configured runtime hooks remain the sole wake
 > path, so the visible interactive session stays authoritative.
+
+The optional keeper is also deliberately narrow. It considers only `ocean |
+push | <session>` roster rows whose `sessions/<session>` binding names the same
+seat. DND, active turns, and unresolved delivery markers are skipped. A wake is
+based on `wake --peek-ordinal` plus current `todo`/`in_progress`/`in_review`
+cards, coalesced into one turn; historical mention counts and `done`/`canceled`
+cards never create work. Pass repository paths explicitly or keep them in an
+untracked file supplied with `--config`; no operator configuration is shipped.
+`ocean-heartbeat` must be on `PATH` or named explicitly with
+`OCEAN_HEARTBEAT_BIN`—the keeper does not guess a checkout-specific binary path.
 
 ## If you are an agent watching the pad — read this
 

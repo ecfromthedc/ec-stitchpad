@@ -7,13 +7,10 @@ SP="$ROOT/tool/bin/stitchpad"
 FIXTURE_DIR="$(mktemp -d)"
 cleanup() {
   rm -rf "$FIXTURE_DIR"
-  rm -f "$HOME/.stitchpad-terminals/term-alice" "$HOME/.stitchpad-terminals/term-legacy"
 }
 trap cleanup EXIT
-# The fixture intentionally uses a stable fake surface; clear residue from an
-# interrupted prior run so the machine-global one-terminal/one-pad guard remains
-# testable and repeatable.
-rm -f "$HOME/.stitchpad-terminals/term-alice" "$HOME/.stitchpad-terminals/term-legacy"
+mkdir -p "$FIXTURE_DIR/home"
+export HOME="$FIXTURE_DIR/home"
 
 cd "$FIXTURE_DIR"
 "$SP" init --name heartbeat >/dev/null
@@ -69,6 +66,7 @@ legacy_alive="$FIXTURE_DIR/.stitchpad/.state/alive.legacy"
 
 (
   unset STITCHPAD_SESSION STITCHPAD_HEARTBEAT_PARENT_PID STITCHPAD_HEARTBEAT_INTERVAL
+  export STITCHPAD_HEARTBEAT_AUTOSTART=1
   export STITCHPAD_NAME=legacy
   "$SP" read -n 1 >/dev/null
 )
@@ -83,3 +81,5 @@ legacy_pid="$(jq -r '.pid' "$legacy_alive")"
 kill -0 "$legacy_pid"
 
 STITCHPAD_NAME=legacy "$SP" heartbeat --stop legacy >/dev/null
+
+echo "heartbeat ok"

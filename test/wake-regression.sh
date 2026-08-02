@@ -4,6 +4,7 @@ set -euo pipefail
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 SP="$ROOT/tool/bin/stitchpad"
 export STITCHPAD_STEAL=1   # allow each case to claim the TTY from the prior case
+export STITCHPAD_HEARTBEAT_AUTOSTART=1
 # Unset herdr context: in a managed pane, sp_this_surface returns a terminal id
 # that activates the one-terminal-one-pad lock, which blocks multi-sender test
 # scenarios. The test suite doesn't run inside herdr, but manual runs might.
@@ -27,14 +28,34 @@ stop_watcher() {
   pkill -9 -f "fswatch.*$d" 2>/dev/null || true
   for _pidfile in "$d"/.stitchpad/.state/alive-ticker.*.pid "$d"/.stitchpad/.state/heartbeat.*.lock/pid; do
     [ -f "$_pidfile" ] || continue
-    _pid="$(timeout 2 cat "$_pidfile" 2>/dev/null || true)"
+    # PID files are tiny regular files; a direct read is portable to macOS
+    # (which does not ship GNU `timeout`) and cannot block on a pipe/device.
+    _pid="$(cat "$_pidfile" 2>/dev/null || true)"
     [ -n "$_pid" ] && kill -9 "$_pid" 2>/dev/null || true
   done
   sleep 0.2
 }
 
 tmp="$(mktemp -d /tmp/stitchpad-wake-regression.XXXXXX)"
-trap 'rm -rf "$tmp"' EXIT
+mkdir -p "$tmp/home"
+export HOME="$tmp/home"
+WATCH_PIDS=""
+
+cleanup() {
+  # Stop only fixture-owned watcher parents, heartbeat PIDs, and fswatch children.
+  for pid in $WATCH_PIDS; do kill -TERM "$pid" 2>/dev/null || true; done
+  for pidfile in "$tmp"/*/.stitchpad/.state/alive-ticker.*.pid "$tmp"/*/.stitchpad/.state/heartbeat.*.lock/pid; do
+    [ -f "$pidfile" ] || continue
+    pid="$(cat "$pidfile" 2>/dev/null || true)"
+    [ -n "$pid" ] && kill -TERM "$pid" 2>/dev/null || true
+  done
+  pkill -TERM -f "fswatch.*$tmp" 2>/dev/null || true
+  sleep 0.1
+  for pid in $WATCH_PIDS; do kill -KILL "$pid" 2>/dev/null || true; done
+  pkill -KILL -f "fswatch.*$tmp" 2>/dev/null || true
+  rm -rf "$tmp"
+}
+trap cleanup EXIT
 
 export STITCHPAD_HOME="$ROOT/tool"
 
@@ -305,17 +326,22 @@ fi
 	# Start watcher backgrounded, CAPTURE output, trigger fswatch.
 	"$SP" watch > "$case10/watcher.out" 2>&1 &
 	WATCH_PID=$!
-	sleep 0.5
-	printf '\n' >> "$case10/.stitchpad/stitchpad.md"
-	sleep 1.5
+	WATCH_PIDS="$WATCH_PIDS $WATCH_PID"
+	for _ in 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19 20; do
+	  printf '\n' >> "$case10/.stitchpad/stitchpad.md"
+	  grep -q 'deferring.*pending recovery target.*ordinal 2' "$case10/watcher.out" 2>/dev/null && break
+	  sleep 0.25
+	done
 	kill -9 $WATCH_PID 2>/dev/null || true
 	wait $WATCH_PID 2>/dev/null || true
 	pkill -9 -f "fswatch.*$case10" 2>/dev/null || true
 	rm -rf "$case10/.stitchpad/.state/watch.lock.d" 2>/dev/null || true
 
 	# Assert: the DEFER branch actually RAN (deferring line present).
-	grep -q 'deferring.*pending recovery target.*ordinal 2' "$case10/watcher.out" \
-	  || fail 'invariant5: watcher did NOT defer — branch not exercised'
+	if ! grep -q 'deferring.*pending recovery target.*ordinal 2' "$case10/watcher.out"; then
+	  sed -n '1,80p' "$case10/watcher.out" >&2
+	  fail 'invariant5: watcher did NOT defer — branch not exercised'
+	fi
 
 	# Assert: NO adapter was fired (defer happened before --peek).
 	! grep -q 'firing' "$case10/watcher.out" \
@@ -377,11 +403,14 @@ fi
 	# both cycles ran (adapter failure -> clear -> retry -> clear again).
 	"$SP" watch > "$case12/watcher.out" 2>&1 &
 	WATCH_PID=$!
-	sleep 0.5
+	WATCH_PIDS="$WATCH_PIDS $WATCH_PID"
 
 	# EVENT 1: trigger fswatch, adapter fails, pending cleared.
-	printf '\n' >> "$case12/.stitchpad/stitchpad.md"
-	sleep 1.5
+	for _ in 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19 20; do
+	  printf '\n' >> "$case12/.stitchpad/stitchpad.md"
+	  [ "$(grep -c 'exit 1 (not consuming gate)' "$case12/watcher.out" 2>/dev/null || true)" -ge 1 ] && break
+	  sleep 0.25
+	done
 	[ ! -f "$case12/.stitchpad/.state/pending.agent" ] \
 	  || fail 'invariant5: pending not cleared after event-1 adapter failure'
 	_s12_1="$(cat "$case12/.stitchpad/.state/seen.agent" 2>/dev/null || echo 0)"
@@ -390,8 +419,11 @@ fi
 
 	# EVENT 2: trigger fswatch again — same mention is still unanswered,
 	# watcher must fire adapter again (no deadlock from stale pending).
-	printf '\n' >> "$case12/.stitchpad/stitchpad.md"
-	sleep 1.5
+	for _ in 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19 20; do
+	  printf '\n' >> "$case12/.stitchpad/stitchpad.md"
+	  [ "$(grep -c 'exit 1 (not consuming gate)' "$case12/watcher.out" 2>/dev/null || true)" -ge 2 ] && break
+	  sleep 0.25
+	done
 	[ ! -f "$case12/.stitchpad/.state/pending.agent" ] \
 	  || fail 'invariant5: pending not cleared after event-2 adapter failure'
 	_s12_2="$(cat "$case12/.stitchpad/.state/seen.agent" 2>/dev/null || echo 0)"
@@ -441,6 +473,7 @@ EOF
 	STITCHPAD_NAME=sender "$SP" say '@agent exactly once over ocean push' >/dev/null
 	PATH="$mockbin:$PATH" "$SP" watch > "$case13/watcher.out" 2>&1 &
 	WATCH_PID=$!
+	WATCH_PIDS="$WATCH_PIDS $WATCH_PID"
 	sleep 0.5
 	printf '\n' >> "$case13/.stitchpad/stitchpad.md"
 	for _ in 1 2 3 4 5 6 7 8 9 10; do
