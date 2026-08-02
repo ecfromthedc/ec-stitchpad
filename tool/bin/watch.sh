@@ -153,9 +153,37 @@ delivery_cancel_ocean_turn() {
   local name="$1" turn_id="$2" reason="$3" dir response http daemon_url lock attempts=0 rc=1
   local cancel_state terminal token epoch claim claim_base nested owner pid pstart live_start born age
   local poll_attempts poll_seconds poll_deadline cancel_deadline_seconds lock_attempts lock_sleep stale_path
-  [ -n "$turn_id" ] || return 0
+  DELIVERY_CANCEL_OUTCOME=none
+  [ -n "$turn_id" ] || { DELIVERY_CANCEL_OUTCOME=no_turn; return 0; }
+  if [ -L "$PAD_STATE" ]; then
+    DELIVERY_CANCEL_OUTCOME=pending
+    echo "[stitchpad] refusing Ocean cancel through symlinked pad state: $PAD_STATE" >&2
+    return 1
+  fi
+  case "$name:$turn_id" in
+    *[!A-Za-z0-9_:-]*)
+      DELIVERY_CANCEL_OUTCOME=pending
+      echo "[stitchpad] refusing unsafe Ocean cancel identity: $name/$turn_id" >&2
+      return 1 ;;
+  esac
   dir="$(delivery_cancel_dir "$name" "$turn_id")"
-  mkdir -p "$dir"
+  if [ -L "$dir" ] || { [ -e "$dir" ] && [ ! -d "$dir" ]; }; then
+    DELIVERY_CANCEL_OUTCOME=pending
+    echo "[stitchpad] refusing unsafe Ocean cancel directory: $dir" >&2
+    return 1
+  fi
+  mkdir "$dir" 2>/dev/null || [ -d "$dir" ] || { DELIVERY_CANCEL_OUTCOME=pending; return 1; }
+  case "$(cd -P "$dir" 2>/dev/null && pwd)" in
+    "$(cd -P "$PAD_STATE" 2>/dev/null && pwd)"/delivery.*.cancel.*) ;;
+    *) DELIVERY_CANCEL_OUTCOME=pending; echo "[stitchpad] Ocean cancel directory escaped pad state" >&2; return 1 ;;
+  esac
+  for response in reason attempts requested_at response error http_status result attempt.lock.d; do
+    if [ -L "$dir/$response" ]; then
+      DELIVERY_CANCEL_OUTCOME=pending
+      echo "[stitchpad] refusing symlinked Ocean cancel state: $dir/$response" >&2
+      return 1
+    fi
+  done
   lock="$dir/attempt.lock.d"
   token="$(date +%s)-$$-$RANDOM-$RANDOM"; epoch="$(date +%s)"
   lock_attempts="${SP_DELIVERY_CANCEL_LOCK_ATTEMPTS:-500}"
@@ -177,8 +205,11 @@ delivery_cancel_ocean_turn() {
       mkdir "$claim" || return 1
       printf '%s|%s|%s|%s\n' "$$" "$pstart" "$token" "$epoch" > "$claim/owner"
     fi
-    case "$(cat "$dir/result" 2>/dev/null || true)" in canceled|completed|errored|cancelled)
-      rm -rf "$claim"; return 0;; esac
+    case "$(cat "$dir/result" 2>/dev/null || true)" in
+      canceled|cancelled) DELIVERY_CANCEL_OUTCOME=cancelled; rm -rf "$claim"; return 0;;
+      completed) DELIVERY_CANCEL_OUTCOME=completed; rm -rf "$claim"; return 0;;
+      errored) DELIVERY_CANCEL_OUTCOME=errored; rm -rf "$claim"; return 0;;
+    esac
     owner="$(cat "$lock/owner" 2>/dev/null || true)"
     born="$(cat "$lock/born" 2>/dev/null || stat -f %m "$lock" 2>/dev/null || stat -c %Y "$lock" 2>/dev/null || echo 0)"
     IFS='|' read -r pid pstart _ _ <<< "$owner"
@@ -200,10 +231,14 @@ delivery_cancel_ocean_turn() {
     fi
   done
   case "$(cat "$dir/result" 2>/dev/null || true)" in
-    canceled|completed|errored|cancelled)
-      [ "$(cut -d'|' -f3 "$lock/owner" 2>/dev/null || true)" = "$token" ] && rm -rf "$lock"
-      return 0;;
+    canceled|cancelled) DELIVERY_CANCEL_OUTCOME=cancelled ;;
+    completed) DELIVERY_CANCEL_OUTCOME=completed ;;
+    errored) DELIVERY_CANCEL_OUTCOME=errored ;;
   esac
+  if [ "$DELIVERY_CANCEL_OUTCOME" != none ]; then
+    [ "$(cut -d'|' -f3 "$lock/owner" 2>/dev/null || true)" = "$token" ] && rm -rf "$lock"
+    return 0
+  fi
   [ -f "$dir/reason" ] || printf '%s\n' "$reason" > "$dir/reason"
   printf '%s|%s\n' "$(delivery_now)" "$reason" >> "$dir/attempts"
   [ -f "$dir/requested_at" ] || printf '%s\n' "$(delivery_now)" > "$dir/requested_at"
@@ -230,11 +265,11 @@ except Exception: print("invalid")' "$response" 2>/dev/null)"
   while :; do
     case "$terminal" in
       completed|errored|cancelled)
-        printf '%s\n' "$terminal" > "$dir/result"; rc=0; break ;;
+        printf '%s\n' "$terminal" > "$dir/result"; DELIVERY_CANCEL_OUTCOME="$terminal"; rc=0; break ;;
     esac
     attempts=$((attempts + 1))
     if [ "$attempts" -ge "$poll_attempts" ] || [ "$(date +%s)" -ge "$poll_deadline" ]; then
-      printf 'cancel_pending\n' > "$dir/result"; rc=1; break
+      printf 'cancel_pending\n' > "$dir/result"; DELIVERY_CANCEL_OUTCOME=pending; rc=1; break
     fi
     sleep "$poll_seconds"
     terminal="$(delivery_ocean_turn_status "" "$turn_id")"
@@ -326,14 +361,36 @@ delivery_task_valid() {
 delivery_drop_current() {
   local name="$1" generation="$2" ordinal="$3" message_id="$4" task_id="$5"
   local accepted_at="$6" reason="$7" task_status="${8:--}" turn_id="${9:-}"
+  local turn_status="${10:-cancelled}"
   delivery_tombstone "$name" "$generation" "$ordinal" "$message_id" "$task_id" "$reason" "$task_status" "$turn_id" || true
   if delivery_pending_matches "$name" "$generation" "$ordinal" "$message_id"; then
     rm -f "$(delivery_pending_file "$name")"
     delivery_write_state "$name" tombstoned "$generation" "$ordinal" "$message_id" "$task_id" \
-      "$accepted_at" "" "" "$(delivery_now)" "$reason:$task_status" "$turn_id" canceled
+      "$accepted_at" "" "" "$(delivery_now)" "$reason:$task_status" "$turn_id" "$turn_status"
     [ -f "$(delivery_successor_file "$name")" ] \
       && mv "$(delivery_successor_file "$name")" "$(delivery_pending_file "$name")"
   fi
+}
+
+delivery_finalize_completed() {
+  local name="$1" generation="$2" ordinal="$3" message_id="$4" task_id="$5"
+  local accepted_at="$6" started_at="$7" turn_id="$8" reason="${9:-}"
+  local error_code=""
+  if delivery_pending_matches "$name" "$generation" "$ordinal" "$message_id"; then
+    delivery_advance_seen "$name" "$ordinal"
+    rm -f "$(delivery_pending_file "$name")" "$(delivery_turn_file "$name" "$generation")" \
+      "$(delivery_ack_file "$name" "$generation")" "$(delivery_submit_file "$name" "$generation")"
+    [ -n "$reason" ] && error_code="completed_after_cancel:$reason"
+    delivery_write_state "$name" completed "$generation" "$ordinal" "$message_id" "$task_id" \
+      "$accepted_at" "$started_at" "$(delivery_now)" "" "$error_code" "$turn_id" completed
+    DELIVERY_ACTIVE_TURN=""
+    return 0
+  fi
+  # A stale generation may finish while a successor is current. Remove only
+  # generation-bound evidence; never consume or overwrite the successor.
+  rm -f "$(delivery_turn_file "$name" "$generation")" \
+    "$(delivery_ack_file "$name" "$generation")" "$(delivery_submit_file "$name" "$generation")"
+  return 1
 }
 
 delivery_validate_current() {
@@ -436,15 +493,26 @@ delivery_worker() {
     [ -n "$turn_id" ] && started="$(sed -n 's/^started_at=//p' "$(delivery_state_file "$name")" 2>/dev/null | tail -1)"
     if sp_dnd_is_on "$name"; then
       if [ "$adapter" = ocean ] && [ -n "$turn_id" ]; then
-        if delivery_cancel_ocean_turn "$name" "$turn_id" dnd; then
-          rm -f "$(delivery_turn_file "$name" "$generation")" \
-            "$(delivery_ack_file "$name" "$generation")" "$(delivery_submit_file "$name" "$generation")"
-          DELIVERY_ACTIVE_TURN=""
-        else
+        if ! delivery_cancel_ocean_turn "$name" "$turn_id" dnd; then
           delivery_write_state "$name" cancel_pending "$generation" "$ordinal" "$message_id" "$task_id" \
             "$accepted_at" "$started" "" "$(delivery_now)" cancel_failed "$turn_id" active
           sleep "$retry_seconds"; continue
         fi
+        case "$DELIVERY_CANCEL_OUTCOME" in
+          completed)
+            delivery_finalize_completed "$name" "$generation" "$ordinal" "$message_id" "$task_id" \
+              "$accepted_at" "$started" "$turn_id" dnd || true
+            continue ;;
+          errored)
+            delivery_write_state "$name" errored "$generation" "$ordinal" "$message_id" "$task_id" \
+              "$accepted_at" "$started" "" "$(delivery_now)" turn_errored "$turn_id" errored
+            break ;;
+          cancelled)
+            rm -f "$(delivery_turn_file "$name" "$generation")" \
+              "$(delivery_ack_file "$name" "$generation")" "$(delivery_submit_file "$name" "$generation")"
+            DELIVERY_ACTIVE_TURN="" ;;
+          *) sleep "$retry_seconds"; continue ;;
+        esac
       fi
       delivery_write_state "$name" deferred_dnd "$generation" "$ordinal" "$message_id" "$task_id" \
         "$accepted_at" "" "" "" dnd "$turn_id" deferred
@@ -460,6 +528,12 @@ delivery_worker() {
         until delivery_cancel_ocean_turn "$name" "$turn_id" superseded_generation; do
           sleep "$retry_seconds"
         done
+        case "$DELIVERY_CANCEL_OUTCOME" in
+          completed) delivery_finalize_completed "$name" "$generation" "$ordinal" "$message_id" "$task_id" \
+            "$accepted_at" "$started" "$turn_id" superseded_generation || true ;;
+          cancelled|errored) rm -f "$(delivery_turn_file "$name" "$generation")" \
+            "$(delivery_ack_file "$name" "$generation")" "$(delivery_submit_file "$name" "$generation")" ;;
+        esac
         continue
       fi
       if ! delivery_task_valid "$name" "$task_id"; then
@@ -468,8 +542,18 @@ delivery_worker() {
             "$accepted_at" "$started" "" "$(delivery_now)" cancel_failed "$turn_id" active
           sleep "$retry_seconds"; continue
         fi
-        delivery_drop_current "$name" "$generation" "$ordinal" "$message_id" "$task_id" \
-          "$accepted_at" "$DELIVERY_TASK_REASON" "$DELIVERY_TASK_STATUS" "$turn_id"
+        case "$DELIVERY_CANCEL_OUTCOME" in
+          completed)
+            delivery_finalize_completed "$name" "$generation" "$ordinal" "$message_id" "$task_id" \
+              "$accepted_at" "$started" "$turn_id" "$DELIVERY_TASK_REASON" || true
+            continue ;;
+          errored)
+            delivery_drop_current "$name" "$generation" "$ordinal" "$message_id" "$task_id" \
+              "$accepted_at" "$DELIVERY_TASK_REASON" "$DELIVERY_TASK_STATUS" "$turn_id" errored ;;
+          cancelled)
+            delivery_drop_current "$name" "$generation" "$ordinal" "$message_id" "$task_id" \
+              "$accepted_at" "$DELIVERY_TASK_REASON" "$DELIVERY_TASK_STATUS" "$turn_id" cancelled ;;
+        esac
         rm -f "$(delivery_turn_file "$name" "$generation")"
         continue
       fi
@@ -482,8 +566,17 @@ delivery_worker() {
               "$accepted_at" "$started" "" "$(delivery_now)" cancel_failed "$turn_id" active
             sleep "$retry_seconds"; continue
           fi
-          delivery_drop_current "$name" "$generation" "$ordinal" "$message_id" "$task_id" \
-            "$accepted_at" superseded_current "$current_ordinal" "$turn_id"
+          case "$DELIVERY_CANCEL_OUTCOME" in
+            completed)
+              delivery_finalize_completed "$name" "$generation" "$ordinal" "$message_id" "$task_id" \
+                "$accepted_at" "$started" "$turn_id" superseded_current || true ;;
+            errored)
+              delivery_drop_current "$name" "$generation" "$ordinal" "$message_id" "$task_id" \
+                "$accepted_at" superseded_current "$current_ordinal" "$turn_id" errored ;;
+            cancelled)
+              delivery_drop_current "$name" "$generation" "$ordinal" "$message_id" "$task_id" \
+                "$accepted_at" superseded_current "$current_ordinal" "$turn_id" cancelled ;;
+          esac
           rm -f "$(delivery_turn_file "$name" "$generation")"
           # The watcher may have observed the successor while cancel was
           # transiently unavailable and intentionally left the old generation
@@ -496,20 +589,8 @@ delivery_worker() {
       turn_status="$(delivery_ocean_turn_status "$target" "$turn_id")"
       case "$turn_status" in
         completed)
-          if [ -d "$(delivery_cancel_dir "$name" "$turn_id")" ]; then
-            delivery_drop_current "$name" "$generation" "$ordinal" "$message_id" "$task_id" \
-              "$accepted_at" cancel_requested completed_after_cancel "$turn_id"
-            rm -f "$(delivery_turn_file "$name" "$generation")" \
-              "$(delivery_ack_file "$name" "$generation")" "$(delivery_submit_file "$name" "$generation")"
-            continue
-          fi
-          if delivery_pending_matches "$name" "$generation" "$ordinal" "$message_id"; then
-            delivery_advance_seen "$name" "$ordinal"
-            rm -f "$pending" "$(delivery_turn_file "$name" "$generation")" \
-              "$(delivery_ack_file "$name" "$generation")" "$(delivery_submit_file "$name" "$generation")"
-            delivery_write_state "$name" completed "$generation" "$ordinal" "$message_id" "$task_id" \
-              "$accepted_at" "$started" "$(delivery_now)" "" "" "$turn_id" completed
-          fi
+          delivery_finalize_completed "$name" "$generation" "$ordinal" "$message_id" "$task_id" \
+            "$accepted_at" "$started" "$turn_id" || true
           ;;
         queued|running|waiting_for_permission|cancelling)
           delivery_write_state "$name" in_flight "$generation" "$ordinal" "$message_id" "$task_id" \
@@ -560,6 +641,12 @@ delivery_worker() {
             "$accepted_at" "$started" "" "$(delivery_now)" cancel_failed "$turn_id" cancelling
           break
         fi
+        case "$DELIVERY_CANCEL_OUTCOME" in
+          completed) delivery_finalize_completed "$name" "$generation" "$ordinal" "$message_id" "$task_id" \
+            "$accepted_at" "$started" "$turn_id" superseded_after_accept || true ;;
+          cancelled|errored) rm -f "$(delivery_turn_file "$name" "$generation")" \
+            "$(delivery_ack_file "$name" "$generation")" "$(delivery_submit_file "$name" "$generation")" ;;
+        esac
         continue
       fi
       if [ "$rc" -eq 0 ]; then
@@ -768,8 +855,23 @@ delivery_enqueue_locked() {
         if [ "$old_adapter" = ocean ] && ! delivery_cancel_ocean_turn "$name" "$old_turn" "$DELIVERY_TASK_REASON"; then
           delivery_start_worker "$name"; return 0
         fi
-        delivery_drop_current "$name" "$old_generation" "$old_ordinal" "$old_message" "$old_task" \
-          "$old_accepted" "$DELIVERY_TASK_REASON" "$DELIVERY_TASK_STATUS" "$old_turn"
+        if [ "$old_adapter" = ocean ]; then
+          case "$DELIVERY_CANCEL_OUTCOME" in
+            completed)
+              delivery_finalize_completed "$name" "$old_generation" "$old_ordinal" "$old_message" "$old_task" \
+                "$old_accepted" "" "$old_turn" "$DELIVERY_TASK_REASON" || true
+              return 0 ;;
+            errored)
+              delivery_drop_current "$name" "$old_generation" "$old_ordinal" "$old_message" "$old_task" \
+                "$old_accepted" "$DELIVERY_TASK_REASON" "$DELIVERY_TASK_STATUS" "$old_turn" errored ;;
+            cancelled|no_turn)
+              delivery_drop_current "$name" "$old_generation" "$old_ordinal" "$old_message" "$old_task" \
+                "$old_accepted" "$DELIVERY_TASK_REASON" "$DELIVERY_TASK_STATUS" "$old_turn" cancelled ;;
+          esac
+        else
+          delivery_drop_current "$name" "$old_generation" "$old_ordinal" "$old_message" "$old_task" \
+            "$old_accepted" "$DELIVERY_TASK_REASON" "$DELIVERY_TASK_STATUS" "$old_turn"
+        fi
         rm -f "$(delivery_turn_file "$name" "$old_generation")"
         return 0
       fi
@@ -795,9 +897,21 @@ delivery_enqueue_locked() {
       if ! delivery_cancel_ocean_turn "$name" "$old_turn" superseded_by_newer; then
         delivery_start_worker "$name"; return 0
       fi
+      case "$DELIVERY_CANCEL_OUTCOME" in
+        completed)
+          delivery_finalize_completed "$name" "$old_generation" "$old_ordinal" "$old_message" "$old_task" \
+            "$old_accepted" "" "$old_turn" superseded_by_newer || true ;;
+        errored)
+          delivery_drop_current "$name" "$old_generation" "$old_ordinal" "$old_message" "$old_task" \
+            "$old_accepted" superseded_by_newer "$ordinal" "$old_turn" errored ;;
+        cancelled)
+          delivery_drop_current "$name" "$old_generation" "$old_ordinal" "$old_message" "$old_task" \
+            "$old_accepted" superseded_by_newer "$ordinal" "$old_turn" cancelled ;;
+      esac
+    else
+      delivery_tombstone "$name" "$old_generation" "$old_ordinal" "$old_message" "$old_task" \
+        superseded_by_newer "$ordinal" "$old_turn" || true
     fi
-    delivery_tombstone "$name" "$old_generation" "$old_ordinal" "$old_message" "$old_task" \
-      superseded_by_newer "$ordinal" "$old_turn" || true
     rm -f "$(delivery_turn_file "$name" "$old_generation")"
   fi
   generation=1

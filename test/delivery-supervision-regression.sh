@@ -260,10 +260,12 @@ if [[ "$url" == */cancel ]]; then
   turn="${url%/cancel}"; turn="${turn##*/}"
   printf '%s\n' "$turn" >> "$state/ocean.cancels"
   if [ ! -f "$state/ocean.cancel_reject" ] \
-     && [ "$(cat "$state/ocean.active" 2>/dev/null || true)" = "$turn" ]; then : > "$state/ocean.active"; fi
+     && [ "$(cat "$state/ocean.active" 2>/dev/null || true)" = "$turn" ]; then
+    : > "$state/ocean.active"
+    printf '%s' "$turn" > "$state/ocean.cancel.requested"
+  fi
   if [ -f "$state/ocean.cancel_delay" ]; then
     printf '%s' "$turn" > "$state/ocean.active"
-    printf '%s' "$turn" > "$state/ocean.cancel.requested"
   fi
   out=""
   while [ "$#" -gt 0 ]; do
@@ -282,12 +284,13 @@ if [ -f "$state/ocean.cancel.requested" ]; then
   turn="$(cat "$state/ocean.cancel.requested")"
   polls=$(( $(cat "$state/ocean.cancel.polls" 2>/dev/null || echo 0) + 1 ))
   printf '%s' "$polls" > "$state/ocean.cancel.polls"
-  if [ "$polls" -lt 3 ]; then
+  if [ -f "$state/ocean.cancel_delay" ] && [ "$polls" -lt 3 ]; then
     printf '{"ok":true,"requests":[{"request_id":"%s","session_id":"ocean-session","state":"cancelling","started_at":"2099-01-01T00:00:00Z"}]}\n' "$turn"
   else
+    terminal="$(cat "$state/ocean.cancel_terminal" 2>/dev/null || printf cancelled)"
     : > "$state/ocean.active"
     rm -f "$state/ocean.cancel.requested"
-    printf '{"ok":true,"requests":[{"request_id":"%s","session_id":"ocean-session","state":"cancelled","started_at":"2099-01-01T00:00:00Z"}]}\n' "$turn"
+    printf '{"ok":true,"requests":[{"request_id":"%s","session_id":"ocean-session","state":"%s","started_at":"2099-01-01T00:00:00Z"}]}\n' "$turn" "$terminal"
   fi
   exit 0
 fi
@@ -435,14 +438,94 @@ for _ in $(seq 1 100); do [ "$(cat "$PAD_STATE/ocean.count" 2>/dev/null || echo 
 : > "$PAD_STATE/ocean.active"
 wait_state oceandnd completed || fail 'Ocean DND-off turn did not complete'
 
+new_case ocean_dnd_completed_before 'dndbefore | ocean | push | ocean-session'
+export STITCHPAD_PAD_DIR="$PAD_DIR"
+printf completed > "$PAD_STATE/ocean.cancel_terminal"
+append_message operator '@dndbefore finish at the DND cancellation boundary'
+delivery_enqueue dndbefore ocean push ocean-session
+wait_state dndbefore in_flight || fail 'completed-before-cancel fixture did not become in-flight'
+touch "$(sp_dnd_file dndbefore)"
+wait_state dndbefore completed || fail 'completed-before-cancel was misclassified as deferred'
+[ "$(state_value dndbefore turn_status)" = completed ] || fail 'completed-before-cancel lost terminal outcome'
+[ "$(state_value dndbefore generation)" = 1 ] || fail 'completed-before-cancel changed generation'
+[ "$(state_value dndbefore turn_id)" = turn-1 ] || fail 'completed-before-cancel lost exact request id'
+[ "$(cat "$PAD_STATE/seen.dndbefore")" = "$(state_value dndbefore ordinal)" ] \
+  || fail 'completed-before-cancel did not advance exact ordinal'
+[ ! -e "$(delivery_pending_file dndbefore)" ] && [ ! -e "$(delivery_turn_file dndbefore 1)" ] \
+  || fail 'completed-before-cancel left replayable generation evidence'
+rm -f "$(sp_dnd_file dndbefore)"
+delivery_enqueue dndbefore ocean push ocean-session
+sleep 0.3
+[ "$(cat "$PAD_STATE/ocean.count")" = 1 ] || fail 'DND release replayed completed-before-cancel work'
+
+new_case ocean_dnd_completed_during 'dndduring | ocean | push | ocean-session'
+export STITCHPAD_PAD_DIR="$PAD_DIR"
+touch "$PAD_STATE/ocean.cancel_delay"
+printf completed > "$PAD_STATE/ocean.cancel_terminal"
+append_message operator '@dndduring complete while cancellation is polling'
+delivery_enqueue dndduring ocean push ocean-session
+wait_state dndduring in_flight || fail 'completed-during-cancel fixture did not become in-flight'
+touch "$(sp_dnd_file dndduring)"
+wait_state dndduring completed || fail 'completed-during-cancel was misclassified as deferred'
+[ "$(state_value dndduring turn_status)" = completed ] || fail 'completed-during-cancel lost terminal outcome'
+[ "$(state_value dndduring generation)" = 1 ] || fail 'completed-during-cancel changed generation'
+[ "$(state_value dndduring turn_id)" = turn-1 ] || fail 'completed-during-cancel lost exact request id'
+[ "$(grep -c '^turn-1$' "$PAD_STATE/ocean.cancels" 2>/dev/null || true)" = 1 ] \
+  || fail 'completed-during-cancel did not target the exact request once'
+[ "$(cat "$PAD_STATE/seen.dndduring")" = "$(state_value dndduring ordinal)" ] \
+  || fail 'completed-during-cancel did not advance exact ordinal'
+[ ! -e "$(delivery_pending_file dndduring)" ] && [ ! -e "$(delivery_turn_file dndduring 1)" ] \
+  || fail 'completed-during-cancel left replayable generation evidence'
+rm -f "$(sp_dnd_file dndduring)"
+delivery_enqueue dndduring ocean push ocean-session
+sleep 0.3
+[ "$(cat "$PAD_STATE/ocean.count")" = 1 ] || fail 'DND release replayed completed-during-cancel work'
+
 new_case cancel_contract 'cancelapi | ocean | push | ocean-session'
 export STITCHPAD_PAD_DIR="$PAD_DIR"
 printf 'turn-reject' > "$PAD_STATE/ocean.active"; touch "$PAD_STATE/ocean.cancel_reject"
 if delivery_cancel_ocean_turn cancelapi turn-reject hostile_reject; then
   fail '2xx ok:false cancel response was accepted as canceled'
 fi
+[ "$DELIVERY_CANCEL_OUTCOME" = pending ] || fail 'rejected cancel did not expose pending outcome'
 [ "$(cat "$(delivery_cancel_dir cancelapi turn-reject)/result")" = cancel_pending ] \
   || fail 'rejected still-running cancel did not remain durably pending'
+rm -f "$PAD_STATE/ocean.cancel_reject"
+printf turn-error > "$PAD_STATE/ocean.active"
+printf errored > "$PAD_STATE/ocean.cancel_terminal"
+delivery_cancel_ocean_turn cancelapi turn-error hostile_error \
+  || fail 'terminal errored cancel outcome was treated as pending'
+[ "$DELIVERY_CANCEL_OUTCOME" = errored ] || fail 'terminal errored cancel was conflated with cancellation'
+[ "$(cat "$(delivery_cancel_dir cancelapi turn-error)/result")" = errored ] \
+  || fail 'terminal errored outcome was not durably recorded'
+
+new_case cancel_containment 'pathseat | ocean | push | ocean-session'
+export STITCHPAD_PAD_DIR="$PAD_DIR"
+outside="$TMP/cancel-outside"
+mkdir -p "$outside"
+printf unchanged > "$outside/sentinel"
+real_state="$PAD_STATE"
+ln -s "$outside" "$CASE_PAD/state-link"
+PAD_STATE="$CASE_PAD/state-link"
+delivery_cancel_ocean_turn pathseat turn-state-link hostile_state_symlink \
+  && fail 'symlinked PAD_STATE was accepted'
+PAD_STATE="$real_state"
+[ ! -e "$outside/delivery.pathseat.cancel.turn-state-link" ] \
+  || fail 'symlinked PAD_STATE created cancel state outside the pad'
+ln -s "$outside" "$(delivery_cancel_dir pathseat turn-link)"
+delivery_cancel_ocean_turn pathseat turn-link hostile_symlink \
+  && fail 'symlinked cancel directory was accepted'
+[ "$(cat "$outside/sentinel")" = unchanged ] && [ "$(find "$outside" -type f | wc -l | tr -d ' ')" = 1 ] \
+  || fail 'symlinked cancel directory escaped pad state'
+rm -f "$(delivery_cancel_dir pathseat turn-link)"
+mkdir "$(delivery_cancel_dir pathseat turn-file-link)"
+ln -s "$outside/response" "$(delivery_cancel_dir pathseat turn-file-link)/response"
+delivery_cancel_ocean_turn pathseat turn-file-link hostile_file_symlink \
+  && fail 'symlinked cancel response was accepted'
+[ ! -e "$outside/response" ] || fail 'symlinked cancel response wrote outside pad state'
+delivery_cancel_ocean_turn pathseat '../turn-traversal' hostile_traversal \
+  && fail 'path-traversal turn id was accepted'
+[ "$(cat "$outside/sentinel")" = unchanged ] || fail 'path containment changed external sentinel'
 
 new_case cancel_lock 'lockseat | ocean | push | ocean-session'
 export STITCHPAD_PAD_DIR="$PAD_DIR"
