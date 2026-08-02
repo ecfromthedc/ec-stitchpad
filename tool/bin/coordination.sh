@@ -14,11 +14,12 @@
 #   coordination.sh lease status --worktree PATH [--json]
 #   coordination.sh lease checkpoint --worktree PATH --token-fd FD --old FULL_OID --new FULL_OID
 #   coordination.sh lease release --worktree PATH --token-fd FD --head FULL_OID
-#   coordination.sh review create|bind|register-process|cancel-requested|refresh|status|submit-report|verify|close ...
+#   coordination.sh review create --repo PATH --commit FULL_OID ...
+#   coordination.sh review <verb> ID [flags]
 #
-# Review verbs parse here and fail closed with not_implemented until the
-# review-core increment lands; their argument surface is fixed so wiring
-# cannot drift.
+# Every review verb except `create` takes the review ID as the first
+# POSITIONAL argument, exactly as design v5 section 2 specifies. There is no
+# `--id` flag: the positional form is the frozen contract (audit P2-6).
 
 set -uo pipefail
 
@@ -43,15 +44,17 @@ areas and verbs:
   lease checkpoint    --worktree PATH --token-fd FD --old FULL_OID --new FULL_OID
   lease release       --worktree PATH --token-fd FD --head FULL_OID
   review create       --repo PATH --commit FULL_OID --author-actor A --reviewer-actor B
-                      --provider ocean --process-token-out-fd FD        [deferred]
-  review bind         --id ID --session UUID --request UUID              [deferred]
-  review register-process --id ID --role ROLE --pid PID --process-token-fd FD [deferred]
-  review cancel-requested --id ID                                        [deferred]
-  review refresh      --id ID [--json]                                   [deferred]
-  review status       --id ID [--json]                                   [deferred]
-  review submit-report --id ID                                           [deferred]
-  review verify       --id ID                                            [deferred]
-  review close        --id ID --verified | --id ID --abandoned           [deferred]
+                      --provider ocean --process-token-out-fd FD
+  review bind         ID --session UUID --request UUID
+  review register-process ID --role ROLE --pid PID --process-token-fd FD
+  review cancel-requested ID
+  review refresh      ID [--json]
+  review status       ID [--json]
+  review submit-report ID
+  review verify       ID
+  review close        ID --verified | ID --abandoned
+
+review IDs are positional and must be exactly 32 lowercase hex characters.
 
 capabilities travel only through inherited FDs; token values never appear in
 argv, output, logs, or diagnostics. exit codes: 0 ok, 2 coordination refusal,
@@ -75,7 +78,7 @@ validate_flags() {
         shift
         ;;
       --worktree|--repo|--actor|--base|--old|--new|--head|--commit|\
---author-actor|--reviewer-actor|--provider|--id|--session|--request|--role|--pid|\
+--author-actor|--reviewer-actor|--provider|--session|--request|--role|--pid|\
 --token-fd|--token-out-fd|--process-token-fd|--process-token-out-fd)
         [ $# -ge 2 ] || die_usage "flag $1 requires a value"
         case "$2" in
@@ -133,24 +136,43 @@ esac
 verb="$2"
 shift 2
 
+# needs_id=1 marks the verbs whose first argument is the positional review ID.
+needs_id=0
 case "$area/$verb" in
   lease/acquire)            pyverb="lease-acquire" ;;
   lease/status)             pyverb="lease-status" ;;
   lease/checkpoint)         pyverb="lease-checkpoint" ;;
   lease/release)            pyverb="lease-release" ;;
   review/create)            pyverb="review-create" ;;
-  review/bind)              pyverb="review-bind" ;;
-  review/register-process)  pyverb="review-register-process" ;;
-  review/cancel-requested)  pyverb="review-cancel-requested" ;;
-  review/refresh)           pyverb="review-refresh" ;;
-  review/status)            pyverb="review-status" ;;
-  review/submit-report)     pyverb="review-submit-report" ;;
-  review/verify)            pyverb="review-verify" ;;
-  review/close)             pyverb="review-close" ;;
+  review/bind)              pyverb="review-bind" ;            needs_id=1 ;;
+  review/register-process)  pyverb="review-register-process" ; needs_id=1 ;;
+  review/cancel-requested)  pyverb="review-cancel-requested" ; needs_id=1 ;;
+  review/refresh)           pyverb="review-refresh" ;         needs_id=1 ;;
+  review/status)            pyverb="review-status" ;          needs_id=1 ;;
+  review/submit-report)     pyverb="review-submit-report" ;   needs_id=1 ;;
+  review/verify)            pyverb="review-verify" ;          needs_id=1 ;;
+  review/close)             pyverb="review-close" ;           needs_id=1 ;;
   *)
     die_usage "unknown command: $area $verb"
     ;;
 esac
+
+# Frozen positional-ID contract (design v5 section 2; audit P2-6). The ID is
+# shape-checked here as exactly 32 lowercase hex characters and is never a
+# flag value; the helper re-validates it against ID_RE before any state read.
+review_id=""
+if [ "$needs_id" = "1" ]; then
+  [ $# -ge 1 ] || die_usage "$area $verb requires a positional review ID"
+  review_id="$1"
+  case "$review_id" in
+    --*) die_usage "$area $verb requires the review ID before any flag" ;;
+    ''|*[!0-9a-f]*) die_usage "review ID must be exactly 32 lowercase hex characters" ;;
+  esac
+  if [ ${#review_id} -ne 32 ]; then
+    die_usage "review ID must be exactly 32 lowercase hex characters"
+  fi
+  shift
+fi
 
 validate_flags "$@"
 
@@ -163,5 +185,9 @@ done
 [ -f "$VERIFY" ] || die_usage "helper not found: $VERIFY"
 
 # exec so the helper inherits the exact capability FD table and its exit code
-# is the exit code the caller observes.
+# is the exit code the caller observes. The positional review ID, when the verb
+# takes one, is passed ahead of the flags in the exact frozen order.
+if [ "$needs_id" = "1" ]; then
+  exec "$PYTHON_BIN" "$VERIFY" "$pyverb" "$review_id" "$@"
+fi
 exec "$PYTHON_BIN" "$VERIFY" "$pyverb" "$@"

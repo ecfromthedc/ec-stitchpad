@@ -969,6 +969,31 @@ def reviewer_ceiling(base):
 # Section 5. Scrubbed Git, canonical identity, clean worktrees
 # ---------------------------------------------------------------------------
 
+# Every helper-created scratch root and retained FD set is registered here so
+# that `main` can dispose of exactly what this process created on EVERY exit
+# path, including refusals. Before this ledger existed, any CoordError raised
+# after `make_git_home` stranded a `scrub.<16hex>` directory under the payload
+# base forever (observed residue; see docs/AUTONOMOUS-BUILDS.md section on the
+# scratch ledger). Disposal is bounded, no-follow, current-UID only, and never
+# touches anything this process did not create.
+_SCRATCH = {"homes": [], "fdsets": []}
+
+
+def release_owned_scratch_ledger():
+    while _SCRATCH["homes"]:
+        home = _SCRATCH["homes"].pop()
+        try:
+            home.release()
+        except Exception:
+            pass
+    while _SCRATCH["fdsets"]:
+        fds = _SCRATCH["fdsets"].pop()
+        try:
+            fds.close_all()
+        except Exception:
+            pass
+
+
 class GitHome(object):
     """A fresh helper-owned HOME/XDG root for every scrubbed Git subprocess."""
 
@@ -977,8 +1002,12 @@ class GitHome(object):
         self.base_path = base_path
         self.name = name
         self.path = base_path + "/" + name
+        self.released = False
 
     def release(self):
+        if self.released:
+            return
+        self.released = True
         remove_owned_scratch(self.base_fd, self.name)
 
 
@@ -994,7 +1023,9 @@ def make_git_home(fds, base):
             mkdir_owned(fd, child, DIR_MODE)
     finally:
         os.umask(old_mask)
-    return GitHome(base.fd, base.path, name)
+    home = GitHome(base.fd, base.path, name)
+    _SCRATCH["homes"].append(home)
+    return home
 
 
 def git_env(git_home, ceiling=None):
@@ -1285,7 +1316,8 @@ RECORD_SCHEMAS = {
     "manifest": (
         "version", "kind", "generation", "review_id", "algo", "commit", "tree",
         "repo_id", "entry_count", "inventory_digest", "src_identity",
-        "payload_identity", "launch_digest", "created_at", "ceiling",
+        "payload_identity", "launch_digest", "helper_digest", "created_at",
+        "ceiling",
     ),
     "facts": (
         "version", "kind", "generation", "review_id", "session_id", "request_id",
@@ -1293,6 +1325,8 @@ RECORD_SCHEMAS = {
         "terminal_completion", "terminal_at", "report_sealed", "report_digest",
         "report_verdict", "report_sealed_at", "artifact_verified", "verified_at",
         "closure", "closure_reason", "closed_at", "conflict",
+        "provider", "provider_model", "session_rotation_required",
+        "last_activity_at",
     ),
     "latest": (
         "version", "kind", "generation", "review_id", "phase", "raw_state",
@@ -1300,7 +1334,7 @@ RECORD_SCHEMAS = {
     ),
     "observation": (
         "version", "kind", "generation", "review_id", "raw_state", "phase",
-        "terminal", "observed_at", "evidence_digest", "diagnostic",
+        "terminal", "observed_at", "evidence_digest", "diagnostic", "raw_model",
     ),
     "process": (
         "version", "kind", "generation", "review_id", "role", "pid", "ppid", "pgid",
@@ -1329,9 +1363,11 @@ def new_record(kind, generation, fields):
 # scalar (None/bool/int/str) within bounds.
 RECORD_DICT_FIELDS = {
     "lease": ("capability",),
+    "review": ("process_capability",),
     "pointer": ("payload_identity", "src_identity"),
     "manifest": ("src_identity", "payload_identity"),
 }
+CAPABILITY_FIELDS = ("capability", "process_capability")
 MAX_RECORD_STRING = 4096
 MAX_RECORD_INT = 2 ** 62
 
@@ -1368,8 +1404,8 @@ def validate_record(record, kind, name):
     dict_fields = RECORD_DICT_FIELDS.get(kind, ())
     for key, value in record.items():
         if key in dict_fields:
-            if key == "capability":
-                continue  # validated by the lease-specific block below
+            if key in CAPABILITY_FIELDS:
+                continue  # validated by the capability block below
             _validate_identity_field(value, "%s.%s" % (name, key))
             continue
         if value is None or isinstance(value, bool):
@@ -1384,16 +1420,18 @@ def validate_record(record, kind, name):
                      % (name, key, MAX_RECORD_STRING))
             continue
         fail("record_field_type", "%s.%s has a non-scalar value" % (name, key))
-    if kind == "lease":
-        capability = record.get("capability")
+    for field in CAPABILITY_FIELDS:
+        if field not in dict_fields:
+            continue
+        capability = record.get(field)
         if not isinstance(capability, dict) or \
                 set(capability.keys()) != {"salt", "verifier", "algorithm"}:
-            fail("record_field_type", "%s capability verifier is malformed" % (name,))
+            fail("record_field_type", "%s %s verifier is malformed" % (name, field))
         for cap_key in ("salt", "verifier"):
             if not isinstance(capability[cap_key], str) or \
                     not HEX_RE.match(capability[cap_key]):
                 fail("record_field_type",
-                     "%s capability %s is not hex" % (name, cap_key))
+                     "%s %s %s is not hex" % (name, field, cap_key))
     return record
 
 
@@ -1790,11 +1828,32 @@ def parse_tar(data, expect_comment=None):
     Every other global header, GNU longname/longlink (`L`/`K`/`X`), and any
     override key besides `path=` is rejected.
     """
+    # GLM cross-review P2: `expect_comment` is normalized to bytes exactly once
+    # here with a hard type guard, so a bytes-vs-str caller can never reach the
+    # comparison below and raise AttributeError instead of failing closed.
+    if expect_comment is not None:
+        if isinstance(expect_comment, bytes):
+            expect_bytes = expect_comment
+        elif isinstance(expect_comment, str):
+            try:
+                expect_bytes = expect_comment.encode("ascii")
+            except UnicodeEncodeError:
+                fail("archive_pax_override", "expected commit comment is not ASCII")
+        else:
+            fail("archive_pax_override",
+                 "expected commit comment has an unsupported type")
+        if not (len(expect_bytes) in (40, 64) and
+                all(byte in b"0123456789abcdef" for byte in expect_bytes)):
+            fail("archive_pax_override",
+                 "expected commit comment is not a native commit OID")
+    else:
+        expect_bytes = None
     members = []
     offset = 0
     total = len(data)
     pending_path = None
     seen_global = False
+    seen_comment = None
     while offset + TAR_BLOCK <= total:
         header = data[offset:offset + TAR_BLOCK]
         if header == b"\0" * TAR_BLOCK:
@@ -1854,8 +1913,8 @@ def parse_tar(data, expect_comment=None):
                     all(byte in b"0123456789abcdef" for byte in comment)):
                 fail("archive_pax_override",
                      "pax global comment is not a native commit OID")
-            if expect_comment is not None and \
-                    comment != expect_comment.encode("ascii"):
+            seen_comment = comment
+            if expect_bytes is not None and comment != expect_bytes:
                 fail("archive_pax_override",
                      "pax global comment does not name the pinned commit")
             continue
@@ -1911,6 +1970,12 @@ def parse_tar(data, expect_comment=None):
             fail("archive_too_many_members", "tar has too many members")
     if pending_path is not None:
         fail("archive_pax_override", "pax extended header has no following entry")
+    # GLM cross-review P2: when the caller pinned a commit, the archive MUST
+    # actually carry the global comment header naming it. Without this an
+    # archive with the comment header stripped would silently pass the pin.
+    if expect_bytes is not None and seen_comment is None:
+        fail("archive_pax_override",
+             "archive carries no pax global comment naming the pinned commit")
     return members
 
 
@@ -2469,6 +2534,12 @@ def sample_process(pid):
 
 
 def classify_process(record):
+    # A record registered without a live baseline sample (the helper could not
+    # observe the PID at registration time) can never be resolved later: an
+    # empty `ps` is indistinguishable from "never existed". It stays unknown
+    # and therefore blocks closure (blueprint gate 21).
+    if record.get("lstart") is None:
+        return "unknown"
     sample = sample_process(record["pid"])
     state = sample.get("state")
     if state == "exited":
@@ -2763,6 +2834,7 @@ def precheck_capability_fd(fd, direction):
 def open_context(args, create_state=True, need_git_home=True):
     """Common front matter: validated base, scrubbed Git home, canonical repo."""
     fds = FDSet()
+    _SCRATCH["fdsets"].append(fds)
     base = open_payload_base(fds)
     _enable_test_hooks(base)
     git_home = make_git_home(fds, base) if need_git_home else None
@@ -3232,10 +3304,17 @@ def build_parser():
     release.add_argument("--head", required=True)
     release.set_defaults(func=cmd_lease_release)
 
-    # Review-core verbs: the exact argument surface is fixed now (so the Bash
-    # front controller and stitchpad wiring cannot drift), but the verbs
-    # themselves fail closed with not_implemented until the review-core
-    # increment lands. Nothing here silently half-runs.
+    # Review-core verbs. The argument surface is frozen: `review create` takes
+    # only flags, and EVERY other review verb takes the review ID as its first
+    # POSITIONAL argument (design v5 section 2; audit P2-6). There is no `--id`
+    # flag anywhere, so the Bash front controller in tool/bin/coordination.sh
+    # and this parser cannot drift apart. The verb bodies still fail closed
+    # with not_implemented until the review-core increment lands; nothing here
+    # silently half-runs.
+    def with_review_id(target):
+        target.add_argument("id", metavar="ID",
+                            help="review id: exactly 32 lowercase hex characters")
+        return target
     create = common(sub.add_parser("review-create"))
     create.add_argument("--repo", required=True)
     create.add_argument("--commit", required=True)
@@ -3245,31 +3324,26 @@ def build_parser():
     create.add_argument("--process-token-out-fd", required=True, type=_fd_number)
     create.set_defaults(func=cmd_not_implemented)
 
-    bind = common(sub.add_parser("review-bind"))
-    bind.add_argument("--id", required=True)
+    bind = with_review_id(common(sub.add_parser("review-bind")))
     bind.add_argument("--session", required=True)
     bind.add_argument("--request", required=True)
     bind.set_defaults(func=cmd_not_implemented)
 
-    register = common(sub.add_parser("review-register-process"))
-    register.add_argument("--id", required=True)
+    register = with_review_id(common(sub.add_parser("review-register-process")))
     register.add_argument("--role", required=True)
     register.add_argument("--pid", required=True, type=int)
     register.add_argument("--process-token-fd", required=True, type=_fd_number)
     register.set_defaults(func=cmd_not_implemented)
 
-    cancel = common(sub.add_parser("review-cancel-requested"))
-    cancel.add_argument("--id", required=True)
+    cancel = with_review_id(common(sub.add_parser("review-cancel-requested")))
     cancel.set_defaults(func=cmd_not_implemented)
 
     for verb in ("review-refresh", "review-status", "review-submit-report",
                  "review-verify"):
-        command = common(sub.add_parser(verb))
-        command.add_argument("--id", required=True)
+        command = with_review_id(common(sub.add_parser(verb)))
         command.set_defaults(func=cmd_not_implemented)
 
-    close = common(sub.add_parser("review-close"))
-    close.add_argument("--id", required=True)
+    close = with_review_id(common(sub.add_parser("review-close")))
     group = close.add_mutually_exclusive_group(required=True)
     group.add_argument("--verified", action="store_true")
     group.add_argument("--abandoned", action="store_true")
@@ -3295,7 +3369,10 @@ def main(argv):
     args = parser.parse_args(argv)
     want_json = bool(getattr(args, "json", False))
     try:
-        result = args.func(args)
+        try:
+            result = args.func(args)
+        finally:
+            release_owned_scratch_ledger()
     except CoordError as exc:
         if want_json:
             sys.stdout.write(json.dumps({
