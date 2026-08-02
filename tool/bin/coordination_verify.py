@@ -4439,6 +4439,143 @@ def cmd_review_cancel_requested(args):
 
 
 # ---------------------------------------------------------------------------
+# Section 13d. Review submit-report (validate and seal write-once)
+# ---------------------------------------------------------------------------
+
+def cmd_review_submit_report(args):
+    """Validate and seal the review report write-once.
+
+    Reads ``inbox/report.pending`` through a no-follow, stable regular-file
+    channel, validates the exact PASS/HOLD/FAIL report headers against the
+    pinned commit and bound reviewer actor, then publishes the sealed report
+    atomically as ``sealed/report.txt`` via an O_EXCL hard link.  The seal is
+    write-once: a second submit, an alias, or crash residue cannot replace or
+    auto-repair the sealed bytes.  After sealing, the facts record is advanced
+    under the transition mutex with generation CAS to record ``report_sealed``,
+    ``report_digest``, ``report_verdict``, and ``report_sealed_at``.
+
+    No deletion, signals, HTTP, scheduler, repair, or cleanup.
+    """
+    ctx = open_context(args, need_git_home=False)
+    fds, base, repo, state = (
+        ctx["fds"], ctx["base"], ctx["repo"], ctx["state"])
+
+    review = _load_review(state, args.id)
+    if review["repo_id"] != repo["repo_id"] or review["top"] != repo["top"]:
+        fail("identity_mismatch",
+             "the review does not belong to this repository")
+
+    payload_fd = _open_payload(fds, base, review)
+
+    # The review must be bound before a report can be submitted.
+    facts = _read_facts(payload_fd)
+    if facts is None:
+        fail("review_not_bound",
+             "the review must be bound before submitting a report")
+    if facts.get("session_id") is None or facts.get("request_id") is None:
+        fail("review_not_bound",
+             "the review facts carry no bound session/request")
+
+    # Refuse if crash residue from an incomplete prior seal is present.
+    # The helper never auto-repairs stale temps or stray hard links.
+    incomplete = detect_incomplete_report(fds, payload_fd)
+    if incomplete is not None:
+        raise CoordError(incomplete,
+                         "crash residue from an incomplete report seal "
+                         "is present; the operator must intervene")
+
+    # Bind the payload root with expected identities from the pointer record.
+    pointer = _read_pointer(payload_fd)
+    binding = RootBinding(fds, base, review["payload_name"],
+                          expect_payload=pointer["payload_identity"],
+                          expect_src=pointer["src_identity"])
+    binding.bind()
+
+    generation = facts["generation"]
+    now = int(time.time())
+
+    mutex = TransitionMutex(state)
+    with mutex:
+        # Generation CAS: re-read facts under the lock.
+        locked_facts = _read_facts(payload_fd)
+        if locked_facts is None:
+            fail("review_not_bound",
+                 "the review facts disappeared under the lock")
+        if locked_facts["generation"] != generation:
+            fail("generation_conflict",
+                 "the review facts changed (generation %d -> %d)"
+                 % (generation, locked_facts["generation"]))
+
+        # Re-check crash residue under the lock ( concurrent cleaner is
+        # impossible — no cleanup path exists — but the check is cheap and
+        # keeps the refusal exact if state changed between samples).
+        locked_incomplete = detect_incomplete_report(fds, payload_fd)
+        if locked_incomplete is not None:
+            raise CoordError(locked_incomplete,
+                             "crash residue from an incomplete report seal "
+                             "appeared under the lock")
+
+        # Seal the report write-once: O_EXCL hard link, nlink checks, digest
+        # verification.  A second submit, alias, or concurrent attempt fails
+        # closed inside seal_report — the sealed bytes cannot be replaced.
+        sealed = seal_report(fds, binding, review["commit"],
+                             review["reviewer_actor"])
+
+        new_generation = generation + 1
+
+        # Advance the facts record with the sealed report evidence.
+        updated_facts = dict(locked_facts)
+        updated_facts["generation"] = new_generation
+        updated_facts["report_sealed"] = True
+        updated_facts["report_digest"] = sealed["digest"]
+        updated_facts["report_verdict"] = sealed["verdict"]
+        updated_facts["report_sealed_at"] = now
+        updated_facts["last_activity_at"] = now
+
+        facts_record = new_record("facts", new_generation, {
+            "review_id": updated_facts["review_id"],
+            "session_id": updated_facts["session_id"],
+            "request_id": updated_facts["request_id"],
+            "bound_at": updated_facts["bound_at"],
+            "cancel_requested": updated_facts["cancel_requested"],
+            "cancel_requested_at": updated_facts["cancel_requested_at"],
+            "terminal_observed": updated_facts["terminal_observed"],
+            "terminal_completion": updated_facts["terminal_completion"],
+            "terminal_at": updated_facts["terminal_at"],
+            "report_sealed": updated_facts["report_sealed"],
+            "report_digest": updated_facts["report_digest"],
+            "report_verdict": updated_facts["report_verdict"],
+            "report_sealed_at": updated_facts["report_sealed_at"],
+            "artifact_verified": updated_facts["artifact_verified"],
+            "verified_at": updated_facts["verified_at"],
+            "closure": updated_facts["closure"],
+            "closure_reason": updated_facts["closure_reason"],
+            "closed_at": updated_facts["closed_at"],
+            "conflict": updated_facts["conflict"],
+            "provider": updated_facts["provider"],
+            "provider_model": updated_facts["provider_model"],
+            "session_rotation_required":
+                updated_facts["session_rotation_required"],
+            "last_activity_at": updated_facts["last_activity_at"],
+        })
+        publish_flat_record(payload_fd, "facts.json", "facts", facts_record,
+                            "review facts")
+
+    fds.close_all()
+    return {
+        "ok": True, "command": "review-submit-report",
+        "review_id": review["review_id"],
+        "report_sealed": True,
+        "report_digest": sealed["digest"],
+        "report_verdict": sealed["verdict"],
+        "report_bytes": sealed["bytes"],
+        "report_sealed_at": _format_ts(now),
+        "report_sealed_at_epoch": now,
+        "generation": new_generation,
+    }
+
+
+# ---------------------------------------------------------------------------
 # Section 14. CLI front matter (invoked only by tool/bin/coordination.sh)
 # ---------------------------------------------------------------------------
 
@@ -4536,9 +4673,12 @@ def build_parser():
     status = with_review_id(common(sub.add_parser("review-status")))
     status.set_defaults(func=cmd_review_status)
 
-    for verb in ("review-submit-report", "review-verify"):
+    for verb in ("review-verify",):
         command = with_review_id(common(sub.add_parser(verb)))
         command.set_defaults(func=cmd_not_implemented)
+
+    submit_report = with_review_id(common(sub.add_parser("review-submit-report")))
+    submit_report.set_defaults(func=cmd_review_submit_report)
 
     close = with_review_id(common(sub.add_parser("review-close")))
     group = close.add_mutually_exclusive_group(required=True)
