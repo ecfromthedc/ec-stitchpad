@@ -148,6 +148,21 @@ async function sp(args, me, extraEnv = {}) {
   });
   return (stdout || "") + (stderr ? `\n${stderr}` : "");
 }
+
+// MCP local join already receives the CLI's injected fragment; relay join and
+// locked-session rejoin do not. Ask the same builder and add it only when the
+// complete trusted block is at a prompt boundary — no second copy of the rules.
+async function withPonytail(textBody) {
+  let body = String(textBody || "");
+  const rules = await sp(["instructions"]).then(s => s.trim()).catch(() => "");
+  if (!rules) return body;
+  const boundaryBody = body.trimEnd();
+  if (boundaryBody === rules || boundaryBody.startsWith(`${rules}\n\n`) || boundaryBody.endsWith(`\n\n${rules}`)) return body;
+  body = body
+    .replaceAll("<!-- stitchpad:ponytail:v1 ", "<!-- stitchpad:user-text:ponytail:v1 ")
+    .replaceAll("<!-- /stitchpad:ponytail:v1 -->", "<!-- stitchpad:user-text:/ponytail:v1 -->");
+  return `${rules}\n\n${body}`;
+}
 // Stamp agent-facing results with the pad they actually hit, so a misrouted
 // call is self-evident to the agent instead of silent.
 const padStamp = (s) => `${s}\n[pad: ${path.basename(padCwd())}]`;
@@ -618,6 +633,7 @@ server.setRequestHandler(CallToolRequestSchema, async (req) => {
       default:
         return text(`unknown tool: ${name}`, true);
     }
+    if (name === "join") out = await withPonytail(out);
     return text(out.trim() || "(ok)");
   } catch (err) {
     return text(`stitchpad error: ${err.stderr || err.message}`, true);

@@ -27,6 +27,24 @@ bin="$(command -v ocean-heartbeat 2>/dev/null || true)"
 
 pad_dir="$(cd "$(dirname "$pad")/.." && pwd)"
 msg="$(head -c 2000 "$taskfile" 2>/dev/null)"
+sp_bin="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)/bin/stitchpad"
+[ -x "$sp_bin" ] || sp_bin="$(command -v stitchpad 2>/dev/null || true)"
+[ -n "$sp_bin" ] && [ -x "$sp_bin" ] || { echo "[ocean.sh] stitchpad CLI not found" >&2; exit 1; }
+
+# Ocean-backed seats include Kimi, GLM, and DeepSeek. Build their wake through
+# the same canonical prompt path as Stop/Herdr/Pi rather than maintaining a
+# model-specific copy here.
+prompt="$("$sp_bin" prompt-context <<EOF
+stitchpad: new @${name} mention on the pad at ${pad}.
+
+${msg}
+
+You are @${name} on this pad. Read the recent conversation with:
+  cd ${pad_dir} && ~/.stitchpad/bin/stitchpad read -n 30
+then reply with:
+  cd ${pad_dir} && STITCHPAD_NAME=${name} ~/.stitchpad/bin/stitchpad say '<your reply>'
+EOF
+)"
 
 # IDLE-GUARD: posting a wake turn while the session is mid-turn queues it as
 # stale pending input (the parked-message bug smaths hit). Defer instead — the
@@ -50,12 +68,5 @@ fi
   --cwd "$pad_dir" \
   --client-type "stitchpad" \
   --timeout-seconds 600 \
-  --prompt "stitchpad: new @${name} mention on the pad at ${pad}.
-
-${msg}
-
-You are @${name} on this pad. Read the recent conversation with:
-  cd ${pad_dir} && ~/.stitchpad/bin/stitchpad read -n 30
-then reply with:
-  cd ${pad_dir} && STITCHPAD_NAME=${name} ~/.stitchpad/bin/stitchpad say '<your reply>'"
+  --prompt "$prompt"
 exit $?

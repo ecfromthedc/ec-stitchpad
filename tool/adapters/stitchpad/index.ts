@@ -61,6 +61,7 @@ export default function stitchpadExtension(pi: ExtensionAPI) {
   // Track the per-instance session key set during join.
   // This lets sp_me() resolve via sessions/<key> instead of shared whoami.
   let sessionKey = "";
+  let ponytailRules: string | null = null;
 
   // Run a stitchpad CLI command in the session's cwd. `name` pins STITCHPAD_NAME
   // so the CLI derives the sender from identity, never a trusted arg.
@@ -73,6 +74,12 @@ export default function stitchpadExtension(pi: ExtensionAPI) {
     };
     const { stdout, stderr } = await exec(bin, args, { cwd, timeout: 10_000, env });
     return (stdout || "") + (stderr ? `\n${stderr}` : "");
+  }
+  async function sharedInstructions(cwd: string): Promise<string> {
+    if (ponytailRules === null) {
+      ponytailRules = (await sp(["instructions"], cwd).catch(() => "")).trim();
+    }
+    return ponytailRules;
   }
   const ok = (text: string) => ({ content: [{ type: "text" as const, text: text.trim() || "(ok)" }], details: {} });
 
@@ -246,6 +253,13 @@ export default function stitchpadExtension(pi: ExtensionAPI) {
   }
 
   pi.on("agent_end", async (_e, ctx) => { await drain(ctx); });
+  pi.on("before_agent_start", async (event, ctx) => {
+    const rules = await sharedInstructions(ctx.cwd);
+    if (!rules) return;
+    const base = event?.systemPrompt || "";
+    if (base.includes("<!-- stitchpad:ponytail:v1 ")) return;
+    return { systemPrompt: `${rules}\n\n${base}` };
+  });
   pi.on("session_start", async (_e, ctx) => {
     await autoRejoin(ctx);
     await drain(ctx);
