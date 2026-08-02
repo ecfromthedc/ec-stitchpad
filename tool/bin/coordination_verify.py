@@ -437,36 +437,42 @@ def read_capability_fd(fd):
 
 
 def _pipe_read_exact(fd, count):
+    """Read until EOF within one monotonic total deadline, then require that
+    the complete stream is exactly ``count`` bytes.
+
+    An open writer that never closes fails as ``fd_deadline``; any byte beyond
+    ``count`` fails as ``fd_trailing_bytes``; EOF early fails as
+    ``fd_short_read``. There is no acceptance without explicit EOF.
+    """
     deadline = time.monotonic() + FD_DEADLINE_SECONDS
     old = fcntl.fcntl(fd, fcntl.F_GETFL)
     fcntl.fcntl(fd, fcntl.F_SETFL, old | os.O_NONBLOCK)
     try:
         raw = b""
-        while len(raw) < count:
+        while True:
             remaining = deadline - time.monotonic()
             if remaining <= 0:
-                fail("fd_deadline", "capability pipe read deadline exceeded")
+                fail("fd_deadline",
+                     "capability pipe deadline exceeded before EOF")
             ready = select.select([fd], [], [], min(remaining, 0.25))[0]
             if not ready:
                 continue
             try:
-                chunk = os.read(fd, count - len(raw))
+                chunk = os.read(fd, 65536)
             except OSError as exc:
                 if exc.errno in (errno.EAGAIN, errno.EWOULDBLOCK):
                     continue
                 fail("fd_unusable", "capability pipe read failed: %s" % (exc.strerror,))
             if not chunk:
-                fail("fd_short_read", "capability pipe ended early")
+                break  # explicit EOF: the writer closed its end
             raw += chunk
-        # Bounded EOF check: one nonblocking peek, never an unbounded drain.
-        remaining = deadline - time.monotonic()
-        if remaining > 0 and select.select([fd], [], [], min(remaining, 0.1))[0]:
-            try:
-                if os.read(fd, 1):
-                    fail("fd_trailing_bytes", "capability pipe has trailing bytes")
-            except OSError as exc:
-                if exc.errno not in (errno.EAGAIN, errno.EWOULDBLOCK):
-                    fail("fd_unusable", "capability pipe peek failed: %s" % (exc.strerror,))
+            if len(raw) > count:
+                fail("fd_trailing_bytes",
+                     "capability pipe carries more than %d bytes" % (count,))
+        if len(raw) != count:
+            fail("fd_short_read",
+                 "capability pipe ended after %d bytes, expected %d"
+                 % (len(raw), count))
         return raw
     finally:
         fcntl.fcntl(fd, fcntl.F_SETFL, old)
@@ -1313,10 +1319,37 @@ def new_record(kind, generation, fields):
     record = {"version": PROTOCOL_VERSION, "kind": kind, "generation": generation}
     record.update(fields)
     allowed = RECORD_SCHEMAS[kind]
-    for key in record:
-        if key not in allowed:
-            fail("record_key_rejected", "%s record rejects key %r" % (kind, key))
+    if set(record.keys()) != set(allowed):
+        fail("record_schema_mismatch",
+             "%s record must carry exactly the %s schema keys" % (kind, kind))
     return record
+
+
+# Fields legitimately holding a nested object; everything else must be a
+# scalar (None/bool/int/str) within bounds.
+RECORD_DICT_FIELDS = {
+    "lease": ("capability",),
+    "pointer": ("payload_identity", "src_identity"),
+    "manifest": ("src_identity", "payload_identity"),
+}
+MAX_RECORD_STRING = 4096
+MAX_RECORD_INT = 2 ** 62
+
+
+def _validate_identity_field(value, name):
+    if value is None:
+        return
+    if not isinstance(value, dict):
+        fail("record_field_type", "%s identity field is not an object" % (name,))
+    if set(value.keys()) - {"dev", "ino", "type"}:
+        fail("record_field_type", "%s identity field has unexpected keys" % (name,))
+    for key in ("dev", "ino"):
+        if key in value and (not isinstance(value[key], int)
+                             or isinstance(value[key], bool)
+                             or value[key] < 0 or value[key] > MAX_RECORD_INT):
+            fail("record_field_type", "%s identity %s is out of bounds" % (name, key))
+    if "type" in value and value["type"] not in ("directory", "regular", "symlink", "other"):
+        fail("record_field_type", "%s identity type is invalid" % (name,))
 
 
 def validate_record(record, kind, name):
@@ -1329,9 +1362,38 @@ def validate_record(record, kind, name):
     generation = record.get("generation")
     require_int(generation, 1, 2 ** 40, "record_invalid", "%s generation" % (name,))
     allowed = RECORD_SCHEMAS[kind]
-    for key in record:
-        if key not in allowed:
-            fail("record_key_rejected", "%s record rejects key %r" % (name, key))
+    if set(record.keys()) != set(allowed):
+        fail("record_schema_mismatch",
+             "%s record keys do not exactly match the %s schema" % (name, kind))
+    dict_fields = RECORD_DICT_FIELDS.get(kind, ())
+    for key, value in record.items():
+        if key in dict_fields:
+            if key == "capability":
+                continue  # validated by the lease-specific block below
+            _validate_identity_field(value, "%s.%s" % (name, key))
+            continue
+        if value is None or isinstance(value, bool):
+            continue
+        if isinstance(value, int):
+            if value < 0 or value > MAX_RECORD_INT:
+                fail("record_field_bounds", "%s.%s is out of bounds" % (name, key))
+            continue
+        if isinstance(value, str):
+            if len(value) > MAX_RECORD_STRING:
+                fail("record_field_bounds", "%s.%s exceeds %d characters"
+                     % (name, key, MAX_RECORD_STRING))
+            continue
+        fail("record_field_type", "%s.%s has a non-scalar value" % (name, key))
+    if kind == "lease":
+        capability = record.get("capability")
+        if not isinstance(capability, dict) or \
+                set(capability.keys()) != {"salt", "verifier", "algorithm"}:
+            fail("record_field_type", "%s capability verifier is malformed" % (name,))
+        for cap_key in ("salt", "verifier"):
+            if not isinstance(capability[cap_key], str) or \
+                    not HEX_RE.match(capability[cap_key]):
+                fail("record_field_type",
+                     "%s capability %s is not hex" % (name, cap_key))
     return record
 
 
@@ -1713,7 +1775,7 @@ def _tar_octal(field, what):
         fail("archive_malformed", "unparseable tar %s field" % (what,))
 
 
-def parse_tar(data):
+def parse_tar(data, expect_comment=None):
     """Minimal strict ustar reader with the match-only pax `x` rule (W2).
 
     `git archive` legitimately emits a pax extended header (`x`) carrying
@@ -1723,9 +1785,10 @@ def parse_tar(data):
     validated against the exact tree/implied-directory set by
     `preflight_archive` — any override that changes the name fails there.
     A single leading global (`g`) header is accepted only when its payload is
-    exactly `comment=<oid>` (the shape `git archive` always emits); every
-    other global header, GNU longname/longlink (`L`/`K`/`X`), and any override
-    key besides `path=` is rejected.
+    exactly `comment=<native commit OID hex>` (the shape `git archive` always
+    emits); when ``expect_comment`` is given the value must equal it exactly.
+    Every other global header, GNU longname/longlink (`L`/`K`/`X`), and any
+    override key besides `path=` is rejected.
     """
     members = []
     offset = 0
@@ -1739,8 +1802,12 @@ def parse_tar(data):
         stored = header[148:156]
         blanked = header[:148] + b" " * 8 + header[156:]
         checksum = _tar_octal(stored, "checksum")
-        if checksum not in (sum(blanked), sum(bytearray(
-                (byte - 256 if byte > 127 else byte) for byte in blanked))):
+        # Signed checksum as a pure integer sum: valid UTF-8 names carry bytes
+        # >127 and must never be pushed through a bytearray (P1-4).
+        signed_sum = sum(
+            (byte - 256) if byte > 127 else byte for byte in blanked
+        )
+        if checksum not in (sum(blanked), signed_sum):
             fail("archive_checksum", "tar header checksum mismatch")
         magic = header[257:263]
         if magic not in (b"ustar\0", b"ustar "):
@@ -1782,6 +1849,15 @@ def parse_tar(data):
             if set(keys) != {b"comment"}:
                 fail("archive_pax_override",
                      "pax global header carries keys other than comment=")
+            comment = keys[b"comment"]
+            if not (len(comment) in (40, 64) and
+                    all(byte in b"0123456789abcdef" for byte in comment)):
+                fail("archive_pax_override",
+                     "pax global comment is not a native commit OID")
+            if expect_comment is not None and \
+                    comment != expect_comment.encode("ascii"):
+                fail("archive_pax_override",
+                     "pax global comment does not name the pinned commit")
             continue
         if typeflag in (b"L", b"K", b"X"):
             fail("archive_pax_override",
@@ -1943,7 +2019,11 @@ def extract_tree(fds, src_fd, data, members, entries, implied_dirs, algo):
             if len(payload) != member["size"]:
                 fail("archive_truncated", "tar member payload is truncated")
             mode = EXEC_MODE if entry["mode"] == GIT_MODE_EXEC else FILE_MODE
-            flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW
+            # O_RDWR so the very bytes written are re-read from the same open
+            # FD and hashed; full stable metadata (identity/size/mode/mtime_ns/
+            # nlink) is compared across the write, the verify read, and the
+            # post-close lstat. A same-inode content swap cannot pass (P1-3).
+            flags = os.O_RDWR | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW
             if hasattr(os, "O_CLOEXEC"):
                 flags |= os.O_CLOEXEC
             try:
@@ -1957,18 +2037,42 @@ def extract_tree(fds, src_fd, data, members, entries, implied_dirs, algo):
                 os.fchmod(fd, mode)
                 os.fsync(fd)
                 before = os.fstat(fd)
+                os.lseek(fd, 0, os.SEEK_SET)
+                hasher = blob_hasher(algo)
+                hasher.update(("blob %d\0" % before.st_size).encode("ascii"))
+                read_total = 0
+                while True:
+                    chunk = os.read(fd, 65536)
+                    if not chunk:
+                        break
+                    read_total += len(chunk)
+                    if read_total > before.st_size:
+                        fail("extract_unstable", "%s grew during verification"
+                             % (member["path"],))
+                    hasher.update(chunk)
+                if read_total != before.st_size:
+                    fail("extract_unstable", "%s shrank during verification"
+                         % (member["path"],))
+                after_read = os.fstat(fd)
             finally:
                 os.close(fd)
-            computed = blob_oid_bytes(algo, payload)
-            if computed != entry["oid"]:
+            if identity(before) != identity(after_read) \
+                    or after_read.st_size != before.st_size \
+                    or after_read.st_mtime_ns != before.st_mtime_ns \
+                    or after_read.st_mode != before.st_mode \
+                    or after_read.st_nlink != before.st_nlink:
+                fail("extract_unstable",
+                     "%s changed during verification" % (member["path"],))
+            if hasher.hexdigest() != entry["oid"]:
                 fail("blob_oid_mismatch", "extracted blob does not match the pinned OID")
             after = lstat_at(parent_fd, name, code="root_replaced", what=member["path"])
             if identity(before) != identity(after):
                 fail("root_replaced", "extracted file identity changed")
             if after.st_nlink != 1:
                 fail("extract_hardlink", "extracted file gained hard links")
-            if after.st_size != member["size"]:
-                fail("extract_unstable", "extracted file size changed")
+            if after.st_size != member["size"] \
+                    or after.st_mtime_ns != before.st_mtime_ns:
+                fail("extract_unstable", "extracted file changed after verification")
             if statmod.S_IMODE(after.st_mode) != mode:
                 fail("extract_unstable", "extracted file mode changed")
             inventory.append((member["raw"], KIND_FILE, entry["mode"], entry["oid"]))
@@ -2026,7 +2130,8 @@ def walk_inventory(fds, src_fd, algo):
             elif statmod.S_ISLNK(info.st_mode):
                 target = os.readlink(name, dir_fd=dir_fd)
                 again = lstat_at(dir_fd, name, code="inventory_unstable", what=path)
-                if identity(info) != identity(again):
+                if identity(info) != identity(again) \
+                        or again.st_mtime_ns != info.st_mtime_ns:
                     fail("inventory_unstable", "%s symlink identity changed" % (path,))
                 oid = blob_oid_bytes(algo, target.encode("utf-8"))
                 records.append((raw_path, KIND_LINK, GIT_MODE_LINK, oid))
@@ -2055,8 +2160,12 @@ def walk_inventory(fds, src_fd, algo):
                     if read_total != opened.st_size:
                         fail("inventory_unstable", "%s shrank during the walk" % (path,))
                     final = os.fstat(fd)
-                    if identity(opened) != identity(final) or final.st_size != opened.st_size:
-                        fail("inventory_unstable", "%s identity changed during read" % (path,))
+                    if identity(opened) != identity(final) \
+                            or final.st_size != opened.st_size \
+                            or final.st_mtime_ns != opened.st_mtime_ns \
+                            or final.st_mode != opened.st_mode \
+                            or final.st_nlink != opened.st_nlink:
+                        fail("inventory_unstable", "%s changed during read" % (path,))
                     perm = statmod.S_IMODE(final.st_mode)
                     if perm == EXEC_MODE:
                         git_mode = GIT_MODE_EXEC
@@ -2072,8 +2181,15 @@ def walk_inventory(fds, src_fd, algo):
                 fail("inventory_special", "%s is not a regular file, directory, or symlink"
                      % (path,))
         after = os.fstat(dir_fd)
-        if identity(before) != identity(after):
-            fail("inventory_unstable", "%s directory identity changed" % (prefix or "src",))
+        if identity(before) != identity(after) \
+                or after.st_mtime_ns != before.st_mtime_ns:
+            fail("inventory_unstable",
+                 "%s directory changed during the walk" % (prefix or "src",))
+        # Re-enumerate: an entry added after the first snapshot must make the
+        # whole walk fail, never produce a torn inventory (P1-3).
+        if list_dir_at(dir_fd, prefix or "src") != names:
+            fail("inventory_unstable",
+                 "%s directory entries changed during the walk" % (prefix or "src",))
     return records
 
 
@@ -2153,23 +2269,34 @@ class RootBinding(object):
         return self
 
     def recheck(self):
-        """Re-lstat the published entries and re-fstat the retained FDs."""
+        """Re-lstat the published entries, re-fstat the retained FDs, and
+        repeat the owner/exact-mode policy (P1-3)."""
         entry = lstat_at(self.base.fd, self.name, code="root_replaced",
                          what="payload directory")
         if not same_identity(identity(entry), self.payload_identity):
             fail("root_replaced",
                  "the published payload entry no longer names the bound directory")
+        if entry.st_uid != os.getuid() \
+                or statmod.S_IMODE(entry.st_mode) != DIR_MODE:
+            fail("root_replaced",
+                 "the published payload entry lost its owner/mode policy")
         retained = os.fstat(self.payload_fd)
         if not same_identity(identity(retained), self.payload_identity):
             fail("root_replaced", "the retained payload FD identity changed")
+        require_owned_dir(retained, DIR_MODE, "payload directory")
         src_entry = lstat_at(self.payload_fd, "src", code="root_replaced",
                              what="payload src directory")
         if not same_identity(identity(src_entry), self.src_identity):
             fail("root_replaced",
                  "the published src entry no longer names the bound directory")
+        if src_entry.st_uid != os.getuid() \
+                or statmod.S_IMODE(src_entry.st_mode) != DIR_MODE:
+            fail("root_replaced",
+                 "the published src entry lost its owner/mode policy")
         retained_src = os.fstat(self.src_fd)
         if not same_identity(identity(retained_src), self.src_identity):
             fail("root_replaced", "the retained src FD identity changed")
+        require_owned_dir(retained_src, DIR_MODE, "payload src directory")
         return True
 
 
@@ -2350,6 +2477,10 @@ def classify_process(record):
         return "unknown"
     if sample.get("lstart") != record.get("lstart"):
         return "reused"
+    # Same start time but different command image: a foreign process now owns
+    # this PID, so the evidence is unresolved, never alive (P2-2; gate 21).
+    if sample.get("command_digest") != record.get("command_digest"):
+        return "foreign"
     return "alive"
 
 
@@ -2408,8 +2539,11 @@ def process_evidence(fds, payload_fd, review_id, payload_path):
     dir_fd = fds.keep(open_dir_at(payload_fd, "processes"))
     records = []
     for name in list_dir_at(dir_fd, "processes"):
-        if not name.endswith(".json") or name.startswith(".tmp."):
-            continue
+        # Hostile or partial evidence makes the review red; it is never
+        # silently skipped (P2-3).
+        if not name.endswith(".json") or not ID_RE.match(name[:-5]):
+            fail("process_evidence_invalid",
+                 "unexpected entry in the process evidence directory")
         record = read_flat_record(dir_fd, name, "process", "process record %s" % (name,))
         records.append(record)
         if len(records) > MAX_PROCESSES:
@@ -2767,8 +2901,14 @@ def cmd_lease_status(args):
         claim = find_worktree_claim(state, repo)
         if claim is None:
             return {"claim": None, "lease": None}
-        lease = load_lease(state, claim["record"]["lease_id"])
-        return {"claim": claim["record"], "lease": lease["record"]}
+        lease = load_lease(state, claim["record"]["lease_id"])["record"]
+        ref_claim = None
+        if lease["ref_key"] is not None:
+            ref_entry = read_record(state.claim_refs, lease["ref_key"], "claim",
+                                    "ref claim", allow_missing=True)
+            ref_claim = ref_entry["record"] if ref_entry is not None else None
+        validate_claim_records(lease, claim["record"], ref_claim)
+        return {"claim": claim["record"], "lease": lease}
 
     try:
         snapshot = double_sampled(state, reader)
@@ -2803,6 +2943,32 @@ def cmd_lease_status(args):
     return payload
 
 
+def validate_claim_records(lease, worktree_claim, ref_claim):
+    """One generation and one identity across lease + worktree claim + ref claim.
+
+    Every cross-record ID, key, repo/top/ref field, and the common generation
+    must agree; a missing, mismatched, or generation-swapped claim fails
+    closed (P1-2; design §6; blueprint gates 2/6/7/23).
+    """
+    expected = [("worktree", lease["worktree_key"], worktree_claim)]
+    if lease["ref_key"] is not None:
+        expected.append(("ref", lease["ref_key"], ref_claim))
+    for claim_type, key, claim in expected:
+        if claim is None:
+            fail("claim_missing", "the %s claim is absent" % (claim_type,))
+        if claim["claim_type"] != claim_type or claim["claim_key"] != key:
+            fail("claim_mismatch", "the %s claim key/type is wrong" % (claim_type,))
+        if claim["lease_id"] != lease["lease_id"] \
+                or claim["repo_id"] != lease["repo_id"] \
+                or claim["top"] != lease["top"] \
+                or claim["ref"] != lease["ref"]:
+            fail("claim_mismatch",
+                 "the %s claim does not describe this lease" % (claim_type,))
+        if claim["generation"] != lease["generation"]:
+            fail("generation_mismatch",
+                 "the %s claim is on a different generation" % (claim_type,))
+
+
 def _authorize_lease(state, repo, token, git_home):
     claim = find_worktree_claim(state, repo, allow_missing=True)
     if claim is None:
@@ -2815,10 +2981,19 @@ def _authorize_lease(state, repo, token, git_home):
         fail("capability_rejected", "the supplied capability does not authorize this lease")
     if lease["repo_id"] != repo["repo_id"] or lease["top"] != repo["top"]:
         fail("identity_mismatch", "the lease does not describe this worktree")
-    if lease["generation"] != claim["record"]["generation"]:
-        raise CoordError("transition_incomplete", "lease and claim generations disagree")
+    if lease["worktree_key"] != repo["worktree_key"] \
+            or lease["ref_key"] != repo["ref_key"]:
+        fail("identity_mismatch", "the lease claim keys do not match this worktree")
     if lease["ref"] != repo["ref"] or lease["detached"] != repo["detached"]:
         fail("head_moved_conflicted", "the worktree ref or detached state changed")
+    ref_claim = None
+    if lease["ref_key"] is not None:
+        ref_claim = read_record(state.claim_refs, lease["ref_key"], "claim",
+                                "ref claim", allow_missing=True)
+        if ref_claim is None:
+            fail("claim_missing", "the attached ref claim is absent")
+        ref_claim = ref_claim["record"]
+    validate_claim_records(lease, claim["record"], ref_claim)
     return lease
 
 
@@ -2884,17 +3059,34 @@ def cmd_lease_checkpoint(args):
         claim = read_record(state.claim_worktrees, repo["worktree_key"], "claim",
                             "worktree claim")["record"]
         claim = dict(claim)
+        if claim["lease_id"] != lease["lease_id"] \
+                or claim["claim_key"] != repo["worktree_key"] \
+                or claim["claim_type"] != "worktree" \
+                or claim["generation"] != lease["generation"]:
+            fail("claim_mismatch",
+                 "the worktree claim changed during the checkpoint")
         claim["generation"] = generation
         publish_record(fds, state.claim_worktrees, repo["worktree_key"], "claim",
                        claim, "worktree claim")
         if repo["ref_key"] is not None:
+            # The ref claim was proven to belong to this lease by
+            # _authorize_lease; require it to still exist on the pre-update
+            # generation and never silently skip or overwrite a swap (P1-2).
             ref_claim = read_record(state.claim_refs, repo["ref_key"], "claim",
-                                    "ref claim", allow_missing=True)
-            if ref_claim is not None:
-                ref_record = dict(ref_claim["record"])
-                ref_record["generation"] = generation
-                publish_record(fds, state.claim_refs, repo["ref_key"], "claim",
-                               ref_record, "ref claim")
+                                    "ref claim", allow_missing=False)
+            ref_record = dict(ref_claim["record"])
+            if ref_record["lease_id"] != lease["lease_id"] \
+                    or ref_record["claim_key"] != repo["ref_key"] \
+                    or ref_record["claim_type"] != "ref" \
+                    or ref_record["repo_id"] != repo["repo_id"] \
+                    or ref_record["top"] != repo["top"] \
+                    or ref_record["ref"] != repo["ref"] \
+                    or ref_record["generation"] != lease["generation"]:
+                fail("claim_mismatch",
+                     "the ref claim changed during the checkpoint")
+            ref_record["generation"] = generation
+            publish_record(fds, state.claim_refs, repo["ref_key"], "claim",
+                           ref_record, "ref claim")
 
     result = {"ok": True, "command": "lease-checkpoint",
               "lease_id": lease["lease_id"], "generation": generation,
