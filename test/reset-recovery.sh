@@ -4,7 +4,7 @@ set -euo pipefail
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 SP="$ROOT/tool/bin/stitchpad"
 tmp="$(mktemp -d /tmp/stitchpad-reset-recovery.XXXXXX)"
-trap 'for n in agent push-agent; do STITCHPAD_PAD_DIR="$tmp/.stitchpad" "$SP" heartbeat --stop "$n" >/dev/null 2>&1 || true; done; rm -rf "$tmp"' EXIT
+trap 'for n in agent push-agent unbound; do STITCHPAD_PAD_DIR="$tmp/.stitchpad" "$SP" heartbeat --stop "$n" >/dev/null 2>&1 || true; done; rm -rf "$tmp"' EXIT
 mkdir -p "$tmp/home"
 export HOME="$tmp/home"
 export STITCHPAD_HEARTBEAT_AUTOSTART=0
@@ -56,6 +56,37 @@ if contains "$hook" 'first historical delivery'; then
   fail "exact recovery replayed ordinal 1 history"
 fi
 [ "$(cat "$state/seen.agent")" = "2" ] || fail "hook recovery rewound seen cursor"
+
+# A same-sender addressed reply closes the canonical gate. Reject the answered
+# ordinal before reset can touch ticker files or any other seat state.
+STITCHPAD_NAME=agent "$SP" say '@beta handled the recovery target' >/dev/null
+mkdir "$state/heartbeat.agent.lock"
+printf '99999999' > "$state/heartbeat.agent.lock/pid"
+printf '{"pid":99999999}' > "$state/alive.agent"
+if err="$("$SP" reset agent --redeliver 2 2>&1)"; then
+  fail "answered ordinal redelivery was accepted"
+fi
+contains "$err" 'already answered' || fail "answered ordinal rejection was not explicit"
+[ -f "$state/alive.agent" ] || fail "answered validation mutated alive state"
+[ -f "$state/heartbeat.agent.lock/pid" ] || fail "answered validation mutated ticker state"
+[ "$(cat "$state/seen.agent")" = "2" ] || fail "answered validation changed seen cursor"
+[ ! -f "$state/pending.agent" ] || fail "answered validation queued recovery"
+
+# An unbound pull seat has no canonical Stop-hook session that could consume a
+# pending marker. Reject before reset activity so the seat cannot wedge forever.
+"$SP" join unbound codex pull - >/dev/null
+"$SP" heartbeat --stop unbound >/dev/null 2>&1 || true
+STITCHPAD_NAME=alpha "$SP" say '@unbound no bound recovery surface' >/dev/null
+mkdir "$state/heartbeat.unbound.lock"
+printf '99999998' > "$state/heartbeat.unbound.lock/pid"
+printf '{"pid":99999998}' > "$state/alive.unbound"
+if err="$("$SP" reset unbound --redeliver 1 2>&1)"; then
+  fail "unbound pull-seat redelivery was accepted"
+fi
+contains "$err" 'requires a canonical sessions/<id> binding' || fail "unbound rejection was not explicit"
+[ -f "$state/alive.unbound" ] || fail "unbound validation mutated alive state"
+[ -f "$state/heartbeat.unbound.lock/pid" ] || fail "unbound validation mutated ticker state"
+[ ! -f "$state/pending.unbound" ] || fail "unbound validation queued permanent recovery"
 
 # Push seats are owned by the durable delivery supervisor, which intentionally
 # clears legacy pending.<name> stamps. Reject this incompatible request instead

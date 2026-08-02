@@ -36,6 +36,7 @@ stop_watcher() {
   sleep 0.2
 }
 
+HOST_HOME="$HOME"
 tmp="$(mktemp -d /tmp/stitchpad-wake-regression.XXXXXX)"
 mkdir -p "$tmp/home"
 export HOME="$tmp/home"
@@ -53,6 +54,14 @@ cleanup() {
   sleep 0.1
   for pid in $WATCH_PIDS; do kill -KILL "$pid" 2>/dev/null || true; done
   pkill -KILL -f "fswatch.*$tmp" 2>/dev/null || true
+  # Ocean join claims its fake session in the machine registry on some nested
+  # runner paths despite fixture HOME. Remove only this fixture's exact claim.
+  host_registry="$HOST_HOME/.stitchpad-terminals"
+  [ ! -d "$HOST_HOME/.pasture-terminals" ] || host_registry="$HOST_HOME/.pasture-terminals"
+  ocean_claim="$host_registry/ocean-session"
+  case "$(cat "$ocean_claim" 2>/dev/null || true)" in
+    "$tmp"/*) rm -f "$ocean_claim" ;;
+  esac
   rm -rf "$tmp"
 }
 trap cleanup EXIT

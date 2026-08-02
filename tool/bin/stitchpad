@@ -400,8 +400,8 @@ EOF
       fi
     }
 
-    _reset_queue_redelivery() {
-      local who="$1" ordinal="$2" engagement open wake_mode
+    _reset_validate_redelivery() {
+      local who="$1" ordinal="$2" engagement open sender last_reply reply_target wake_mode binding="" sf
       case "$ordinal" in
         ''|0|*[!0-9]*)
           echo "stitchpad: --redeliver requires a positive mention ordinal (never 0)" >&2
@@ -413,12 +413,32 @@ EOF
         echo "stitchpad: --redeliver is only supported for pull/hook seats; @$who uses ${wake_mode:-unknown} delivery supervision" >&2
         return 1
       fi
+      for sf in "$PAD_STATE"/sessions/*; do
+        [ -f "$sf" ] || continue
+        if [ "$(cat "$sf" 2>/dev/null)" = "$who" ]; then
+          binding="$(basename "$sf")"
+          break
+        fi
+      done
+      if [ -z "$binding" ]; then
+        echo "stitchpad: --redeliver requires a canonical sessions/<id> binding for @$who" >&2
+        return 1
+      fi
       engagement="$(sp_engagement "$who" "$((ordinal - 1))")"
-      open="$(printf '%s\n' "$engagement" | awk '{print $1}')"
+      read -r open sender last_reply reply_target <<<"$engagement"
       if [ "${open:-0}" != "$ordinal" ]; then
         echo "stitchpad: mention ordinal $ordinal is not currently open for @$who" >&2
         return 1
       fi
+      if [ "${last_reply:-0}" -gt "$ordinal" ] \
+        && [ -n "${sender:-}" ] && [ "${reply_target:-}" = "$sender" ]; then
+        echo "stitchpad: mention ordinal $ordinal is already answered by @$who" >&2
+        return 1
+      fi
+    }
+
+    _reset_queue_redelivery() {
+      local who="$1" ordinal="$2"
       printf '%s' "$ordinal" > "$PAD_STATE/pending.$who"
       echo "  · @$who: queued exact redelivery ordinal $ordinal (seen cursor unchanged)"
     }
@@ -446,13 +466,10 @@ EOF
     fi
     if [ -n "$who" ]; then
       sp_user_exists "$who" || { echo "stitchpad: @$who not in roster" >&2; exit 1; }
-      if [ -n "$redeliver" ] && [ "$(sp_user_field "$who" wake)" != "pull" ]; then
-        echo "stitchpad: --redeliver is only supported for pull/hook seats; @$who uses $(sp_user_field "$who" wake) delivery supervision" >&2
-        exit 1
-      fi
+      [ -z "$redeliver" ] || _reset_validate_redelivery "$who" "$redeliver" || exit 1
       echo "reset @$who:"
       _reset_seat "$who"
-      [ -z "$redeliver" ] || _reset_queue_redelivery "$who" "$redeliver" || exit 1
+      [ -z "$redeliver" ] || _reset_queue_redelivery "$who" "$redeliver"
     else
       echo "reset pad ($PAD_DIR):"
       names="$(sp_roster | cut -d'|' -f1 | awk '{gsub(/^[ \t]+|[ \t]+$/,"");print}')"
