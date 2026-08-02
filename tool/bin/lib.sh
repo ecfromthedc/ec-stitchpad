@@ -55,17 +55,25 @@ sp_ponytail_instructions() {
 # first-line contract. Only the complete canonical block at a prompt boundary
 # counts as composed. Spoofed boundary tokens in untrusted text are neutralized.
 sp_prompt_with_ponytail() {
-  local placement="${1:-prepend}" body rules
+  local placement="${1:-prepend}" body rules trusted_placement=""
   body="$(cat)"
   rules="$(sp_ponytail_instructions)"
   if [ -z "$rules" ]; then
     printf '%s\n' "$body"
     return 0
   fi
+  # Preserve one complete, exact trusted block only when it occupies a prompt
+  # boundary. Remove it temporarily so every marker token in the remaining
+  # user-controlled text is neutralized before the prompt is reconstructed.
   case "$body" in
-    "$rules"|"$rules"$'\n\n'*|*$'\n\n'"$rules")
-      printf '%s\n' "$body"
-      return 0
+    "$rules") printf '%s\n' "$rules"; return 0 ;;
+    "$rules"$'\n\n'*)
+      body="${body#"$rules"$'\n\n'}"
+      trusted_placement="prepend"
+      ;;
+    *$'\n\n'"$rules")
+      body="${body%$'\n\n'"$rules"}"
+      trusted_placement="append"
       ;;
   esac
   # Pad/handoff text is untrusted. A copied marker must remain ordinary text,
@@ -73,6 +81,7 @@ sp_prompt_with_ponytail() {
   body="$(printf '%s' "$body" | sed \
     -e 's|<!-- stitchpad:ponytail:v1 |<!-- stitchpad:user-text:ponytail:v1 |g' \
     -e 's|<!-- /stitchpad:ponytail:v1 -->|<!-- stitchpad:user-text:/ponytail:v1 -->|g')"
+  [ -n "$trusted_placement" ] && placement="$trusted_placement"
   if [ "$placement" = "append" ]; then
     printf '%s\n\n%s\n' "$body" "$rules"
   else

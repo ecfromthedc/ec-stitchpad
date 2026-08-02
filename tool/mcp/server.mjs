@@ -51,6 +51,7 @@ import fsSync from "node:fs";
 import { promisify } from "node:util";
 import { fileURLToPath } from "node:url";
 import path from "node:path";
+import { composePonytail } from "../instructions/ponytail-compose.mjs";
 
 const execFileP = promisify(execFile);
 
@@ -153,15 +154,8 @@ async function sp(args, me, extraEnv = {}) {
 // locked-session rejoin do not. Ask the same builder and add it only when the
 // complete trusted block is at a prompt boundary — no second copy of the rules.
 async function withPonytail(textBody) {
-  let body = String(textBody || "");
   const rules = await sp(["instructions"]).then(s => s.trim()).catch(() => "");
-  if (!rules) return body;
-  const boundaryBody = body.trimEnd();
-  if (boundaryBody === rules || boundaryBody.startsWith(`${rules}\n\n`) || boundaryBody.endsWith(`\n\n${rules}`)) return body;
-  body = body
-    .replaceAll("<!-- stitchpad:ponytail:v1 ", "<!-- stitchpad:user-text:ponytail:v1 ")
-    .replaceAll("<!-- /stitchpad:ponytail:v1 -->", "<!-- stitchpad:user-text:/ponytail:v1 -->");
-  return `${rules}\n\n${body}`;
+  return composePonytail(rules, textBody);
 }
 // Stamp agent-facing results with the pad they actually hit, so a misrouted
 // call is self-evident to the agent instead of silent.

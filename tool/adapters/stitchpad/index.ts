@@ -29,6 +29,7 @@ import { join } from "node:path";
 import { homedir } from "node:os";
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { Type } from "typebox";
+import { composePonytail } from "../../instructions/ponytail-compose.mjs";
 
 const exec = promisify(execFile);
 
@@ -257,8 +258,9 @@ export default function stitchpadExtension(pi: ExtensionAPI) {
     const rules = await sharedInstructions(ctx.cwd);
     if (!rules) return;
     const base = event?.systemPrompt || "";
-    if (base.includes("<!-- stitchpad:ponytail:v1 ")) return;
-    return { systemPrompt: `${rules}\n\n${base}` };
+    const systemPrompt = composePonytail(rules, base);
+    if (systemPrompt === base) return;
+    return { systemPrompt };
   });
   pi.on("session_start", async (_e, ctx) => {
     await autoRejoin(ctx);
