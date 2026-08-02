@@ -9,12 +9,13 @@ malformed or stale files are reported as evidence, not rewritten.
 from __future__ import annotations
 
 import argparse
+import datetime as dt
 import glob
-import heapq
 import itertools
 import json
 import os
 import re
+import socket
 import subprocess
 import time
 import urllib.error
@@ -25,6 +26,10 @@ from typing import Any
 
 
 MAX_STATE_BYTES = 1_048_576
+MAX_COUNTER = 2_147_483_647
+MAX_PID = 2_147_483_647
+MAX_EPOCH_SECONDS = 4_102_444_800  # 2100-01-01; rejects absurd false-green clocks.
+DEEP_DEADLINE_SECONDS = 1.0
 DELIVERY_KEYS = {
     "state", "generation", "ordinal", "message_id", "task_id", "accepted_at",
     "started_at", "completed_at", "error_at", "error_code", "turn_id", "turn_status",
@@ -32,6 +37,7 @@ DELIVERY_KEYS = {
 DELIVERY_STATES = {
     "accepted", "started", "busy", "error", "in_flight", "cancel_pending", "completed", "tombstoned",
 }
+DELIVERY_TIMESTAMP_KEYS = {"accepted_at", "started_at", "completed_at", "error_at"}
 KEEPER_STATES = {"accepted", "in_flight", "completed", "acceptance_unknown"}
 
 
@@ -110,7 +116,9 @@ def read_json(path: Path, *, root: Path | None = None) -> tuple[dict[str, Any] |
     return (value, None) if isinstance(value, dict) else (None, "json_not_object")
 
 
-def strict_int(value: Any, *, allow_zero: bool = True) -> tuple[int | None, str]:
+def strict_int(
+    value: Any, *, allow_zero: bool = True, max_value: int = MAX_COUNTER,
+) -> tuple[int | None, str]:
     if isinstance(value, bool):
         return None, "malformed"
     if isinstance(value, int):
@@ -127,7 +135,7 @@ def strict_int(value: Any, *, allow_zero: bool = True) -> tuple[int | None, str]
         return None, "missing"
     else:
         return None, "malformed"
-    if number < 0 or (number == 0 and not allow_zero):
+    if number < 0 or number > max_value or (number == 0 and not allow_zero):
         return None, "malformed"
     return number, "ok"
 
@@ -161,6 +169,19 @@ def safe_seat(name: str) -> bool:
 def safe_token(value: str) -> bool:
     allowed = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789_-"
     return 0 < len(value) <= 64 and all(char in allowed for char in value)
+
+
+def valid_timestamp(value: str) -> bool:
+    if not value or len(value) > 64:
+        return False
+    if value.isdigit():
+        number, parse = strict_int(value, max_value=MAX_EPOCH_SECONDS * 1000)
+        return parse == "ok" and number is not None
+    try:
+        parsed = dt.datetime.fromisoformat(value.replace("Z", "+00:00"))
+    except ValueError:
+        return False
+    return 2000 <= parsed.year <= 2100
 
 
 def roster_rows(pad_md: Path) -> tuple[list[dict[str, str]], list[str], str]:
@@ -232,11 +253,13 @@ def session_bindings(state: Path) -> tuple[dict[str, list[str]], list[dict[str, 
     return by_name, all_bindings, issues
 
 
-def read_scalar(path: Path, *, root: Path | None = None) -> dict[str, Any]:
+def read_scalar(
+    path: Path, *, root: Path | None = None, max_value: int = MAX_COUNTER,
+) -> dict[str, Any]:
     raw, error = read_text(path, 4096, root=root)
     if raw is None:
         return {"present": path.is_file(), "value": None, "parse": error or "missing"}
-    value, parse = strict_int(raw.strip())
+    value, parse = strict_int(raw.strip(), max_value=max_value)
     return {"present": True, "value": value, "parse": parse, "raw": raw.strip()[:128] if parse != "ok" else None}
 
 
@@ -260,16 +283,16 @@ def heartbeat(state: Path, name: str, now: float) -> tuple[dict[str, Any], list[
             issues.append("heartbeat:missing")
         return result, issues
 
-    pid, pid_parse = strict_int(obj.get("pid"), allow_zero=False)
+    pid, pid_parse = strict_int(obj.get("pid"), allow_zero=False, max_value=MAX_PID)
     parent_value = obj.get("parentPid")
     if parent_value in (None, "", 0, "0"):
         parent, parent_parse = None, "missing"
     else:
-        parent, parent_parse = strict_int(parent_value, allow_zero=False)
+        parent, parent_parse = strict_int(parent_value, allow_zero=False, max_value=MAX_PID)
     reported = obj.get("ts")
     reported_valid = (
         isinstance(reported, (int, float)) and not isinstance(reported, bool)
-        and -1_000_000_000_000 <= reported <= 1_000_000_000_000
+        and 0 <= reported <= MAX_EPOCH_SECONDS
     )
     reported_age = max(0, int(now - reported)) if reported_valid else None
     alive = pid_alive(pid)
@@ -379,23 +402,83 @@ def engagement_index(raw: str, roster_names: list[str]) -> dict[str, Any]:
             first_content = line
         body_lines.append(re.sub(r"`[^`]*`", " ", line))
     flush()
-    return {"seats": result, "broadcasts": broadcasts}
+    return {"seats": result, "broadcasts": broadcasts, "message_count": ordinal}
 
 
-def indexed_open(index: dict[str, Any], name: str, since: int) -> dict[str, Any]:
-    seat = index["seats"].get(name.lower())
-    if seat is None:
-        return {"value": None, "status": "invalid_seat_name"}
-    mentions = heapq.merge(seat["mentions"], index["broadcasts"], key=lambda event: event[0])
-    for ordinal, sender in mentions:
-        if sender == name.lower():
+def precompute_open(
+    index: dict[str, Any], roster_names: list[str], since_by_name: dict[str, int],
+) -> dict[str, dict[str, int]]:
+    """Resolve both open gates in one event pass using seat bitsets."""
+    names = list(dict.fromkeys(
+        name.lower() for name in roster_names if safe_seat(name)
+    ))
+    bit_for = {name: 1 << position for position, name in enumerate(names)}
+    name_for = {bit: name for name, bit in bit_for.items()}
+    all_seats = (1 << len(names)) - 1
+    event_masks: dict[int, int] = {}
+
+    # Explicit mentions cost one bit per address token already present in the
+    # pad; handled ones are removed using each seat's latest reply by sender.
+    for name, seat in index["seats"].items():
+        bit = bit_for[name]
+        for ordinal, sender in seat["mentions"]:
+            if sender != name and seat["replies"].get(sender, 0) <= ordinal:
+                event_masks[ordinal] = event_masks.get(ordinal, 0) | bit
+
+    # Broadcasts remain one event each. For each sender, walk broadcasts and
+    # replies newest-first so a single integer mask captures all seats whose
+    # later same-sender reply handled that broadcast.
+    broadcasts_by_sender: dict[str, list[int]] = {}
+    for ordinal, sender in index["broadcasts"]:
+        broadcasts_by_sender.setdefault(sender, []).append(ordinal)
+    replies_by_sender: dict[str, list[tuple[int, int]]] = {}
+    for name, seat in index["seats"].items():
+        bit = bit_for[name]
+        for sender, reply_ordinal in seat["replies"].items():
+            replies_by_sender.setdefault(sender, []).append((reply_ordinal, bit))
+    for sender, ordinals in broadcasts_by_sender.items():
+        replies = sorted(replies_by_sender.get(sender, []), reverse=True)
+        reply_index = 0
+        handled_mask = 0
+        author_bit = bit_for.get(sender, 0)
+        for ordinal in reversed(ordinals):
+            while reply_index < len(replies) and replies[reply_index][0] > ordinal:
+                handled_mask |= replies[reply_index][1]
+                reply_index += 1
+            eligible = all_seats & ~handled_mask & ~author_bit
+            if eligible:
+                event_masks[ordinal] = event_masks.get(ordinal, 0) | eligible
+
+    true_values = {name: 0 for name in names}
+    next_values = {name: 0 for name in names}
+    remaining_true = all_seats
+    remaining_next = all_seats
+    active_next = 0
+    thresholds = sorted((since_by_name.get(name, 0), bit_for[name]) for name in names)
+    threshold_index = 0
+
+    def assign(mask: int, destination: dict[str, int], ordinal: int) -> None:
+        while mask:
+            bit = mask & -mask
+            destination[name_for[bit]] = ordinal
+            mask ^= bit
+
+    for ordinal in range(1, index["message_count"] + 1):
+        while threshold_index < len(thresholds) and thresholds[threshold_index][0] < ordinal:
+            active_next |= thresholds[threshold_index][1]
+            threshold_index += 1
+        mask = event_masks.get(ordinal, 0)
+        if not mask:
             continue
-        if ordinal <= since:
-            continue
-        handled = seat["replies"].get(sender, 0) > ordinal
-        if not handled:
-            return {"value": ordinal, "status": "ok"}
-    return {"value": 0, "status": "ok"}
+        true_hits = mask & remaining_true
+        next_hits = mask & active_next & remaining_next
+        assign(true_hits, true_values, ordinal)
+        assign(next_hits, next_values, ordinal)
+        remaining_true &= ~true_hits
+        remaining_next &= ~next_hits
+        if not remaining_true and not remaining_next:
+            break
+    return {"true": true_values, "next": next_values}
 
 
 def parse_delivery(state: Path, name: str) -> tuple[dict[str, Any] | None, list[str]]:
@@ -426,6 +509,13 @@ def parse_delivery(state: Path, name: str) -> tuple[dict[str, Any] | None, list[
             if key not in DELIVERY_KEYS or key in snapshot or len(value) > 4096:
                 malformed_lines.append(line[:120])
                 continue
+            if key in {"generation", "ordinal"} and value:
+                if strict_int(value, allow_zero=False)[1] != "ok":
+                    malformed_lines.append(line[:120])
+                    continue
+            if key in DELIVERY_TIMESTAMP_KEYS and value and not valid_timestamp(value):
+                malformed_lines.append(line[:120])
+                continue
             snapshot[key] = value
     if malformed_lines:
         issues.append("delivery_state:malformed_lines")
@@ -444,6 +534,7 @@ def parse_delivery(state: Path, name: str) -> tuple[dict[str, Any] | None, list[
         ordinal = strict_int(fields[1], allow_zero=False)[1] if len(fields) == len(keys) else "malformed"
         if (len(fields) == len(keys) and generation == "ok" and ordinal == "ok"
                 and all(0 < len(field) <= 512 for field in fields[2:])
+                and valid_timestamp(fields[4])
                 and safe_token(fields[5]) and fields[6] in {"push", "pull"}):
             pending = {**dict(zip(keys, fields)), "parse": "ok"}
         else:
@@ -456,7 +547,7 @@ def parse_delivery(state: Path, name: str) -> tuple[dict[str, Any] | None, list[
         issues.append(f"keeper_reservation:{keeper_error}")
     elif keeper_raw is not None:
         fields = keeper_raw.rstrip("\n").split("|")
-        ordinal, ordinal_parse = strict_int(fields[0], allow_zero=False) if len(fields) == 4 else (None, "malformed")
+        ordinal, ordinal_parse = strict_int(fields[0], allow_zero=True) if len(fields) == 4 else (None, "malformed")
         if (len(fields) == 4 and ordinal_parse == "ok" and fields[2] in KEEPER_STATES
                 and bool(fields[1]) and bool(fields[3])
                 and all(len(field) <= 512 for field in fields[1:])):
@@ -468,7 +559,7 @@ def parse_delivery(state: Path, name: str) -> tuple[dict[str, Any] | None, list[
             keeper = {"raw": keeper_raw[:256], "parse": "malformed"}
             issues.append("keeper_reservation:malformed")
 
-    worker = read_scalar(lock_pid_file, root=state)
+    worker = read_scalar(lock_pid_file, root=state, max_value=MAX_PID)
     worker["pid_alive"] = pid_alive(worker.get("value")) if worker.get("parse") == "ok" else None
     if worker["present"] and worker["parse"] != "ok":
         issues.append("delivery_worker:malformed_pid")
@@ -479,7 +570,10 @@ def parse_delivery(state: Path, name: str) -> tuple[dict[str, Any] | None, list[
     for filename in turn_files[:16]:
         path = Path(filename)
         turn_id, turn_error = read_text(path, 4096, root=state)
-        turns.append({"generation": path.name.rsplit(".turn.", 1)[-1],
+        generation = path.name.rsplit(".turn.", 1)[-1]
+        if strict_int(generation, allow_zero=False)[1] != "ok":
+            turn_error = turn_error or "malformed_generation"
+        turns.append({"generation": generation,
                       "turn_id": turn_id.strip() if turn_id else None, "parse_error": turn_error})
     if len(turn_files) > 16:
         issues.append("delivery_turns:truncated_at_16")
@@ -517,7 +611,7 @@ def process_table() -> list[tuple[int, int, str]]:
 
 def watcher_health(state: Path, pad_md: Path) -> dict[str, Any]:
     lock = state / "watch.lock.d"
-    pid_info = read_scalar(lock / "pid", root=state)
+    pid_info = read_scalar(lock / "pid", root=state, max_value=MAX_PID)
     pid = pid_info.get("value") if pid_info.get("parse") == "ok" else None
     alive = pid_alive(pid)
     rows = process_table()
@@ -551,19 +645,54 @@ def watcher_health(state: Path, pad_md: Path) -> dict[str, Any]:
     }
 
 
+def bounded_http_body(response: Any, deadline: float) -> bytes:
+    chunks: list[bytes] = []
+    total = 0
+    reader = getattr(response, "read1", response.read)
+    raw_stream = getattr(getattr(response, "fp", None), "raw", None)
+    sock = getattr(raw_stream, "_sock", None)
+    while total <= MAX_STATE_BYTES:
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            raise TimeoutError("whole-request deadline exceeded")
+        if sock is not None:
+            try:
+                sock.settimeout(max(0.001, remaining))
+            except OSError:
+                # http.client can close the socket after buffering a small
+                # response.  The buffered body is still safe to consume.
+                sock = None
+        chunk = reader(min(65_536, MAX_STATE_BYTES + 1 - total))
+        if not chunk:
+            break
+        chunks.append(chunk)
+        total += len(chunk)
+        if time.monotonic() > deadline:
+            raise TimeoutError("whole-request deadline exceeded")
+    return b"".join(chunks)
+
+
 def deep_ocean(target: str) -> dict[str, Any]:
     base = os.environ.get("OCEAN_DAEMON_URL", "http://127.0.0.1:4780").rstrip("/")
-    parsed = urllib.parse.urlparse(base)
-    if parsed.scheme != "http" or parsed.hostname not in {"127.0.0.1", "::1"}:
+    try:
+        parsed = urllib.parse.urlparse(base)
+        hostname = parsed.hostname
+        _ = parsed.port
+    except ValueError as exc:
+        return {"status": "malformed_url", "active_turn": None,
+                "detail": exc.__class__.__name__}
+    if (parsed.scheme != "http" or hostname not in {"127.0.0.1", "::1"}
+            or parsed.username is not None or parsed.password is not None):
         return {"status": "refused_non_loopback", "active_turn": None}
     url = f"{base}/v1/agent/sessions/{urllib.parse.quote(target, safe='')}"
+    deadline = time.monotonic() + DEEP_DEADLINE_SECONDS
     try:
         request = urllib.request.Request(url, method="GET", headers={"accept": "application/json"})
         # Ignore ambient HTTP_PROXY: an explicit loopback diagnostic must stay
         # loopback and never disclose target/session identifiers to a proxy.
         opener = urllib.request.build_opener(urllib.request.ProxyHandler({}), NoRedirect())
-        with opener.open(request, timeout=1.0) as response:
-            raw = response.read(MAX_STATE_BYTES + 1)
+        with opener.open(request, timeout=max(0.001, deadline - time.monotonic())) as response:
+            raw = bounded_http_body(response, deadline)
         if len(raw) > MAX_STATE_BYTES:
             return {"status": "response_too_large", "active_turn": None}
         value = json.loads(raw, parse_constant=reject_json_constant)
@@ -578,7 +707,14 @@ def deep_ocean(target: str) -> dict[str, Any]:
             return {"status": "malformed_response", "active_turn": None,
                     "detail": "session_fields_not_scalar"}
         return {"status": "ok", "active_turn": active_turn, "session_status": session_status}
-    except (urllib.error.URLError, TimeoutError, OSError) as exc:
+    except (TimeoutError, socket.timeout):
+        return {"status": "timeout", "active_turn": None}
+    except urllib.error.URLError as exc:
+        if isinstance(exc.reason, (TimeoutError, socket.timeout)):
+            return {"status": "timeout", "active_turn": None}
+        return {"status": "unavailable", "active_turn": None,
+                "detail": exc.__class__.__name__}
+    except OSError as exc:
         return {"status": "unavailable", "active_turn": None, "detail": exc.__class__.__name__}
     except (ValueError, TypeError) as exc:
         return {"status": "malformed_response", "active_turn": None, "detail": exc.__class__.__name__}
@@ -586,7 +722,7 @@ def deep_ocean(target: str) -> dict[str, Any]:
 
 def severity(issues: list[str]) -> str:
     errors = ("duplicate_", "invalid_", "missing_adapter", "malformed", "dead_pid",
-              "pid_mismatch", "acceptance_unknown")
+              "pid_mismatch", "acceptance_unknown", "pad_file:")
     return "error" if any(any(token in issue for token in errors) for issue in issues) else ("warn" if issues else "ok")
 
 
@@ -629,6 +765,18 @@ def build(args: argparse.Namespace) -> dict[str, Any]:
     name_counts: dict[str, int] = {}
     deep_cache: dict[str, dict[str, Any]] = {}
     engagement = engagement_index(pad_raw, roster_names)
+    seen_cache: dict[str, dict[str, Any]] = {}
+    since_by_name: dict[str, int] = {}
+    for name in roster_names:
+        if not safe_seat(name) or name.lower() in seen_cache:
+            continue
+        if state_refused:
+            seen = unavailable_scalar("state_symlink_refused")
+        else:
+            seen = read_scalar(state / f"seen.{name}", root=state)
+        seen_cache[name.lower()] = seen
+        since_by_name[name.lower()] = int(seen.get("value") or 0) if seen.get("parse") == "ok" else 0
+    open_values = precompute_open(engagement, roster_names, since_by_name)
 
     for row in rows:
         name_counts[row["name"]] = name_counts.get(row["name"], 0) + 1
@@ -684,20 +832,22 @@ def build(args: argparse.Namespace) -> dict[str, Any]:
                 elif target_binding["name"] != name:
                     issues.append(f"ocean_target_bound_to:{target_binding['name']}")
 
-        true_open = indexed_open(engagement, name, 0)
+        true_open = {"value": open_values["true"].get(name.lower(), 0), "status": "ok"}
         if state_refused:
             unavailable = "state_symlink_refused"
             issues.append(f"state_unavailable:{unavailable}")
             hb = unavailable_heartbeat(unavailable)
             ticker = {**unavailable_scalar(unavailable), "pid_alive": None}
-            seen = unavailable_scalar(unavailable)
+            seen = seen_cache[name.lower()]
             pending_stamp = unavailable_scalar(unavailable)
             next_unseen = {"value": None, "status": f"unavailable:{unavailable}"}
             dnd = None
             delivery = None
         else:
             hb, hb_issues = heartbeat(state, name, now)
-            ticker = read_scalar(state / f"heartbeat.{name}.lock" / "pid", root=state)
+            ticker = read_scalar(
+                state / f"heartbeat.{name}.lock" / "pid", root=state, max_value=MAX_PID,
+            )
             ticker["pid_alive"] = pid_alive(ticker.get("value")) if ticker.get("parse") == "ok" else None
             if ticker["present"] and ticker["parse"] != "ok":
                 issues.append("ticker:malformed_pid")
@@ -710,14 +860,13 @@ def build(args: argparse.Namespace) -> dict[str, Any]:
                 if hb.get("progress") in {"stale", "stalled", "malformed", "missing"}:
                     repairs.append("restart the authoritative seat/runtime; preserve wake cursors and re-run health")
 
-            seen = read_scalar(state / f"seen.{name}", root=state)
+            seen = seen_cache[name.lower()]
             if seen["present"] and seen["parse"] != "ok":
                 issues.append("seen:malformed")
             pending_stamp = read_scalar(state / f"pending.{name}", root=state)
             if pending_stamp["present"] and pending_stamp["parse"] != "ok":
                 issues.append("pending:malformed")
-            seen_value = seen.get("value") if seen.get("parse") == "ok" else 0
-            next_unseen = indexed_open(engagement, name, int(seen_value or 0))
+            next_unseen = {"value": open_values["next"].get(name.lower(), 0), "status": "ok"}
             dnd = (state / f"dnd.{name}").is_file()
             if dnd and (true_open.get("value") or pending_stamp.get("value")):
                 repairs.append(f"when ready, resume explicitly: STITCHPAD_NAME={name} stitchpad dnd off")

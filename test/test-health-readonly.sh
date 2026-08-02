@@ -15,7 +15,8 @@ trap cleanup EXIT
 fail() { echo "FAIL: $*" >&2; exit 1; }
 
 mkdir -p "$STATE/sessions" "$STATE/heartbeat.alice.lock" \
-  "$STATE/delivery.bob.worker.lock.d" "$STATE/watch.lock.d"
+  "$STATE/delivery.bob.worker.lock.d" "$STATE/delivery.frank.worker.lock.d" \
+  "$STATE/watch.lock.d"
 cat > "$PAD/stitchpad.md" <<'EOF'
 # health fixture
 
@@ -102,6 +103,7 @@ printf 'frank' > "$STATE/sessions/frank-session"
 ln -s "$PAD/stitchpad.md" "$STATE/sessions/leaky-session"
 printf 'operator' > "$STATE/runtime.operator"
 printf '0' > "$STATE/seen.bob"
+printf '99999999999999999999' > "$STATE/seen.dave"
 printf '1' > "$STATE/pending.bob"
 printf '%s' "$READREF_OLD" > "$STATE/readref.bob"
 : > "$STATE/dnd.bob"
@@ -116,12 +118,12 @@ put("alive.alice", {"name":"alice","ts":int(time.time()),"pid":live,"parentPid":
 put("alive.bob", {"name":"bob","ts":int(time.time())-300,"pid":999999,"parentPid":999998,"session":"ocean-session","target":"ocean-session"})
 old = time.time() - 300
 os.utime(os.path.join(state, "alive.bob"), (old, old))
-put("alive.carol", {"name":"carol","ts":int(time.time()),"pid":"9"*100,"parentPid":-2,"session":"carol-session"})
+put("alive.carol", {"name":"carol","ts":99999999999999999999,"pid":"9"*100,"parentPid":-2,"session":"carol-session"})
 put("alive.frank", {"name":"frank","ts":float("inf"),"pid":live,"parentPid":parent,"session":"frank-session"})
 PY
 
 printf '%s' "$$" > "$STATE/heartbeat.alice.lock/pid"
-printf 'not-a-pid' > "$STATE/watch.lock.d/pid"
+printf '99999999999999999999' > "$STATE/watch.lock.d/pid"
 printf '2026-08-02T12:00:00Z' > "$STATE/watch.lock.d/ts"
 printf '%s\n' '1|1|m-1|TASK-1|2026-08-02T12:00:00|ocean|push|ocean-session' > "$STATE/delivery.bob.pending"
 cat > "$STATE/delivery.bob.state" <<'EOF'
@@ -144,6 +146,15 @@ printf '%s' '1|m-1|acceptance_unknown|attempt-1' > "$STATE/delivery.bob.keeper-r
 printf '%s' '0||accepted|' > "$STATE/delivery.carol.keeper-reservation"
 printf '%s' '|||||||' > "$STATE/delivery.dave.pending"
 printf '%s\n' 'state=accepted' > "$STATE/delivery.dave.state"
+printf '%s' '0|task-message|accepted|attempt-zero' > "$STATE/delivery.frank.keeper-reservation"
+printf '%s' '1|1|m-frank|TASK-F|2026-08-02T12:00:00|ocean|push|frank-target' > "$STATE/delivery.frank.pending"
+cat > "$STATE/delivery.frank.state" <<'EOF'
+state=accepted
+generation=99999999999999999999
+ordinal=1
+accepted_at=2026-08-02T12:00:00
+EOF
+printf '%s' '99999999999999999999' > "$STATE/delivery.frank.worker.lock.d/pid"
 
 snapshot() {
   python3 - "${1:-$STATE}" "${2:-}" <<'PY'
@@ -188,6 +199,7 @@ who="$($SP who)"
 read_window="$($SP read -n 5)"
 deep_json="$(OCEAN_DAEMON_URL=http://127.0.0.1:1 "$SP" health --deep --json)"
 hostname_json="$(OCEAN_DAEMON_URL=http://localhost:1 "$SP" health --deep --json)"
+bad_url_json="$(OCEAN_DAEMON_URL='http://[::1]@evil.test' "$SP" health --deep --json)"
 
 # A loopback daemon may be compromised or misconfigured. Refuse its redirect
 # instead of following a nominally local health request onto the network.
@@ -201,13 +213,27 @@ class Handler(http.server.BaseHTTPRequestHandler):
         if mode == "redirect":
             self.send_response(302)
             self.send_header("Location", "http://example.invalid/stitchpad-health-leak")
+        elif mode == "slow":
+            body = b"x" * 100
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(body)))
         else:
             body = b'{"session":null}'
             self.send_response(200)
             self.send_header("Content-Type", "application/json")
             self.send_header("Content-Length", str(len(body)))
         self.end_headers()
-        if mode != "redirect":
+        if mode == "slow":
+            import time
+            try:
+                for byte in body:
+                    self.wfile.write(bytes([byte]))
+                    self.wfile.flush()
+                    time.sleep(0.15)
+            except (BrokenPipeError, ConnectionResetError):
+                pass
+        elif mode != "redirect":
             self.wfile.write(body)
     def log_message(self, *args):
         pass
@@ -231,6 +257,14 @@ start_http_fixture malformed "$malformed_port_file"
 malformed_deep_json="$(OCEAN_DAEMON_URL="http://127.0.0.1:$(cat "$malformed_port_file")" "$SP" health --deep --json)"
 wait "$SERVER_PID"
 SERVER_PID=""
+slow_port_file="$TMP/slow.port"
+start_http_fixture slow "$slow_port_file"
+slow_start_ns="$(python3 -c 'import time; print(time.monotonic_ns())')"
+slow_deep_json="$(OCEAN_DAEMON_URL="http://127.0.0.1:$(cat "$slow_port_file")" "$SP" health --deep --json)"
+slow_end_ns="$(python3 -c 'import time; print(time.monotonic_ns())')"
+wait "$SERVER_PID"
+SERVER_PID=""
+slow_elapsed_ms=$(( (slow_end_ns - slow_start_ns) / 1000000 ))
 after="$(snapshot "$TMP/project")"
 ready_after="$(cksum < "$PAD/stitchpad.md.ready")|$(stat -f %m "$PAD/stitchpad.md.ready" 2>/dev/null || stat -c %Y "$PAD/stitchpad.md.ready")"
 
@@ -256,9 +290,12 @@ read_new_second="$($SP read --new)"
 state_after_second="$(snapshot "$TMP/project")"
 [ "$state_after_first" = "$state_after_second" ] || fail "second read --new rewrote an unchanged cursor or other state"
 
-python3 - "$local_json" "$deep_json" "$hostname_json" "$redirect_json" "$malformed_deep_json" "$doctor_json" <<'PY'
+python3 - "$local_json" "$deep_json" "$hostname_json" "$bad_url_json" \
+  "$redirect_json" "$malformed_deep_json" "$slow_deep_json" "$slow_elapsed_ms" "$doctor_json" <<'PY'
 import json, sys
-local, deep, hostname, redirect, malformed_deep, doctor = map(json.loads, sys.argv[1:7])
+local, deep, hostname, bad_url, redirect, malformed_deep, slow_deep = map(json.loads, sys.argv[1:8])
+slow_elapsed_ms = int(sys.argv[8])
+doctor = json.loads(sys.argv[9])
 assert local["schema_version"] == 1 and local["mode"] == "local"
 assert all(seat["deep_ocean"] is None for seat in local["seats"])
 assert local["pad"]["watcher"]["status"] == "malformed_lock"
@@ -283,10 +320,17 @@ assert any("never auto-retry" in item for item in seats["bob"]["repair"])
 assert any(x.startswith("duplicate_target:") for x in seats["bob"]["issues"])
 assert seats["carol"]["heartbeat"]["pid_parse"] == "malformed"
 assert "heartbeat:malformed_pid" in seats["carol"]["issues"]
+assert "heartbeat:malformed_time" in seats["carol"]["issues"]
 assert seats["carol"]["delivery"]["keeper_reservation"]["parse"] == "malformed"
 assert seats["frank"]["heartbeat"]["parse_error"].startswith("malformed_json:")
+assert seats["frank"]["delivery"]["keeper_reservation"]["ordinal"] == 0
+assert seats["frank"]["delivery"]["keeper_reservation"]["parse"] == "ok"
+assert seats["frank"]["delivery"]["worker"]["parse"] == "malformed"
+assert seats["frank"]["delivery"]["recoverable"] is False
+assert "delivery_state:malformed_lines" in seats["frank"]["issues"]
 assert seats["dave"]["delivery"]["pending"]["parse"] == "malformed"
 assert seats["dave"]["delivery"]["recoverable"] is False
+assert seats["dave"]["seen_cursor"]["parse"] == "malformed"
 invalid = seats["bad/name"]
 assert invalid["heartbeat"]["progress"] == "unavailable"
 assert {"ticker","dnd","seen_cursor","delivery","deep_ocean"} <= set(invalid)
@@ -298,12 +342,17 @@ assert deep["mode"] == "deep"
 assert deep_seats["bob"]["deep_ocean"]["status"] == "unavailable"
 hostname_seats = {seat["name"]: seat for seat in hostname["seats"]}
 assert hostname_seats["bob"]["deep_ocean"]["status"] == "refused_non_loopback"
+bad_url_seats = {seat["name"]: seat for seat in bad_url["seats"]}
+assert bad_url_seats["bob"]["deep_ocean"]["status"] == "malformed_url"
 redirect_seats = {seat["name"]: seat for seat in redirect["seats"]}
 assert redirect_seats["bob"]["deep_ocean"]["status"] == "unavailable"
 assert redirect_seats["bob"]["deep_ocean"]["detail"] == "HTTPError"
 malformed_deep_seats = {seat["name"]: seat for seat in malformed_deep["seats"]}
 assert malformed_deep_seats["bob"]["deep_ocean"]["status"] == "malformed_response"
 assert malformed_deep_seats["bob"]["deep_ocean"]["detail"] == "session_not_object"
+slow_deep_seats = {seat["name"]: seat for seat in slow_deep["seats"]}
+assert slow_deep_seats["bob"]["deep_ocean"]["status"] == "timeout"
+assert slow_elapsed_ms <= 2500, slow_elapsed_ms
 assert isinstance(doctor, list) and doctor
 assert {"name","adapter","wake","target","status","health"} <= set(doctor[0])
 PY
@@ -317,14 +366,19 @@ PY
 
 # Broadcast indexing stays O(pad + seats), not O(broadcasts * seats).
 python3 - "$ROOT/tool/bin/health.py" <<'PY'
-import runpy, sys
+import runpy, sys, time
 sys.dont_write_bytecode = True
 module = runpy.run_path(sys.argv[1])
 names = [f"seat{i}" for i in range(128)]
-raw = "\n".join(f"## @sender{i}\n\n@all ping" for i in range(10_000))
+start = time.monotonic()
+raw = "## @sender\n\n@all ping\n" * 280_000  # ~7.3 MiB hostile broadcast pad
 index = module["engagement_index"](raw, names)
-assert len(index["broadcasts"]) == 10_000
+opened = module["precompute_open"](index, names, {name: 0 for name in names})
+elapsed = time.monotonic() - start
+assert len(index["broadcasts"]) == 280_000
 assert sum(len(seat["mentions"]) for seat in index["seats"].values()) == 0
+assert all(value == 1 for value in opened["true"].values())
+assert elapsed < 4.0, elapsed
 PY
 
 # A read-only command on a pad with no runtime state must not create `.state`,
@@ -344,6 +398,17 @@ bare_doctor="$(cd "$TMP/bare" && STITCHPAD_PAD_DIR="$BARE" "$SP" doctor --json)"
 [ "$bare_doctor" = "[]" ] || fail "empty doctor JSON compatibility changed"
 [ ! -e "$BARE/.state" ] || fail "read-only commands created .state on a bare pad"
 [ ! -e "$BARE/stitchpad-git" ] || fail "read-only commands initialized pad git"
+
+MISSING="$TMP/missing/.stitchpad"
+mkdir -p "$MISSING"
+missing_json="$(cd "$TMP/missing" && STITCHPAD_PAD_DIR="$MISSING" "$SP" health --json)"
+python3 - "$missing_json" <<'PY'
+import json, sys
+snapshot = json.loads(sys.argv[1])
+assert "pad_file:missing" in snapshot["pad"]["issues"]
+assert snapshot["summary"]["pad_status"] == "error"
+assert snapshot["summary"]["overall_status"] == "error"
+PY
 
 # Refuse a symlinked runtime-state root rather than traversing it. This keeps a
 # malicious pad from using health as an arbitrary local-file reader.
