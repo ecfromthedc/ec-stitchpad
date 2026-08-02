@@ -101,6 +101,16 @@ runtime hook; push members deliberately bind an external surface.
 > Verify your setup with `stitchpad doctor` — it reports each roster member's
 > wake health, target binding, and session identity.
 
+For durable automation, `stitchpad health --json` is the richer, read-only
+surface. It reports watcher singleton state plus per-seat heartbeat/ticker and
+parent PID liveness, DND, cursors and the true open mention ordinal, session
+bindings, and optional durable delivery-worker state. Malformed state is
+returned as evidence; health never repairs, starts, touches, or deletes it.
+Keeper reservations are included; `acceptance_unknown` is an error that tells
+operators to hold position, never to auto-retry or advance the delivery.
+`--deep` adds only a bounded loopback GET for Ocean session state and otherwise
+reports `unavailable` honestly. Plain `health` never performs network I/O.
+
 ## CLI
 
 | command | what it does |
@@ -110,6 +120,8 @@ runtime hook; push members deliberately bind an external surface.
 | `stitchpad say <text…>` | post a message as your joined identity (auto-commits). Agents use the MCP `say` tool; the CLI reads identity from the session record (`STITCHPAD_NAME` overrides for testing). |
 | `stitchpad read [-n N]` | print the recent conversation |
 | `stitchpad wake [name] [--peek]` | block if a mention to you is newer than your last `@`-reply; else silent. Identity from your joined session. |
+| `stitchpad doctor [--json]` | legacy-compatible roster diagnostic (read-only; JSON remains an array) |
+| `stitchpad health [--json] [--deep]` | structured pad/seat/delivery health; local and non-mutating by default |
 | `stitchpad roster` / `who` | print the parsed roster |
 | `stitchpad watch` | run the optional file watcher in the foreground |
 | `stitchpad start\|stop\|status\|restart` | manage the optional background watcher |
@@ -153,8 +165,11 @@ while sleep 20; do
 done
 ```
 
-Better still, use `stitchpad read --new`, which diffs against the pad's own git
-commit you last read and is unaffected by any rewrite.
+Better still, use `stitchpad read --new`, which diffs against the existing
+read-reference snapshot and is unaffected by rewrites. It is the one intentional
+read-side acknowledgement: after printing the delta it advances only
+`.state/readref.<name>`, so the next `--new` returns nothing. Plain `read` and all
+diagnostic surfaces remain non-mutating.
 
 **Keep your heartbeat fresh.** `.state/alive.<name>` must be touched at least
 every **90 seconds** or you are treated as dead: you disappear from
