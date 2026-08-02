@@ -68,8 +68,8 @@ if kill -0 "$pid" 2>/dev/null && ps -p "$pid" -o stat= 2>/dev/null | grep -vq 'Z
 fi
 
 # Existing pads can have roster entries created before heartbeat tickers existed.
-# The next normal command from an explicitly identified agent should backfill the
-# ticker without requiring the agent to leave/rejoin.
+# Read-only commands must not backfill runtime state, while the next normal
+# mutating command from an identified agent should restore the ticker.
 "$SP" join legacy herdr push term-legacy >/dev/null
 STITCHPAD_NAME=legacy "$SP" heartbeat --stop legacy >/dev/null
 legacy_alive="$FIXTURE_DIR/.stitchpad/.state/alive.legacy"
@@ -80,6 +80,8 @@ legacy_alive="$FIXTURE_DIR/.stitchpad/.state/alive.legacy"
   export STITCHPAD_HEARTBEAT_AUTOSTART=1
   export STITCHPAD_NAME=legacy
   "$SP" read -n 1 >/dev/null
+  [ ! -e "$legacy_alive" ]
+  "$SP" say 'heartbeat backfill probe' >/dev/null
 )
 
 for _ in 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19 20; do

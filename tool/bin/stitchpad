@@ -997,9 +997,13 @@ PY
       echo "✓ model for @$nm: $_model"
     fi
     # Push-target capture is owned by MCP/pi Herdr join and SessionStart repair.
-    STITCHPAD_NAME="$nm" STITCHPAD_HEARTBEAT_PARENT_PID="${STITCHPAD_HEARTBEAT_PARENT_PID:-$PPID}" \
-      "$BIN_DIR/stitchpad" heartbeat start "$nm" >/dev/null 2>&1 \
-      && echo "✓ heartbeat for @$nm"
+    # Honor the same explicit autostart opt-out as join; tests and maintenance
+    # can bind identity without silently creating a ticker/watcher generation.
+    if [ "${STITCHPAD_HEARTBEAT_AUTOSTART:-1}" != "0" ]; then
+      STITCHPAD_NAME="$nm" STITCHPAD_HEARTBEAT_PARENT_PID="${STITCHPAD_HEARTBEAT_PARENT_PID:-$PPID}" \
+        "$BIN_DIR/stitchpad" heartbeat start "$nm" >/dev/null 2>&1 \
+        && echo "✓ heartbeat for @$nm"
+    fi
     ;;
 
   whoami)
