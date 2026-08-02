@@ -3542,6 +3542,666 @@ def cmd_review_create(args):
 
 
 # ---------------------------------------------------------------------------
+# Section 13b. Review bind, refresh, status
+# ---------------------------------------------------------------------------
+
+# Known provider state strings mapped to normalized review phases. Unknown raw
+# states are preserved verbatim as diagnostic evidence; they never fail refresh.
+_STATE_PHASE = {
+    "queued": "pending",
+    "running": "active",
+    "active": "active",
+    "completed": "terminal",
+    "succeeded": "terminal",
+    "failed": "terminal",
+    "cancelled": "terminal",
+    "canceled": "terminal",
+    "timed_out": "terminal",
+    "timeout": "terminal",
+}
+
+# States that are sticky terminal: once observed, the review does not regress.
+_TERMINAL_STATES = frozenset(
+    ("completed", "succeeded", "failed", "cancelled", "canceled",
+     "timed_out", "timeout"))
+
+# Maximum number of observation records retained per review. Older observations
+# are left in place (evidence is never erased) but the latest.json pointer only
+# tracks the most recent; verify/close walk the full observations directory.
+_MAX_OBSERVATIONS_REPORTED = 64
+
+# Bound on stale-session seconds: if last_activity_at is older than this and the
+# review is not terminal, status projects a fail-closed blocker for verify/close.
+_STALE_SESSION_SECONDS = 86400  # 24 hours
+
+
+def _load_review(state, review_id):
+    """Load and validate the review record by its frozen positional ID."""
+    require_match(ID_RE, review_id, "review_id_invalid", "review id")
+    entry = read_record(state.reviews, review_id, "review",
+                        "review record", allow_missing=True)
+    if entry is None:
+        fail("review_not_found", "no review with id %s" % (review_id,))
+    return entry["record"]
+
+
+def _open_payload(fds, base, review):
+    """Open the payload directory for an existing review by its payload_name."""
+    payload_name = review["payload_name"]
+    require_match(ENTRY_NAME_RE, payload_name,
+                  "payload_name_invalid", "payload name")
+    entry = try_lstat_at(base.fd, payload_name)
+    if entry is None:
+        fail("payload_missing",
+             "the payload directory for this review is absent")
+    if not statmod.S_ISDIR(entry.st_mode) or statmod.S_ISLNK(entry.st_mode):
+        fail("payload_invalid", "the payload directory is not a real directory")
+    if entry.st_uid != os.getuid():
+        fail("payload_invalid", "the payload directory is not owned by you")
+    if statmod.S_IMODE(entry.st_mode) != DIR_MODE:
+        fail("payload_invalid", "the payload directory mode is not 0700")
+    payload_fd = fds.keep(open_dir_at(base.fd, payload_name,
+                                      code="payload_invalid",
+                                      what="payload directory"))
+    opened = os.fstat(payload_fd)
+    if identity(entry) != identity(opened):
+        fail("payload_invalid",
+             "the payload directory changed between lstat and open")
+    return payload_fd
+
+
+def _read_facts(payload_fd):
+    """Read the review facts flat record, allowing missing for pre-bind state."""
+    return read_flat_record(payload_fd, "facts.json", "facts",
+                            "review facts", allow_missing=True)
+
+
+def _read_pointer(payload_fd):
+    return read_flat_record(payload_fd, "pointer.json", "pointer",
+                            "review pointer", allow_missing=False)
+
+
+def _read_manifest(payload_fd):
+    return read_flat_record(payload_fd, "manifest.json", "manifest",
+                            "review manifest", allow_missing=False)
+
+
+def cmd_review_bind(args):
+    """Bind exactly one request/session identity to an existing review.
+
+    The review must be in the ``created`` state and not yet bound (facts.json
+    absent or carrying null session/request).  The caller supplies a single
+    --session and --request; ambiguity (extra identity env vars that disagree)
+    is rejected.  The provider and model are pinned from the review record and
+    the invoking environment; a mismatch fails closed.
+    """
+    ctx = open_context(args)
+    fds, base, git_home, repo, state = (
+        ctx["fds"], ctx["base"], ctx["git_home"], ctx["repo"], ctx["state"])
+
+    review = _load_review(state, args.id)
+    if review["repo_id"] != repo["repo_id"] or review["top"] != repo["top"]:
+        fail("identity_mismatch",
+             "the review does not belong to this repository")
+
+    payload_fd = _open_payload(fds, base, review)
+
+    # The review must still be in the created phase.
+    if review["state"] != "created":
+        fail("review_not_bindable",
+             "the review is not in the created state (current: %s)"
+             % (review["state"],))
+
+    # Read the current facts (if any) to check idempotency or pre-bind state.
+    existing_facts = _read_facts(payload_fd)
+
+    session = require_match(ID_RE, args.session, "session_invalid", "session id")
+    request = require_match(ID_RE, args.request, "request_invalid", "request id")
+
+    # Reject ambiguity: any STITCHPAD_SESSION/REQUEST env that disagrees with
+    # the explicit argv is a binding hazard.
+    env_session = _bounded_env(_SESSION_ENV)
+    env_request = _bounded_env(_REQUEST_ENV)
+    if env_session is not None and env_session != session:
+        fail("session_ambiguous",
+             "the --session disagrees with STITCHPAD_SESSION")
+    if env_request is not None and env_request != request:
+        fail("request_ambiguous",
+             "the --request disagrees with STITCHPAD_REQUEST")
+
+    provider = review["provider"]
+    model = _bounded_env(_MODEL_ENV)
+
+    # Idempotent re-bind: if facts already carry the same identity, succeed.
+    if existing_facts is not None:
+        if existing_facts.get("session_id") == session and \
+                existing_facts.get("request_id") == request:
+            # Confirm provider/model consistency.
+            if existing_facts.get("provider") == provider:
+                git_home.release()
+                fds.close_all()
+                return {
+                    "ok": True, "command": "review-bind",
+                    "review_id": review["review_id"],
+                    "session_id": session, "request_id": request,
+                    "provider": provider,
+                    "already_bound": True,
+                    "generation": existing_facts["generation"],
+                }
+        # If facts exist but carry a different identity, the review is bound.
+        if existing_facts.get("session_id") is not None or \
+                existing_facts.get("request_id") is not None:
+            fail("review_already_bound",
+                 "the review is already bound to a different session/request")
+
+    now = int(time.time())
+
+    mutex = TransitionMutex(state)
+    with mutex:
+        # Re-read the review record under the lock to confirm state.
+        locked_review = _load_review(state, args.id)["record"] \
+            if False else _load_review(state, args.id)
+        if locked_review["state"] != "created":
+            fail("review_not_bindable",
+                 "the review transitioned out of created state")
+
+        facts = new_record("facts", 1, {
+            "review_id": review["review_id"],
+            "session_id": session,
+            "request_id": request,
+            "bound_at": now,
+            "cancel_requested": False,
+            "cancel_requested_at": None,
+            "terminal_observed": False,
+            "terminal_completion": None,
+            "terminal_at": None,
+            "report_sealed": False,
+            "report_digest": None,
+            "report_verdict": None,
+            "report_sealed_at": None,
+            "artifact_verified": False,
+            "verified_at": None,
+            "closure": None,
+            "closure_reason": None,
+            "closed_at": None,
+            "conflict": None,
+            "provider": provider,
+            "provider_model": model,
+            "session_rotation_required": False,
+            "last_activity_at": now,
+        })
+        publish_flat_record(payload_fd, "facts.json", "facts", facts,
+                            "review facts")
+
+        # Advance the review state to bound.
+        updated = dict(locked_review)
+        updated["generation"] = locked_review["generation"] + 1
+        updated["state"] = "bound"
+        updated["updated_at"] = now
+        publish_record(fds, state.reviews, review["review_id"],
+                       "review", updated, "review record")
+
+    git_home.release()
+    fds.close_all()
+    return {
+        "ok": True, "command": "review-bind",
+        "review_id": review["review_id"],
+        "session_id": session, "request_id": request,
+        "provider": provider, "provider_model": model,
+        "already_bound": False,
+        "generation": updated["generation"],
+    }
+
+
+def _map_state_phase(raw_state):
+    """Map a raw provider state to a normalized phase; preserve unknowns."""
+    if not isinstance(raw_state, str) or not raw_state:
+        return ("unknown", raw_state)
+    lower = raw_state.lower()
+    phase = _STATE_PHASE.get(lower)
+    if phase is not None:
+        return (phase, lower)
+    return ("unknown", raw_state)
+
+
+def _is_terminal_state(raw_state):
+    if not isinstance(raw_state, str):
+        return False
+    return raw_state.lower() in _TERMINAL_STATES
+
+
+def _next_observation_slot(payload_fd, fds):
+    """Allocate the next positional observation slot name.
+
+    Observations are stored as ``observations/<n>.json`` where ``<n>`` is a
+    zero-based sequential integer.  The slot name is derived from the current
+    count of observation files, never from caller input.
+    """
+    obs_entry = try_lstat_at(payload_fd, "observations")
+    if obs_entry is None:
+        obs_fd, _ = ensure_owned_dir(fds, payload_fd, "observations",
+                                     "observations directory", mode=DIR_MODE)
+        return obs_fd, 0
+    if not statmod.S_ISDIR(obs_entry.st_mode) or \
+            statmod.S_ISLNK(obs_entry.st_mode):
+        fail("observations_invalid",
+             "the observations entry is not a real directory")
+    if obs_entry.st_uid != os.getuid():
+        fail("observations_invalid",
+             "the observations directory is not owned by you")
+    if statmod.S_IMODE(obs_entry.st_mode) != DIR_MODE:
+        fail("observations_invalid", "observations mode is not 0700")
+    obs_fd = fds.keep(open_dir_at(payload_fd, "observations",
+                                  code="observations_invalid",
+                                  what="observations directory"))
+    names = list_dir_at(obs_fd, "observations directory")
+    max_n = -1
+    for name in names:
+        if name.endswith(".json") and not name.endswith(".READY") and \
+                not name.startswith("."):
+            stem = name[:-5]
+            if stem.isdigit():
+                n = int(stem)
+                if n > max_n:
+                    max_n = n
+    return obs_fd, max_n + 1
+
+
+def cmd_review_refresh(args):
+    """Correlate provider rows against the bound review and append an observation.
+
+    The refresh reads a bounded JSON file of provider rows (via
+    --provider-rows-fd), correlates the exact request+session, maps the known
+    state to a phase, preserves sticky terminal/cancel facts, and appends an
+    observation record under the payload with generation CAS.  Missing or
+    malformed provider rows never erase evidence.
+    """
+    ctx = open_context(args)
+    fds, base, git_home, repo, state = (
+        ctx["fds"], ctx["base"], ctx["git_home"], ctx["repo"], ctx["state"])
+
+    review = _load_review(state, args.id)
+    if review["repo_id"] != repo["repo_id"] or review["top"] != repo["top"]:
+        fail("identity_mismatch",
+             "the review does not belong to this repository")
+
+    payload_fd = _open_payload(fds, base, review)
+    facts = _read_facts(payload_fd)
+    if facts is None:
+        fail("review_not_bound",
+             "the review must be bound before refresh")
+    pointer = _read_pointer(payload_fd)
+    manifest = _read_manifest(payload_fd)
+
+    expected_session = facts["session_id"]
+    expected_request = facts["request_id"]
+    if expected_session is None or expected_request is None:
+        fail("review_not_bound",
+             "the review facts carry no bound session/request")
+
+    # Read provider rows from the FD-delivered JSON file.
+    raw_data = None
+    try:
+        with os.fdopen(args.provider_rows_fd, "rb") as fh:
+            raw_data = fh.read(MAX_RECORD_BYTES + 1)
+    except OSError as exc:
+        fail("provider_rows_unreadable",
+             "cannot read provider rows: %s" % (exc.strerror,))
+    if raw_data is None:
+        fail("provider_rows_unreadable", "provider rows FD produced no data")
+    if len(raw_data) > MAX_RECORD_BYTES:
+        fail("provider_rows_too_large",
+             "provider rows exceed %d bytes" % (MAX_RECORD_BYTES,))
+
+    try:
+        rows = strict_json_loads(raw_data)
+    except CoordError:
+        fail("provider_rows_malformed",
+             "provider rows are not valid JSON")
+
+    if not isinstance(rows, list):
+        fail("provider_rows_malformed",
+             "provider rows must be a JSON array")
+    if len(rows) > 256:
+        fail("provider_rows_too_many",
+             "provider rows exceed 256 entries")
+
+    # Correlate: find the row whose request+session match exactly.
+    matched = None
+    ambiguous = False
+    output_correlation = None
+    for row in rows:
+        if not isinstance(row, dict):
+            continue
+        row_req = row.get("request")
+        row_sess = row.get("session")
+        if not isinstance(row_req, str) or not isinstance(row_sess, str):
+            continue
+        if row_req == expected_request and row_sess == expected_session:
+            if matched is not None:
+                ambiguous = True
+            else:
+                matched = row
+        # Record output correlation: any row with the same request but a
+        # different session is evidence of cross-session leakage.
+        if row_req == expected_request and row_sess != expected_session:
+            output_correlation = row_sess
+
+    now = int(time.time())
+    generation = facts["generation"]
+
+    # Determine the new phase and raw state.
+    if matched is None:
+        raw_state = None
+        phase = "unknown"
+        terminal = False
+        diagnostic = "no_correlating_provider_row"
+    elif ambiguous:
+        raw_state = None
+        phase = "unknown"
+        terminal = False
+        diagnostic = "ambiguous_provider_rows"
+    else:
+        raw_state = matched.get("state")
+        phase, normalized = _map_state_phase(raw_state)
+        terminal = _is_terminal_state(normalized) if normalized else False
+        diagnostic = None
+        # Record additional evidence fields if present.
+        for evidence_key in ("completion", "exit_code", "error"):
+            if evidence_key in matched:
+                diagnostic = matched.get(evidence_key)
+                break
+
+    # Preserve sticky terminal facts: once terminal_observed is True, it stays.
+    cancel_requested = facts["cancel_requested"]
+    cancel_requested_at = facts["cancel_requested_at"]
+    terminal_observed = facts["terminal_observed"]
+    terminal_completion = facts["terminal_completion"]
+    terminal_at = facts["terminal_at"]
+
+    if terminal and not terminal_observed:
+        terminal_observed = True
+        terminal_at = now
+        if matched is not None:
+            terminal_completion = matched.get("completion") or \
+                matched.get("state")
+
+    mutex = TransitionMutex(state)
+    with mutex:
+        # Generation CAS: re-read facts under the lock and confirm generation.
+        locked_facts = _read_facts(payload_fd)
+        if locked_facts is None:
+            fail("review_not_bound",
+                 "the review facts disappeared under the lock")
+        if locked_facts["generation"] != generation:
+            fail("generation_conflict",
+                 "the review facts changed (generation %d -> %d)"
+                 % (generation, locked_facts["generation"]))
+
+        # Re-confirm sticky facts under the lock.
+        if locked_facts["terminal_observed"]:
+            terminal_observed = True
+        if locked_facts["cancel_requested"]:
+            cancel_requested = True
+            cancel_requested_at = locked_facts["cancel_requested_at"]
+
+        new_generation = generation + 1
+
+        # Append observation record.
+        obs_fd, slot = _next_observation_slot(payload_fd, fds)
+        obs_name = "%d.json" % (slot,)
+
+        evidence = {"request_matched": matched is not None,
+                    "ambiguous": ambiguous}
+        if output_correlation is not None:
+            evidence["output_correlation_session"] = output_correlation
+        evidence_digest = sha256_hex(canonical_json_bytes(evidence))
+
+        raw_model = None
+        if isinstance(matched, dict):
+            raw_model = matched.get("model")
+
+        observation = new_record("observation", new_generation, {
+            "review_id": review["review_id"],
+            "raw_state": raw_state if isinstance(raw_state, str) else None,
+            "phase": phase,
+            "terminal": terminal,
+            "observed_at": now,
+            "evidence_digest": evidence_digest,
+            "diagnostic": diagnostic if isinstance(diagnostic, str) else None,
+            "raw_model": raw_model if isinstance(raw_model, str) else None,
+        })
+        publish_flat_record(obs_fd, obs_name, "observation", observation,
+                            "observation %d" % (slot,))
+
+        # Update latest.json pointer.
+        latest = new_record("latest", new_generation, {
+            "review_id": review["review_id"],
+            "phase": phase,
+            "raw_state": raw_state if isinstance(raw_state, str) else None,
+            "observed_at": now,
+            "diagnostic": diagnostic if isinstance(diagnostic, str) else None,
+            "diagnostic_at": now if diagnostic is not None else None,
+            "observation_count": slot + 1,
+        })
+        publish_flat_record(payload_fd, "latest.json", "latest", latest,
+                            "review latest")
+
+        # Update facts with generation CAS and sticky preservation.
+        updated_facts = dict(locked_facts)
+        updated_facts["generation"] = new_generation
+        updated_facts["terminal_observed"] = terminal_observed
+        updated_facts["terminal_completion"] = terminal_completion
+        updated_facts["terminal_at"] = terminal_at
+        updated_facts["cancel_requested"] = cancel_requested
+        updated_facts["cancel_requested_at"] = cancel_requested_at
+        updated_facts["last_activity_at"] = now
+        # Stale-session detection: if the session/request env changed since
+        # bind, flag for rotation (consumed by verify/close).
+        env_session = _bounded_env(_SESSION_ENV)
+        if env_session is not None and env_session != expected_session:
+            updated_facts["session_rotation_required"] = True
+        # Output correlation evidence (consumed by verify/close).
+        if output_correlation is not None:
+            updated_facts["conflict"] = "output_correlation"
+        facts_record = new_record("facts", new_generation, {
+            "review_id": updated_facts["review_id"],
+            "session_id": updated_facts["session_id"],
+            "request_id": updated_facts["request_id"],
+            "bound_at": updated_facts["bound_at"],
+            "cancel_requested": updated_facts["cancel_requested"],
+            "cancel_requested_at": updated_facts["cancel_requested_at"],
+            "terminal_observed": updated_facts["terminal_observed"],
+            "terminal_completion": updated_facts["terminal_completion"],
+            "terminal_at": updated_facts["terminal_at"],
+            "report_sealed": updated_facts["report_sealed"],
+            "report_digest": updated_facts["report_digest"],
+            "report_verdict": updated_facts["report_verdict"],
+            "report_sealed_at": updated_facts["report_sealed_at"],
+            "artifact_verified": updated_facts["artifact_verified"],
+            "verified_at": updated_facts["verified_at"],
+            "closure": updated_facts["closure"],
+            "closure_reason": updated_facts["closure_reason"],
+            "closed_at": updated_facts["closed_at"],
+            "conflict": updated_facts["conflict"],
+            "provider": updated_facts["provider"],
+            "provider_model": updated_facts["provider_model"],
+            "session_rotation_required":
+                updated_facts["session_rotation_required"],
+            "last_activity_at": updated_facts["last_activity_at"],
+        })
+        publish_flat_record(payload_fd, "facts.json", "facts", facts_record,
+                            "review facts")
+
+    git_home.release()
+    fds.close_all()
+    return {
+        "ok": True, "command": "review-refresh",
+        "review_id": review["review_id"],
+        "phase": phase,
+        "raw_state": raw_state if isinstance(raw_state, str) else None,
+        "terminal": terminal,
+        "terminal_observed": terminal_observed,
+        "ambiguous": ambiguous,
+        "correlated": matched is not None,
+        "output_correlation": output_correlation,
+        "generation": new_generation,
+        "observation_count": slot + 1,
+    }
+
+
+def _format_ts(ts):
+    """Format an epoch integer as a human-visible UTC timestamp string."""
+    if ts is None:
+        return None
+    if not isinstance(ts, int) or isinstance(ts, bool):
+        return None
+    import datetime as _dt
+    try:
+        return _dt.datetime.utcfromtimestamp(ts).strftime(
+            "%Y-%m-%dT%H:%M:%SZ")
+    except (ValueError, OSError):
+        return None
+
+
+def cmd_review_status(args):
+    """Lock-free, double-sampled, read-only status projection.
+
+    Reads the review record, pointer, manifest, facts, and latest observation
+    twice (double-sampling) to detect concurrent mutation.  Never writes.
+    Projects human-visible timestamps, active state, last activity, current
+    request, provider/model, session, worktree, and fail-closed blockers.
+    """
+    ctx = open_context(args, need_git_home=False)
+    fds, base, repo, state = (
+        ctx["fds"], ctx["base"], ctx["repo"], ctx["state"])
+
+    review = _load_review(state, args.id)
+    if review["repo_id"] != repo["repo_id"] or review["top"] != repo["top"]:
+        fail("identity_mismatch",
+             "the review does not belong to this repository")
+
+    payload_fd = _open_payload(fds, base, review)
+
+    def _sample():
+        """Read all payload records in one consistent snapshot."""
+        r = _load_review(state, args.id)
+        p = read_flat_record(payload_fd, "pointer.json", "pointer",
+                             "review pointer", allow_missing=False)
+        m = read_flat_record(payload_fd, "manifest.json", "manifest",
+                             "review manifest", allow_missing=False)
+        f = _read_facts(payload_fd)
+        l = read_flat_record(payload_fd, "latest.json", "latest",
+                             "review latest", allow_missing=True)
+        return {"review": r, "pointer": p, "manifest": m,
+                "facts": f, "latest": l}
+
+    sample1 = _sample()
+    sample2 = _sample()
+
+    # Double-sample consistency: if the review generation changed between
+    # samples, report it as a concurrent-mutation diagnostic (not an error).
+    gen1 = sample1["review"]["generation"]
+    gen2 = sample2["review"]["generation"]
+    concurrent = gen1 != gen2
+
+    r = sample2["review"]
+    p = sample2["pointer"]
+    m = sample2["manifest"]
+    f = sample2["facts"]
+    l = sample2["latest"]
+
+    now = int(time.time())
+
+    # Determine the display phase.
+    if l is not None:
+        phase = l.get("phase") or r["state"]
+    else:
+        phase = r["state"]
+
+    # Build blockers list (fail-closed conditions for verify/close).
+    blockers = []
+    if f is None:
+        blockers.append("not_bound")
+    else:
+        if f.get("conflict") is not None:
+            blockers.append(f["conflict"])
+        if f.get("session_rotation_required"):
+            blockers.append("session_rotation_required")
+        if not f.get("terminal_observed") and \
+                r["state"] not in ("closed", "abandoned"):
+            blockers.append("not_terminal")
+        # Stale-session blocker: if last_activity_at is older than the threshold
+        # and the review is not terminal/closed.
+        last_act = f.get("last_activity_at")
+        if isinstance(last_act, int) and not isinstance(last_act, bool):
+            if now - last_act > _STALE_SESSION_SECONDS and \
+                    not f.get("terminal_observed") and \
+                    r["state"] not in ("closed", "abandoned"):
+                blockers.append("stale_session")
+    if r["state"] in ("closed", "abandoned"):
+        blockers = []  # closed reviews have no active blockers
+
+    result = {
+        "ok": True, "command": "review-status",
+        "review_id": r["review_id"],
+        "state": r["state"],
+        "phase": phase,
+        "commit": r["commit"],
+        "tree": r["tree"],
+        "author_actor": r["author_actor"],
+        "reviewer_actor": r["reviewer_actor"],
+        "created_at": _format_ts(r["created_at"]),
+        "created_at_epoch": r["created_at"],
+        "updated_at": _format_ts(r["updated_at"]),
+        "updated_at_epoch": r["updated_at"],
+        "payload_path": p["payload_path"],
+        "ceiling": m.get("ceiling"),
+        "entry_count": m.get("entry_count"),
+        "blockers": blockers,
+        "concurrent_mutation": concurrent,
+    }
+
+    if f is not None:
+        result["session_id"] = f.get("session_id")
+        result["request_id"] = f.get("request_id")
+        result["provider"] = f.get("provider") or r.get("provider")
+        result["provider_model"] = f.get("provider_model")
+        result["bound_at"] = _format_ts(f.get("bound_at"))
+        result["bound_at_epoch"] = f.get("bound_at")
+        result["last_activity_at"] = _format_ts(f.get("last_activity_at"))
+        result["last_activity_at_epoch"] = f.get("last_activity_at")
+        result["terminal_observed"] = f.get("terminal_observed", False)
+        result["cancel_requested"] = f.get("cancel_requested", False)
+        result["report_sealed"] = f.get("report_sealed", False)
+        result["artifact_verified"] = f.get("artifact_verified", False)
+        result["closure"] = f.get("closure")
+        result["closure_reason"] = f.get("closure_reason")
+        if f.get("terminal_at") is not None:
+            result["terminal_at"] = _format_ts(f.get("terminal_at"))
+            result["terminal_at_epoch"] = f.get("terminal_at")
+        if f.get("closed_at") is not None:
+            result["closed_at"] = _format_ts(f.get("closed_at"))
+            result["closed_at_epoch"] = f.get("closed_at")
+
+    if l is not None:
+        result["latest_phase"] = l.get("phase")
+        result["latest_raw_state"] = l.get("raw_state")
+        result["latest_observed_at"] = _format_ts(l.get("observed_at"))
+        result["latest_observed_at_epoch"] = l.get("observed_at")
+        result["observation_count"] = l.get("observation_count", 0)
+        if l.get("diagnostic") is not None:
+            result["latest_diagnostic"] = l.get("diagnostic")
+
+    # Worktree identity (descriptive, from the review record's repo).
+    result["repo_id"] = r["repo_id"]
+    result["top"] = r["top"]
+
+    fds.close_all()
+    return result
+
+
+# ---------------------------------------------------------------------------
 # Section 14. CLI front matter (invoked only by tool/bin/coordination.sh)
 # ---------------------------------------------------------------------------
 
@@ -3621,7 +4281,7 @@ def build_parser():
     bind = with_review_id(common(sub.add_parser("review-bind")))
     bind.add_argument("--session", required=True)
     bind.add_argument("--request", required=True)
-    bind.set_defaults(func=cmd_not_implemented)
+    bind.set_defaults(func=cmd_review_bind)
 
     register = with_review_id(common(sub.add_parser("review-register-process")))
     register.add_argument("--role", required=True)
@@ -3632,8 +4292,14 @@ def build_parser():
     cancel = with_review_id(common(sub.add_parser("review-cancel-requested")))
     cancel.set_defaults(func=cmd_not_implemented)
 
-    for verb in ("review-refresh", "review-status", "review-submit-report",
-                 "review-verify"):
+    refresh = with_review_id(common(sub.add_parser("review-refresh")))
+    refresh.add_argument("--provider-rows-fd", required=True, type=_fd_number)
+    refresh.set_defaults(func=cmd_review_refresh)
+
+    status = with_review_id(common(sub.add_parser("review-status")))
+    status.set_defaults(func=cmd_review_status)
+
+    for verb in ("review-submit-report", "review-verify"):
         command = with_review_id(common(sub.add_parser(verb)))
         command.set_defaults(func=cmd_not_implemented)
 
