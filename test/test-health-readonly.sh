@@ -374,14 +374,15 @@ sys.dont_write_bytecode = True
 module = runpy.run_path(sys.argv[1])
 names = [f"seat{i}" for i in range(128)]
 start = time.monotonic()
-raw = "## @sender\n\n@all ping\n" * 280_000  # ~7.3 MiB hostile broadcast pad
+raw = "## @sender\n\n@all ping\n" * 350_000  # 7,700,000 bytes / 7.343 MiB
+assert len(raw.encode("utf-8")) == 7_700_000  # Keep the hostile fixture honest.
 index = module["engagement_index"](raw, names)
 opened = module["precompute_open"](index, names, {name: 0 for name in names})
 elapsed = time.monotonic() - start
-assert len(index["broadcasts"]) == 280_000
+assert len(index["broadcasts"]) == 350_000
 assert sum(len(seat["mentions"]) for seat in index["seats"].values()) == 0
 assert all(value == 1 for value in opened["true"].values())
-assert elapsed < 4.0, elapsed
+assert elapsed < 4.0, elapsed  # Independent gate measured 2.743s.
 PY
 
 # Keep health's delivery vocabulary aligned with every state emitted by the
