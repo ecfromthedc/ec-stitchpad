@@ -12,6 +12,7 @@
 #   stitchpad invite [--name <handle>] [--ttl 1h|30m|7d|never]   make a remote-join invite
 #   stitchpad invite --revoke <token>     revoke an invite token
 #   stitchpad start|stop|status|restart   manage the daemon (background)
+#   stitchpad health [--json] [--deep]    non-mutating local health snapshot
 #   stitchpad roster                      print parsed roster
 #   stitchpad rename <old> <new>          rename a member everywhere local state knows them
 #   stitchpad reset [name]                repair a wedged seat (or whole pad): zombie tickers, stale locks, wake cursors
@@ -61,7 +62,7 @@ sp_autostart_name() {
 sp_maybe_start_heartbeat() {
   [ "${STITCHPAD_HEARTBEAT_AUTOSTART:-1}" = "0" ] && return 0
   case "$cmd" in
-    init|instructions|prompt-context|heartbeat|hook|bind-session|whoami|leave|stop|daemon|watch|migration-check|reset|compact|restore-roster|help|-h|--help) return 0 ;;
+    init|instructions|prompt-context|doctor|health|status|roster|who|read|heartbeat|hook|bind-session|whoami|leave|stop|daemon|watch|migration-check|reset|compact|restore-roster|help|-h|--help) return 0 ;;
   esac
   sp_init_paths >/dev/null 2>&1 || return 0
   local who
@@ -1227,10 +1228,12 @@ PY
     ;;
 
   read)
-    sp_init_paths || exit 1
+    sp_init_paths_readonly || exit 1
     # --new: DELTA read — the pad is GIT-VERSIONED (every write is a commit),
-    # so "unread" is precisely the diff since the commit this agent last read
-    # (.state/readref.<name>). Git handles mid-file rewrites (roster edits)
+    # so "unread" is the diff since the commit this agent last acknowledged
+    # (.state/readref.<name>). Unlike plain `read` and the diagnostic commands,
+    # `read --new` intentionally advances only that per-agent acknowledgement.
+    # Git handles mid-file rewrites
     # that break line-number cursors, and an append-only pad diffs to pure
     # additions. Capped at 400 lines; falls back to the tail window when
     # unidentified or the pad has no git.
@@ -1238,12 +1241,17 @@ PY
       _me="$(sp_me)"
       _head="$(sgit rev-parse HEAD 2>/dev/null || true)"
       if [ -n "$_me" ] && [ -n "$_head" ]; then
+        case "$_me" in *[!a-zA-Z0-9_-]*) echo "stitchpad: invalid identity for read cursor" >&2; exit 1 ;; esac
+        [ ! -L "$PAD_STATE" ] || { echo "stitchpad: refusing symlinked read cursor directory" >&2; exit 1; }
+        [ ! -L "$PAD_STATE/readref.$_me" ] \
+          || { echo "stitchpad: refusing symlinked read cursor" >&2; exit 1; }
         _ref="$(cat "$PAD_STATE/readref.$_me" 2>/dev/null || true)"
         sgit cat-file -e "${_ref}^{commit}" 2>/dev/null || _ref=""
         if [ "$_ref" = "$_head" ]; then echo "(nothing new since your last read)"; exit 0; fi
         if [ -n "$_ref" ]; then
           # added lines only, diff metadata stripped — reads as normal pad text
-          _out="$(sgit diff "$_ref..$_head" -- stitchpad.md 2>/dev/null | sed -n 's/^+\([^+].*\|$\)/\1/p')"
+          _out="$(sgit diff "$_ref..$_head" -- stitchpad.md 2>/dev/null \
+            | sed -n -e '/^+++/d' -e 's/^+//p')"
         else
           _out="$(tail -n 80 "$PAD_MD")"   # first read: bounded window, not history
         fi
@@ -1253,7 +1261,16 @@ PY
           _out="$(printf '%s\n' "$_out" | tail -n 400)"
         fi
         printf '%s\n' "$_out"
-        printf '%s' "$_head" > "$PAD_STATE/readref.$_me"
+        mkdir -p "$PAD_STATE" || { echo "stitchpad: cannot create read cursor directory" >&2; exit 1; }
+        _rr_tmp="$(mktemp "$PAD_STATE/.readref.$_me.XXXXXX")" \
+          || { echo "stitchpad: cannot stage read cursor" >&2; exit 1; }
+        if printf '%s' "$_head" > "$_rr_tmp" && mv -f "$_rr_tmp" "$PAD_STATE/readref.$_me"; then
+          :
+        else
+          rm -f "$_rr_tmp" 2>/dev/null
+          echo "stitchpad: cannot advance read cursor" >&2
+          exit 1
+        fi
         exit 0
       fi
       tail -n 80 "$PAD_MD"; exit 0
@@ -1656,7 +1673,7 @@ except: print("")' 2>/dev/null)"
 
   start)  sp_init_paths || exit 1; ensure_watcher; echo "→ watcher ensured"; ;;
   stop)   sp_init_paths || exit 1; if [ -f "$PAD_STATE/watch.lock.d/pid" ]; then kill "$(cat "$PAD_STATE/watch.lock.d/pid")" 2>/dev/null || true; fi; rm -rf "$PAD_STATE/watch.lock.d" 2>/dev/null; echo "→ watcher stopped"; ;;
-  status) sp_init_paths || exit 1; sp_watcher_alive && echo "running (pid $(cat "$PAD_STATE/watch.lock.d/pid" 2>/dev/null))" || echo "stopped"; ;;
+  status) sp_init_paths_readonly || exit 1; sp_watcher_alive_readonly && echo "running (pid $(cat "$PAD_STATE/watch.lock.d/pid" 2>/dev/null))" || echo "stopped"; ;;
   restart) sp_init_paths || exit 1; if [ -f "$PAD_STATE/watch.lock.d/pid" ]; then kill "$(cat "$PAD_STATE/watch.lock.d/pid")" 2>/dev/null || true; fi; rm -rf "$PAD_STATE/watch.lock.d" 2>/dev/null; ensure_watcher; echo "→ watcher restarted"; ;;
   watch)   exec "$STITCHPAD_HOME/bin/watch.sh" ;;
   daemon)  exec "$STITCHPAD_HOME/bin/daemon.sh" "${@}" ;;
@@ -1895,11 +1912,21 @@ except: print("")' 2>/dev/null)"
     exec "$0" say --image "$file" ${caption:+"$caption"}
     ;;
 
-  roster|who)  sp_init_paths || exit 1; sp_roster ;;
+  roster|who)  sp_init_paths_readonly || exit 1; sp_roster ;;
   log)
     sp_init_paths || exit 1
     n=10; [ "${1:-}" = "-n" ] && n="$2"
     sgit log --oneline -n "$n"
+    ;;
+
+  health)
+    # Structured, non-mutating local snapshot. `--deep` is the only mode that
+    # performs I/O beyond local files/process probes, and it is loopback GET-only.
+    sp_init_paths_readonly || exit 1
+    command -v python3 >/dev/null 2>&1 || { echo "stitchpad: health requires python3" >&2; exit 1; }
+    exec python3 "$BIN_DIR/health.py" \
+      --pad-dir "$PAD_DIR" --pad-md "$PAD_MD" --state-dir "$PAD_STATE" \
+      --adapter-dir "$ADAPTER_DIR" "$@"
     ;;
 
   doctor)
@@ -1908,10 +1935,26 @@ except: print("")' 2>/dev/null)"
     # session identity, duplicate names, orphaned session files.
     #   stitchpad doctor
     #   stitchpad doctor --json   machine-readable roster array for TUI/widgets
-    sp_init_paths || exit 1
+    sp_init_paths_readonly || exit 1
     _json=0; [ "${1:-}" = "--json" ] && _json=1
     warn=0; err=0
     declare -a _json_entries=()
+    _doc_read_state() {
+      [ ! -L "$PAD_STATE" ] && [ ! -L "$1" ] && [ -f "$1" ] || return 0
+      head -c 4096 "$1" 2>/dev/null || true
+    }
+    _doc_json_entry() {
+      python3 - "$@" <<'PY'
+import json, sys
+keys = ("name", "adapter", "wake", "target", "harness", "model",
+        "status", "health", "role", "level")
+values = sys.argv[1:]
+entry = dict(zip(keys, values[:10]))
+if len(values) > 10:
+    entry["delivered_no_reply"] = values[10] == "true"
+print(json.dumps(entry, ensure_ascii=False, separators=(",", ":")))
+PY
+    }
     [ "$_json" -eq 0 ] && printf 'stitchpad doctor — roster health check\n\n'
 
     # Collect roster entries
@@ -1929,17 +1972,24 @@ except: print("")' 2>/dev/null)"
       _name="${_doc_names[_di]}"; _adapter="${_doc_adapters[_di]}"
       _wake="${_doc_wakes[_di]}"; _target="${_doc_targets[_di]}"
       issues=()
+      _doc_name_safe=1
+      case "$_name" in ''|*[!a-zA-Z0-9_-]*) _doc_name_safe=0 ;; esac
 
       # Operator/human members are NOT agents — they read & post, they don't get
       # woken. So they're exempt from wake-health checks (no target is expected,
       # not a fault). Mark healthy and skip the agent diagnostics.
-      _rt="$(cat "$PAD_STATE/runtime.$_name" 2>/dev/null || true)"
+      _rt=""
+      [ "$_doc_name_safe" -eq 1 ] && _rt="$(_doc_read_state "$PAD_STATE/runtime.$_name")"
+      _rt="${_rt:-$_adapter}"
       if [ "$_rt" = "operator" ] || [ "$_rt" = "human" ]; then
         if [ "$_json" -eq 1 ]; then
-          _role="$(cat "$PAD_STATE/role.$_name" 2>/dev/null || true)"
-          _level="$(cat "$PAD_STATE/level.$_name" 2>/dev/null || true)"
-          _entry="$(printf '{"name":"%s","adapter":"%s","wake":"%s","target":"%s","harness":"%s","model":"%s","status":"%s","health":"%s","role":"%s","level":"%s"}' \
-            "$_name" "$_adapter" "$_wake" "$_target" "$_rt" "human" "operator" "ok" "$_role" "$_level")"
+          _role=""; _level=""
+          if [ "$_doc_name_safe" -eq 1 ]; then
+            _role="$(_doc_read_state "$PAD_STATE/role.$_name")"
+            _level="$(_doc_read_state "$PAD_STATE/level.$_name")"
+          fi
+          _entry="$(_doc_json_entry "$_name" "$_adapter" "$_wake" "$_target" \
+            "$_rt" "human" "operator" "ok" "$_role" "$_level")"
           _json_entries+=("$_entry")
         else
           printf '  ✓ @%s (%s) — operator\n' "$_name" "$_rt"
@@ -1956,20 +2006,23 @@ except: print("")' 2>/dev/null)"
 
       # Check 2: adapter is installed. Avoid a hard-coded allowlist so a real
       # adapter such as herdr becomes diagnosable as soon as its script lands.
-      if [ ! -f "$ADAPTER_DIR/$_adapter.sh" ]; then
+      case "$_adapter" in ''|*[!a-zA-Z0-9_-]*) _adapter_ok=0 ;; *) _adapter_ok=1 ;; esac
+      if [ "$_adapter_ok" -eq 0 ] || [ ! -f "$ADAPTER_DIR/$_adapter.sh" ]; then
         issues+=("missing adapter script '$_adapter.sh'")
         (( err++ ))
       fi
 
       # Check 3: missing session identity (read-only)
       _found_session=0
-      for _sf in "$PAD_STATE/sessions/"*; do
-        [ -f "$_sf" ] || continue
-        if [ "$(cat "$_sf" 2>/dev/null)" = "$_name" ]; then
-          _found_session=1; break
-        fi
-      done
-      if [ "$(cat "$PAD_STATE/whoami" 2>/dev/null)" = "$_name" ]; then
+      if [ "$_doc_name_safe" -eq 1 ] && [ ! -L "$PAD_STATE" ] && [ ! -L "$PAD_STATE/sessions" ]; then
+        for _sf in "$PAD_STATE/sessions/"*; do
+          [ -f "$_sf" ] && [ ! -L "$_sf" ] || continue
+          if [ "$(_doc_read_state "$_sf")" = "$_name" ]; then
+            _found_session=1; break
+          fi
+        done
+      fi
+      if [ "$_doc_name_safe" -eq 1 ] && [ "$(_doc_read_state "$PAD_STATE/whoami")" = "$_name" ]; then
         _found_session=1
       fi
       if [ "$_wake" = "pull" ] && [ "$_found_session" -eq 0 ]; then
@@ -1994,7 +2047,8 @@ except: print("")' 2>/dev/null)"
       # Compute online from heartbeat freshness + pid liveness
       _online="offline"
       _alive="$PAD_STATE/alive.$_name"
-      if [ -f "$_alive" ]; then
+      if [ "$_doc_name_safe" -eq 1 ] && [ ! -L "$PAD_STATE" ] \
+        && [ -f "$_alive" ] && [ ! -L "$_alive" ]; then
         _alive_ts="$(stat -f %m "$_alive" 2>/dev/null || stat -c %Y "$_alive" 2>/dev/null || echo 0)"
         _alive_age=$(( $(date +%s) - _alive_ts ))
         if [ "$_alive_age" -lt 90 ]; then
@@ -2014,17 +2068,22 @@ except: print("")' 2>/dev/null)"
         done
       fi
       _harness_display="${_harness:-$_adapter}"
-      _model="$(cat "$PAD_STATE/model.$_name" 2>/dev/null || true)"
-      _role="$(cat "$PAD_STATE/role.$_name" 2>/dev/null || true)"
-      _level="$(cat "$PAD_STATE/level.$_name" 2>/dev/null || true)"
+      _model=""; _role=""; _level=""
+      if [ "$_doc_name_safe" -eq 1 ]; then
+        _model="$(_doc_read_state "$PAD_STATE/model.$_name")"
+        _role="$(_doc_read_state "$PAD_STATE/role.$_name")"
+        _level="$(_doc_read_state "$PAD_STATE/level.$_name")"
+      fi
 
       if [ "$_json" -eq 1 ]; then
         # delivered_no_reply: a mention was re-delivered to this agent and STILL got
         # no authored reply (dropped twice). Surfaced so persistent silence is
         # visible, not lost. "true"/"false" — TUI can flag the row.
-        _dnr="false"; [ -f "$PAD_STATE/delivered_no_reply.$_name" ] && _dnr="true"
-        _entry="$(printf '{"name":"%s","adapter":"%s","wake":"%s","target":"%s","harness":"%s","model":"%s","status":"%s","health":"%s","role":"%s","level":"%s","delivered_no_reply":%s}' \
-          "$_name" "$_adapter" "$_wake" "$_target" "$_harness_display" "${_model:-}" "$_online" "$_health" "$_role" "$_level" "$_dnr")"
+        _dnr="false"
+        [ "$_doc_name_safe" -eq 1 ] && [ ! -L "$PAD_STATE" ] && [ -f "$PAD_STATE/delivered_no_reply.$_name" ] \
+          && [ ! -L "$PAD_STATE/delivered_no_reply.$_name" ] && _dnr="true"
+        _entry="$(_doc_json_entry "$_name" "$_adapter" "$_wake" "$_target" \
+          "$_harness_display" "${_model:-}" "$_online" "$_health" "$_role" "$_level" "$_dnr")"
         _json_entries+=("$_entry")
       else
         if [ ${#issues[@]} -eq 0 ]; then
@@ -2048,15 +2107,20 @@ except: print("")' 2>/dev/null)"
 
     # JSON output (machine-readable roster) — emit before human-only sections
     if [ "$_json" -eq 1 ]; then
-      for _e in "${_json_entries[@]}"; do printf '%s\n' "$_e"; done | python3 -c 'import sys,json; print(json.dumps([json.loads(x) for x in sys.stdin.read().split("\n") if x.strip()]))'
+      if [ "${#_json_entries[@]}" -eq 0 ]; then
+        printf '[]\n'
+      else
+        for _e in "${_json_entries[@]}"; do printf '%s\n' "$_e"; done | python3 -c 'import sys,json; print(json.dumps([json.loads(x) for x in sys.stdin.read().split("\n") if x.strip()]))'
+      fi
       exit 0
     fi
 
     # Check 5: orphaned session files
     printf '\nSession files:\n'
     for _sf in "$PAD_STATE/sessions/"*; do
-      [ -f "$_sf" ] || continue
-      _sname=$(cat "$_sf" 2>/dev/null)
+      [ ! -L "$PAD_STATE" ] && [ ! -L "$PAD_STATE/sessions" ] \
+        && [ -f "$_sf" ] && [ ! -L "$_sf" ] || continue
+      _sname="$(_doc_read_state "$_sf")"
       _skey=$(basename "$_sf")
       _in_roster=0
       for _dn in "${_doc_names[@]}"; do
@@ -2073,8 +2137,9 @@ except: print("")' 2>/dev/null)"
     # Bridge liveness check
     printf '\nBridge:\n'
     _bridge_file="$PAD_STATE/bridge-heartbeat"
-    if [ -f "$_bridge_file" ]; then
-      _bridge_ts="$(jq -r '.ts // empty' "$_bridge_file" 2>/dev/null)"
+    _bridge_raw="$(_doc_read_state "$_bridge_file")"
+    if [ -n "$_bridge_raw" ]; then
+      _bridge_ts="$(printf '%s' "$_bridge_raw" | jq -r '.ts // empty' 2>/dev/null)"
       # TASK-70: fall back to the SLOWEST known writer cadence, not the
       # fastest. The polling bridge writes interval=3; the ws bridge writes
       # 15. A writer that omits the field (as ws did) previously defaulted to
@@ -2082,7 +2147,8 @@ except: print("")' 2>/dev/null)"
       # bridge. Defaulting high can only delay a real staleness report by a
       # few cycles; defaulting low cries wolf forever, and a health check
       # nobody trusts is worse than none.
-      _bridge_interval="$(jq -r '.interval // 15' "$_bridge_file" 2>/dev/null)"
+      _bridge_interval="$(printf '%s' "$_bridge_raw" | jq -r '.interval // 15' 2>/dev/null)"
+      case "$_bridge_interval" in ''|*[!0-9]*) _bridge_interval=15 ;; esac
       if [ -n "$_bridge_ts" ]; then
         _bridge_ts_s="$(printf '%s' "$_bridge_ts" | sed 's/\.[0-9]*Z$/Z/')"
         _bridge_epoch="$(date -juf '%Y-%m-%dT%H:%M:%SZ' "$_bridge_ts_s" +%s 2>/dev/null || date -u -d "$_bridge_ts_s" +%s 2>/dev/null || echo 0)"

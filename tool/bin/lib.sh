@@ -120,7 +120,7 @@ sp_ensure_outer_git_ignore() {
   grep -Fqx "$pattern" "$exclude" 2>/dev/null || printf '\n# stitchpad runtime (isolated history)\n%s\n' "$pattern" >> "$exclude"
 }
 
-sp_init_paths() {
+sp_init_paths_readonly() {
   # Resolution order for which pad we operate on:
   #   1. explicit arg ($1)            — caller passed a dir
   #   2. STITCHPAD_PAD_DIR env        — pin a pad regardless of cwd (daemons/hooks)
@@ -137,6 +137,10 @@ sp_init_paths() {
   # still read — see sp_tasks() — so existing pads keep working untouched.
   PAD_TASKS="$PAD_DIR/tasks.md"
   PAD_ARCHIVE_DIR="$PAD_DIR/archive"
+}
+
+sp_init_paths() {
+  sp_init_paths_readonly "${1:-}" || return 1
   mkdir -p "$PAD_STATE/sessions"
   # Replay an in-place rewrite that was interrupted between truncate and write.
   sp_recover_inplace "$PAD_MD"
@@ -836,6 +840,20 @@ sp_reap_dead() {
 }
 
 # Is the watcher running? (lock dir exists AND PID alive)
+# Diagnostic callers use this non-mutating probe. The operational sibling below
+# deliberately reclaims stale locks, so it must never back `status`/`health`.
+sp_watcher_alive_readonly() {
+  local watch_lock="$PAD_STATE/watch.lock.d" p
+  [ ! -L "$PAD_STATE" ] || return 1
+  [ ! -L "$watch_lock" ] || return 1
+  [ -d "$watch_lock" ] || return 1
+  [ ! -L "$watch_lock/pid" ] || return 1
+  p="$(cat "$watch_lock/pid" 2>/dev/null || true)"
+  case "$p" in ''|*[!0-9]*) return 1 ;; esac
+  [ "$p" -gt 0 ] 2>/dev/null || return 1
+  kill -0 "$p" 2>/dev/null
+}
+
 sp_watcher_alive() {
   local watch_lock="$PAD_STATE/watch.lock.d"
   [ -d "$watch_lock" ] || return 1

@@ -10,7 +10,25 @@ set -uo pipefail
 HERE="$(cd -P "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 SP="$HERE/../tool/bin/stitchpad"
 WORK="$(mktemp -d "${TMPDIR:-/tmp}/sp-padio.XXXXXX")"
-trap 'rm -rf "$WORK"' EXIT
+cleanup() {
+  # `join` deliberately starts a heartbeat even when command autostart is
+  # disabled.  Stop only processes whose lock files belong to this fixture so
+  # repeated tests cannot leave lane-rooted tickers or watchers behind.
+  for pidfile in "$WORK/.stitchpad/.state"/heartbeat.*.lock/pid \
+                 "$WORK/.stitchpad/.state/watch.lock.d/pid"; do
+    [ -f "$pidfile" ] || continue
+    pid="$(cat "$pidfile" 2>/dev/null || true)"
+    case "$pid" in ''|*[!0-9]*) continue ;; esac
+    kill "$pid" 2>/dev/null || true
+    for _cleanup_wait in 1 2 3 4 5 6 7 8 9 10; do
+      kill -0 "$pid" 2>/dev/null || break
+      sleep 0.05
+    done
+    kill -0 "$pid" 2>/dev/null && kill -KILL "$pid" 2>/dev/null || true
+  done
+  rm -rf "$WORK"
+}
+trap cleanup EXIT
 
 pass=0; fail=0
 ok()   { printf '  \033[32mPASS\033[0m %s\n' "$1"; pass=$(( pass + 1 )); }
@@ -192,8 +210,12 @@ sp roster >/dev/null 2>&1
 check "fresh .ready is left for its writer (no replay)" "$(cat "$PAD")" ""
 [ -f "$PAD.ready" ] && ok "fresh .ready is kept, not consumed" || bad "fresh .ready is kept, not consumed"
 touch -t 202001010000 "$PAD.ready"                  # now provably abandoned
-sp roster >/dev/null 2>&1                           # any command triggers recovery
-check "interrupted write is replayed on next command" "$(cat "$PAD")" "RECOVERED PAD CONTENT"
+sp roster >/dev/null 2>&1                           # passive reads never recover
+check "abandoned .ready is preserved by passive roster" "$(cat "$PAD")" ""
+[ -f "$PAD.ready" ] && ok "passive roster leaves abandoned .ready untouched" \
+  || bad "passive roster leaves abandoned .ready untouched"
+sp say "explicit mutating recovery trigger" >/dev/null 2>&1 || true
+check "interrupted write is replayed on a mutating command" "$(cat "$PAD")" "RECOVERED PAD CONTENT"
 [ -f "$PAD.ready" ] && bad "recovery cleared its .ready file" || ok "recovery cleared its .ready file"
 cp "$WORK/expected.md" "$PAD"
 
