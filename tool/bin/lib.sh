@@ -601,6 +601,103 @@ sp_latest_to() {
   ' "$PAD_MD"
 }
 
+# Print one authored message block by its authored-block ordinal.  Delivery
+# state uses this ordinal rather than a byte offset so an append-only pad can be
+# re-read after a watcher/worker restart without persisting untrusted body text
+# in .state.  Anonymous headings do not consume an ordinal, matching
+# sp_engagement.
+sp_message_ordinal() {
+  local want="$1"
+  awk -v want="$want" '
+    /^## / {
+      if (emit) exit
+      if ($2 ~ /^@/) {
+        n++
+        if (n == want) emit=1
+      }
+    }
+    emit { print }
+  ' "$PAD_MD"
+}
+
+# Return the newest currently-unanswered directive for <who> after <since> as:
+#   ordinal|sender|stable-message-id|first-TASK-N-or--
+#
+# Push delivery intentionally coalesces to current work instead of replaying an
+# unbounded FIFO after a worker was offline.  Per-sender reply tracking keeps a
+# reply to Alice from hiding Bob's newer unresolved directive.  Silent acks,
+# fenced/code mentions, self-mentions and handle-boundary rules mirror the
+# engagement gate.  The stable id binds the ordinal to the exact message bytes,
+# so compaction/rewrite drift is rejected before adapter submission.
+sp_current_to_meta() {
+  local who="$1" since="${2:-0}" agents raw ordinal sender block checksum task
+  agents="$(sp_roster 2>/dev/null | cut -d'|' -f1 | tr 'A-Z' 'a-z' | paste -sd, -)"
+  raw="$(awk -v who="$(printf '%s' "$who" | tr 'A-Z' 'a-z')" -v agents="$agents" -v since="$since" '
+    function body_mentions(name,   re) {
+      re="(^|[ \t])@(" name "|all)([^a-z0-9_-]|$)"
+      return (buf ~ re)
+    }
+    function record_replies(   count,tokens,i,t,name) {
+      count=split(buf, tokens, /[ \t\n]+/)
+      for (i=1; i<=count; i++) {
+        t=tolower(tokens[i])
+        if (t ~ /^@[a-z0-9_-]+/) {
+          name=substr(t, 2)
+          sub(/[^a-z0-9_-].*$/, "", name)
+          if (name != "" && name != "all" && name != who) reply[name]=n
+        }
+      }
+    }
+    function flush() {
+      if (author == "") return
+      n++
+      if (author == who) {
+        if (silent || buf ~ /(^|[ \t])@[a-z0-9_-]/) record_replies()
+      } else if (!silent && n > since && body_mentions(who)) {
+        mention[author]=n
+      }
+    }
+    /^## @/ {
+      flush()
+      a=$2; sub(/^@/, "", a); author=tolower(a)
+      buf=""; silent=0; seen_body=0; infence=0
+      next
+    }
+    /^[[:space:]]*```/ { infence=!infence; next }
+    infence { next }
+    !seen_body && /[^[:space:]]/ {
+      seen_body=1
+      b=tolower($0); sub(/^[ \t]*/, "", b)
+      n_at=0; tmp=b
+      while (match(tmp, /@[a-z0-9_-]+/)) { n_at++; tmp=substr(tmp, RSTART+RLENGTH) }
+      sub(/^(@[a-z0-9_-]+[ \t]*)+/, "", b); sub(/[ \t]+$/, "", b)
+      if (n_at < 2) {
+        if (b ~ /^(\.|\[ack\])/) silent=1
+        if (index("," agents ",", "," author ",") > 0 && b ~ /^(ack|read|noted|got it|standing down|standing by|stand by|will do|understood|done here|copy|sounds good)[. !]*$/) silent=1
+      }
+    }
+    { line=tolower($0); gsub(/`[^`]*`/, " ", line); buf=buf " " line }
+    END {
+      flush()
+      best=0; best_sender=""
+      for (s in mention) {
+        if (mention[s] > reply[s] && mention[s] > best) {
+          best=mention[s]; best_sender=s
+        }
+      }
+      if (best > 0) print best "|" best_sender
+    }
+  ' "$PAD_MD")"
+  [ -n "$raw" ] || return 1
+  IFS='|' read -r ordinal sender <<< "$raw"
+  block="$(sp_message_ordinal "$ordinal")"
+  [ -n "$block" ] || return 1
+  checksum="$(printf '%s' "$block" | cksum | awk '{print $1}')"
+  task="$(printf '%s\n' "$block" | grep -oE 'TASK-[0-9]+' | head -1 || true)"
+  [ -n "$task" ] || task="-"
+  printf '%s|%s|m%s-%s|%s\n' "$ordinal" "$sender" "$ordinal" "$checksum" "$task"
+}
+
 # Engagement gate derived from pad CONTENT, not git commit subjects. The watch.sh
 # daemon auto-commits the pad as "update (HH:MM:SS)", which clobbers the authored
 # "<name>: <text>" subject the old gate relied on — so git subjects are unreliable.
@@ -896,20 +993,91 @@ sp_watch_fswatch_parents_for_pad() {
 sp_stop_watchers_for_pad() {
   [ -n "${PAD_STATE:-}" ] || return 0
   local watch_lock="$PAD_STATE/watch.lock.d"
-  local p pids=()
+  local p pids_text
   p="$(cat "$watch_lock/pid" 2>/dev/null || true)"
-  [ -n "$p" ] && pids+=( "$p" )
-  while IFS= read -r p; do
-    [ -n "$p" ] && pids+=( "$p" )
-  done < <(sp_watch_processes_for_pad)
+  pids_text="$({ [ -n "$p" ] && printf '%s\n' "$p"; sp_watch_processes_for_pad; } | sort -nu)"
 
   rm -rf "$watch_lock" 2>/dev/null || true
-  for p in "${pids[@]}"; do
+  while IFS= read -r p; do
+    [ -n "$p" ] || continue
     kill "$p" 2>/dev/null || true
-  done
+  done <<< "$pids_text"
   sleep 0.2
-  for p in "${pids[@]}"; do
+  while IFS= read -r p; do
+    [ -n "$p" ] || continue
     kill -0 "$p" 2>/dev/null && kill -KILL "$p" 2>/dev/null || true
+  done <<< "$pids_text"
+}
+
+sp_stop_delivery_worker() {
+  local name="$1" lock="$PAD_STATE/delivery.$1.worker.lock.d" pid token owner command
+  local owner_start owner_token owner_pad owner_name live_start born age tries=0
+  [ -d "$lock" ] || return 0
+  token="$(cat "$lock/token" 2>/dev/null || true)"
+  # Mark intent first. A launcher that has created the lock but not yet spawned
+  # must observe this and abort; an already-starting worker checks it before and
+  # during atomic owner publication.
+  : > "$lock/stop-requested" 2>/dev/null || true
+  while :; do
+    [ -d "$lock" ] || return 0
+    owner="$(cat "$lock/owner" 2>/dev/null || true)"
+    IFS='|' read -r pid owner_start owner_token owner_pad owner_name <<< "$owner"
+    if [ -z "$owner_name" ] && [ "$owner_token" = "$PAD_DIR" ] && [ "$owner_pad" = "$name" ]; then
+      # Rolling-upgrade compatibility with pid|token|pad|name owners.
+      owner_name="$name"; owner_pad="$PAD_DIR"; owner_token="$owner_start"
+      owner_start="$(ps -p "$pid" -o lstart= 2>/dev/null | sed 's/^[[:space:]]*//;s/[[:space:]]*$//' || true)"
+    fi
+    if [ -n "$pid" ] && [ -n "$owner_start" ] && [ "$owner_token" = "$token" ] \
+       && [ "$owner_pad" = "$PAD_DIR" ] && [ "$owner_name" = "$name" ]; then
+      break
+    fi
+    born="$(cat "$lock/born" 2>/dev/null || stat -f %m "$lock" 2>/dev/null || stat -c %Y "$lock" 2>/dev/null || echo 0)"
+    age=$(( $(date +%s) - ${born:-0} ))
+    tries=$((tries + 1))
+    [ "$tries" -lt 200 ] && [ "$age" -lt 5 ] || { pid=""; break; }
+    sleep 0.01
+  done
+  live_start="$(ps -p "$pid" -o lstart= 2>/dev/null | sed 's/^[[:space:]]*//;s/[[:space:]]*$//' || true)"
+  command="$(ps -p "$pid" -o command= 2>/dev/null || true)"
+  if [ -n "$pid" ] && kill -0 "$pid" 2>/dev/null && [ "$live_start" = "$owner_start" ] \
+     && [[ "$command" == *"--delivery-worker $name $token"* ]]; then
+    kill "$pid" 2>/dev/null || true
+    # The worker's TERM trap may spend up to five seconds completing one bounded
+    # Ocean cancellation request. Let that exact cleanup finish before KILL.
+    for _ in $(seq 1 120); do kill -0 "$pid" 2>/dev/null || break; sleep 0.05; done
+    kill -0 "$pid" 2>/dev/null && kill -KILL "$pid" 2>/dev/null || true
+  fi
+  [ "$(cat "$lock/token" 2>/dev/null || true)" = "$token" ] && rm -rf "$lock"
+}
+
+sp_delivery_ocean_unresolved_after_stop() {
+  local name="$1" state pending_adapter submit generation turn_file turn_id result
+  state="$(sed -n 's/^state=//p' "$PAD_STATE/delivery.$name.state" 2>/dev/null | tail -1)"
+  case "$state" in acceptance_unknown|cancel_pending) return 0;; esac
+  pending_adapter="$(cut -d'|' -f6 "$PAD_STATE/delivery.$name.pending" 2>/dev/null || true)"
+  [ "$pending_adapter" = ocean ] || return 1
+  for submit in "$PAD_STATE"/delivery."$name".submit.*; do
+    [ -f "$submit" ] || continue
+    generation="${submit##*.submit.}"
+    [ -s "$PAD_STATE/delivery.$name.turn.$generation" ] || return 0
+  done
+  for turn_file in "$PAD_STATE"/delivery."$name".turn.*; do
+    [ -s "$turn_file" ] || continue
+    turn_id="$(cat "$turn_file" 2>/dev/null || true)"
+    result="$(cat "$PAD_STATE/delivery.$name.cancel.$turn_id/result" 2>/dev/null || true)"
+    case "$result" in canceled|completed|errored|cancelled) ;;
+      *) return 0 ;;
+    esac
+  done
+  return 1
+}
+
+sp_stop_delivery_workers() {
+  local lock name
+  for lock in "$PAD_STATE"/delivery.*.worker.lock.d; do
+    [ -d "$lock" ] || continue
+    name="${lock##*/delivery.}"; name="${name%.worker.lock.d}"
+    sp_stop_delivery_worker "$name"
   done
 }
 

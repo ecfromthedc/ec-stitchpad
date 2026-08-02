@@ -95,8 +95,33 @@ runtime hook; push members deliberately bind an external surface.
   The watcher delivers through `herdr pane run`, with cross-pad and focus guards.
 
 - **Ocean daemon wake.** Ocean sessions bind their daemon session ID as an
-  `ocean | push` target. The watcher submits a bounded wake turn through
-  `ocean-heartbeat`, deferring while the session is already busy.
+  `ocean | push` target. A per-seat supervisor submits through
+  `ocean-heartbeat --no-wait`, persists the accepted `turn_id`, and monitors the
+  daemon without blocking other seats. A newer directive or terminal task
+  cancels that exact in-flight request before its replacement is submitted. A
+  `cancelling` response only acknowledges the cancellation request; replacement
+  waits until the exact request registry row is terminal.
+  Completion is reconciled against the exact request row from `/v1/requests`;
+  canceled, errored, missing, or ambiguous turns never consume the mention.
+  DND leaves accepted work pending without submission and resumes it when DND
+  is removed. Because Ocean currently has no client idempotency key, a crash in
+  the POST/ack window is quarantined as `acceptance_unknown` whenever the request
+  registry shows any possible admission or cannot answer. Only a healthy empty
+  match proves that retry is safe; ambiguous work is never blindly replayed.
+
+Push state is per seat under `.state/delivery.<name>.*`. A live verified worker
+owns mention delivery. A fallback keeper may reserve a mention only while that
+worker is absent by atomically writing `delivery.<name>.keeper-reservation` as
+`ordinal|message_id|state|attempt_id`; the supervisor will not duplicate a
+matching accepted, in-flight, completed, or unknown-outcome reservation.
+An ordinal-zero `keeper-task-*` reservation owns the whole seat while that task
+admission is unresolved. Malformed reservations fail closed and leave a durable
+`keeper-reservation.invalid` diagnostic instead of risking a second admission.
+
+Ocean model selection is currently operator-owned runtime state at
+`.state/seat-model.<name>`. Roster columns are not a second model authority; any
+future roster-annotation implementation must explicitly migrate or reconcile
+that file rather than silently choosing one source over the other.
 
 > Verify your setup with `stitchpad doctor` — it reports each roster member's
 > wake health, target binding, and session identity.
@@ -223,7 +248,7 @@ itself is wired once per machine at the runtime level (see Quickstart).
 | `codex` | Stop hook → `stitchpad wake` | `~/.codex/hooks.json` → `adapters/stop-hook.sh`; session binding from MCP `join` |
 | `pi` | `agent_end` extension event → `stitchpad wake` | `pi install ~/.stitchpad/adapters/stitchpad` |
 | `herdr` | `herdr pane run` → live managed pane | auto-detected from `HERDR_PANE_ID` by MCP/pi |
-| `ocean` | `ocean-heartbeat wake` → daemon session | roster target is the bound Ocean session ID |
+| `ocean` | supervised `ocean-heartbeat wake --no-wait` → cancellable daemon turn | roster target is the bound Ocean session ID |
 
 Identity isn't in the hook — it's bound when the agent calls the MCP `join` tool,
 which writes a session record the hook reads (via the Stop payload's session id).
