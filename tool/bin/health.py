@@ -554,7 +554,12 @@ def parse_delivery(state: Path, name: str) -> tuple[dict[str, Any] | None, list[
     elif keeper_raw is not None:
         fields = keeper_raw.rstrip("\n").split("|")
         ordinal, ordinal_parse = strict_int(fields[0], allow_zero=True) if len(fields) == 4 else (None, "malformed")
+        task_sentinel_valid = (
+            ordinal_parse == "ok"
+            and (ordinal != 0 or fields[1].startswith("keeper-task-"))
+        )
         if (len(fields) == 4 and ordinal_parse == "ok" and fields[2] in KEEPER_STATES
+                and task_sentinel_valid
                 and bool(fields[1]) and bool(fields[3])
                 and all(len(field) <= 512 for field in fields[1:])):
             keeper = {"ordinal": ordinal, "message_id": fields[1], "state": fields[2],

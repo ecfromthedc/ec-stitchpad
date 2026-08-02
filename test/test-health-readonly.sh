@@ -146,7 +146,8 @@ printf '%s' '1|m-1|acceptance_unknown|attempt-1' > "$STATE/delivery.bob.keeper-r
 printf '%s' '0||accepted|' > "$STATE/delivery.carol.keeper-reservation"
 printf '%s' '|||||||' > "$STATE/delivery.dave.pending"
 printf '%s\n' 'state=accepted' > "$STATE/delivery.dave.state"
-printf '%s' '0|task-message|accepted|attempt-zero' > "$STATE/delivery.frank.keeper-reservation"
+printf '%s' '0|task-message|accepted|attempt-zero' > "$STATE/delivery.dave.keeper-reservation"
+printf '%s' '0|keeper-task-12345-67|accepted|attempt-zero' > "$STATE/delivery.frank.keeper-reservation"
 printf '%s' '1|1|m-frank|TASK-F|2026-08-02T12:00:00|ocean|push|frank-target' > "$STATE/delivery.frank.pending"
 cat > "$STATE/delivery.frank.state" <<'EOF'
 state=accepted
@@ -329,7 +330,9 @@ assert seats["frank"]["delivery"]["worker"]["parse"] == "malformed"
 assert seats["frank"]["delivery"]["recoverable"] is False
 assert "delivery_state:malformed_lines" in seats["frank"]["issues"]
 assert seats["dave"]["delivery"]["pending"]["parse"] == "malformed"
+assert seats["dave"]["delivery"]["keeper_reservation"]["parse"] == "malformed"
 assert seats["dave"]["delivery"]["recoverable"] is False
+assert "keeper_reservation:malformed" in seats["dave"]["issues"]
 assert seats["dave"]["seen_cursor"]["parse"] == "malformed"
 invalid = seats["bad/name"]
 assert invalid["heartbeat"]["progress"] == "unavailable"
