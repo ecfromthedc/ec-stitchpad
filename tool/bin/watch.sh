@@ -68,7 +68,10 @@ fire_adapter() {
   [ -f "$PAD_STATE/forcewake.$name" ] && force=1
   SP_WAKE="$wake" SP_TARGET="$target" SP_PAD_DIR="$PAD_DIR" SP_PAD_MD="$PAD_MD" \
     SP_DELIVERY_ACK_FILE="$ack_file" STITCHPAD_FORCE_WAKE="$force" \
-    bash "$script" mention "$name" "$PAD_MD" "$taskfile" </dev/null || rc=$?
+    bash "$script" mention "$name" "$PAD_MD" "$taskfile" </dev/null &
+  DELIVERY_ADAPTER_PID=$!
+  wait "$DELIVERY_ADAPTER_PID" || rc=$?
+  DELIVERY_ADAPTER_PID=""
   rm -f "$taskfile"
   # Return the adapter's exit code so the caller can distinguish DELIVERED (0) from
   # DEFERRED (3, focus-guard) or FAILED (1). Only a real delivery should consume the
@@ -82,12 +85,16 @@ fire_adapter() {
 # an older one before submission. Pull seats remain owned by lifecycle hooks and
 # never enter this queue.
 delivery_pending_file() { echo "$PAD_STATE/delivery.$1.pending"; }
+delivery_successor_file() { echo "$PAD_STATE/delivery.$1.successor"; }
 delivery_state_file() { echo "$PAD_STATE/delivery.$1.state"; }
 delivery_generation_file() { echo "$PAD_STATE/delivery.$1.generation"; }
 delivery_tombstone_file() { echo "$PAD_STATE/delivery.$1.tombstones"; }
 delivery_worker_lock() { echo "$PAD_STATE/delivery.$1.worker.lock.d"; }
 delivery_cancel_dir() { echo "$PAD_STATE/delivery.$1.cancel.$2"; }
 delivery_turn_file() { echo "$PAD_STATE/delivery.$1.turn.$2"; }
+delivery_ack_file() { echo "$PAD_STATE/delivery.$1.ack.$2.json"; }
+delivery_submit_file() { echo "$PAD_STATE/delivery.$1.submit.$2"; }
+delivery_keeper_reservation() { echo "$PAD_STATE/delivery.$1.keeper-reservation"; }
 delivery_now() { date -u +%Y-%m-%dT%H:%M:%SZ; }
 
 delivery_write_state() {
@@ -115,29 +122,40 @@ delivery_write_state() {
 
 delivery_cancel_ocean_turn() {
   local name="$1" turn_id="$2" reason="$3" dir response http daemon_url lock attempts=0 rc=1
+  local cancel_state terminal
   [ -n "$turn_id" ] || return 0
   dir="$(delivery_cancel_dir "$name" "$turn_id")"
   mkdir -p "$dir"
   lock="$dir/attempt.lock.d"
   while ! mkdir "$lock" 2>/dev/null; do
-    [ "$(cat "$dir/result" 2>/dev/null || true)" = canceled ] && return 0
+    case "$(cat "$dir/result" 2>/dev/null || true)" in canceled|completed|errored|cancelled) return 0;; esac
     attempts=$((attempts + 1)); [ "$attempts" -lt 100 ] || return 1
     sleep 0.01
   done
-  if [ "$(cat "$dir/result" 2>/dev/null || true)" = canceled ]; then
-    rmdir "$lock"; return 0
-  fi
+  case "$(cat "$dir/result" 2>/dev/null || true)" in
+    canceled|completed|errored|cancelled) rmdir "$lock"; return 0;;
+  esac
   [ -f "$dir/reason" ] || printf '%s\n' "$reason" > "$dir/reason"
   printf '%s|%s\n' "$(delivery_now)" "$reason" >> "$dir/attempts"
   [ -f "$dir/requested_at" ] || printf '%s\n' "$(delivery_now)" > "$dir/requested_at"
   response="$dir/response"; daemon_url="${OCEAN_DAEMON_URL:-http://127.0.0.1:4780}"
-  http="$(curl -sS -o "$response" -w '%{http_code}' -X POST \
+  http="$(curl -sS --connect-timeout 2 --max-time 5 -o "$response" -w '%{http_code}' -X POST \
     -H 'content-type: application/json' -d '{}' \
     "$daemon_url/v1/requests/$turn_id/cancel" 2>"$dir/error" || true)"
   printf '%s\n' "${http:-000}" > "$dir/http_status"
-  case "$http" in
-    2??) printf 'canceled\n' > "$dir/result"; rc=0 ;;
-    *) printf 'cancel_error\n' > "$dir/result"; rc=1 ;;
+  cancel_state="$(python3 -c 'import json,sys
+try:
+ d=json.load(open(sys.argv[1])); print(str(d.get("state", "")).lower() if d.get("ok") is True else "rejected")
+except Exception: print("invalid")' "$response" 2>/dev/null)"
+  case "$http:$cancel_state" in
+    2??:cancelling|2??:cancelled) printf 'canceled\n' > "$dir/result"; rc=0 ;;
+    *)
+      terminal="$(delivery_ocean_turn_status "" "$turn_id")"
+      case "$terminal" in
+        completed|errored|cancelled) printf '%s\n' "$terminal" > "$dir/result"; rc=0 ;;
+        *) printf 'cancel_error\n' > "$dir/result"; rc=1 ;;
+      esac
+      ;;
   esac
   rmdir "$lock"
   return "$rc"
@@ -146,18 +164,31 @@ delivery_cancel_ocean_turn() {
 delivery_ocean_turn_status() {
   local target="$1" turn_id="$2" daemon_url body
   daemon_url="${OCEAN_DAEMON_URL:-http://127.0.0.1:4780}"
-  body="$(curl -sf --max-time 3 "$daemon_url/v1/agent/sessions/$target" 2>/dev/null || true)"
+  body="$(curl -sf --max-time 3 "$daemon_url/v1/requests" 2>/dev/null || true)"
   [ -n "$body" ] || { printf 'unknown\n'; return; }
   printf '%s' "$body" | python3 -c 'import json,sys
 turn=sys.argv[1]
 try:
-    active=json.load(sys.stdin).get("session", {}).get("active_turn")
-    if isinstance(active, dict):
-        active=active.get("turn_id") or active.get("id") or active.get("request_id")
-    if not active: print("finished")
-    elif str(active)==turn: print("active")
-    else: print("other")
+    body=json.load(sys.stdin)
+    rows=body.get("requests", []) if body.get("ok") is True else []
+    hit=next((r for r in rows if str(r.get("request_id", "")) == turn), None)
+    print(str(hit.get("state", "unknown")).lower() if hit else "missing")
 except Exception: print("unknown")' "$turn_id" 2>/dev/null || printf 'unknown\n'
+}
+
+delivery_ocean_reconcile_attempt() {
+  local target="$1" attempted_at="$2" daemon_url body
+  daemon_url="${OCEAN_DAEMON_URL:-http://127.0.0.1:4780}"
+  body="$(curl -sf --max-time 3 "$daemon_url/v1/requests" 2>/dev/null || true)"
+  [ -n "$body" ] || { printf 'unknown\n'; return; }
+  printf '%s' "$body" | python3 -c 'import json,sys
+sid,started=sys.argv[1:3]
+try:
+ d=json.load(sys.stdin)
+ if d.get("ok") is not True: print("unknown"); raise SystemExit
+ rows=[r for r in d.get("requests",[]) if str(r.get("session_id",""))==sid and str(r.get("started_at", ""))>=started]
+ print("none" if len(rows)==0 else "unknown")
+except Exception: print("unknown")' "$target" "$attempted_at" 2>/dev/null || printf 'unknown\n'
 }
 
 delivery_tombstone() {
@@ -216,13 +247,10 @@ delivery_drop_current() {
   delivery_tombstone "$name" "$generation" "$ordinal" "$message_id" "$task_id" "$reason" "$task_status" "$turn_id" || true
   if delivery_pending_matches "$name" "$generation" "$ordinal" "$message_id"; then
     rm -f "$(delivery_pending_file "$name")"
-    # Tombstoned current work is resolved work. Advance monotonically so a
-    # canceled/reassigned directive is not rediscovered and re-tombstoned on
-    # every later pad append. Never move a cursor backwards if a lifecycle hook
-    # advanced it concurrently.
-    delivery_advance_seen "$name" "$ordinal"
     delivery_write_state "$name" tombstoned "$generation" "$ordinal" "$message_id" "$task_id" \
       "$accepted_at" "" "" "$(delivery_now)" "$reason:$task_status" "$turn_id" canceled
+    [ -f "$(delivery_successor_file "$name")" ] \
+      && mv "$(delivery_successor_file "$name")" "$(delivery_pending_file "$name")"
   fi
 }
 
@@ -250,31 +278,92 @@ delivery_validate_current() {
 }
 
 delivery_worker_cleanup() {
-  local name="$1" lock owner
+  local name="$1" token="$2" lock owner
   lock="$(delivery_worker_lock "$name")"
-  owner="$(cat "$lock/pid" 2>/dev/null || true)"
-  [ "$owner" = "$$" ] && rm -rf "$lock" 2>/dev/null || true
+  owner="$(cat "$lock/token" 2>/dev/null || true)"
+  [ "$owner" = "$token" ] && rm -rf "$lock" 2>/dev/null || true
+}
+
+delivery_worker_signal() {
+  local code="$1" ack_turn=""
+  if [ -n "${DELIVERY_ADAPTER_PID:-}" ]; then
+    pkill -TERM -P "$DELIVERY_ADAPTER_PID" 2>/dev/null || true
+    kill "$DELIVERY_ADAPTER_PID" 2>/dev/null || true
+  fi
+  if [ "${DELIVERY_ACTIVE_ADAPTER:-}" = ocean ] && [ -z "${DELIVERY_ACTIVE_TURN:-}" ] \
+     && [ -n "${DELIVERY_ACTIVE_GENERATION:-}" ]; then
+    ack_turn="$(python3 -c 'import json,sys
+try: print(json.load(open(sys.argv[1])).get("turn_id", ""))
+except Exception: print("")' "$(delivery_ack_file "$DELIVERY_WORKER_NAME" "$DELIVERY_ACTIVE_GENERATION")" 2>/dev/null)"
+  fi
+  if [ "${DELIVERY_ACTIVE_ADAPTER:-}" = ocean ] && [ -n "${DELIVERY_ACTIVE_TURN:-$ack_turn}" ]; then
+    delivery_cancel_ocean_turn "$DELIVERY_WORKER_NAME" "${DELIVERY_ACTIVE_TURN:-$ack_turn}" operator_stop || true
+  fi
+  delivery_worker_cleanup "$DELIVERY_WORKER_NAME" "$DELIVERY_WORKER_TOKEN"
+  exit "$code"
 }
 
 delivery_worker() {
-  local name="$1" lock pending generation ordinal message_id task_id accepted_at adapter wake target
+  local name="$1" token="$2" lock pending generation ordinal message_id task_id accepted_at adapter wake target
   local started rc retry_seconds="${SP_DELIVERY_RETRY_SECONDS:-2}"
   local turn_id turn_status meta current_ordinal current_sender current_id current_task ack_file tmp_turn
+  local attempt_at reconcile
   lock="$(delivery_worker_lock "$name")"
-  mkdir "$lock" 2>/dev/null || exit 0
+  [ "$(cat "$lock/token" 2>/dev/null || true)" = "$token" ] || exit 0
   printf '%s' "$$" > "$lock/pid"
+  printf '%s|%s|%s|%s\n' "$$" "$token" "$PAD_DIR" "$name" > "$lock/owner"
   # EXIT runs after this function's locals have gone out of scope, so retain the
   # seat name explicitly. Referring to local `$name` from the trap leaves every
   # successful/error worker lock behind and permanently wedges that seat.
   DELIVERY_WORKER_NAME="$name"
-  trap 'delivery_worker_cleanup "$DELIVERY_WORKER_NAME"' EXIT
-  trap 'delivery_worker_cleanup "$DELIVERY_WORKER_NAME"; exit 130' INT
-  trap 'delivery_worker_cleanup "$DELIVERY_WORKER_NAME"; exit 143' TERM
+  DELIVERY_WORKER_TOKEN="$token"
+  trap 'delivery_worker_cleanup "$DELIVERY_WORKER_NAME" "$DELIVERY_WORKER_TOKEN"' EXIT
+  trap 'delivery_worker_signal 130' INT
+  trap 'delivery_worker_signal 143' TERM
   while :; do
     pending="$(delivery_pending_file "$name")"; [ -f "$pending" ] || break
     IFS='|' read -r generation ordinal message_id task_id accepted_at adapter wake target < "$pending"
     turn_id="$(cat "$(delivery_turn_file "$name" "$generation")" 2>/dev/null || true)"
+    DELIVERY_ACTIVE_ADAPTER="$adapter"; DELIVERY_ACTIVE_TURN="$turn_id"
+    DELIVERY_ACTIVE_GENERATION="$generation"
+    if [ "$adapter" = ocean ] && [ -z "$turn_id" ] && [ -s "$(delivery_ack_file "$name" "$generation")" ]; then
+      turn_id="$(python3 -c 'import json,sys
+try: print(json.load(open(sys.argv[1])).get("turn_id", ""))
+except Exception: print("")' "$(delivery_ack_file "$name" "$generation")" 2>/dev/null)"
+      if [ -n "$turn_id" ]; then
+        printf '%s' "$turn_id" > "$(delivery_turn_file "$name" "$generation")"
+        continue
+      fi
+    fi
+    if [ "$adapter" = ocean ] && [ -z "$turn_id" ] && [ -f "$(delivery_submit_file "$name" "$generation")" ]; then
+      attempt_at="$(cut -d'|' -f1 "$(delivery_submit_file "$name" "$generation")")"
+      reconcile="$(delivery_ocean_reconcile_attempt "$target" "$attempt_at")"
+      case "$reconcile" in
+        none) rm -f "$(delivery_submit_file "$name" "$generation")" "$(delivery_ack_file "$name" "$generation")" ;;
+        *)
+          delivery_write_state "$name" acceptance_unknown "$generation" "$ordinal" "$message_id" "$task_id" \
+            "$accepted_at" "" "" "$(delivery_now)" ack_incomplete
+          break ;;
+      esac
+    fi
     [ -n "$turn_id" ] && started="$(sed -n 's/^started_at=//p' "$(delivery_state_file "$name")" 2>/dev/null | tail -1)"
+    if sp_dnd_is_on "$name"; then
+      if [ "$adapter" = ocean ] && [ -n "$turn_id" ]; then
+        if delivery_cancel_ocean_turn "$name" "$turn_id" dnd; then
+          rm -f "$(delivery_turn_file "$name" "$generation")" \
+            "$(delivery_ack_file "$name" "$generation")" "$(delivery_submit_file "$name" "$generation")"
+          DELIVERY_ACTIVE_TURN=""
+        else
+          delivery_write_state "$name" cancel_pending "$generation" "$ordinal" "$message_id" "$task_id" \
+            "$accepted_at" "$started" "" "$(delivery_now)" cancel_failed "$turn_id" active
+          sleep "$retry_seconds"; continue
+        fi
+      fi
+      delivery_write_state "$name" deferred_dnd "$generation" "$ordinal" "$message_id" "$task_id" \
+        "$accepted_at" "" "" "" dnd "$turn_id" deferred
+      sleep "${SP_DELIVERY_POLL_SECONDS:-0.2}"
+      continue
+    fi
 
     # Ocean delivery is ack-first so the exact daemon turn remains cancellable.
     # A restarted worker resumes this branch from the durable turn file instead
@@ -319,18 +408,31 @@ delivery_worker() {
       fi
       turn_status="$(delivery_ocean_turn_status "$target" "$turn_id")"
       case "$turn_status" in
-        finished|other)
+        completed)
+          if [ -d "$(delivery_cancel_dir "$name" "$turn_id")" ]; then
+            delivery_drop_current "$name" "$generation" "$ordinal" "$message_id" "$task_id" \
+              "$accepted_at" cancel_requested completed_after_cancel "$turn_id"
+            rm -f "$(delivery_turn_file "$name" "$generation")" \
+              "$(delivery_ack_file "$name" "$generation")" "$(delivery_submit_file "$name" "$generation")"
+            continue
+          fi
           if delivery_pending_matches "$name" "$generation" "$ordinal" "$message_id"; then
             delivery_advance_seen "$name" "$ordinal"
-            rm -f "$pending" "$(delivery_turn_file "$name" "$generation")"
+            rm -f "$pending" "$(delivery_turn_file "$name" "$generation")" \
+              "$(delivery_ack_file "$name" "$generation")" "$(delivery_submit_file "$name" "$generation")"
             delivery_write_state "$name" completed "$generation" "$ordinal" "$message_id" "$task_id" \
-              "$accepted_at" "$started" "$(delivery_now)" "" "" "$turn_id" finished
+              "$accepted_at" "$started" "$(delivery_now)" "" "" "$turn_id" completed
           fi
           ;;
-        active)
+        queued|running|waiting_for_permission|cancelling)
           delivery_write_state "$name" in_flight "$generation" "$ordinal" "$message_id" "$task_id" \
-            "$accepted_at" "$started" "" "" "" "$turn_id" active
+            "$accepted_at" "$started" "" "" "" "$turn_id" "$turn_status"
           sleep "${SP_DELIVERY_POLL_SECONDS:-0.2}"
+          ;;
+        errored|cancelled)
+          delivery_write_state "$name" "$turn_status" "$generation" "$ordinal" "$message_id" "$task_id" \
+            "$accepted_at" "$started" "" "$(delivery_now)" "turn_$turn_status" "$turn_id" "$turn_status"
+          break
           ;;
         *)
           delivery_write_state "$name" in_flight "$generation" "$ordinal" "$message_id" "$task_id" \
@@ -348,21 +450,26 @@ delivery_worker() {
     delivery_write_state "$name" started "$generation" "$ordinal" "$message_id" "$task_id" "$accepted_at" "$started"
     rc=0
     ack_file=""
-    [ "$adapter" = ocean ] && ack_file="$(mktemp "$PAD_STATE/.delivery-ocean-ack.XXXXXX")"
+    if [ "$adapter" = ocean ]; then
+      ack_file="$(delivery_ack_file "$name" "$generation")"
+      : > "$ack_file"
+      printf '%s|%s\n' "$(delivery_now)" "$message_id" > "$(delivery_submit_file "$name" "$generation")"
+    fi
     fire_adapter "$name" "$adapter" "$wake" "$target" "$ordinal" "$ack_file" || rc=$?
     if [ "$rc" -eq 0 ]; then
       if [ "$adapter" = ocean ]; then
         turn_id="$(python3 -c 'import json,sys
 try: print(json.load(open(sys.argv[1])).get("turn_id", ""))
 except Exception: print("")' "$ack_file" 2>/dev/null)"
-        rm -f "$ack_file"
         if [ -z "$turn_id" ]; then
           delivery_write_state "$name" error "$generation" "$ordinal" "$message_id" "$task_id" \
             "$accepted_at" "$started" "" "$(delivery_now)" missing_turn_id
           break
         fi
+        DELIVERY_ACTIVE_TURN="$turn_id"
         tmp_turn="$(mktemp "$PAD_STATE/.delivery-turn.XXXXXX")"
         printf '%s' "$turn_id" > "$tmp_turn" && mv "$tmp_turn" "$(delivery_turn_file "$name" "$generation")"
+        rm -f "$(delivery_submit_file "$name" "$generation")"
         if ! delivery_pending_matches "$name" "$generation" "$ordinal" "$message_id"; then
           until delivery_cancel_ocean_turn "$name" "$turn_id" superseded_after_accept; do
             sleep "$retry_seconds"
@@ -383,11 +490,14 @@ except Exception: print("")' "$ack_file" 2>/dev/null)"
         rm -f "$pending"
         delivery_write_state "$name" completed "$generation" "$ordinal" "$message_id" "$task_id" \
           "$accepted_at" "$started" "$(delivery_now)"
+        if [ -f "$(delivery_successor_file "$name")" ]; then
+          mv "$(delivery_successor_file "$name")" "$pending"
+        fi
       fi
       continue
     fi
-    [ -n "$ack_file" ] && rm -f "$ack_file"
     if [ "$rc" -eq 3 ]; then
+      [ -n "$ack_file" ] && rm -f "$ack_file" "$(delivery_submit_file "$name" "$generation")"
       # The adapter response belongs to the submitted generation. If a newer
       # generation arrived while it was running, loop directly to that work
       # instead of overwriting its accepted state with stale busy metadata.
@@ -396,6 +506,18 @@ except Exception: print("")' "$ack_file" 2>/dev/null)"
         "$accepted_at" "$started" "" "$(delivery_now)" busy
       sleep "$retry_seconds"
       continue
+    fi
+    if [ "$adapter" = ocean ] && [ -f "$(delivery_submit_file "$name" "$generation")" ]; then
+      attempt_at="$(cut -d'|' -f1 "$(delivery_submit_file "$name" "$generation")")"
+      reconcile="$(delivery_ocean_reconcile_attempt "$target" "$attempt_at")"
+      if [ "$reconcile" != none ]; then
+        delivery_write_state "$name" acceptance_unknown "$generation" "$ordinal" "$message_id" "$task_id" \
+          "$accepted_at" "$started" "" "$(delivery_now)" "adapter_exit_${rc}_after_submit"
+        break
+      fi
+      rm -f "$ack_file" "$(delivery_submit_file "$name" "$generation")"
+    elif [ -n "$ack_file" ]; then
+      rm -f "$ack_file"
     fi
     # Hard adapter failure is durable and leaves the pending generation intact.
     # A watcher restart (or explicit enqueue of the same current directive)
@@ -412,22 +534,59 @@ except Exception: print("")' "$ack_file" 2>/dev/null)"
 }
 
 delivery_start_worker() {
-  local name="$1" lock pid
+  local name="$1" lock pid token age now born command
   lock="$(delivery_worker_lock "$name")"
   if [ -d "$lock" ]; then
     pid="$(cat "$lock/pid" 2>/dev/null || true)"
-    [ -n "$pid" ] && kill -0 "$pid" 2>/dev/null && return 0
+    token="$(cat "$lock/token" 2>/dev/null || true)"
+    command="$(ps -p "$pid" -o command= 2>/dev/null || true)"
+    if [ -n "$pid" ] && kill -0 "$pid" 2>/dev/null \
+       && [[ "$command" == *"--delivery-worker $name $token"* ]]; then return 0; fi
+    born="$(cat "$lock/born" 2>/dev/null || stat -f %m "$lock" 2>/dev/null || stat -c %Y "$lock" 2>/dev/null || date +%s)"
+    now="$(date +%s)"; age=$((now-born))
+    [ -z "$pid" ] && [ "$age" -lt 5 ] && return 0
     rm -rf "$lock" 2>/dev/null || true
   fi
+  mkdir "$lock" 2>/dev/null || return 0
+  token="$(date +%s)-$$-$RANDOM-$RANDOM"
+  printf '%s' "$token" > "$lock/token"; date +%s > "$lock/born"
   STITCHPAD_PAD_DIR="$PAD_DIR" SP_DELIVERY_RETRY_SECONDS="${SP_DELIVERY_RETRY_SECONDS:-2}" \
-    bash "$BIN_DIR/watch.sh" --delivery-worker "$name" </dev/null \
+    bash "$BIN_DIR/watch.sh" --delivery-worker "$name" "$token" </dev/null \
       >> "$PAD_STATE/delivery.$name.log" 2>&1 &
+  pid=$!; printf '%s' "$pid" > "$lock/pid"
+  printf '%s|%s|%s|%s\n' "$pid" "$token" "$PAD_DIR" "$name" > "$lock/owner"
 }
 
 delivery_enqueue() {
+  local name="$1" qlock="$PAD_STATE/delivery.$1.queue.lock.d" tries=0 rc qpid qborn qage qstart current_start
+  while ! mkdir "$qlock" 2>/dev/null; do
+    qpid="$(cat "$qlock/pid" 2>/dev/null || true)"
+    qstart="$(cat "$qlock/process-start" 2>/dev/null || true)"
+    current_start="$(ps -p "$qpid" -o lstart= 2>/dev/null | sed 's/^[[:space:]]*//;s/[[:space:]]*$//' || true)"
+    qborn="$(cat "$qlock/born" 2>/dev/null || stat -f %m "$qlock" 2>/dev/null || stat -c %Y "$qlock" 2>/dev/null || date +%s)"
+    qage=$(( $(date +%s) - qborn ))
+    if { [ -n "$qpid" ] && { ! kill -0 "$qpid" 2>/dev/null \
+         || { [ -n "$qstart" ] && [ "$current_start" != "$qstart" ]; }; }; } \
+       || { [ -z "$qpid" ] && [ "$qage" -ge 5 ]; }; then
+      rm -rf "$qlock"; continue
+    fi
+    tries=$((tries + 1)); [ "$tries" -lt 700 ] || return 1
+    sleep 0.01
+  done
+  date +%s > "$qlock/born"
+  printf '%s|%s|%s\n' "$$" "$PAD_DIR" "$name" > "$qlock/owner"
+  printf '%s' "$$" > "$qlock/pid"
+  ps -p "$$" -o lstart= 2>/dev/null | sed 's/^[[:space:]]*//;s/[[:space:]]*$//' > "$qlock/process-start"
+  rc=0; delivery_enqueue_locked "$@" || rc=$?
+  rm -rf "$qlock"
+  return "$rc"
+}
+
+delivery_enqueue_locked() {
   local name="$1" adapter="$2" wake="$3" target="$4" seen=0 meta ordinal sender message_id task_id
   local pending old_generation old_ordinal old_message old_task old_accepted old_adapter old_wake old_target
-  local old_turn generation accepted tmp
+  local old_turn old_state generation accepted tmp successor successor_message
+  local keeper_ordinal keeper_message keeper_state
   # Preserve an unresolved pre-supervisor terminal-delivery recovery stamp during
   # rolling upgrades. Its Stop hook still owns that accepted turn; enqueueing a
   # newer generation here could present work over a turn that may already have
@@ -451,6 +610,17 @@ delivery_enqueue() {
     return 0
   fi
   IFS='|' read -r ordinal sender message_id task_id <<< "$meta"
+  if [ -f "$(delivery_keeper_reservation "$name")" ]; then
+    IFS='|' read -r keeper_ordinal keeper_message keeper_state _ < "$(delivery_keeper_reservation "$name")"
+    if [ "$keeper_ordinal" = "$ordinal" ] && [ "$keeper_message" = "$message_id" ]; then
+      case "$keeper_state" in accepted|in_flight|completed|acceptance_unknown) return 0;; esac
+    fi
+  fi
+  if [ ! -f "$pending" ] && [ -f "$(delivery_state_file "$name")" ] \
+     && [ "$(sed -n 's/^state=//p' "$(delivery_state_file "$name")")" = tombstoned ] \
+     && [ "$(sed -n 's/^message_id=//p' "$(delivery_state_file "$name")")" = "$message_id" ]; then
+    return 0
+  fi
   if [ -f "$pending" ]; then
     IFS='|' read -r old_generation old_ordinal old_message old_task old_accepted old_adapter old_wake old_target < "$pending"
     old_turn="$(cat "$(delivery_turn_file "$name" "$old_generation")" 2>/dev/null || true)"
@@ -465,6 +635,22 @@ delivery_enqueue() {
         return 0
       fi
       delivery_start_worker "$name"; return 0
+    fi
+    old_state="$(sed -n 's/^state=//p' "$(delivery_state_file "$name")" 2>/dev/null | tail -1)"
+    if [ "$old_adapter" != ocean ] && [ "$old_state" = started ]; then
+      successor="$(delivery_successor_file "$name")"
+      if [ -f "$successor" ]; then
+        IFS='|' read -r _ _ successor_message _ < "$successor"
+        [ "$successor_message" = "$message_id" ] && return 0
+      fi
+      generation=$(( $(cat "$(delivery_generation_file "$name")" 2>/dev/null || echo 0) + 1 ))
+      printf '%s' "$generation" > "$(delivery_generation_file "$name")"
+      accepted="$(delivery_now)"; tmp="$(mktemp "$PAD_STATE/.delivery-successor.XXXXXX")"
+      printf '%s|%s|%s|%s|%s|%s|%s|%s\n' "$generation" "$ordinal" "$message_id" "$task_id" \
+        "$accepted" "$adapter" "$wake" "$target" > "$tmp"
+      mv "$tmp" "$successor"
+      delivery_start_worker "$name"
+      return 0
     fi
     if [ "$old_adapter" = ocean ] && [ -n "$old_turn" ]; then
       if ! delivery_cancel_ocean_turn "$name" "$old_turn" superseded_by_newer; then
@@ -555,7 +741,7 @@ if [ "$WATCH_LIBRARY_MODE" = "1" ]; then
 fi
 
 if [ "$DELIVERY_WORKER_MODE" -eq 1 ]; then
-  delivery_worker "${2:?missing delivery seat}"
+  delivery_worker "${2:?missing delivery seat}" "${3:?missing delivery token}"
   exit $?
 fi
 

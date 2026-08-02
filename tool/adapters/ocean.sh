@@ -56,16 +56,21 @@ You are @${name} on this pad. Read the recent conversation with:
 then reply with:
   cd ${pad_dir} && STITCHPAD_NAME=${name} ~/.stitchpad/bin/stitchpad say '<your reply>'"
 
+seat_model=""
+_mf="$(dirname "$pad")/.state/seat-model.${name}"
+[ -f "$_mf" ] && seat_model="$(tr -d '[:space:]' < "$_mf" 2>/dev/null || true)"
 wake_args=(wake --session-id "$session_id" --cwd "$pad_dir" --client-type stitchpad \
   --timeout-seconds 600 --prompt "$prompt")
+[ -n "$seat_model" ] && wake_args+=(--model "$seat_model")
 [ -n "${SP_DELIVERY_ACK_FILE:-}" ] && wake_args+=(--no-wait)
 
-out="$("$bin" "${wake_args[@]}")" || exit $?
 if [ -n "${SP_DELIVERY_ACK_FILE:-}" ]; then
-  turn_id="$(printf '%s' "$out" | python3 -c 'import json,sys
-try: print(json.load(sys.stdin).get("turn_id", ""))
-except Exception: print("")' 2>/dev/null)"
+  "$bin" "${wake_args[@]}" > "$SP_DELIVERY_ACK_FILE" || exit $?
+  turn_id="$(python3 -c 'import json,sys
+try: print(json.load(open(sys.argv[1])).get("turn_id", ""))
+except Exception: print("")' "$SP_DELIVERY_ACK_FILE" 2>/dev/null)"
   [ -n "$turn_id" ] || { echo '[ocean.sh] accepted wake omitted turn_id' >&2; exit 1; }
-  printf '%s\n' "$out" > "$SP_DELIVERY_ACK_FILE"
+  cat "$SP_DELIVERY_ACK_FILE"
+else
+  "$bin" "${wake_args[@]}"
 fi
-printf '%s\n' "$out"

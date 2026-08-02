@@ -99,6 +99,19 @@ runtime hook; push members deliberately bind an external surface.
   `ocean-heartbeat --no-wait`, persists the accepted `turn_id`, and monitors the
   daemon without blocking other seats. A newer directive or terminal task
   cancels that exact in-flight request before its replacement is submitted.
+  Completion is reconciled against the exact request row from `/v1/requests`;
+  canceled, errored, missing, or ambiguous turns never consume the mention.
+  DND leaves accepted work pending without submission and resumes it when DND
+  is removed. Because Ocean currently has no client idempotency key, a crash in
+  the POST/ack window is quarantined as `acceptance_unknown` whenever the request
+  registry shows any possible admission or cannot answer. Only a healthy empty
+  match proves that retry is safe; ambiguous work is never blindly replayed.
+
+Push state is per seat under `.state/delivery.<name>.*`. A live verified worker
+owns mention delivery. A fallback keeper may reserve a mention only while that
+worker is absent by atomically writing `delivery.<name>.keeper-reservation` as
+`ordinal|message_id|state|attempt_id`; the supervisor will not duplicate a
+matching accepted, in-flight, completed, or unknown-outcome reservation.
 
 > Verify your setup with `stitchpad doctor` — it reports each roster member's
 > wake health, target binding, and session identity.

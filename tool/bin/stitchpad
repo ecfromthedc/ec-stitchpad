@@ -246,6 +246,11 @@ EOF
     target="${3:--}"
     adapter="${4:-}"
     sp_user_exists "$who" || { echo "stitchpad: @$who not in roster" >&2; exit 1; }
+    sp_stop_delivery_worker "$who"
+    if sp_delivery_ocean_unresolved_after_stop "$who"; then
+      echo "stitchpad: refusing to retarget @$who — Ocean acceptance/cancellation outcome is unresolved" >&2
+      exit 1
+    fi
     # ONE TERMINAL = ONE PAD: refuse pointing a wake at a terminal that is live
     # in a different pad (this also stops the bridge auto-heal from stealing).
     if [ "$target" != "-" ]; then sp_term_lock_claim "$target" "$who" || exit 1; fi
@@ -267,6 +272,9 @@ EOF
     ' "$PAD_MD" > "$tmp" && sp_write_inplace "$tmp" "$PAD_MD"
     sp_commit "roster: ~ $who wake=$wake target=$target"
     sp_unlock
+    rm -f "$PAD_STATE/delivery.$who.pending" "$PAD_STATE/delivery.$who.successor" \
+      "$PAD_STATE"/delivery."$who".turn.* "$PAD_STATE"/delivery."$who".ack.* \
+      "$PAD_STATE"/delivery."$who".submit.* 2>/dev/null || true
     # `set-wake` is also the repair path for an existing seat. Resolve the
     # effective adapter after rewriting the roster, then keep Ocean's Stop-hook
     # identity binding in sync with the push target.
@@ -733,6 +741,11 @@ PY
     sp_init_paths || exit 1
     who="${1:-$(sp_me)}"
     [ -z "$who" ] && { echo "usage: stitchpad leave <name>" >&2; exit 1; }
+    sp_stop_delivery_worker "$who"
+    if sp_delivery_ocean_unresolved_after_stop "$who"; then
+      echo "stitchpad: refusing to remove @$who — Ocean acceptance/cancellation outcome is unresolved" >&2
+      exit 1
+    fi
     sp_lock || exit 1
     tmp="$(sp_stage "$PAD_MD")"
     awk -v who="$who" '
@@ -745,6 +758,8 @@ PY
     sp_commit "roster: - $who"
     # also release any file claims and wake state this agent held
     rm -f "$PAD_STATE/seen.$who" "$PAD_STATE/forcewake.$who" 2>/dev/null
+    rm -f "$PAD_STATE"/delivery."$who".* 2>/dev/null || true
+    rm -rf "$PAD_STATE"/delivery."$who".*.lock.d "$PAD_STATE"/delivery."$who".cancel.* 2>/dev/null || true
     for _ld in "$PAD_STATE"/claims/*.d; do
       [ -d "$_ld" ] && read -r _h _ < "$_ld/holder" 2>/dev/null && [ "$_h" = "$who" ] && rm -rf "$_ld"
     done
@@ -756,7 +771,7 @@ PY
     # release this agent's terminal claims so the terminal can join another pad
     sp_term_lock_release "$who" 2>/dev/null || true
     # AUTO-WATCHER: stop watcher if roster is empty (no members = no heartbeats).
-    _remaining="$(sp_roster | grep -cv '^[[:space:]]*$' 2>/dev/null || echo 0)"
+    _remaining="$(sp_roster | awk 'NF { n++ } END { print n + 0 }')"
     if [ "${_remaining:-0}" -le 0 ]; then
       rm -rf "$PAD_STATE/watch.lock.d" 2>/dev/null \
         && echo "── last member left — wake watcher stopped ──"
@@ -1624,9 +1639,9 @@ except: print("")' 2>/dev/null)"
     ;;
 
   start)  sp_init_paths || exit 1; ensure_watcher; echo "→ watcher ensured"; ;;
-  stop)   sp_init_paths || exit 1; if [ -f "$PAD_STATE/watch.lock.d/pid" ]; then kill "$(cat "$PAD_STATE/watch.lock.d/pid")" 2>/dev/null || true; fi; rm -rf "$PAD_STATE/watch.lock.d" 2>/dev/null; echo "→ watcher stopped"; ;;
+  stop)   sp_init_paths || exit 1; sp_stop_watchers_for_pad; sp_stop_delivery_workers; echo "→ watcher stopped"; ;;
   status) sp_init_paths || exit 1; sp_watcher_alive && echo "running (pid $(cat "$PAD_STATE/watch.lock.d/pid" 2>/dev/null))" || echo "stopped"; ;;
-  restart) sp_init_paths || exit 1; if [ -f "$PAD_STATE/watch.lock.d/pid" ]; then kill "$(cat "$PAD_STATE/watch.lock.d/pid")" 2>/dev/null || true; fi; rm -rf "$PAD_STATE/watch.lock.d" 2>/dev/null; ensure_watcher; echo "→ watcher restarted"; ;;
+  restart) sp_init_paths || exit 1; sp_stop_watchers_for_pad; sp_stop_delivery_workers; ensure_watcher; echo "→ watcher restarted"; ;;
   watch)   exec "$STITCHPAD_HOME/bin/watch.sh" ;;
   daemon)  exec "$STITCHPAD_HOME/bin/daemon.sh" "${@}" ;;
 

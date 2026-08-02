@@ -23,6 +23,9 @@ cleanup() {
     pid="$(cat "$pid_file" 2>/dev/null || true)"
     [ -n "$pid" ] && kill "$pid" 2>/dev/null || true
   done
+  pkill -TERM -f "$TMP" 2>/dev/null || true
+  sleep 0.1
+  pkill -KILL -f "$TMP" 2>/dev/null || true
   rm -rf "$TMP"
 }
 trap cleanup EXIT
@@ -43,7 +46,7 @@ count_file="$state/mock.$name.count"
 count=$(( $(cat "$count_file" 2>/dev/null || printf 0) + 1 ))
 printf '%s' "$count" > "$count_file"
 body="$(tr '\n' ' ' < "$4")"
-printf '%s|%s|%s\n' "$name" "$count" "$body" >> "$state/mock.calls"
+printf '%s|%s|%s|%s\n' "$name" "$count" "${SP_TARGET:-}" "$body" >> "$state/mock.calls"
 case "$mode" in
   slow) sleep 1 ;;
   busy-once) [ "$count" -eq 1 ] && exit 3 ;;
@@ -110,7 +113,8 @@ hold_worker() {
   local name="$1" lock
   lock="$(delivery_worker_lock "$name")"
   mkdir -p "$lock"
-  printf '%s' "$$" > "$lock/pid"
+  printf 'test-hold' > "$lock/token"
+  date +%s > "$lock/born"
 }
 
 release_worker() {
@@ -209,10 +213,14 @@ wait_state failover started || fail 'old failover generation never started'
 append_message operator '@failover replacement generation survives old failure'
 delivery_enqueue failover mock push failover-target
 printf success > "$PAD_STATE/mock.failover.mode"
+wait_state failover error || fail 'failed generic in-flight work was not held honestly'
+[ -f "$(delivery_successor_file failover)" ] || fail 'generic successor was not queued behind uncertain work'
+wait_no_worker failover || fail 'failed generic worker did not release'
+delivery_start_worker failover
 wait_state failover completed || fail 'old generation failure stranded newer accepted work'
 [ "$(state_value failover generation)" = 2 ] || fail 'replacement generation did not own completion'
-[ "$(cat "$PAD_STATE/mock.failover.count")" = 2 ] || fail 'failover did not submit old and replacement exactly once each'
-ok 'old in-flight failure cannot strand a newer accepted generation'
+[ "$(cat "$PAD_STATE/mock.failover.count")" = 2 ] || fail 'explicit recovery did not drain queued successor honestly'
+ok 'generic successor queues honestly behind uncertain in-flight work'
 
 # Ocean's daemon ack exposes the exact cancellable turn. Keep the first turn
 # active, supersede it, and prove one exact cancel occurs before the replacement
@@ -229,7 +237,12 @@ count=$(( $(cat "$state/ocean.count" 2>/dev/null || printf 0) + 1 ))
 printf '%s' "$count" > "$state/ocean.count"
 turn="turn-$count"
 printf '%s' "$turn" > "$state/ocean.active"
+printf '%s\n' "$*" >> "$state/ocean.args"
+[ -f "$state/ocean.pause_before_ack" ] && sleep 5
+if [ -f "$state/ocean.invalid_ack" ]; then printf '{invalid ack\n'; exit 0; fi
 printf '{"ok":true,"session_id":"ocean-session","turn_id":"%s"}\n' "$turn"
+[ -f "$state/ocean.pause_after_ack" ] && sleep 5
+exit 0
 HEARTBEAT
 cat > "$ocean_bin/curl" <<'CURL'
 #!/usr/bin/env bash
@@ -238,29 +251,42 @@ url="${!#}"
 if [[ "$url" == */cancel ]]; then
   turn="${url%/cancel}"; turn="${turn##*/}"
   printf '%s\n' "$turn" >> "$state/ocean.cancels"
-  [ "$(cat "$state/ocean.active" 2>/dev/null || true)" = "$turn" ] && : > "$state/ocean.active"
+  if [ ! -f "$state/ocean.cancel_reject" ] \
+     && [ "$(cat "$state/ocean.active" 2>/dev/null || true)" = "$turn" ]; then : > "$state/ocean.active"; fi
   out=""
   while [ "$#" -gt 0 ]; do
     [ "$1" = -o ] && { shift; out="$1"; }
     shift
   done
-  [ -n "$out" ] && printf '{"ok":true}\n' > "$out"
+  if [ -f "$state/ocean.cancel_reject" ]; then
+    [ -n "$out" ] && printf '{"ok":false,"state":"errored","message":"request not found"}\n' > "$out"
+  else
+    [ -n "$out" ] && printf '{"ok":true,"state":"cancelling"}\n' > "$out"
+  fi
   printf '202'
   exit 0
 fi
 active="$(cat "$state/ocean.active" 2>/dev/null || true)"
+if [ -f "$state/ocean.ambiguous" ]; then
+  printf '{"ok":true,"requests":[{"request_id":"turn-a","session_id":"ocean-session","state":"running","started_at":"2099-01-01T00:00:00Z"},{"request_id":"turn-b","session_id":"ocean-session","state":"running","started_at":"2099-01-01T00:00:01Z"}]}\n'
+  exit 0
+fi
 if [ -n "$active" ]; then
-  printf '{"session":{"active_turn":"%s"}}\n' "$active"
+  printf '{"ok":true,"requests":[{"request_id":"%s","session_id":"ocean-session","state":"running","started_at":"2099-01-01T00:00:00Z"}]}\n' "$active"
 else
-  printf '{"session":{"active_turn":null}}\n'
+  count="$(cat "$state/ocean.count" 2>/dev/null || echo 0)"
+  if [ "$count" -gt 0 ]; then printf '{"ok":true,"requests":[{"request_id":"turn-%s","state":"completed"}]}\n' "$count"
+  else printf '{"ok":true,"requests":[]}\n'; fi
 fi
 CURL
 chmod +x "$ocean_bin/ocean-heartbeat" "$ocean_bin/curl"
 old_path="$PATH"; export PATH="$ocean_bin:$PATH"
 append_message operator '@oceanseat stale Ocean directive'
+printf 'kimi-k2.5' > "$PAD_STATE/seat-model.oceanseat"
 delivery_enqueue oceanseat ocean push ocean-session
 wait_state oceanseat in_flight || fail 'Ocean turn did not persist accepted in-flight state'
 [ "$(state_value oceanseat turn_id)" = turn-1 ] || fail 'Ocean turn_id was not persisted'
+grep -q -- '--model kimi-k2.5' "$PAD_STATE/ocean.args" || fail 'per-seat Ocean model was not forwarded'
 append_message operator '@oceanseat replacement Ocean directive'
 delivery_enqueue oceanseat ocean push ocean-session
 for _ in $(seq 1 100); do
@@ -297,8 +323,136 @@ wait_state taskocean tombstoned || fail 'terminal task did not cancel in-flight 
 [ "$(grep -c '^turn-1$' "$PAD_STATE/ocean.cancels" 2>/dev/null || true)" = 1 ] \
   || fail 'terminal task did not cancel its exact Ocean turn once'
 [ ! -f "$(delivery_pending_file taskocean)" ] || fail 'canceled Ocean task remained pending'
+
+new_case ocean_ack_crash 'ackseat | ocean | push | ocean-session'
+export STITCHPAD_PAD_DIR="$PAD_DIR"
+touch "$PAD_STATE/ocean.pause_after_ack"
+append_message operator '@ackseat survive kill after daemon ack'
+delivery_enqueue ackseat ocean push ocean-session
+for _ in $(seq 1 100); do [ -s "$(delivery_ack_file ackseat 1)" ] && break; sleep 0.05; done
+[ -s "$(delivery_ack_file ackseat 1)" ] || fail 'generation-bound ack was not durable before adapter returned'
+worker_pid="$(cat "$(delivery_worker_lock ackseat)/pid")"
+kill -KILL "$worker_pid" 2>/dev/null || true
+wait "$worker_pid" 2>/dev/null || true
+sleep 0.1; rm -f "$PAD_STATE/ocean.pause_after_ack"
+delivery_start_worker ackseat
+for _ in $(seq 1 100); do [ "$(state_value ackseat state)" = in_flight ] && break; sleep 0.05; done
+[ "$(cat "$PAD_STATE/ocean.count")" = 1 ] || fail 'restart duplicated an already-acked Ocean turn'
+: > "$PAD_STATE/ocean.active"
+wait_state ackseat completed || fail 'restarted worker did not reconcile durable ack'
+
+new_case ocean_unknown 'unknownseat | ocean | push | ocean-session'
+export STITCHPAD_PAD_DIR="$PAD_DIR"
+touch "$PAD_STATE/ocean.pause_before_ack" "$PAD_STATE/ocean.ambiguous"
+append_message operator '@unknownseat quarantine ambiguous accepted turn'
+delivery_enqueue unknownseat ocean push ocean-session
+for _ in $(seq 1 100); do [ "$(cat "$PAD_STATE/ocean.count" 2>/dev/null || echo 0)" -eq 1 ] && break; sleep 0.05; done
+unknown_worker="$(cat "$(delivery_worker_lock unknownseat)/pid")"
+unknown_child="$(pgrep -P "$unknown_worker" 2>/dev/null | head -1 || true)"
+[ -n "$unknown_child" ] && kill -KILL "$unknown_child" 2>/dev/null || true
+kill -KILL "$unknown_worker" 2>/dev/null || true
+wait "$unknown_worker" 2>/dev/null || true
+sleep 0.1; rm -f "$PAD_STATE/ocean.pause_before_ack"
+delivery_start_worker unknownseat
+wait_state unknownseat acceptance_unknown || fail 'ambiguous accept window was not quarantined'
+[ "$(cat "$PAD_STATE/ocean.count")" = 1 ] || fail 'ambiguous accept window auto-resubmitted'
+[ ! -f "$PAD_STATE/seen.unknownseat" ] || fail 'ambiguous acceptance advanced seen'
+if STITCHPAD_PAD_DIR="$PAD_DIR" "$ROOT/tool/bin/stitchpad" set-wake unknownseat push new-session ocean >/dev/null 2>&1; then
+  fail 'retarget erased an unresolved Ocean acceptance outcome'
+fi
+[ -f "$(delivery_pending_file unknownseat)" ] || fail 'refused retarget discarded unresolved pending work'
+grep -qF 'unknownseat | ocean | push | ocean-session' "$PAD_MD" \
+  || fail 'refused retarget mutated the old Ocean target'
+
+new_case ocean_bad_ack 'badackseat | ocean | push | ocean-session'
+export STITCHPAD_PAD_DIR="$PAD_DIR"
+touch "$PAD_STATE/ocean.invalid_ack"
+append_message operator '@badackseat quarantine invalid ack after admission'
+delivery_enqueue badackseat ocean push ocean-session
+wait_state badackseat acceptance_unknown || fail 'invalid post-admission ack was not quarantined'
+[ "$(cat "$PAD_STATE/ocean.count")" = 1 ] || fail 'invalid post-admission ack was replayed'
+[ ! -f "$PAD_STATE/seen.badackseat" ] || fail 'invalid post-admission ack advanced seen'
+[ -f "$(delivery_submit_file badackseat 1)" ] || fail 'invalid post-admission ack lost its durable submit marker'
+
+new_case ocean_dnd 'oceandnd | ocean | push | ocean-session'
+export STITCHPAD_PAD_DIR="$PAD_DIR"
+append_message operator '@oceandnd cancel in-flight work while DND is on'
+delivery_enqueue oceandnd ocean push ocean-session
+wait_state oceandnd in_flight || fail 'Ocean DND fixture did not become in-flight'
+touch "$(sp_dnd_file oceandnd)"
+wait_state oceandnd deferred_dnd || fail 'DND did not cancel and defer the exact Ocean turn'
+[ "$(grep -c '^turn-1$' "$PAD_STATE/ocean.cancels" 2>/dev/null || true)" = 1 ] \
+  || fail 'Ocean DND did not cancel its exact turn once'
+[ "$(cat "$PAD_STATE/ocean.count")" = 1 ] || fail 'Ocean DND rediscovered its durable ack and resubmitted'
+[ ! -f "$PAD_STATE/seen.oceandnd" ] || fail 'Ocean DND consumed seen before resumed completion'
+rm -f "$(sp_dnd_file oceandnd)"
+for _ in $(seq 1 100); do [ "$(cat "$PAD_STATE/ocean.count" 2>/dev/null || echo 0)" -eq 2 ] && break; sleep 0.05; done
+[ "$(cat "$PAD_STATE/ocean.count")" = 2 ] || fail 'Ocean DND-off did not submit one fresh turn'
+: > "$PAD_STATE/ocean.active"
+wait_state oceandnd completed || fail 'Ocean DND-off turn did not complete'
+
+new_case cancel_contract 'cancelapi | ocean | push | ocean-session'
+export STITCHPAD_PAD_DIR="$PAD_DIR"
+printf 'turn-reject' > "$PAD_STATE/ocean.active"; touch "$PAD_STATE/ocean.cancel_reject"
+if delivery_cancel_ocean_turn cancelapi turn-reject hostile_reject; then
+  fail '2xx ok:false cancel response was accepted as canceled'
+fi
+[ "$(cat "$(delivery_cancel_dir cancelapi turn-reject)/result")" = cancel_error ] \
+  || fail 'rejected cancel did not remain retryable error'
+
 export PATH="$old_path"
 ok 'superseded directives and terminal tasks cancel exact in-flight Ocean turns'
+
+new_case dnd 'dndseat | mock | push | dnd-target'
+touch "$(sp_dnd_file dndseat)"
+append_message operator '@dndseat wait until DND is off'
+delivery_enqueue dndseat mock push dnd-target
+wait_state dndseat deferred_dnd || fail 'DND did not durably defer push delivery'
+[ ! -f "$PAD_STATE/mock.dndseat.count" ] || fail 'DND seat submitted adapter work'
+[ ! -f "$PAD_STATE/seen.dndseat" ] || fail 'DND seat consumed seen cursor'
+rm -f "$(sp_dnd_file dndseat)"
+wait_state dndseat completed || fail 'DND-off did not resume pending delivery'
+ok 'DND defers durably without submit or cursor consumption'
+
+new_case controls 'controlseat | mock | push | old-target'
+printf slow > "$PAD_STATE/mock.controlseat.mode"
+append_message operator '@controlseat operator-controlled work'
+delivery_enqueue controlseat mock push old-target
+wait_state controlseat started || fail 'control worker never started'
+STITCHPAD_PAD_DIR="$PAD_DIR" "$ROOT/tool/bin/stitchpad" stop >/dev/null
+[ ! -d "$(delivery_worker_lock controlseat)" ] || fail 'operator stop left worker lock'
+sleep 1.1
+[ "$(state_value controlseat state)" != completed ] || fail 'work completed after operator stop'
+printf success > "$PAD_STATE/mock.controlseat.mode"
+printf '{"pid":%s}\n' "$$" > "$PAD_STATE/alive.test-operator"
+STITCHPAD_PAD_DIR="$PAD_DIR" "$ROOT/tool/bin/stitchpad" restart >/dev/null
+wait_state controlseat completed || fail 'operator restart did not resume pending work'
+STITCHPAD_PAD_DIR="$PAD_DIR" "$ROOT/tool/bin/stitchpad" stop >/dev/null
+rm -f "$PAD_STATE/alive.test-operator"
+append_message operator '@controlseat retarget this directive'
+printf slow > "$PAD_STATE/mock.controlseat.mode"
+delivery_enqueue controlseat mock push old-target
+wait_state controlseat started || fail 'retarget fixture did not start old target'
+STITCHPAD_PAD_DIR="$PAD_DIR" "$ROOT/tool/bin/stitchpad" set-wake controlseat push new-target mock >/dev/null
+[ ! -d "$(delivery_worker_lock controlseat)" ] || fail 'retarget left old worker alive'
+[ ! -f "$(delivery_pending_file controlseat)" ] || fail 'retarget kept frozen old target pending'
+printf success > "$PAD_STATE/mock.controlseat.mode"
+delivery_enqueue controlseat mock push new-target
+wait_state controlseat completed || fail 'retargeted worker did not complete'
+grep -qF '|new-target|' "$PAD_STATE/mock.calls" || fail 'retargeted delivery used frozen old target'
+printf slow > "$PAD_STATE/mock.controlseat.mode"
+append_message operator '@controlseat leave stops this exact worker'
+delivery_enqueue controlseat mock push new-target
+wait_state controlseat started || fail 'leave fixture did not start worker'
+STITCHPAD_PAD_DIR="$PAD_DIR" "$ROOT/tool/bin/stitchpad" leave controlseat >/dev/null
+[ ! -d "$(delivery_worker_lock controlseat)" ] || fail 'leave left exact delivery worker alive'
+if compgen -G "$PAD_STATE/delivery.controlseat.*" >/dev/null; then
+  ls -ld "$PAD_STATE"/delivery.controlseat.* >&2
+  fail 'leave retained delivery cruft'
+fi
+! sp_user_exists controlseat || fail 'leave retained roster seat'
+sp_term_lock_release controlseat 2>/dev/null || true
+ok 'stop, restart, leave, and retarget control exact workers safely'
 
 # A terminal task invalidates its directive before adapter submission.
 new_case cancel 'cancel | mock | push | cancel-target'
@@ -320,11 +474,21 @@ wait_state cancel tombstoned || fail 'terminal task was not tombstoned'
 [ ! -f "$(delivery_pending_file cancel)" ] || fail 'terminal task remained pending'
 [ ! -f "$PAD_STATE/mock.cancel.count" ] || fail 'terminal task reached adapter'
 grep -qF '|task_terminal|done' "$(delivery_tombstone_file cancel)" || fail 'task cancellation reason/status missing'
-[ "$(cat "$PAD_STATE/seen.cancel")" -gt 0 ] || fail 'terminal task tombstone did not drain its directive cursor'
+[ ! -f "$PAD_STATE/seen.cancel" ] || fail 'terminal task cancellation consumed the seen cursor'
 cancel_generation="$(cat "$(delivery_generation_file cancel)")"
 delivery_enqueue cancel mock push cancel-target
 [ "$(cat "$(delivery_generation_file cancel)")" = "$cancel_generation" ] || fail 'later watcher event rediscovered canceled directive'
 ok 'terminal task cancels pending delivery before submit'
+
+new_case keeper 'keeperseat | mock | push | keeper-target'
+append_message operator '@keeperseat keeper accepted this mention'
+keeper_meta="$(sp_current_to_meta keeperseat 0)"
+IFS='|' read -r keeper_ord _ keeper_id _ <<< "$keeper_meta"
+printf '%s|%s|accepted|keeper-attempt-1\n' "$keeper_ord" "$keeper_id" > "$(delivery_keeper_reservation keeperseat)"
+delivery_enqueue keeperseat mock push keeper-target
+[ ! -f "$(delivery_pending_file keeperseat)" ] || fail 'supervisor duplicated keeper-reserved mention'
+[ ! -f "$PAD_STATE/mock.keeperseat.count" ] || fail 'keeper-reserved mention reached watcher adapter'
+ok 'keeper reservation prevents a racing supervisor duplicate'
 
 # Pull-seat ownership remains with lifecycle hooks; watcher react must not create
 # any push-supervisor artifacts for it.

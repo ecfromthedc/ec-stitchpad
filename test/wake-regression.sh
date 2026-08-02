@@ -24,17 +24,46 @@ contains() {
 stop_watcher() {
   local d="$1"
   "$SP" daemon stop >/dev/null 2>&1 || true
-  pkill -9 -f "fswatch.*$d" 2>/dev/null || true
   for _pidfile in "$d"/.stitchpad/.state/alive-ticker.*.pid "$d"/.stitchpad/.state/heartbeat.*.lock/pid; do
     [ -f "$_pidfile" ] || continue
     _pid="$(timeout 2 cat "$_pidfile" 2>/dev/null || true)"
-    [ -n "$_pid" ] && kill -9 "$_pid" 2>/dev/null || true
+    [ -n "$_pid" ] && kill "$_pid" 2>/dev/null || true
   done
+  # A ticker can be inside its immediate ensure-watcher child when TERM lands.
+  # Let both unwind before the exact per-pad watcher sweep below.
+  sleep 0.4
+  pkill -TERM -f "$d/.stitchpad" 2>/dev/null || true
+  sleep 0.1
+  pkill -KILL -f "$d/.stitchpad" 2>/dev/null || true
+  rm -rf "$d"/.stitchpad/.state/heartbeat.*.lock "$d"/.stitchpad/.state/alive-ticker.*.pid \
+    "$d"/.stitchpad/.state/alive.* 2>/dev/null || true
+  STITCHPAD_PAD_DIR="$d/.stitchpad" "$SP" stop >/dev/null 2>&1 || true
+  pkill -9 -f "fswatch.*$d" 2>/dev/null || true
   sleep 0.2
 }
 
+wait_for_fswatch() {
+  local d="$1"
+  for _ in $(seq 1 100); do
+    pgrep -f "fswatch -0 $d/.stitchpad/stitchpad.md" >/dev/null 2>&1 && return 0
+    sleep 0.05
+  done
+  fail "watcher fswatch did not become ready for $d"
+}
+
 tmp="$(mktemp -d /tmp/stitchpad-wake-regression.XXXXXX)"
-trap 'rm -rf "$tmp"' EXIT
+cleanup_all() {
+  local pidfile pid
+  while IFS= read -r pidfile; do
+    pid="$(cat "$pidfile" 2>/dev/null || true)"
+    [ -n "$pid" ] && kill "$pid" 2>/dev/null || true
+  done < <(find "$tmp" -type f \( -path '*/heartbeat.*.lock/pid' -o -path '*/alive-ticker.*.pid' -o -path '*/delivery.*.worker.lock.d/pid' \) 2>/dev/null)
+  pkill -TERM -f "$tmp" 2>/dev/null || true
+  sleep 0.1
+  pkill -KILL -f "$tmp" 2>/dev/null || true
+  rm -rf "$tmp"
+}
+trap cleanup_all EXIT
 
 export STITCHPAD_HOME="$ROOT/tool"
 
@@ -292,6 +321,7 @@ fi
 	"$SP" init --name case10 >/dev/null
 	"$SP" join agent herdr push >/dev/null     # push adapter, NOT pull
 	stop_watcher "$case10"
+	rm -f "$case10/.stitchpad/.state"/alive.*
 
 	# Build: one mention consumed (seen=1), second stamped pending=2 then
 	# consumed (turn crashed), third mention posted — watcher must defer.
@@ -305,17 +335,23 @@ fi
 	# Start watcher backgrounded, CAPTURE output, trigger fswatch.
 	"$SP" watch > "$case10/watcher.out" 2>&1 &
 	WATCH_PID=$!
-	sleep 0.5
+	wait_for_fswatch "$case10"
 	printf '\n' >> "$case10/.stitchpad/stitchpad.md"
-	sleep 1.5
+	for _ in $(seq 1 100); do
+	  grep -q 'deferring.*pending recovery target.*ordinal 2' "$case10/watcher.out" 2>/dev/null && break
+	  sleep 0.05
+	done
 	kill -9 $WATCH_PID 2>/dev/null || true
 	wait $WATCH_PID 2>/dev/null || true
 	pkill -9 -f "fswatch.*$case10" 2>/dev/null || true
 	rm -rf "$case10/.stitchpad/.state/watch.lock.d" 2>/dev/null || true
 
 	# Assert: the DEFER branch actually RAN (deferring line present).
-	grep -q 'deferring.*pending recovery target.*ordinal 2' "$case10/watcher.out" \
-	  || fail 'invariant5: watcher did NOT defer — branch not exercised'
+	if ! grep -q 'deferring.*pending recovery target.*ordinal 2' "$case10/watcher.out"; then
+	  cat "$case10/watcher.out" >&2
+	  find "$case10/.stitchpad/.state" -maxdepth 2 -type f -print -exec sh -c 'printf "  "; cat "$1"; printf "\n"' _ {} \; >&2
+	  fail 'invariant5: watcher did NOT defer — branch not exercised'
+	fi
 
 	# Assert: NO adapter was fired (defer happened before --peek).
 	! grep -q 'firing' "$case10/watcher.out" \
@@ -367,6 +403,7 @@ fi
 	"$SP" init --name case12 >/dev/null
 	"$SP" join agent test-fail push >/dev/null    # push adapter that always exits 1
 	stop_watcher "$case12"
+	rm -f "$case12/.stitchpad/.state"/alive.*
 
 	# Post a mention and start the watcher — the test-fail adapter exits 1,
 	# so the seat worker records a durable error and keeps its accepted generation.
@@ -376,11 +413,15 @@ fi
 	# both cycles ran (adapter failure -> clear -> retry -> clear again).
 	"$SP" watch > "$case12/watcher.out" 2>&1 &
 	WATCH_PID=$!
-	sleep 0.5
+	wait_for_fswatch "$case12"
 
 	# EVENT 1: trigger fswatch; adapter fails and supervised pending survives.
 	printf '\n' >> "$case12/.stitchpad/stitchpad.md"
-	sleep 1.5
+	for _ in $(seq 1 100); do
+	  grep -q '^state=error$' "$case12/.stitchpad/.state/delivery.agent.state" 2>/dev/null \
+	    && [ ! -d "$case12/.stitchpad/.state/delivery.agent.worker.lock.d" ] && break
+	  sleep 0.05
+	done
 	[ -f "$case12/.stitchpad/.state/delivery.agent.pending" ] \
 	  || fail 'supervision: adapter failure discarded accepted generation'
 	grep -q '^state=error$' "$case12/.stitchpad/.state/delivery.agent.state" \
@@ -393,7 +434,11 @@ fi
 	# generation without creating a duplicate generation or consuming seen.
 	_gen12="$(cat "$case12/.stitchpad/.state/delivery.agent.generation")"
 	printf '\n' >> "$case12/.stitchpad/stitchpad.md"
-	sleep 1.5
+	for _ in $(seq 1 100); do
+	  [ "$(grep -c 'exit 1 (not consuming gate)' "$case12/.stitchpad/.state/delivery.agent.log" 2>/dev/null || true)" -ge 2 ] \
+	    && [ ! -d "$case12/.stitchpad/.state/delivery.agent.worker.lock.d" ] && break
+	  sleep 0.05
+	done
 	[ "$(cat "$case12/.stitchpad/.state/delivery.agent.generation")" = "$_gen12" ] \
 	  || fail 'supervision: retry created a duplicate generation'
 	[ -f "$case12/.stitchpad/.state/delivery.agent.pending" ] \
@@ -425,6 +470,7 @@ fi
 	"$SP" init --name case13 >/dev/null
 	"$SP" join agent ocean push ocean-session >/dev/null
 	stop_watcher "$case13"
+	rm -f "$case13/.stitchpad/.state"/alive.*
 	rm -f "$case13/.stitchpad/.state/alive.agent"
 	[ "$(cat "$case13/.stitchpad/.state/sessions/ocean-session" 2>/dev/null)" = "agent" ] \
 	  || fail 'ocean join did not bind push session identity'
@@ -435,7 +481,10 @@ fi
 	mkdir "$mockbin"
 	cat > "$mockbin/curl" <<'EOF'
 #!/usr/bin/env bash
-printf '{"session":{"active_turn":null}}\n'
+case "${!#}" in
+  */v1/requests) printf '{"ok":true,"requests":[{"request_id":"turn-13","state":"completed"}]}\n' ;;
+  *) printf '{"session":{"active_turn":null}}\n' ;;
+esac
 EOF
 	cat > "$mockbin/ocean-heartbeat" <<'EOF'
 #!/usr/bin/env bash
@@ -447,7 +496,7 @@ EOF
 	STITCHPAD_NAME=sender "$SP" say '@agent exactly once over ocean push' >/dev/null
 	PATH="$mockbin:$PATH" "$SP" watch > "$case13/watcher.out" 2>&1 &
 	WATCH_PID=$!
-	sleep 0.5
+	wait_for_fswatch "$case13"
 	printf '\n' >> "$case13/.stitchpad/stitchpad.md"
 	for _ in 1 2 3 4 5 6 7 8 9 10; do
 	  [ "$(cat "$case13/.stitchpad/.state/seen.agent" 2>/dev/null || echo 0)" -eq 1 ] && break

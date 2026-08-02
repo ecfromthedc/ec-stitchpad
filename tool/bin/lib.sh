@@ -920,20 +920,67 @@ sp_watch_fswatch_parents_for_pad() {
 sp_stop_watchers_for_pad() {
   [ -n "${PAD_STATE:-}" ] || return 0
   local watch_lock="$PAD_STATE/watch.lock.d"
-  local p pids=()
+  local p pids_text
   p="$(cat "$watch_lock/pid" 2>/dev/null || true)"
-  [ -n "$p" ] && pids+=( "$p" )
-  while IFS= read -r p; do
-    [ -n "$p" ] && pids+=( "$p" )
-  done < <(sp_watch_processes_for_pad)
+  pids_text="$({ [ -n "$p" ] && printf '%s\n' "$p"; sp_watch_processes_for_pad; } | sort -nu)"
 
   rm -rf "$watch_lock" 2>/dev/null || true
-  for p in "${pids[@]}"; do
+  while IFS= read -r p; do
+    [ -n "$p" ] || continue
     kill "$p" 2>/dev/null || true
-  done
+  done <<< "$pids_text"
   sleep 0.2
-  for p in "${pids[@]}"; do
+  while IFS= read -r p; do
+    [ -n "$p" ] || continue
     kill -0 "$p" 2>/dev/null && kill -KILL "$p" 2>/dev/null || true
+  done <<< "$pids_text"
+}
+
+sp_stop_delivery_worker() {
+  local name="$1" lock="$PAD_STATE/delivery.$1.worker.lock.d" pid token owner command
+  [ -d "$lock" ] || return 0
+  pid="$(cat "$lock/pid" 2>/dev/null || true)"; token="$(cat "$lock/token" 2>/dev/null || true)"
+  owner="$(cat "$lock/owner" 2>/dev/null || true)"; command="$(ps -p "$pid" -o command= 2>/dev/null || true)"
+  if [ -n "$pid" ] && [ "$(printf '%s' "$owner" | cut -d'|' -f3)" = "$PAD_DIR" ] \
+     && [ "$(printf '%s' "$owner" | cut -d'|' -f4)" = "$name" ] \
+     && [[ "$command" == *"--delivery-worker $name $token"* ]]; then
+    kill "$pid" 2>/dev/null || true
+    # The worker's TERM trap may spend up to five seconds completing one bounded
+    # Ocean cancellation request. Let that exact cleanup finish before KILL.
+    for _ in $(seq 1 120); do kill -0 "$pid" 2>/dev/null || break; sleep 0.05; done
+    kill -0 "$pid" 2>/dev/null && kill -KILL "$pid" 2>/dev/null || true
+  fi
+  rm -rf "$lock"
+}
+
+sp_delivery_ocean_unresolved_after_stop() {
+  local name="$1" state pending_adapter submit generation turn_file turn_id result
+  state="$(sed -n 's/^state=//p' "$PAD_STATE/delivery.$name.state" 2>/dev/null | tail -1)"
+  case "$state" in acceptance_unknown|cancel_pending) return 0;; esac
+  pending_adapter="$(cut -d'|' -f6 "$PAD_STATE/delivery.$name.pending" 2>/dev/null || true)"
+  [ "$pending_adapter" = ocean ] || return 1
+  for submit in "$PAD_STATE"/delivery."$name".submit.*; do
+    [ -f "$submit" ] || continue
+    generation="${submit##*.submit.}"
+    [ -s "$PAD_STATE/delivery.$name.turn.$generation" ] || return 0
+  done
+  for turn_file in "$PAD_STATE"/delivery."$name".turn.*; do
+    [ -s "$turn_file" ] || continue
+    turn_id="$(cat "$turn_file" 2>/dev/null || true)"
+    result="$(cat "$PAD_STATE/delivery.$name.cancel.$turn_id/result" 2>/dev/null || true)"
+    case "$result" in canceled|completed|errored|cancelled) ;;
+      *) return 0 ;;
+    esac
+  done
+  return 1
+}
+
+sp_stop_delivery_workers() {
+  local lock name
+  for lock in "$PAD_STATE"/delivery.*.worker.lock.d; do
+    [ -d "$lock" ] || continue
+    name="${lock##*/delivery.}"; name="${name%.worker.lock.d}"
+    sp_stop_delivery_worker "$name"
   done
 }
 
