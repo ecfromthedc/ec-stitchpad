@@ -5,7 +5,12 @@ ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 SP="$ROOT/tool/bin/stitchpad"
 tmp="$(mktemp -d /tmp/stitchpad-reset-recovery.XXXXXX)"
 foreign_pid=""
+reset_pid=""
 cleanup() {
+  if [ -n "$reset_pid" ]; then
+    kill "$reset_pid" 2>/dev/null || true
+    wait "$reset_pid" 2>/dev/null || true
+  fi
   if [ -n "$foreign_pid" ]; then
     kill -KILL "$foreign_pid" 2>/dev/null || true
     wait "$foreign_pid" 2>/dev/null || true
@@ -137,18 +142,22 @@ barrier="$tmp/reset-reply-race"
 ) > "$tmp/reset-racer.out" 2>&1 &
 reset_pid=$!
 # Full CLI startup plus exact worker/ticker ownership checks can approach one
-# second on a loaded Mac. Match the production test seam's five-second bound so
-# this asserts the race semantics instead of scheduler luck.
-for _ in $(seq 1 250); do
+# second on a loaded Mac. A bounded ten-second admission window asserts the
+# race semantics instead of scheduler luck and leaves room for concurrent CI.
+barrier_wait_i=0
+while [ "$barrier_wait_i" -lt 500 ]; do
   [ -f "$barrier.ready" ] && break
   sleep 0.02
+  barrier_wait_i=$((barrier_wait_i + 1))
 done
 [ -f "$barrier.ready" ] || fail "reply-race reset never reached pre-queue barrier"
 STITCHPAD_NAME=racer "$SP" say '@alpha answered during reset queue window' >/dev/null
 touch "$barrier.release"
 if wait "$reset_pid"; then
+  reset_pid=""
   fail "reply-race reset reported a queued redelivery after the gate closed"
 fi
+reset_pid=""
 [ ! -f "$state/pending.racer" ] || fail "reply race left a permanent pending ordinal"
 [ ! -f "$state/pending.racer.reset" ] || fail "reply race left reset provenance"
 [ -z "$("$SP" wake racer --peek)" ] || fail "reply race replayed the answered mention"
