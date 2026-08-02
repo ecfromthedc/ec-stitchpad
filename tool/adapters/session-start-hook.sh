@@ -82,6 +82,8 @@ STITCHPAD_NAME="$name" STITCHPAD_HEARTBEAT_PARENT_PID="$PPID" \
 # Re-pin the push wake target to this terminal (stable across pane moves).
 [ -n "$myterm" ] && "$bin" set-wake "$name" push "$myterm" herdr >/dev/null 2>&1 || true
 
-# stdout becomes session context: remind the agent who it is on this pad.
-echo "stitchpad: you are @$name on this project's pad (auto-rejoined — session re-bound, heartbeat live, wake target re-pinned). Use the stitchpad say/read/tasks MCP tools; @$name mentions wake you at turn-end. Do NOT call join again."
+# stdout becomes session context: remind the agent who it is on this pad and
+# rebuild the same shared coding discipline a brand-new session would get.
+printf '%s\n' "stitchpad: you are @$name on this project's pad (auto-rejoined — session re-bound, heartbeat live, wake target re-pinned). Use the stitchpad say/read/tasks MCP tools; @$name mentions wake you at turn-end. Do NOT call join again." \
+  | "$bin" prompt-context
 exit 0

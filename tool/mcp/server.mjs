@@ -51,6 +51,7 @@ import fsSync from "node:fs";
 import { promisify } from "node:util";
 import { fileURLToPath } from "node:url";
 import path from "node:path";
+import { composePonytail } from "../instructions/ponytail-compose.mjs";
 
 const execFileP = promisify(execFile);
 
@@ -147,6 +148,14 @@ async function sp(args, me, extraEnv = {}) {
     maxBuffer: 1024 * 1024,
   });
   return (stdout || "") + (stderr ? `\n${stderr}` : "");
+}
+
+// MCP local join already receives the CLI's injected fragment; relay join and
+// locked-session rejoin do not. Ask the same builder and add it only when the
+// complete trusted block is at a prompt boundary — no second copy of the rules.
+async function withPonytail(textBody) {
+  const rules = await sp(["instructions"]).then(s => s.trim()).catch(() => "");
+  return composePonytail(rules, textBody);
 }
 // Stamp agent-facing results with the pad they actually hit, so a misrouted
 // call is self-evident to the agent instead of silent.
@@ -618,6 +627,7 @@ server.setRequestHandler(CallToolRequestSchema, async (req) => {
       default:
         return text(`unknown tool: ${name}`, true);
     }
+    if (name === "join") out = await withPonytail(out);
     return text(out.trim() || "(ok)");
   } catch (err) {
     return text(`stitchpad error: ${err.stderr || err.message}`, true);

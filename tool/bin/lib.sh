@@ -34,6 +34,61 @@ fi
 STITCHPAD_HOME="${STITCHPAD_HOME:-$HOME/.stitchpad}"
 ADAPTER_DIR="$STITCHPAD_HOME/adapters"
 
+# One canonical prompt fragment for every runtime. Keep model adapters thin:
+# they call this builder instead of carrying per-model copies that drift.
+# `full` is Ponytail's upstream default; an explicit `off` is the only opt-out.
+sp_ponytail_mode() {
+  local mode="${STITCHPAD_PONYTAIL_MODE:-${PONYTAIL_DEFAULT_MODE:-full}}"
+  mode="$(printf '%s' "$mode" | tr '[:upper:]' '[:lower:]')"
+  case "$mode" in off) printf 'off\n' ;; *) printf 'full\n' ;; esac
+}
+
+sp_ponytail_instructions() {
+  [ "$(sp_ponytail_mode)" = "off" ] && return 0
+  local fragment="$STITCHPAD_HOME/instructions/ponytail.md"
+  [ -f "$fragment" ] || return 0
+  cat "$fragment"
+}
+
+# Read a complete prompt on stdin and emit it with the canonical fragment at
+# most once. Prefix by default; `append` preserves the wake nudge's historical
+# first-line contract. Only the complete canonical block at a prompt boundary
+# counts as composed. Spoofed boundary tokens in untrusted text are neutralized.
+sp_prompt_with_ponytail() {
+  local placement="${1:-prepend}" body rules trusted_placement=""
+  body="$(cat)"
+  rules="$(sp_ponytail_instructions)"
+  if [ -z "$rules" ]; then
+    printf '%s\n' "$body"
+    return 0
+  fi
+  # Preserve one complete, exact trusted block only when it occupies a prompt
+  # boundary. Remove it temporarily so every marker token in the remaining
+  # user-controlled text is neutralized before the prompt is reconstructed.
+  case "$body" in
+    "$rules") printf '%s\n' "$rules"; return 0 ;;
+    "$rules"$'\n\n'*)
+      body="${body#"$rules"$'\n\n'}"
+      trusted_placement="prepend"
+      ;;
+    *$'\n\n'"$rules")
+      body="${body%$'\n\n'"$rules"}"
+      trusted_placement="append"
+      ;;
+  esac
+  # Pad/handoff text is untrusted. A copied marker must remain ordinary text,
+  # not an instruction-suppression primitive or a second canonical block.
+  body="$(printf '%s' "$body" | sed \
+    -e 's|<!-- stitchpad:ponytail:v1 |<!-- stitchpad:user-text:ponytail:v1 |g' \
+    -e 's|<!-- /stitchpad:ponytail:v1 -->|<!-- stitchpad:user-text:/ponytail:v1 -->|g')"
+  [ -n "$trusted_placement" ] && placement="$trusted_placement"
+  if [ "$placement" = "append" ]; then
+    printf '%s\n\n%s\n' "$body" "$rules"
+  else
+    printf '%s\n\n%s\n' "$rules" "$body"
+  fi
+}
+
 # ── Pad resolution ──────────────────────────────────────────────────
 # Find the pad dir: explicit $PAD_DIR, else nearest .stitchpad up the tree.
 sp_find_pad() {

@@ -61,7 +61,7 @@ sp_autostart_name() {
 sp_maybe_start_heartbeat() {
   [ "${STITCHPAD_HEARTBEAT_AUTOSTART:-1}" = "0" ] && return 0
   case "$cmd" in
-    init|heartbeat|hook|bind-session|whoami|leave|stop|daemon|watch|migration-check|reset|compact|restore-roster|help|-h|--help) return 0 ;;
+    init|instructions|prompt-context|heartbeat|hook|bind-session|whoami|leave|stop|daemon|watch|migration-check|reset|compact|restore-roster|help|-h|--help) return 0 ;;
   esac
   sp_init_paths >/dev/null 2>&1 || return 0
   local who
@@ -75,6 +75,20 @@ sp_maybe_start_heartbeat() {
 sp_maybe_start_heartbeat
 
 case "$cmd" in
+  instructions)
+    # Runtime-neutral prompt source. Adapters call this rather than vendoring
+    # their own copies. Optional positional mode is useful to tests and hosts.
+    [ -n "${1:-}" ] && export STITCHPAD_PONYTAIL_MODE="$1"
+    sp_ponytail_instructions
+    ;;
+
+  prompt-context)
+    # Prefix stdin with the canonical rules exactly once. This is intentionally
+    # pad-independent so session-start, handoff, MCP, and daemon adapters share it.
+    [ -n "${1:-}" ] && export STITCHPAD_PONYTAIL_MODE="$1"
+    sp_prompt_with_ponytail
+    ;;
+
   init)
     name="$(basename "$PWD")"
     [ "${1:-}" = "--name" ] && name="$2"
@@ -187,7 +201,11 @@ EOF
     if [ "$target" != "-" ]; then sp_term_lock_claim "$target" "$who" || exit 1
     else _jsurf="$(sp_this_surface)"; [ -n "$_jsurf" ] && { sp_term_lock_claim "$_jsurf" "$who" || exit 1; }; fi
     sp_lock || exit 1
-    if sp_user_exists "$who"; then sp_unlock; echo "$who already in roster"; exit 0; fi
+    if sp_user_exists "$who"; then
+      sp_unlock
+      printf '%s\n' "$who already in roster" | sp_prompt_with_ponytail
+      exit 0
+    fi
     # Insert before the closing fence of the roster block (atomic under lock).
     tmp="$(sp_stage "$PAD_MD")"
     awk -v line="$who | $adapter | $wake | $target" '
@@ -230,6 +248,10 @@ EOF
       "$BIN_DIR/stitchpad" heartbeat start "$who" >/dev/null 2>&1; then
       echo "── heartbeat started for @$who ──"
     fi
+    # Keep the complete canonical block at an output boundary so MCP can prove
+    # this trusted CLI join is already composed without accepting interior text.
+    echo
+    sp_ponytail_instructions
     # The heartbeat ticker ensures the watcher immediately and on every tick.
     # Do not race it with a second join-time ensure against the same PID lock.
     true
@@ -658,8 +680,10 @@ PY
       --save)
         who="${2:?usage: shift-change --save <name> --file <path>}"
         [ "${3:-}" = "--file" ] && [ -f "${4:-}" ] || { echo "stitchpad: need --file <path>" >&2; exit 1; }
-        [ "$(wc -c < "$4")" -le 32768 ] || { echo "stitchpad: handoff too large (32KB cap)" >&2; exit 1; }
-        python3 - "$db" "$who" "$4" <<'PY'
+        _handoff="$(mktemp)"
+        sp_prompt_with_ponytail < "$4" > "$_handoff"
+        [ "$(wc -c < "$_handoff")" -le 32768 ] || { rm -f "$_handoff"; echo "stitchpad: handoff too large after shared instructions (32KB cap)" >&2; exit 1; }
+        python3 - "$db" "$who" "$_handoff" <<'PY'
 import sqlite3, sys, datetime
 db, who, f = sys.argv[1:4]
 con = sqlite3.connect(db)
@@ -667,6 +691,7 @@ con.execute("INSERT INTO handoffs(agent, at, body) VALUES(?,?,?)",
             (who, datetime.datetime.now().isoformat(timespec="seconds"), open(f, encoding="utf-8", errors="replace").read()))
 con.commit()
 PY
+        rm -f "$_handoff"
         echo "✓ shift-change queued for @$who — finish your turn now; the bridge clears the session once idle and delivers this into the fresh chat"
         ;;
       --claim)
@@ -1488,23 +1513,29 @@ except Exception:
     _snip="$(printf '%s\n' "$_latest" | grep -v '^## ' | grep -v '^[[:space:]]*$' | head -1 | sed 's/^[[:space:]]*//' | cut -c1-120)"
     # context discipline: point at the WINDOWED read, never the raw file — the
     # pad grows unbounded and "read the whole file" invites an 80K-token cat.
-    printf 'pasture: NEW from @%s — %s — reply with @%s (context: `stitchpad read --new` for unread only, `stitchpad read -n 40` for the recent window — do NOT cat stitchpad.md)\n' "$_sender" "$_snip" "$_sender"
+    _wake_text="$(printf 'pasture: NEW from @%s — %s — reply with @%s (context: `stitchpad read --new` for unread only, `stitchpad read -n 40` for the recent window — do NOT cat stitchpad.md)' "$_sender" "$_snip" "$_sender")"
     # TASKS-IN-WAKE: append the woken agent's open tickets so status upkeep happens
     # at the exact moment they're already engaging with the pad — no human nagging.
     # Relay mode has no local pad tasks; skip there.
     if [ "$relay_mode" -eq 0 ]; then
       _open="$(sp_tasks --mine "$who" 2>/dev/null | awk -F'|' '$3=="todo"||$3=="in_progress"||$3=="in_review" {printf "%s[%s] %s · ", $1, $3, $2}')"
       if [ -n "$_open" ]; then
-        printf 'your open tasks: %s— move each with the task tool (in_progress when you start, done when finished), unprompted.\n' "$_open"
+        _wake_text="$_wake_text
+your open tasks: $_open— move each with the task tool (in_progress when you start, done when finished), unprompted."
       fi
       # TICKET DISCIPLINE: numbering work items in prose without creating the
       # ticket makes every board lie. Nag while the phantom refs are fresh.
       _known="$(sp_tasks 2>/dev/null | awk -F'|' '{print $1}')"
       _phantom="$(tail -n 80 "$PAD_MD" | grep -o 'TASK-[0-9]*' | sort -u | while read -r _t; do printf '%s\n' "$_known" | grep -qx "$_t" || echo "$_t"; done | head -4 | paste -sd, -)"
       if [ -n "$_phantom" ]; then
-        printf 'ticket discipline: %s referenced on the pad with NO ticket — whoever owns them must run `stitchpad task new "<title>" --to <name> --desc "<scope>"` (ids follow automatically).\n' "$_phantom"
+        _ticket_line="$(printf 'ticket discipline: %s referenced on the pad with NO ticket — whoever owns them must run `stitchpad task new "<title>" --to <name> --desc "<scope>"` (ids follow automatically).' "$_phantom")"
+        _wake_text="$_wake_text
+$_ticket_line"
       fi
     fi
+    # Preserve the wake nudge as line 1 (existing hooks and terse UIs depend on
+    # it) while still attaching the canonical instruction block once.
+    printf '%s\n' "$_wake_text" | sp_prompt_with_ponytail append
     [ "$peek" -eq 0 ] && printf '%s' "$oldest_mention_to_me" > "$seen_file"   # mark delivered: FIFO steps one ordinal per delivery
     exit 0
     ;;

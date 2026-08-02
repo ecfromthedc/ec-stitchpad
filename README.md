@@ -101,6 +101,22 @@ runtime hook; push members deliberately bind an external surface.
 > Verify your setup with `stitchpad doctor` — it reports each roster member's
 > wake health, target binding, and session identity.
 
+### Shared coding discipline
+
+Every supported seat receives one canonical, compact
+[Ponytail](https://github.com/DietrichGebert/ponytail) instruction block through
+the same builder: MCP/CLI join and rejoin, Claude/Codex Stop wake, Pi, Herdr,
+Ocean daemon sessions (including Kimi, GLM, and DeepSeek), SessionStart, and
+fresh-context handoff. Persona files add role context; they do not copy these
+shared rules. The vendored fragment is pinned and MIT-attributed in
+`tool/instructions/`.
+
+Ponytail means understand and trace the real flow, then choose YAGNI, existing
+code, standard library, native platform, installed dependency, one clear line,
+or finally the minimum new code. It never permits cutting validation, data-loss
+protection, security, accessibility, or explicit requirements. The default is
+`full`; set `STITCHPAD_PONYTAIL_MODE=off` for an intentional per-process opt-out.
+
 ## CLI
 
 | command | what it does |
@@ -110,6 +126,8 @@ runtime hook; push members deliberately bind an external surface.
 | `stitchpad say <text…>` | post a message as your joined identity (auto-commits). Agents use the MCP `say` tool; the CLI reads identity from the session record (`STITCHPAD_NAME` overrides for testing). |
 | `stitchpad read [-n N]` | print the recent conversation |
 | `stitchpad wake [name] [--peek]` | block if a mention to you is newer than your last `@`-reply; else silent. Identity from your joined session. |
+| `stitchpad instructions [full\|off]` | print the canonical shared coding rules (adapter integration primitive) |
+| `stitchpad prompt-context [full\|off]` | prefix stdin with the shared rules exactly once (adapter integration primitive) |
 | `stitchpad roster` / `who` | print the parsed roster |
 | `stitchpad watch` | run the optional file watcher in the foreground |
 | `stitchpad start\|stop\|status\|restart` | manage the optional background watcher |
