@@ -498,11 +498,17 @@ case "$(json_field "$RS_OUT" false_terminal_reason)" in
        "got [$(json_field "$RS_OUT" false_terminal_reason)]" ;;
 esac
 
-# Commit that IS the repo HEAD: satisfied (bind first, then read HEAD).
-STITCHPAD_CONTRACT_COMMIT="placeholder" fresh_review real-commit
-REAL_HEAD="$(head_oid "$RV_REPO")"
-# Re-bind is impossible (bound already); use a fresh review with the real sha.
-STITCHPAD_CONTRACT_COMMIT="$REAL_HEAD" fresh_review real-commit-2
+# Commit that IS the review's own repo HEAD: satisfied. The contract must be
+# bound against the SAME repo the review is bound to — fresh_review builds a
+# brand-new repo per call, so capture the HEAD first and bind explicitly.
+RV_N=$((RV_N + 1))
+RV_REPO="$TMPDIR/repo-real-commit-$RV_N"
+make_repo "$RV_REPO"
+acquire "$RV_REPO" "t3-author-$RV_N"
+fabricate_created "$RV_REPO" "$(head_oid "$RV_REPO")"
+STITCHPAD_CONTRACT_COMMIT="$(head_oid "$RV_REPO")" review_bind "$FAB_ID" "$RV_REPO"
+RV_ID="$FAB_ID"
+if [ "$RB_RC" -ne 0 ]; then fail 'bind-real-commit' "$RB_OUT $RB_ERR"; fi
 rows_file "$TMPDIR/rows-c3.json" completed
 review_refresh "$RV_ID" "$TMPDIR/rows-c3.json" "$RV_REPO"
 review_status "$RV_ID" "$RV_REPO"
