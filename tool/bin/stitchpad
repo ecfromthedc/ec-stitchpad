@@ -1128,6 +1128,14 @@ PY
     sp_init_paths || exit 1
     q="${1:?usage: stitchpad search <query> [-n N]}"; shift || true
     n=20; [ "${1:-}" = "-n" ] && n="${2:-20}"
+    # C13 (rc1): $n lands at a CLEAN sqlite statement boundary (LIMIT $n;) in
+    # the archive query — unvalidated, `search x -n '1;DROP TABLE messages;--'`
+    # executed and dropped the archive messages table (irrecoverable: the
+    # sqlite is not in pad git). The live-section head also takes $n. Numeric
+    # only, before either section runs.
+    case "$n" in *[!0-9]*|'')
+      echo "stitchpad: search -n must be a positive integer" >&2; exit 1 ;;
+    esac
     echo "— live pad —"
     grep -in -- "$q" "$PAD_MD" | head -n "$n" || true
     db="$PAD_STATE/archive.sqlite"
