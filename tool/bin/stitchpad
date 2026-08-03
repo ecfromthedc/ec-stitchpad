@@ -1380,7 +1380,22 @@ PY
           # Bash 3.2 has no BASHPID. A direct child reports this background
           # shell as its PPID, giving the ticker its real process identity.
           ticker_pid="$(python3 -c 'import os; print(os.getppid())')"
+          _hb_sleep_pid=""
+          _hb_sleep_start=""
+          _hb_sleep_command=""
           heartbeat_child_cleanup() {
+            # TERM interrupts the shell's wait but does not terminate its
+            # background sleep. Reap only the exact child identity this ticker
+            # observed, so stop/reset cannot leave it orphaned under PID 1 or
+            # signal a reused/foreign PID.
+            if [ -n "$_hb_sleep_pid" ] \
+              && sp_process_identity_matches "$_hb_sleep_pid" "$_hb_sleep_start" "$_hb_sleep_command"; then
+              kill "$_hb_sleep_pid" 2>/dev/null || true
+              wait "$_hb_sleep_pid" 2>/dev/null || true
+            fi
+            _hb_sleep_pid=""
+            _hb_sleep_start=""
+            _hb_sleep_command=""
             if sp_ticker_owner_matches "$lockd" "$generation" "$ticker_pid" "$STITCHPAD_NAME"; then
               sp_ticker_alive_remove_generation "$STITCHPAD_NAME" "$generation"
               _hb_owner_observed="$(cat "$lockd/owner" 2>/dev/null || true)"
@@ -1432,7 +1447,13 @@ PY
             sp_term_lock_touch "$surface" "$STITCHPAD_NAME" 2>/dev/null || true
             "$BIN_DIR/stitchpad" ensure-watcher >/dev/null 2>&1 || true
             sleep "$interval" &
-            wait $! || exit 0
+            _hb_sleep_pid=$!
+            _hb_sleep_start="$(sp_process_start "$_hb_sleep_pid")"
+            _hb_sleep_command="$(sp_process_command "$_hb_sleep_pid")"
+            wait "$_hb_sleep_pid" || exit 0
+            _hb_sleep_pid=""
+            _hb_sleep_start=""
+            _hb_sleep_command=""
             [ -n "$parent" ] && ! kill -0 "$parent" 2>/dev/null && exit 0
           done
         ) &

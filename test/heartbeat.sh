@@ -5,8 +5,13 @@ set -euo pipefail
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 SP="$ROOT/tool/bin/stitchpad"
 FIXTURE_DIR="$(mktemp -d)"
+foreign_sleep_pid=""
 cleanup() {
-  for name in alice legacy; do
+  if [ -n "$foreign_sleep_pid" ] && kill -0 "$foreign_sleep_pid" 2>/dev/null; then
+    kill "$foreign_sleep_pid" 2>/dev/null || true
+    wait "$foreign_sleep_pid" 2>/dev/null || true
+  fi
+  for name in alice sleeper legacy; do
     STITCHPAD_PAD_DIR="$FIXTURE_DIR/.stitchpad" "$SP" heartbeat --stop "$name" >/dev/null 2>&1 || true
   done
   STITCHPAD_PAD_DIR="$FIXTURE_DIR/.stitchpad" "$SP" daemon stop >/dev/null 2>&1 || true
@@ -75,6 +80,36 @@ if kill -0 "$pid" 2>/dev/null && ps -p "$pid" -o stat= 2>/dev/null | grep -vq 'Z
   echo "heartbeat ticker still running after --stop" >&2
   exit 1
 fi
+
+# TERM must reap the ticker's active delay child. The old wait-based loop exited
+# its shell but silently left `sleep 30` under PID 1. A same-command foreign
+# canary proves that child identity, not command matching, is signal authority.
+STITCHPAD_HEARTBEAT_INTERVAL=30 "$SP" join sleeper herdr push term-sleeper >/dev/null
+STITCHPAD_NAME=sleeper STITCHPAD_HEARTBEAT_INTERVAL=30 \
+  STITCHPAD_HEARTBEAT_PARENT_PID="$$" "$SP" heartbeat start sleeper >/dev/null
+sleeper_owner="$FIXTURE_DIR/.stitchpad/.state/heartbeat.sleeper.lock/owner"
+for _ in $(seq 1 40); do [ -s "$sleeper_owner" ] && break; sleep 0.05; done
+[ -s "$sleeper_owner" ] || { echo "sleeper ticker did not publish owner" >&2; exit 1; }
+sleeper_pid="$(jq -r '.pid' "$sleeper_owner")"
+sleeper_child=""
+for _ in $(seq 1 40); do
+  sleeper_child="$(ps -axo pid=,ppid=,command= | awk -v parent="$sleeper_pid" \
+    '$2 == parent && $3 == "sleep" && $4 == "30" && !found { print $1; found=1 }')"
+  [ -n "$sleeper_child" ] && break
+  sleep 0.05
+done
+[ -n "$sleeper_child" ] || { echo "sleeper ticker did not start its delay child" >&2; exit 1; }
+sleep 30 &
+foreign_sleep_pid=$!
+STITCHPAD_NAME=sleeper "$SP" heartbeat --stop sleeper >/dev/null
+if kill -0 "$sleeper_child" 2>/dev/null && ps -p "$sleeper_child" -o stat= 2>/dev/null | grep -vq 'Z'; then
+  echo "heartbeat stop left its exact sleep child alive" >&2
+  exit 1
+fi
+kill -0 "$foreign_sleep_pid" 2>/dev/null || { echo "heartbeat stop killed a foreign sleep canary" >&2; exit 1; }
+kill "$foreign_sleep_pid" 2>/dev/null || true
+wait "$foreign_sleep_pid" 2>/dev/null || true
+foreign_sleep_pid=""
 
 # Existing pads can have roster entries created before heartbeat tickers existed.
 # Read-only commands must not backfill runtime state, while the next normal
