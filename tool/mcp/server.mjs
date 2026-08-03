@@ -101,8 +101,15 @@ async function persistRelayHookEnv() {
     `STITCHPAD_HANDLE=${shellQuote(myHandle)}`,
     "",
   ].join("\n");
-  const files = [path.join(stateDir, "relay-hook.env")];
-  if (SESSION_ID) files.unshift(path.join(stateDir, `relay-hook.${SESSION_ID}.env`));
+  // MULTI-PAD (rc7 F2): the shared relay-hook.env is machine-global — every
+  // relay join used to overwrite it, so pad B's join clobbered pad A's
+  // credentials for every legacy (no-session-id) Stop hook on the machine.
+  // When we know our session id, write ONLY the per-session file; the shared
+  // file is written only by session-less servers (legacy runtimes), which is
+  // also the only case the Stop hook will consult it for.
+  const files = [];
+  if (SESSION_ID) files.push(path.join(stateDir, `relay-hook.${SESSION_ID}.env`));
+  else files.push(path.join(stateDir, "relay-hook.env"));
   for (const file of files) {
     await writeFile(file, body, { mode: 0o600 });
     await chmod(file, 0o600).catch(() => {});
