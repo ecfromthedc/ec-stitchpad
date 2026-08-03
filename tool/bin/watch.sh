@@ -225,6 +225,36 @@ delivery_write_state() {
   mv "$tmp" "$file"
 }
 
+# E7: shared bound-check for every call site that retries
+# delivery_cancel_ocean_turn after a failure. Returns 0 (not exhausted — the
+# caller may retry) or 1 (exhausted — the caller must give up and surface a
+# terminal state, never retry again). Records the attempt when NOT exhausted
+# so the count advances on every failed cancel; the caller resets the key on
+# the next successful cancel for that name/turn/reason.
+#
+# TASK-4's original bound wrapped exactly one of these sites (superseded_
+# generation, below). The other six — DND, task-invalid (both the live
+# dispatch path and the reconcile-time duplicate), superseded_current,
+# superseded_after_accept, and the reconcile-time superseded_by_newer path —
+# retried delivery_cancel_ocean_turn with plain sleep+continue/break inside
+# an unbounded outer loop: a daemon that never acks a cancel looped forever.
+_sp_delivery_cancel_bound_check() {
+  local name="$1" turn_id="$2" reason="$3"
+  local key="cancel:$name:$turn_id:$reason"
+  if type sp_recovery_is_exhausted >/dev/null 2>&1 && sp_recovery_is_exhausted "$PAD_STATE" "$key"; then
+    type sp_recovery_terminal_refuse >/dev/null 2>&1 && \
+      sp_recovery_terminal_refuse "$name" "delivery-cancel" "$key"
+    return 1
+  fi
+  type sp_recovery_attempt_record >/dev/null 2>&1 && sp_recovery_attempt_record "$PAD_STATE" "$key"
+  return 0
+}
+_sp_delivery_cancel_bound_reset() {
+  local name="$1" turn_id="$2" reason="$3"
+  type sp_recovery_reset >/dev/null 2>&1 && \
+    sp_recovery_reset "$PAD_STATE" "cancel:$name:$turn_id:$reason" || true
+}
+
 delivery_cancel_ocean_turn() {
   local name="$1" turn_id="$2" reason="$3" dir response http daemon_url lock attempts=0 rc=1
   local cancel_state terminal token epoch claim claim_base nested owner pid pstart live_start born age
@@ -570,10 +600,18 @@ delivery_worker() {
     if sp_dnd_is_on "$name"; then
       if [ "$adapter" = ocean ] && [ -n "$turn_id" ]; then
         if ! delivery_cancel_ocean_turn "$name" "$turn_id" dnd; then
+          # E7: bound this retry. A daemon that never acks a DND cancel must
+          # not loop forever — terminal refusal surfaces as errored state.
+          if ! _sp_delivery_cancel_bound_check "$name" "$turn_id" dnd; then
+            delivery_write_state "$name" errored "$generation" "$ordinal" "$message_id" "$task_id" \
+              "$accepted_at" "$started" "" "$(delivery_now)" cancel_exhausted "$turn_id" errored
+            continue
+          fi
           delivery_write_state "$name" cancel_pending "$generation" "$ordinal" "$message_id" "$task_id" \
             "$accepted_at" "$started" "" "$(delivery_now)" cancel_failed "$turn_id" active
           sleep "$retry_seconds"; continue
         fi
+        _sp_delivery_cancel_bound_reset "$name" "$turn_id" dnd
         case "$DELIVERY_CANCEL_OUTCOME" in
           completed)
             delivery_finalize_completed "$name" "$generation" "$ordinal" "$message_id" "$task_id" \
@@ -634,10 +672,19 @@ delivery_worker() {
       fi
       if ! delivery_task_valid "$name" "$task_id"; then
         if ! delivery_cancel_ocean_turn "$name" "$turn_id" "$DELIVERY_TASK_REASON"; then
+          # E7: bound this retry — the task-invalid cancel must not loop
+          # forever if the daemon never acks it.
+          if ! _sp_delivery_cancel_bound_check "$name" "$turn_id" "$DELIVERY_TASK_REASON"; then
+            delivery_write_state "$name" errored "$generation" "$ordinal" "$message_id" "$task_id" \
+              "$accepted_at" "$started" "" "$(delivery_now)" cancel_exhausted "$turn_id" errored
+            rm -f "$(delivery_turn_file "$name" "$generation")"
+            continue
+          fi
           delivery_write_state "$name" cancel_pending "$generation" "$ordinal" "$message_id" "$task_id" \
             "$accepted_at" "$started" "" "$(delivery_now)" cancel_failed "$turn_id" active
           sleep "$retry_seconds"; continue
         fi
+        _sp_delivery_cancel_bound_reset "$name" "$turn_id" "$DELIVERY_TASK_REASON"
         case "$DELIVERY_CANCEL_OUTCOME" in
           completed)
             delivery_finalize_completed "$name" "$generation" "$ordinal" "$message_id" "$task_id" \
@@ -658,10 +705,19 @@ delivery_worker() {
         IFS='|' read -r current_ordinal current_sender current_id current_task <<< "$meta"
         if [ "$current_ordinal" != "$ordinal" ] || [ "$current_id" != "$message_id" ]; then
           if ! delivery_cancel_ocean_turn "$name" "$turn_id" superseded_current; then
+            # E7: bound this retry — a superseded-current cancel that never
+            # gets acked must not loop forever.
+            if ! _sp_delivery_cancel_bound_check "$name" "$turn_id" superseded_current; then
+              delivery_write_state "$name" errored "$generation" "$ordinal" "$message_id" "$task_id" \
+                "$accepted_at" "$started" "" "$(delivery_now)" cancel_exhausted "$turn_id" errored
+              rm -f "$(delivery_turn_file "$name" "$generation")"
+              continue
+            fi
             delivery_write_state "$name" cancel_pending "$generation" "$ordinal" "$message_id" "$task_id" \
               "$accepted_at" "$started" "" "$(delivery_now)" cancel_failed "$turn_id" active
             sleep "$retry_seconds"; continue
           fi
+          _sp_delivery_cancel_bound_reset "$name" "$turn_id" superseded_current
           case "$DELIVERY_CANCEL_OUTCOME" in
             completed)
               delivery_finalize_completed "$name" "$generation" "$ordinal" "$message_id" "$task_id" \
@@ -733,10 +789,18 @@ delivery_worker() {
       rm -f "$(delivery_submit_file "$name" "$generation")"
       if ! delivery_pending_matches "$name" "$generation" "$ordinal" "$message_id"; then
         if ! delivery_cancel_ocean_turn "$name" "$turn_id" superseded_after_accept; then
+          # E7: bound this retry — a superseded-after-accept cancel that
+          # never gets acked must not loop forever across worker restarts.
+          if ! _sp_delivery_cancel_bound_check "$name" "$turn_id" superseded_after_accept; then
+            delivery_write_state "$name" errored "$generation" "$ordinal" "$message_id" "$task_id" \
+              "$accepted_at" "$started" "" "$(delivery_now)" cancel_exhausted "$turn_id" errored
+            break
+          fi
           delivery_write_state "$name" cancel_pending "$generation" "$ordinal" "$message_id" "$task_id" \
             "$accepted_at" "$started" "" "$(delivery_now)" cancel_failed "$turn_id" cancelling
           break
         fi
+        _sp_delivery_cancel_bound_reset "$name" "$turn_id" superseded_after_accept
         case "$DELIVERY_CANCEL_OUTCOME" in
           completed) delivery_finalize_completed "$name" "$generation" "$ordinal" "$message_id" "$task_id" \
             "$accepted_at" "$started" "$turn_id" superseded_after_accept || true ;;
@@ -949,8 +1013,17 @@ delivery_enqueue_locked() {
     if [ "$old_ordinal" = "$ordinal" ] && [ "$old_message" = "$message_id" ]; then
       if ! delivery_task_valid "$name" "$old_task"; then
         if [ "$old_adapter" = ocean ] && ! delivery_cancel_ocean_turn "$name" "$old_turn" "$DELIVERY_TASK_REASON"; then
+          # E7: bound this retry — the reconcile-time task-invalid cancel
+          # must not restart the worker forever if the daemon never acks it.
+          if ! _sp_delivery_cancel_bound_check "$name" "$old_turn" "$DELIVERY_TASK_REASON"; then
+            delivery_drop_current "$name" "$old_generation" "$old_ordinal" "$old_message" "$old_task" \
+              "$old_accepted" "$DELIVERY_TASK_REASON" "$DELIVERY_TASK_STATUS" "$old_turn" cancel_exhausted
+            rm -f "$(delivery_turn_file "$name" "$old_generation")"
+            return 0
+          fi
           delivery_start_worker "$name"; return 0
         fi
+        _sp_delivery_cancel_bound_reset "$name" "$old_turn" "$DELIVERY_TASK_REASON"
         if [ "$old_adapter" = ocean ]; then
           case "$DELIVERY_CANCEL_OUTCOME" in
             completed)
@@ -994,8 +1067,18 @@ delivery_enqueue_locked() {
     fi
     if [ "$old_adapter" = ocean ] && [ -n "$old_turn" ]; then
       if ! delivery_cancel_ocean_turn "$name" "$old_turn" superseded_by_newer; then
+        # E7: bound this retry — the reconcile-time superseded-by-newer
+        # cancel must not restart the worker forever if the daemon never
+        # acks it, otherwise the newer message can never take over.
+        if ! _sp_delivery_cancel_bound_check "$name" "$old_turn" superseded_by_newer; then
+          delivery_drop_current "$name" "$old_generation" "$old_ordinal" "$old_message" "$old_task" \
+            "$old_accepted" superseded_by_newer "$ordinal" "$old_turn" cancel_exhausted
+          rm -f "$(delivery_turn_file "$name" "$old_generation")"
+          return 0
+        fi
         delivery_start_worker "$name"; return 0
       fi
+      _sp_delivery_cancel_bound_reset "$name" "$old_turn" superseded_by_newer
       case "$DELIVERY_CANCEL_OUTCOME" in
         completed)
           delivery_finalize_completed "$name" "$old_generation" "$old_ordinal" "$old_message" "$old_task" \
