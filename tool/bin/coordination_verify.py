@@ -1325,6 +1325,7 @@ RECORD_SCHEMAS = {
         "terminal_completion", "terminal_at", "report_sealed", "report_digest",
         "report_verdict", "report_sealed_at", "artifact_verified", "verified_at",
         "closure", "closure_reason", "closed_at", "conflict",
+        "contract", "false_terminal", "false_terminal_reason", "false_terminal_at",
         "provider", "provider_model", "session_rotation_required",
         "last_activity_at",
     ),
@@ -3258,6 +3259,118 @@ _MODEL_ENV = "STITCHPAD_MODEL"
 _SESSION_ENV = "STITCHPAD_SESSION"
 _REQUEST_ENV = "STITCHPAD_REQUEST"
 _WORKTREE_ENV = "STITCHPAD_WORKTREE"
+# Contract env vars: populate the facts.contract dict at review-create time.
+# Each is optional — a missing env means the artifact is not contracted.
+_CONTRACT_COMMIT_ENV = "STITCHPAD_CONTRACT_COMMIT"
+_CONTRACT_REPORT_ENV = "STITCHPAD_CONTRACT_REPORT"
+_CONTRACT_SIDECAR_ENV = "STITCHPAD_CONTRACT_SIDECAR"
+_CONTRACT_SIDECAR_DIGEST_ENV = "STITCHPAD_CONTRACT_SIDECAR_DIGEST"
+
+
+def _read_contract():
+    """Build the contract dict from env; None if no contract is specified."""
+    commit = _bounded_env(_CONTRACT_COMMIT_ENV, limit=128)
+    report = _bounded_env(_CONTRACT_REPORT_ENV, limit=MAX_PATH_BYTES)
+    sidecar = _bounded_env(_CONTRACT_SIDECAR_ENV, limit=MAX_PATH_BYTES)
+    sidecar_digest = _bounded_env(_CONTRACT_SIDECAR_DIGEST_ENV, limit=128)
+    contract = {}
+    if commit:
+        contract["commit"] = commit
+    if report:
+        contract["report"] = report
+    if sidecar:
+        contract["sidecar"] = sidecar
+    if sidecar_digest:
+        contract["sidecar_digest"] = sidecar_digest
+    return contract if contract else None
+
+
+def _parse_series_sidecar(data):
+    """Parse fleet series sidecar bytes (``shasum -a 256`` output).
+
+    Accepts ``<64-hex><whitespace>[*]<filename>`` on the first line, as
+    produced by ``shasum -a 256 report.md > report.md.sha256``. Returns the
+    lowercase digest or None when unparseable.
+    """
+    try:
+        text = data.decode("utf-8", "strict")
+    except UnicodeDecodeError:
+        return None
+    line = text.split("\n")[0].strip()
+    m = re.match(r"^([0-9A-Fa-f]{64})[ \t]+\*?\S.*$", line)
+    if m is None:
+        return None
+    return m.group(1).lower()
+
+
+def _sha256_file(path):
+    """Stream a file's sha256; None on OSError."""
+    h = hashlib.sha256()
+    try:
+        with open(path, "rb") as fh:
+            while True:
+                chunk = fh.read(65536)
+                if not chunk:
+                    break
+                h.update(chunk)
+    except OSError:
+        return None
+    return h.hexdigest()
+
+
+def _check_contract_satisfaction(contract, repo=None):
+    """Verify contract artifacts by existence + sidecar checksum.
+
+    Never trusts seat claims — verifies filesystem and git object state
+    directly.  The sidecar follows the fleet series format (``shasum -a
+    256`` output) and must pin the report's actual digest; an optional
+    contract ``sidecar_digest`` additionally pins the sidecar's own bytes.
+    ``repo`` (optional) enables commit-existence verification against the
+    review's own object store.  Returns (satisfied, blockers_list).
+    """
+    blockers = []
+    if contract is None:
+        return True, blockers
+    report_path = contract.get("report")
+    if report_path and not os.path.isfile(report_path):
+        blockers.append("contract_report_missing")
+    sidecar_path = contract.get("sidecar")
+    if sidecar_path:
+        if not os.path.isfile(sidecar_path):
+            blockers.append("contract_sidecar_missing")
+        else:
+            sidecar_digest = _sha256_file(sidecar_path)
+            if sidecar_digest is None:
+                blockers.append("contract_sidecar_unreadable")
+            else:
+                if contract.get("sidecar_digest") \
+                        and sidecar_digest != contract["sidecar_digest"]:
+                    blockers.append("contract_sidecar_digest_mismatch")
+                try:
+                    with open(sidecar_path, "rb") as fh:
+                        pinned = _parse_series_sidecar(
+                            fh.read(MAX_RECORD_BYTES + 1))
+                except OSError:
+                    pinned = None
+                if pinned is None:
+                    blockers.append("contract_sidecar_malformed")
+                elif report_path and os.path.isfile(report_path):
+                    report_digest = _sha256_file(report_path)
+                    if report_digest is None:
+                        blockers.append("contract_report_unreadable")
+                    elif report_digest != pinned:
+                        blockers.append("contract_report_digest_mismatch")
+    commit = contract.get("commit")
+    if commit:
+        if not HEX_RE.match(commit):
+            blockers.append("contract_commit_invalid")
+        elif repo is not None:
+            result = git_raw(["-C", repo["top"], "cat-file", "-e",
+                              "%s^{commit}" % (commit,)],
+                             None, check=False)
+            if result["rc"] != 0:
+                blockers.append("contract_commit_missing")
+    return len(blockers) == 0, blockers
 
 
 def _bounded_env(name, limit=128):
@@ -3467,7 +3580,8 @@ def cmd_review_create(args):
         publish_flat_record(payload_fd, "pointer.json", "pointer", pointer,
                             "review pointer")
 
-        # Facts: initial bound state, identity inputs recorded.
+        # Facts: initial bound state, identity and contract inputs recorded.
+        contract = _read_contract()
         facts = new_record("facts", 1, {
             "review_id": review_id,
             "session_id": session_id,
@@ -3488,6 +3602,10 @@ def cmd_review_create(args):
             "closure_reason": None,
             "closed_at": None,
             "conflict": None,
+            "contract": contract,
+            "false_terminal": False,
+            "false_terminal_reason": None,
+            "false_terminal_at": None,
             "provider": args.provider,
             "provider_model": model,
             "session_rotation_required": False,
@@ -3799,6 +3917,7 @@ def cmd_review_bind(args):
                      "the session/request pair is already bound to "
                      "review %s" % (name,))
 
+        contract = _read_contract()
         facts = new_record("facts", 1, {
             "review_id": review["review_id"],
             "session_id": session,
@@ -3819,6 +3938,10 @@ def cmd_review_bind(args):
             "closure_reason": None,
             "closed_at": None,
             "conflict": None,
+            "contract": contract,
+            "false_terminal": False,
+            "false_terminal_reason": None,
+            "false_terminal_at": None,
             "provider": provider,
             "provider_model": model,
             "session_rotation_required": False,
@@ -4024,6 +4147,11 @@ def cmd_review_refresh(args):
     terminal_observed = facts["terminal_observed"]
     terminal_completion = facts["terminal_completion"]
     terminal_at = facts["terminal_at"]
+    # TASK-3: sticky false-terminal audit truth, loaded for every refresh
+    # (terminal or not) so the writeback below is always well-defined.
+    false_terminal = facts.get("false_terminal", False)
+    false_terminal_reason = facts.get("false_terminal_reason")
+    false_terminal_at = facts.get("false_terminal_at")
 
     if terminal and not terminal_observed:
         terminal_observed = True
@@ -4037,6 +4165,34 @@ def cmd_review_refresh(args):
         terminal_completion = matched.get("completion") or \
             matched.get("state")
 
+        # TASK-3: Zero-duration completion detection.  If the provider row
+        # carries started_at == finished_at (both non-None and equal), the
+        # completion is a kimi2-class zero-run: refuse it as terminal evidence
+        # and flag it as false_terminal/zero_duration.
+        started = matched.get("started_at")
+        finished = matched.get("finished_at")
+        if terminal_completion == "completed" \
+           and isinstance(started, (int, float)) \
+           and isinstance(finished, (int, float)) \
+           and started == finished:
+            terminal_completion = "false_terminal"
+
+        # TASK-3: Contract satisfaction check.  When a turn reaches terminal
+        # state without its contracted artifacts, it is false_terminal —
+        # sticky, never erased, same discipline as mismatch conflicts.
+        if terminal_completion == "completed" and not false_terminal:
+            contract = facts.get("contract")
+            if contract is not None:
+                satisfied, cblockers = _check_contract_satisfaction(
+                    contract, repo=repo)
+                if not satisfied:
+                    false_terminal = True
+                    false_terminal_reason = "contract_unsatisfied:" + ",".join(cblockers)
+                    false_terminal_at = now
+        elif terminal_completion == "false_terminal" and not false_terminal:
+            false_terminal = True
+            false_terminal_reason = "zero_duration"
+            false_terminal_at = now
     mutex = TransitionMutex(state)
     with mutex:
         # Generation CAS: re-read facts under the lock and confirm generation.
@@ -4055,6 +4211,12 @@ def cmd_review_refresh(args):
         if locked_facts["cancel_requested"]:
             cancel_requested = True
             cancel_requested_at = locked_facts["cancel_requested_at"]
+        # TASK-3: false_terminal is sticky audit truth — a concurrent
+        # detection must never be erased by this refresh's pre-lock snapshot.
+        if locked_facts.get("false_terminal"):
+            false_terminal = True
+            false_terminal_reason = locked_facts.get("false_terminal_reason")
+            false_terminal_at = locked_facts.get("false_terminal_at")
 
         new_generation = generation + 1
 
@@ -4108,6 +4270,9 @@ def cmd_review_refresh(args):
         updated_facts["terminal_at"] = terminal_at
         updated_facts["cancel_requested"] = cancel_requested
         updated_facts["cancel_requested_at"] = cancel_requested_at
+        updated_facts["false_terminal"] = false_terminal
+        updated_facts["false_terminal_reason"] = false_terminal_reason
+        updated_facts["false_terminal_at"] = false_terminal_at
         updated_facts["last_activity_at"] = now
         # Stale-session detection: if the session/request env changed since
         # bind, flag for rotation (consumed by verify/close).
@@ -4153,6 +4318,10 @@ def cmd_review_refresh(args):
             "closure_reason": updated_facts["closure_reason"],
             "closed_at": updated_facts["closed_at"],
             "conflict": updated_facts["conflict"],
+            "contract": updated_facts["contract"],
+            "false_terminal": updated_facts["false_terminal"],
+            "false_terminal_reason": updated_facts["false_terminal_reason"],
+            "false_terminal_at": updated_facts["false_terminal_at"],
             "provider": updated_facts["provider"],
             "provider_model": updated_facts["provider_model"],
             "session_rotation_required":
@@ -4317,13 +4486,20 @@ def cmd_review_status(args):
         result["artifact_verified"] = f.get("artifact_verified", False)
         result["closure"] = f.get("closure")
         result["closure_reason"] = f.get("closure_reason")
+        result["false_terminal"] = f.get("false_terminal", False)
+        result["false_terminal_reason"] = f.get("false_terminal_reason")
+        result["contract"] = f.get("contract")
+        if f.get("terminal_completion") is not None:
+            result["terminal_completion"] = f.get("terminal_completion")
         if f.get("terminal_at") is not None:
             result["terminal_at"] = _format_ts(f.get("terminal_at"))
             result["terminal_at_epoch"] = f.get("terminal_at")
         if f.get("closed_at") is not None:
             result["closed_at"] = _format_ts(f.get("closed_at"))
             result["closed_at_epoch"] = f.get("closed_at")
-
+        if f.get("false_terminal_at") is not None:
+            result["false_terminal_at"] = _format_ts(f.get("false_terminal_at"))
+            result["false_terminal_at_epoch"] = f.get("false_terminal_at")
     if l is not None:
         result["latest_phase"] = l.get("phase")
         result["latest_raw_state"] = l.get("raw_state")
@@ -4563,6 +4739,10 @@ def cmd_review_cancel_requested(args):
             "closure_reason": updated_facts["closure_reason"],
             "closed_at": updated_facts["closed_at"],
             "conflict": updated_facts["conflict"],
+            "contract": updated_facts["contract"],
+            "false_terminal": updated_facts["false_terminal"],
+            "false_terminal_reason": updated_facts["false_terminal_reason"],
+            "false_terminal_at": updated_facts["false_terminal_at"],
             "provider": updated_facts["provider"],
             "provider_model": updated_facts["provider_model"],
             "session_rotation_required":
@@ -4701,6 +4881,10 @@ def cmd_review_submit_report(args):
             "closure_reason": updated_facts["closure_reason"],
             "closed_at": updated_facts["closed_at"],
             "conflict": updated_facts["conflict"],
+            "contract": updated_facts["contract"],
+            "false_terminal": updated_facts["false_terminal"],
+            "false_terminal_reason": updated_facts["false_terminal_reason"],
+            "false_terminal_at": updated_facts["false_terminal_at"],
             "provider": updated_facts["provider"],
             "provider_model": updated_facts["provider_model"],
             "session_rotation_required":
@@ -4812,10 +4996,21 @@ def _closure_blockers(fds, binding, review, facts, pointer, manifest):
         blockers.append("not_terminal")
     elif facts.get("terminal_completion") != "completed":
         blockers.append("terminal_not_completed")
+    if facts.get("false_terminal"):
+        reason = facts.get("false_terminal_reason") or "unspecified"
+        blockers.append("false_terminal:" + bounded(reason, 64))
     if facts.get("conflict") is not None:
         blockers.append(bounded(facts["conflict"], 64))
     if facts.get("session_rotation_required"):
         blockers.append("session_rotation_required")
+    # TASK-3: Contract satisfaction is re-verified at closure time.  A
+    # missing, mismatched, or unreadable contract artifact is a blocker.
+    contract = facts.get("contract")
+    if contract is not None:
+        satisfied, cblockers = _check_contract_satisfaction(
+            contract, repo={"top": review["top"]})
+        if not satisfied:
+            blockers.extend(cblockers)
 
     report_blockers, sealed = _report_blockers(fds, binding, review, facts)
     blockers.extend(report_blockers)
@@ -4966,6 +5161,10 @@ def cmd_review_close(args):
             "closure_reason": updated_facts["closure_reason"],
             "closed_at": updated_facts["closed_at"],
             "conflict": updated_facts["conflict"],
+            "contract": updated_facts["contract"],
+            "false_terminal": updated_facts["false_terminal"],
+            "false_terminal_reason": updated_facts["false_terminal_reason"],
+            "false_terminal_at": updated_facts["false_terminal_at"],
             "provider": updated_facts["provider"],
             "provider_model": updated_facts["provider_model"],
             "session_rotation_required":
