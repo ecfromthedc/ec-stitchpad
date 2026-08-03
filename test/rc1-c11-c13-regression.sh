@@ -55,6 +55,45 @@ else
   bad "c13-legit-search-still-works"
 fi
 
+# ── C13-GAP (fx1 inc2, fixed by kimi2): query wildcard/metachar escaping ────
+# The -n SQLi fix left the QUERY interpolated raw into both sinks: grep read
+# it as a regex pattern (and a lone backslash errored the live section), LIKE
+# read % and _ as wildcards ('%' dumped the ENTIRE archive). Fix: fixed-string
+# grep + LIKE wildcards escaped with an explicit ESCAPE clause. Fixture below
+# archives 4 distinctive rows (compact --keep 2 forces real archive content).
+mkdir -p "$tmp/proj2"; ( cd "$tmp/proj2" && git init -q )
+(
+  cd "$tmp/proj2"
+  "$SP" init --name c13gap >/dev/null 2>&1
+  "$SP" join alice claude >/dev/null 2>&1
+  STITCHPAD_NAME=alice "$SP" say 'zz-one plain' >/dev/null 2>&1
+  STITCHPAD_NAME=alice "$SP" say 'zz_two under' >/dev/null 2>&1
+  STITCHPAD_NAME=alice "$SP" say 'zz 100% mark' >/dev/null 2>&1
+  STITCHPAD_NAME=alice "$SP" say 'zz back\slash zz' >/dev/null 2>&1
+  STITCHPAD_NAME=alice "$SP" say 'zz tail one' >/dev/null 2>&1
+  STITCHPAD_NAME=alice "$SP" say 'zz tail two' >/dev/null 2>&1
+  "$SP" compact --keep 2 --no-llm >/dev/null 2>&1
+  # post-compact so a backslash row also exists in the LIVE tail
+  STITCHPAD_NAME=alice "$SP" say 'zz livetail back\slash zz' >/dev/null 2>&1
+)
+db2="$tmp/proj2/.stitchpad/.state/archive.sqlite"
+arch() { ( cd "$tmp/proj2" && STITCHPAD_NAME=alice "$SP" search "$1" -n 10 2>/dev/null ) | sed -n '/— archive —/,$p' | grep -c '@alice'; }
+live() { ( cd "$tmp/proj2" && STITCHPAD_NAME=alice "$SP" search "$1" -n 10 2>&1 ) | sed -n '/— live pad —/,/— archive —/p'; }
+
+# '%' is a literal, not a wildcard: exactly ONE archive row (the 100% one), not all 4
+[ "$(arch '%')" -eq 1 ] && ok "c13gap-archive-pct-literal" || bad "c13gap-archive-pct-literal ($(arch '%') rows — archive dump?)"
+# '_' is a literal: exactly ONE archive row (zz_two), not false matches
+[ "$(arch '_')" -eq 1 ] && ok "c13gap-archive-underscore-literal" || bad "c13gap-archive-underscore-literal ($(arch '_') rows)"
+# literal backslash matches in the archive (escape char itself round-trips)
+[ "$(arch 'back\slash')" -eq 1 ] && ok "c13gap-archive-backslash-literal" || bad "c13gap-archive-backslash-literal"
+# live side: backslash query returns its row WITHOUT a grep error
+lout="$(live 'back\slash')"
+printf '%s' "$lout" | grep -q 'zz livetail' && ! printf '%s' "$lout" | grep -qi 'grep:'   && ok "c13gap-live-backslash-no-grep-error" || bad "c13gap-live-backslash-no-grep-error"
+# live side: regex metacharacters are literal — 'zz.one' must NOT match 'zz-one'
+printf '%s' "$(live 'zz.one')" | grep -q '@alice\|zz-one'   && bad "c13gap-live-regex-metachar-literal" || ok "c13gap-live-regex-metachar-literal"
+# legit substring search still works on both paths
+[ "$(arch 'zz-one')" -eq 1 ] && ok "c13gap-legit-archive-search" || bad "c13gap-legit-archive-search"
+
 # ── C11: session-start-hook shape gate ───────────────────────────────────────
 LONG=$(printf 'a%.0s' $(seq 1 241))
 pad="$tmp/proj/.stitchpad"
