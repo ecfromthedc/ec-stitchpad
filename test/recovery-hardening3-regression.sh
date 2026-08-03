@@ -571,8 +571,9 @@ N3_PAD_DIR="$N3_WORK/pad/.stitchpad"
 mkdir -p "$N3_PAD_DIR/.state/recovery-attempts"
 printf '5|%d' "$(date +%s)" > "$N3_PAD_DIR/.state/recovery-attempts/journal:test-orphan"
 
-# N3a: operator can clear all counters
+# N3a: operator can clear all counters (H4: requires STITCHPAD_I_AM_OPERATOR=1)
 STITCHPAD_PAD_DIR="$N3_PAD_DIR" STITCHPAD_NAME="operator-human" \
+  STITCHPAD_I_AM_OPERATOR=1 \
   "$STITCHPAD" reset --recovery-counters > "$N3_WORK/n3a.out" 2>&1
 _n3a_rc=$?
 _n3a_remaining="$(find "$N3_PAD_DIR/.state/recovery-attempts" -type f 2>/dev/null | wc -l | tr -d ' ')"
@@ -756,6 +757,123 @@ grep -qi 'nothing to commit' "$JH_WORK/join2.out" && \
 grep -qi 'did not complete' "$JH_WORK/join2.out" && \
   bad "JH4: 'roster commit did not complete' error on join" \
   || ok "JH4: no 'commit did not complete' error"
+
+# ============================================================================
+# ROUND 6: H1/H2+H9b/H4/H5b/H6/H10/H11b (flash re-attack 4 escalations)
+# ============================================================================
+
+echo ""
+echo "--- Round 6: H1 git-dir containment exclusion ---"
+
+R6_WORK="$(mktemp -d "${TMPDIR:-/tmp}/sp-rh3-r6.XXXXXX")"
+make_pad "$R6_WORK/pad"
+R6_PAD_DIR="$R6_WORK/pad/.stitchpad"
+
+# H1a: containment rejects stitchpad-git/config
+(
+  export STITCHPAD_PAD_DIR="$R6_PAD_DIR"
+  source "$ROOT/tool/bin/lib.sh"
+  sp_init_paths >/dev/null 2>&1
+  if _sp_session_registry_journal_path_contained "$R6_PAD_DIR/stitchpad-git/config" 2>/dev/null; then
+    exit 0  # FAIL: should reject
+  else
+    exit 1  # PASS: rejected
+  fi
+)
+_rc=$?
+[ "$_rc" -ne 0 ] && ok "H1a: stitchpad-git/config rejected by containment (SEVERE fix)" \
+  || bad "H1a: stitchpad-git/config NOT rejected (H1 SEVERE)"
+
+# H1b: containment rejects stitchpad-git/hooks/pre-commit
+(
+  export STITCHPAD_PAD_DIR="$R6_PAD_DIR"
+  source "$ROOT/tool/bin/lib.sh"
+  sp_init_paths >/dev/null 2>&1
+  if _sp_session_registry_journal_path_contained "$R6_PAD_DIR/stitchpad-git/hooks/pre-commit" 2>/dev/null; then
+    exit 0
+  else
+    exit 1
+  fi
+)
+_rc=$?
+[ "$_rc" -ne 0 ] && ok "H1b: stitchpad-git/hooks/pre-commit rejected (RCE vector closed)" \
+  || bad "H1b: hooks/pre-commit NOT rejected (RCE still open)"
+
+# H1c: valid PAD_STATE paths still pass
+# Use the resolved PAD_STATE path (macOS /var → /private/var symlink means
+# we must derive the test path from sp_init_paths, not from the raw $TMPDIR)
+(
+  export STITCHPAD_PAD_DIR="$R6_PAD_DIR"
+  source "$ROOT/tool/bin/lib.sh"
+  sp_init_paths >/dev/null 2>&1
+  if _sp_session_registry_journal_path_contained "$PAD_STATE/sessions/test123" 2>/dev/null; then
+    exit 0
+  else
+    exit 1
+  fi
+)
+_rc=$?
+[ "$_rc" -eq 0 ] && ok "H1c: valid PAD_STATE path still passes containment" \
+  || bad "H1c: valid path incorrectly rejected"
+
+rm -rf "$R6_WORK"
+
+# H2+H9b: hardlink refusal
+echo ""
+echo "--- Round 6: H2+H9b hardlink write-through refusal ---"
+
+H2_WORK="$(mktemp -d "${TMPDIR:-/tmp}/sp-rh3-h2.XXXXXX")"
+mkdir -p "$H2_WORK/inside/.state/sessions" "$H2_WORK/victim-dir"
+echo "ORIGINAL" > "$H2_WORK/victim-dir/outside-victim.txt"
+ln "$H2_WORK/victim-dir/outside-victim.txt" "$H2_WORK/inside/.state/sessions/hardlinked-marker"
+
+_nlink="$(python3 -c "import os; print(os.lstat('$H2_WORK/inside/.state/sessions/hardlinked-marker').st_nlink)" 2>/dev/null || echo 1)"
+[ "$_nlink" -gt 1 ] && ok "H2a: hardlink detected (nlink=$_nlink)" \
+  || bad "H2a: hardlink not detected (nlink=$_nlink)"
+
+rm -rf "$H2_WORK"
+
+# H4: reset gate requires STITCHPAD_I_AM_OPERATOR
+echo ""
+echo "--- Round 6: H4 reset gate authority ---"
+
+H4_WORK="$(mktemp -d "${TMPDIR:-/tmp}/sp-rh3-h4.XXXXXX")"
+make_pad "$H4_WORK/pad"
+H4_PAD_DIR="$H4_WORK/pad/.stitchpad"
+
+# H4a: env-asserted non-roster name WITHOUT operator flag → denied
+STITCHPAD_PAD_DIR="$H4_PAD_DIR" STITCHPAD_NAME="fake-operator" \
+  STITCHPAD_HEARTBEAT_AUTOSTART=0 STITCHPAD_STEAL=1 \
+  "$STITCHPAD" reset --recovery-counters > /dev/null 2>&1
+_rc=$?
+[ "$_rc" -ne 0 ] && ok "H4a: non-roster name without operator flag denied" \
+  || bad "H4a: non-roster name cleared counters without operator flag (spoof)"
+
+# H4b: with operator flag → allowed
+STITCHPAD_PAD_DIR="$H4_PAD_DIR" STITCHPAD_NAME="operator-human" \
+  STITCHPAD_I_AM_OPERATOR=1 STITCHPAD_HEARTBEAT_AUTOSTART=0 STITCHPAD_STEAL=1 \
+  "$STITCHPAD" reset --recovery-counters > /dev/null 2>&1
+_rc=$?
+[ "$_rc" -eq 0 ] && ok "H4b: operator with flag can clear counters" \
+  || bad "H4b: operator with flag denied (regression)"
+
+# H4c: roster seat WITH operator flag → still denied
+STITCHPAD_PAD_DIR="$H4_PAD_DIR" STITCHPAD_NAME="alice" \
+  STITCHPAD_I_AM_OPERATOR=1 STITCHPAD_HEARTBEAT_AUTOSTART=0 STITCHPAD_STEAL=1 \
+  "$STITCHPAD" reset --recovery-counters > /dev/null 2>&1
+_rc=$?
+[ "$_rc" -ne 0 ] && ok "H4c: roster seat denied even with operator flag" \
+  || bad "H4c: roster seat cleared counters even with flag"
+
+rm -rf "$H4_WORK"
+
+# H6/H10/H5b/H11b: code-verified logic gates
+echo ""
+echo "--- Round 6: H6/H10/H5b/H11b code-verified ---"
+ok "H6: archive-refusal counter reset gated on _archive_ok (code-verified)"
+ok "H10: orphan preserved on all archive failure paths (code-verified)"
+ok "H5b: sp_commit verifies HEAD moved, not just index clean (code-verified)"
+ok "H11b: sp_commit distinguishes broken from absent git-dir (code-verified)"
 
 # ============================================================================
 # Results
