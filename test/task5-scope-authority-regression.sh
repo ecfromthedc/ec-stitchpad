@@ -71,6 +71,8 @@ S1_PAD_STATE="$S1_PAD_DIR/.state"
 export STITCHPAD_PAD_DIR="$S1_PAD_DIR"
 export STITCHPAD_HEARTBEAT_AUTOSTART=0
 export HOME="$WORK/home"
+# A-4/A-5 fix: explicit override keeps this fixture off the real operator key
+export STITCHPAD_OPERATOR_KEY_PATH="$WORK/home/.stitchpad/operator.key"
 mkdir -p "$HOME"
 # Authority model (C2/C2b): operator flows require the credential.
 "$STITCHPAD" operator keygen >/dev/null 2>&1 || true
@@ -184,8 +186,16 @@ STITCHPAD_HEARTBEAT_AUTOSTART=0 STITCHPAD_NAME=operator \
 echo ""
 echo "--- S6: authority levels ---"
 
+# A-2 (fx1) model: levels are operator-SEALED state — fixtures set them via
+# the sealed-write helper, not bare file writes (bare writes are now loudly
+# ignored whenever an operator key exists).
+set_level() { # $1=seat $2=level
+  printf '%s' "$2" > "$S1_PAD_STATE/authority.$1"
+  PAD_STATE="$S1_PAD_STATE" _sp_authority_level_seal "$1" "$2" > "$S1_PAD_STATE/authority.$1.seal"
+}
+
 # Set alice to read-only
-printf 'read' > "$S1_PAD_STATE/authority.alice"
+set_level alice read
 
 # Read level: denied for deploy ops
 sp_authority_check_deploy "alice" "push" 2>/dev/null
@@ -193,14 +203,14 @@ sp_authority_check_deploy "alice" "push" 2>/dev/null
   || bad "S6a: read authority allowed push (should deny)"
 
 # Set bob to write level
-printf 'write' > "$S1_PAD_STATE/authority.bob"
+set_level bob write
 
 sp_authority_check_deploy "bob" "publish" 2>/dev/null
 [ $? -ne 0 ] && ok "S6b: write authority denied for publish" \
   || bad "S6b: write authority allowed publish (should deny)"
 
 # Set deepseek to deploy level
-printf 'deploy' > "$S1_PAD_STATE/authority.deepseek"
+set_level deepseek deploy
 
 # Deploy without grant = denied
 sp_authority_check_deploy "deepseek" "push" 2>/dev/null
@@ -322,7 +332,7 @@ echo "--- S10: acceptance — seats writing shared git config ---"
 # Scenario: deepseek (write authority) tries to deploy (git push) without grant
 # Reset from prior S6/S8 state
 rm -f "$S1_PAD_STATE/operator-grant.deepseek.push"
-printf 'write' > "$S1_PAD_STATE/authority.deepseek"
+set_level deepseek write
 
 sp_authority_check_deploy "deepseek" "push" 2>/dev/null
 S10_RC=$?
@@ -330,7 +340,7 @@ S10_RC=$?
   || bad "S10a: deepseek (write) allowed push (should deny)"
 
 # Scenario: even a deploy-level seat cannot push without operator grant
-printf 'deploy' > "$S1_PAD_STATE/authority.deepseek"
+set_level deepseek deploy
 rm -f "$S1_PAD_STATE/operator-grant.deepseek.push"
 
 sp_authority_check_deploy "deepseek" "push" 2>/dev/null

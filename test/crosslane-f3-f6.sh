@@ -27,6 +27,8 @@ cleanup() {
 trap cleanup EXIT
 mkdir -p "$tmp/home"
 export HOME="$tmp/home"
+# A-4/A-5 fix: explicit override keeps this fixture off the real operator key
+export STITCHPAD_OPERATOR_KEY_PATH="$tmp/home/.stitchpad/operator.key"
 mkdir -p "$HOME"
 # Authority model (C2/C2b): operator flows require the credential — a key
 # OUTSIDE the pad (isolated fixture HOME) presented via env token.
@@ -84,7 +86,8 @@ audit_op="$(python3 -c 'import json,sys; d=json.loads(sys.argv[1]); print(d.get(
 check 'F3 operator reset audited (op target actor)' 'reset victim operator' "$audit_op"
 
 # 4) deploy seat WITH one-shot operator grant may reset; grant is consumed.
-printf 'deploy' > "$STATE/authority.deployer"
+# A-2 (fx1) model: levels are operator-sealed — set via the gated CLI path.
+STITCHPAD_OPERATOR_TOKEN="$TOK" "$SP" authority set deployer deploy >/dev/null
 STITCHPAD_OPERATOR_TOKEN="$TOK" "$SP" operator grant deployer reset-others >/dev/null
 out="$(STITCHPAD_NAME=deployer "$SP" reset victim 2>/dev/null)"
 check 'F3 deploy+grant cross-seat reset allowed' '0' "$?"
