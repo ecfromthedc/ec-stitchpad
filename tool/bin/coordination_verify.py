@@ -1325,7 +1325,9 @@ RECORD_SCHEMAS = {
         "terminal_completion", "terminal_at", "report_sealed", "report_digest",
         "report_verdict", "report_sealed_at", "artifact_verified", "verified_at",
         "closure", "closure_reason", "closed_at", "conflict",
-        "contract", "false_terminal", "false_terminal_reason", "false_terminal_at",
+        "contract_commit", "contract_report", "contract_sidecar",
+        "contract_sidecar_digest",
+        "false_terminal", "false_terminal_reason", "false_terminal_at",
         "provider", "provider_model", "session_rotation_required",
         "last_activity_at",
     ),
@@ -3285,6 +3287,24 @@ def _read_contract():
     return contract if contract else None
 
 
+def _facts_contract(facts):
+    """Assemble the contract dict from flattened scalar facts fields.
+
+    The record layer enforces scalar-only fields (validate_record), so the
+    contract is persisted as contract_commit/report/sidecar/sidecar_digest
+    and reassembled here. None when the dispatch declared no contract.
+    """
+    contract = {}
+    for flat, key in (("contract_commit", "commit"),
+                      ("contract_report", "report"),
+                      ("contract_sidecar", "sidecar"),
+                      ("contract_sidecar_digest", "sidecar_digest")):
+        value = facts.get(flat)
+        if value:
+            contract[key] = value
+    return contract or None
+
+
 def _parse_series_sidecar(data):
     """Parse fleet series sidecar bytes (``shasum -a 256`` output).
 
@@ -3581,7 +3601,7 @@ def cmd_review_create(args):
                             "review pointer")
 
         # Facts: initial bound state, identity and contract inputs recorded.
-        contract = _read_contract()
+        contract = _read_contract() or {}
         facts = new_record("facts", 1, {
             "review_id": review_id,
             "session_id": session_id,
@@ -3602,7 +3622,10 @@ def cmd_review_create(args):
             "closure_reason": None,
             "closed_at": None,
             "conflict": None,
-            "contract": contract,
+            "contract_commit": contract.get("commit"),
+            "contract_report": contract.get("report"),
+            "contract_sidecar": contract.get("sidecar"),
+            "contract_sidecar_digest": contract.get("sidecar_digest"),
             "false_terminal": False,
             "false_terminal_reason": None,
             "false_terminal_at": None,
@@ -3917,7 +3940,7 @@ def cmd_review_bind(args):
                      "the session/request pair is already bound to "
                      "review %s" % (name,))
 
-        contract = _read_contract()
+        contract = _read_contract() or {}
         facts = new_record("facts", 1, {
             "review_id": review["review_id"],
             "session_id": session,
@@ -3938,7 +3961,10 @@ def cmd_review_bind(args):
             "closure_reason": None,
             "closed_at": None,
             "conflict": None,
-            "contract": contract,
+            "contract_commit": contract.get("commit"),
+            "contract_report": contract.get("report"),
+            "contract_sidecar": contract.get("sidecar"),
+            "contract_sidecar_digest": contract.get("sidecar_digest"),
             "false_terminal": False,
             "false_terminal_reason": None,
             "false_terminal_at": None,
@@ -4181,7 +4207,7 @@ def cmd_review_refresh(args):
         # state without its contracted artifacts, it is false_terminal —
         # sticky, never erased, same discipline as mismatch conflicts.
         if terminal_completion == "completed" and not false_terminal:
-            contract = facts.get("contract")
+            contract = _facts_contract(facts)
             if contract is not None:
                 satisfied, cblockers = _check_contract_satisfaction(
                     contract, repo=repo)
@@ -4318,7 +4344,10 @@ def cmd_review_refresh(args):
             "closure_reason": updated_facts["closure_reason"],
             "closed_at": updated_facts["closed_at"],
             "conflict": updated_facts["conflict"],
-            "contract": updated_facts["contract"],
+            "contract_commit": updated_facts["contract_commit"],
+            "contract_report": updated_facts["contract_report"],
+            "contract_sidecar": updated_facts["contract_sidecar"],
+            "contract_sidecar_digest": updated_facts["contract_sidecar_digest"],
             "false_terminal": updated_facts["false_terminal"],
             "false_terminal_reason": updated_facts["false_terminal_reason"],
             "false_terminal_at": updated_facts["false_terminal_at"],
@@ -4488,7 +4517,7 @@ def cmd_review_status(args):
         result["closure_reason"] = f.get("closure_reason")
         result["false_terminal"] = f.get("false_terminal", False)
         result["false_terminal_reason"] = f.get("false_terminal_reason")
-        result["contract"] = f.get("contract")
+        result["contract"] = _facts_contract(f)
         if f.get("terminal_completion") is not None:
             result["terminal_completion"] = f.get("terminal_completion")
         if f.get("terminal_at") is not None:
@@ -4739,7 +4768,10 @@ def cmd_review_cancel_requested(args):
             "closure_reason": updated_facts["closure_reason"],
             "closed_at": updated_facts["closed_at"],
             "conflict": updated_facts["conflict"],
-            "contract": updated_facts["contract"],
+            "contract_commit": updated_facts["contract_commit"],
+            "contract_report": updated_facts["contract_report"],
+            "contract_sidecar": updated_facts["contract_sidecar"],
+            "contract_sidecar_digest": updated_facts["contract_sidecar_digest"],
             "false_terminal": updated_facts["false_terminal"],
             "false_terminal_reason": updated_facts["false_terminal_reason"],
             "false_terminal_at": updated_facts["false_terminal_at"],
@@ -4881,7 +4913,10 @@ def cmd_review_submit_report(args):
             "closure_reason": updated_facts["closure_reason"],
             "closed_at": updated_facts["closed_at"],
             "conflict": updated_facts["conflict"],
-            "contract": updated_facts["contract"],
+            "contract_commit": updated_facts["contract_commit"],
+            "contract_report": updated_facts["contract_report"],
+            "contract_sidecar": updated_facts["contract_sidecar"],
+            "contract_sidecar_digest": updated_facts["contract_sidecar_digest"],
             "false_terminal": updated_facts["false_terminal"],
             "false_terminal_reason": updated_facts["false_terminal_reason"],
             "false_terminal_at": updated_facts["false_terminal_at"],
@@ -5005,7 +5040,7 @@ def _closure_blockers(fds, binding, review, facts, pointer, manifest):
         blockers.append("session_rotation_required")
     # TASK-3: Contract satisfaction is re-verified at closure time.  A
     # missing, mismatched, or unreadable contract artifact is a blocker.
-    contract = facts.get("contract")
+    contract = _facts_contract(facts)
     if contract is not None:
         satisfied, cblockers = _check_contract_satisfaction(
             contract, repo={"top": review["top"]})
@@ -5161,7 +5196,10 @@ def cmd_review_close(args):
             "closure_reason": updated_facts["closure_reason"],
             "closed_at": updated_facts["closed_at"],
             "conflict": updated_facts["conflict"],
-            "contract": updated_facts["contract"],
+            "contract_commit": updated_facts["contract_commit"],
+            "contract_report": updated_facts["contract_report"],
+            "contract_sidecar": updated_facts["contract_sidecar"],
+            "contract_sidecar_digest": updated_facts["contract_sidecar_digest"],
             "false_terminal": updated_facts["false_terminal"],
             "false_terminal_reason": updated_facts["false_terminal_reason"],
             "false_terminal_at": updated_facts["false_terminal_at"],
