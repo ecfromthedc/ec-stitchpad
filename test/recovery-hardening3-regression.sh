@@ -325,6 +325,144 @@ echo "$E3_LAST" | grep -qi "RECOVERY EXHAUSTED" && \
   || bad "E3e: terminal refusal never reachable (counter kept resetting on failure)"
 
 # ============================================================================
+# E4: atomic bind-session + shift-change --save (kill torn/duplicate races)
+# ============================================================================
+echo ""
+echo "--- E4: concurrent bind-session and shift-change --save races ---"
+
+E4_WORK="$(mktemp -d "${TMPDIR:-/tmp}/sp-h3-e4.XXXXXX")"
+make_pad "$E4_WORK/test-pad" "e4-pad"
+E4_PAD_DIR="$E4_WORK/test-pad/.stitchpad"
+
+# E4a: concurrent bind-session of one fresh sid by two different names —
+# must never produce torn garbage. The lock serializes each full
+# read-decide-write cycle; the loser's write simply lands after (or the
+# collision guard refuses it), but the on-disk value is always a complete,
+# valid name — never an interleaved fragment.
+E4A_SID="e4a-race-sid"
+E4A_ROUNDS=20
+E4A_TORN=0
+for _r in $(seq 1 "$E4A_ROUNDS"); do
+  rm -f "$E4_PAD_DIR/.state/sessions/$E4A_SID"
+  (
+    STITCHPAD_PAD_DIR="$E4_PAD_DIR" STITCHPAD_HEARTBEAT_AUTOSTART=0 STITCHPAD_NAME=alice \
+      "$STITCHPAD" bind-session "$E4A_SID" alice >/dev/null 2>&1
+  ) &
+  (
+    STITCHPAD_PAD_DIR="$E4_PAD_DIR" STITCHPAD_HEARTBEAT_AUTOSTART=0 STITCHPAD_NAME=bob \
+      "$STITCHPAD" bind-session "$E4A_SID" bob >/dev/null 2>&1
+  ) &
+  wait
+  _e4a_val="$(cat "$E4_PAD_DIR/.state/sessions/$E4A_SID" 2>/dev/null)"
+  if [ "$_e4a_val" != "alice" ] && [ "$_e4a_val" != "bob" ]; then
+    E4A_TORN=$((E4A_TORN + 1))
+    echo "    torn value on round $_r: '$_e4a_val'" >&2
+  fi
+done
+[ "$E4A_TORN" -eq 0 ] && \
+  ok "E4a: $E4A_ROUNDS rounds of concurrent bind-session — zero torn writes" \
+  || bad "E4a: $E4A_TORN/$E4A_ROUNDS rounds produced torn/invalid binding content"
+
+# E4b: concurrent shift-change --save for the SAME agent — must produce
+# exactly one pending row, never a duplicate (SELECT-then-INSERT race).
+E4B_HANDOFF="$E4_WORK/handoff.txt"
+echo "handoff body for race test" > "$E4B_HANDOFF"
+E4B_ROUNDS=15
+for _r in $(seq 1 "$E4B_ROUNDS"); do
+  (
+    STITCHPAD_PAD_DIR="$E4_PAD_DIR" STITCHPAD_HEARTBEAT_AUTOSTART=0 STITCHPAD_NAME=alice \
+      "$STITCHPAD" shift-change --save alice --file "$E4B_HANDOFF" >/dev/null 2>&1
+  ) &
+done
+wait
+
+E4B_DB="$E4_PAD_DIR/.state/archive.sqlite"
+E4B_PENDING="$(/usr/bin/sqlite3 "$E4B_DB" "SELECT COUNT(*) FROM handoffs WHERE agent='alice' AND status='pending';" 2>/dev/null || echo -1)"
+[ "$E4B_PENDING" = "1" ] && \
+  ok "E4b: $E4B_ROUNDS concurrent shift-change --save calls — exactly 1 pending row" \
+  || bad "E4b: $E4B_PENDING pending rows after $E4B_ROUNDS concurrent saves (want 1, duplicate-row race)"
+
+# ============================================================================
+# E7: cancel bound extended to all 6 remaining call sites
+# ============================================================================
+echo ""
+echo "--- E7: cancel bound wired at all 6 remaining call sites ---"
+
+# E7a-f: structural verification — each of the six previously-unbounded call
+# sites must invoke _sp_delivery_cancel_bound_check within a few lines of its
+# delivery_cancel_ocean_turn call. This is the exact defect: before the fix,
+# these sites had ZERO calls to the bound helper anywhere near them (grep
+# would find nothing); after the fix, each site's failure branch calls it.
+_e7_watch="$ROOT/tool/bin/watch.sh"
+
+_e7_site_wired() {
+  local anchor="$1" label="$2"
+  local line_no window
+  line_no="$(grep -n "$anchor" "$_e7_watch" | head -1 | cut -d: -f1)"
+  if [ -z "$line_no" ]; then
+    bad "E7 $label: anchor pattern not found in watch.sh (site removed/renamed?)"
+    return
+  fi
+  window="$(sed -n "$((line_no)),$((line_no + 10))p" "$_e7_watch")"
+  echo "$window" | grep -q '_sp_delivery_cancel_bound_check' && \
+    ok "E7 $label: bound check wired at call site" \
+    || bad "E7 $label: no _sp_delivery_cancel_bound_check within 10 lines of $anchor"
+}
+
+_e7_site_wired 'delivery_cancel_ocean_turn "\$name" "\$turn_id" dnd' "DND"
+_e7_site_wired 'delivery_cancel_ocean_turn "\$name" "\$turn_id" "\$DELIVERY_TASK_REASON"; then' "task-invalid (live dispatch)"
+_e7_site_wired 'delivery_cancel_ocean_turn "\$name" "\$turn_id" superseded_current' "superseded_current"
+_e7_site_wired 'delivery_cancel_ocean_turn "\$name" "\$turn_id" superseded_after_accept' "superseded_after_accept"
+_e7_site_wired 'delivery_cancel_ocean_turn "\$name" "\$old_turn" "\$DELIVERY_TASK_REASON"' "task-invalid (reconcile)"
+_e7_site_wired 'delivery_cancel_ocean_turn "\$name" "\$old_turn" superseded_by_newer' "superseded_by_newer (reconcile)"
+
+# E7g: the shared helper itself — attempt recording, exhaustion, reset.
+E7_WORK="$(mktemp -d "${TMPDIR:-/tmp}/sp-h3-e7.XXXXXX")"
+make_pad "$E7_WORK/test-pad" "e7-pad"
+E7_PAD_DIR="$E7_WORK/test-pad/.stitchpad"
+export STITCHPAD_PAD_DIR="$E7_PAD_DIR"
+unset STITCHPAD_SESSION CLAUDE_CODE_SESSION_ID CODEX_SESSION_ID 2>/dev/null || true
+
+(
+  STITCHPAD_WATCH_LIB_ONLY=1
+  source "$ROOT/tool/bin/lib.sh"
+  sp_init_paths >/dev/null 2>&1
+  source "$ROOT/tool/bin/recovery-policy.sh"
+  source "$ROOT/tool/bin/watch.sh" >/dev/null 2>&1
+
+  SP_RECOVERY_MAX_ATTEMPTS=3
+
+  # Three failed attempts should not yet exhaust (< max)
+  _sp_delivery_cancel_bound_check testname testturn testreason >/dev/null 2>&1
+  _sp_delivery_cancel_bound_check testname testturn testreason >/dev/null 2>&1
+  _rc_before_exhaust=$?
+  # Third call crosses the bound (count reaches 3)
+  _sp_delivery_cancel_bound_check testname testturn testreason >/dev/null 2>&1
+  # Fourth call: exhausted — must return 1 and print terminal refusal
+  _e7g_out="$(_sp_delivery_cancel_bound_check testname testturn testreason 2>&1)"
+  _e7g_rc=$?
+  echo "RC=$_e7g_rc"
+  echo "OUT=$_e7g_out"
+
+  # Reset clears it — next check should succeed again (rc 0, not exhausted)
+  _sp_delivery_cancel_bound_reset testname testturn testreason
+  _sp_delivery_cancel_bound_check testname testturn testreason >/dev/null 2>&1
+  echo "RC_AFTER_RESET=$?"
+) > "$E7_WORK/e7g.out" 2>&1
+
+grep -q '^RC=1$' "$E7_WORK/e7g.out" && \
+  ok "E7g1: bound check returns 1 once exhausted (max attempts reached)" \
+  || bad "E7g1: bound check did not exhaust (got: $(grep '^RC=' "$E7_WORK/e7g.out"))"
+
+grep -qi 'RECOVERY EXHAUSTED' "$E7_WORK/e7g.out" && \
+  ok "E7g2: terminal refusal diagnostic printed on exhaustion" \
+  || bad "E7g2: no terminal refusal diagnostic on exhaustion"
+
+grep -q '^RC_AFTER_RESET=0$' "$E7_WORK/e7g.out" && \
+  ok "E7g3: reset clears the counter — bound check succeeds again" \
+  || bad "E7g3: reset did not clear the counter (got: $(grep RC_AFTER_RESET "$E7_WORK/e7g.out"))"
+
+# ============================================================================
 # Results
 # ============================================================================
 echo ""
