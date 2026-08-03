@@ -40,7 +40,18 @@ fi
 # ONE TERMINAL = ONE PAD: never inject a wake into a terminal that is live in a
 # DIFFERENT pad or under a different name. ~/.stitchpad-terminals/<surface> is
 # the machine-global claim registry ("pad_dir|name|epoch", heartbeat-refreshed).
-lockf="$HOME/.pasture-terminals/${target##*@@}"; [ -f "$lockf" ] || lockf="$HOME/.stitchpad-terminals/${target##*@@}"
+# C12 (rc1): the registry path is built from the ROSTER target — a roster-write
+# primitive (C7) with a `../` component and no `@@` traversed the path into an
+# arbitrary local file read. The terminal component must be a plain filename;
+# anything else is never a legitimate surface id. Fail closed: a wake whose
+# target cannot be safety-checked is not delivered.
+_tcomp="${target##*@@}"
+case "$_tcomp" in
+  *[!A-Za-z0-9._-]*|''|..)
+    echo "[$(ts)] CROSS-PAD CHECK REFUSED: roster target '$target' has a malformed terminal component — wake NOT delivered (re-pin the roster target)" >>"$log"
+    exit 1 ;;
+esac
+lockf="$HOME/.pasture-terminals/${_tcomp}"; [ -f "$lockf" ] || lockf="$HOME/.stitchpad-terminals/${_tcomp}"
 if [ -f "$lockf" ]; then
   IFS='|' read -r _lpad _lname _lts < "$lockf"
   if [ $(( $(date +%s) - ${_lts:-0} )) -lt 300 ] \

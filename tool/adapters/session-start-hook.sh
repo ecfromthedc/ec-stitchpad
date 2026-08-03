@@ -31,6 +31,18 @@ name=""
 [ -f "$pad/.state/autoname.claude" ] && name="$(cat "$pad/.state/autoname.claude" 2>/dev/null | tr -d '[:space:]')"
 [ -n "$name" ] || exit 0
 
+# C11 (rc1): the sticky name is written by the MCP join tool WITHOUT a shape
+# gate (C7 family) and this hook feeds it straight into `heartbeat start` on
+# EVERY session start — a 241-char handle turns every restart into the
+# ENAMETOOLONG exec-self spin (fx3 F1), an auto-recurring bomb. Gate the
+# handle BEFORE any use. Grammar = kimi2's dm-handle allowlist (rc1 C7 fix
+# shape); the shared sp_valid_name_shape consolidation swaps in here later.
+# Exit 0, loudly: a session-start hook must never break the session itself.
+if ! printf '%s' "$name" | grep -qE '^[A-Za-z0-9][A-Za-z0-9_-]{0,31}$'; then
+  echo "stitchpad: session-start auto-rejoin REFUSED — sticky handle '$(printf '%s' "$name" | cut -c1-40)' fails the handle shape gate; re-join with a valid handle to re-arm" >&2
+  exit 0
+fi
+
 bin="$HOME/.stitchpad/bin/stitchpad"
 [ -x "$bin" ] || bin="$(command -v stitchpad 2>/dev/null || true)"
 [ -n "$bin" ] && [ -x "$bin" ] || exit 0
