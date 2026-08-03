@@ -11,6 +11,7 @@ from __future__ import annotations
 import argparse
 import datetime as dt
 import glob
+import http.client
 import itertools
 import json
 import os
@@ -43,6 +44,25 @@ DELIVERY_ATTENTION_STATES = {"cancel_pending", "deferred_dnd"}
 DELIVERY_ERROR_STATES = {"error", "errored", "cancelled", "acceptance_unknown"}
 DELIVERY_TIMESTAMP_KEYS = {"accepted_at", "started_at", "completed_at", "error_at"}
 KEEPER_STATES = {"accepted", "in_flight", "completed", "acceptance_unknown"}
+
+# ── Provider availability ─────────────────────────────────────────────
+# Non-mutating probes against the Ocean daemon's turn-free surfaces. The
+# daemon's /health is always hardcoded ok:true, so it can never be the sole
+# routing decision.  We probe /v1/models (model catalog with per-model
+# readiness) and /ready (provider credential + failover state) — both are
+# GET-only and never post turns. Timestamps gate staleness; a stale ready:true
+# or ready:false must age out instead of silently controlling routing.
+PROVIDER_PROBE_DEADLINE_SECONDS = 1.5
+PROVIDER_STALENESS_SECONDS = 90  # age out a probe older than this
+PROVIDER_STATES = (
+    "configured",           # ocean-adapter seat with a non-empty target
+    "catalog_ready",        # /v1/models returned ok with model entries
+    "probe_successful",     # at least one probe returned valid JSON in time
+    "rate_limited",         # 429 or x-ratelimit-* evidence from any probe
+    "actively_responding",  # all probes pass within deadline, no rate-limiting
+)
+# Endpoints that are safe non-mutating probes (GET only, no side effects).
+PROVIDER_PROBE_PATHS = ("/v1/models", "/ready")
 
 
 class NoRedirect(urllib.request.HTTPRedirectHandler):
@@ -772,6 +792,170 @@ def deep_ocean(target: str) -> dict[str, Any]:
         return {"status": "malformed_response", "active_turn": None, "detail": exc.__class__.__name__}
 
 
+def _probe_endpoint(
+    base: str, path: str, deadline: float, *, accept_statuses: frozenset[int] = frozenset({200}),
+) -> dict[str, Any]:
+    """Issue one bounded GET to a daemon endpoint. Never mutates — no POST body."""
+    started = time.monotonic()
+    url = f"{base}{path}"
+    try:
+        request = urllib.request.Request(url, method="GET", headers={"accept": "application/json"})
+        opener = urllib.request.build_opener(urllib.request.ProxyHandler({}), NoRedirect())
+        remaining = max(0.001, deadline - time.monotonic())
+        with opener.open(request, timeout=remaining) as response:
+            raw = bounded_http_body(response, deadline)
+        elapsed_ms = int((time.monotonic() - started) * 1000)
+        status = response.getcode()
+        if status not in accept_statuses:
+            return {
+                "status": "unexpected_status", "http_status": status,
+                "elapsed_ms": elapsed_ms, "present": False,
+            }
+        if len(raw) > MAX_STATE_BYTES:
+            return {"status": "response_too_large", "elapsed_ms": elapsed_ms, "present": False}
+        value = json.loads(raw, parse_constant=reject_json_constant)
+        if not isinstance(value, dict):
+            return {"status": "malformed_response", "elapsed_ms": elapsed_ms, "present": False}
+        # Carry the deserialized body so callers can inspect per-model readiness,
+        # failover lists, etc. without re-fetching.
+        return {"status": "ok", "elapsed_ms": elapsed_ms, "body": value, "present": True}
+    except urllib.error.HTTPError as exc:
+        elapsed_ms = int((time.monotonic() - started) * 1000)
+        status_code = exc.code
+        # Read headers for rate-limit evidence even on error responses.
+        rate_limit_headers: dict[str, str] = {}
+        for header in ("retry-after", "x-ratelimit-remaining", "x-ratelimit-reset",
+                       "ratelimit-remaining", "ratelimit-reset"):
+            value = exc.headers.get(header) or exc.headers.get(header.replace("-", "_"))
+            if value:
+                rate_limit_headers[header] = value[:128]
+        if status_code == 429:
+            return {
+                "status": "rate_limited", "http_status": 429, "elapsed_ms": elapsed_ms,
+                "rate_limit_headers": rate_limit_headers, "present": True,
+            }
+        return {
+            "status": "http_error", "http_status": status_code, "elapsed_ms": elapsed_ms,
+            "rate_limit_headers": rate_limit_headers if rate_limit_headers else None,
+            "present": False,
+        }
+    except (TimeoutError, socket.timeout):
+        elapsed_ms = int((time.monotonic() - started) * 1000)
+        return {"status": "timeout", "elapsed_ms": elapsed_ms, "present": False}
+    except urllib.error.URLError as exc:
+        elapsed_ms = int((time.monotonic() - started) * 1000)
+        if isinstance(exc.reason, (TimeoutError, socket.timeout)):
+            return {"status": "timeout", "elapsed_ms": elapsed_ms, "present": False}
+        return {"status": "unavailable", "elapsed_ms": elapsed_ms,
+                "detail": exc.__class__.__name__, "present": False}
+    except OSError as exc:
+        elapsed_ms = int((time.monotonic() - started) * 1000)
+        return {"status": "unavailable", "elapsed_ms": elapsed_ms,
+                "detail": exc.__class__.__name__, "present": False}
+    except (ValueError, TypeError) as exc:
+        elapsed_ms = int((time.monotonic() - started) * 1000)
+        return {"status": "malformed_response", "elapsed_ms": elapsed_ms,
+                "detail": exc.__class__.__name__, "present": False}
+
+
+def provider_availability(daemon_url: str, now: float, *, stale_seconds: int = PROVIDER_STALENESS_SECONDS) -> dict[str, Any]:
+    """Bounded, non-mutating provider availability snapshot.
+
+    Probes the Ocean daemon's turn-free surfaces (/v1/models, /ready) and
+    classifies the provider into explicit, timestamped states. This is the
+    truth layer that /health's hardcoded ``ok:true`` cannot provide: a stale
+    ready signal must never control routing decisions.
+
+    The k3-outage acceptance scenario (0ms completed turns while /health was
+    green) is caught here: when probes fail or time out while /health returns
+    instantly, the provider lands in ``probe_successful`` at best — never
+    ``actively_responding``.
+    """
+    now_int = int(now)
+    deadline = time.monotonic() + PROVIDER_PROBE_DEADLINE_SECONDS
+    endpoints: dict[str, dict[str, Any]] = {}
+
+    # Probe each turn-free endpoint sequentially within the shared deadline.
+    for path in PROVIDER_PROBE_PATHS:
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            endpoints[path] = {"status": "deadline_exhausted", "elapsed_ms": 0, "present": False}
+        else:
+            endpoints[path] = _probe_endpoint(daemon_url, path, deadline)
+
+    # ── Classify into explicit states ──────────────────────────────────
+    states: list[dict[str, Any]] = []
+
+    # configured: we were called with a daemon URL — the seat is ocean-backed.
+    states.append({"state": "configured", "at": now_int})
+
+    models_ep = endpoints.get("/v1/models", {})
+    ready_ep = endpoints.get("/ready", {})
+
+    # catalog_ready: /v1/models returned ok with a non-empty model list.
+    if models_ep.get("status") == "ok" and isinstance(models_ep.get("body", {}).get("models"), list):
+        model_entries = models_ep["body"]["models"]
+        if model_entries:
+            # Collect per-model ready counts for operator visibility.
+            ready_count = sum(1 for m in model_entries if isinstance(m, dict) and m.get("ready"))
+            states.append({
+                "state": "catalog_ready", "at": now_int,
+                "model_count": len(model_entries), "models_ready": ready_count,
+            })
+
+    # probe_successful: at least one probe returned a parseable JSON response.
+    any_ok = any(ep.get("status") == "ok" for ep in endpoints.values())
+    any_rate_limited = any(ep.get("status") == "rate_limited" for ep in endpoints.values())
+    if any_ok:
+        # Carry the fastest ok elapsed for timing visibility.
+        ok_elapsed = min(
+            (ep.get("elapsed_ms", 999_999) for ep in endpoints.values() if ep.get("status") == "ok"),
+            default=None,
+        )
+        states.append({"state": "probe_successful", "at": now_int, "fastest_ok_ms": ok_elapsed})
+
+    # rate_limited: any endpoint returned 429 or carried rate-limit headers.
+    if any_rate_limited:
+        states.append({"state": "rate_limited", "at": now_int})
+
+    # actively_responding: ALL probes returned ok within the deadline AND no
+    # rate-limiting was observed. This is the only state that should unblock
+    # routing decisions.
+    all_ok = all(ep.get("status") == "ok" for ep in endpoints.values())
+    if all_ok and not any_rate_limited:
+        max_elapsed = max(
+            (ep.get("elapsed_ms", 0) for ep in endpoints.values()), default=0,
+        )
+        states.append({"state": "actively_responding", "at": now_int, "max_elapsed_ms": max_elapsed})
+
+    # Derive a summary label from the best attained state.
+    if states:
+        best = states[-1]["state"]
+    else:
+        best = "unreachable"
+
+    # Check staleness against any prior probe timestamp stored on disk.
+    # The caller passes `now`; we compute age and mark stale when the freshest
+    # endpoint probe is older than the staleness threshold.
+    freshest_at = max(
+        (now_int for ep in endpoints.values() if ep.get("present")), default=0,
+    )
+    if freshest_at == 0:
+        freshest_at = now_int
+    age_seconds = max(0, now_int - freshest_at)
+    stale = age_seconds > stale_seconds
+
+    return {
+        "probed_at": now_int,
+        "daemon_url": daemon_url,
+        "states": states,
+        "summary": best,
+        "age_seconds": age_seconds,
+        "stale": stale,
+        "endpoints": endpoints,
+    }
+
+
 def severity(issues: list[str]) -> str:
     errors = ("duplicate_", "invalid_", "missing_adapter", "malformed", "dead_pid",
               "pid_mismatch", "acceptance_unknown", "delivery_state:error",
@@ -839,6 +1023,11 @@ def build(args: argparse.Namespace) -> dict[str, Any]:
             target_counts[row["target"]] = target_counts.get(row["target"], 0) + 1
 
     seats: list[dict[str, Any]] = []
+    # Resolve daemon URL once for all deep probes (provider + per-session).
+    daemon_url = os.environ.get(
+        "OCEAN_DAEMON_URL",
+        getattr(args, "daemon_url", None) or "http://127.0.0.1:4780",
+    ).rstrip("/")
     for row in rows:
         name, adapter, wake, target = row["name"], row["adapter"], row["wake"], row["target"]
         issues: list[str] = []
@@ -963,6 +1152,40 @@ def build(args: argparse.Namespace) -> dict[str, Any]:
         seat["status"] = severity(seat["issues"])
         seats.append(seat)
 
+    # ── Provider availability (after per-seat probes) ──────────────────
+    # Probe the daemon's turn-free surfaces AFTER all per-seat deep_ocean
+    # calls so a single-request test fixture is never consumed before its
+    # intended consumer.  The provider snapshot is a separate truth layer
+    # that /health's hardcoded ok:true cannot replace.
+    provider = None
+    if args.deep:
+        try:
+            parsed = urllib.parse.urlparse(daemon_url)
+            hostname = parsed.hostname
+            port_str = parsed.port
+            port_ok = port_str is None or (isinstance(port_str, int) and 1 <= port_str <= 65535)
+            if (parsed.scheme == "http" and hostname in {"127.0.0.1", "::1"}
+                    and parsed.username is None and parsed.password is None
+                    and port_ok):
+                provider = provider_availability(daemon_url, now)
+            else:
+                reason = "refused_non_loopback"
+                if parsed.scheme != "http":
+                    reason = "malformed_url"
+                elif not port_ok:
+                    reason = "malformed_url"
+                provider = {
+                    "probed_at": int(now), "daemon_url": daemon_url,
+                    "states": [], "summary": reason,
+                    "age_seconds": 0, "stale": False, "endpoints": {},
+                }
+        except (ValueError, urllib.error.URLError, OSError) as exc:
+            provider = {
+                "probed_at": int(now), "daemon_url": daemon_url,
+                "states": [], "summary": f"unavailable:{exc.__class__.__name__}",
+                "age_seconds": 0, "stale": False, "endpoints": {},
+            }
+
     pad_issues.extend(binding_issues)
     pad_issues.extend(f"orphan_session:{item['session_id']}->{item['name']}" for item in orphan_bindings)
     watcher = watcher_health(state, pad_md, args.watch_start_grace)
@@ -988,6 +1211,7 @@ def build(args: argparse.Namespace) -> dict[str, Any]:
                 "orphan_session_bindings": orphan_bindings, "issues": sorted(set(pad_issues)),
                 "repair": pad_repairs},
         "seats": seats,
+        "provider": provider,
         "summary": {"seats": len(seats), "ok": len(seats) - errors - warnings,
                     "warnings": warnings, "errors": errors, "pad_status": pad_status,
                     "pad_issues": len(set(pad_issues)), "overall_status": overall_status},
@@ -999,6 +1223,22 @@ def human(snapshot: dict[str, Any]) -> str:
     watcher = pad["watcher"]
     lines = [f"stitchpad health — {snapshot['mode']} read-only snapshot",
              f"watcher: {watcher['status']} pid={watcher['pid']} singleton={watcher['singleton']}"]
+    provider = snapshot.get("provider")
+    if provider:
+        stale_tag = " STALE" if provider.get("stale") else ""
+        age = provider.get("age_seconds", 0)
+        lines.append(
+            f"provider: {provider.get('summary','none')}{stale_tag} "
+            f"age={age}s probed_at={provider.get('probed_at')} "
+            f"states=[{', '.join(s['state'] for s in provider.get('states',[]))}]"
+        )
+        for path, ep in (provider.get("endpoints") or {}).items():
+            extra = ""
+            if ep.get("elapsed_ms") is not None:
+                extra += f" {ep['elapsed_ms']}ms"
+            if ep.get("rate_limit_headers"):
+                extra += f" rate-limit={{{','.join(ep['rate_limit_headers'])}}}"
+            lines.append(f"  {path}: {ep.get('status','?')}{extra}")
     for seat in snapshot["seats"]:
         hb = seat.get("heartbeat", {})
         open_ord = seat.get("open_pending_ordinal", {}).get("value")
@@ -1044,6 +1284,8 @@ def main() -> int:
     parser.add_argument("--watch-start-grace", required=True, type=int)
     parser.add_argument("--json", action="store_true")
     parser.add_argument("--deep", action="store_true")
+    parser.add_argument("--daemon-url", default=None,
+                        help="Ocean daemon URL (default: $OCEAN_DAEMON_URL or http://127.0.0.1:4780)")
     parser.add_argument("-h", "--help", action="help")
     args = parser.parse_args()
     if args.watch_start_grace < 0:
