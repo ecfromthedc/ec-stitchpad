@@ -803,24 +803,10 @@ sp_session_registry_journal_recover() {
       # Legacy orphan with no stamped sid — fall back to env, but warn.
       sid="${STITCHPAD_SESSION:-}"
     fi
-    # R3: refuse recovery when HEAD has advanced past the stamped base SHA.
-    # The orphan's pad snapshot predates committed work; restoring it would
-    # silently clobber later commits.  Refuse loudly and PRESERVE the orphan
-    # for manual inspection instead of consuming it.
-    if [ -f "$orphan/.base-sha" ] && [ -n "${PAD_DIR:-}" ] && \
-       [ -d "${PAD_DIR}/stitchpad-git" ]; then
-      local _recovery_base_sha _recovery_head_sha
-      _recovery_base_sha="$(cat "$orphan/.base-sha" 2>/dev/null)" || _recovery_base_sha=""
-      _recovery_head_sha="$(git --git-dir="${PAD_DIR}/stitchpad-git" rev-parse HEAD 2>/dev/null)" || _recovery_head_sha=""
-      if [ -n "$_recovery_base_sha" ] && [ -n "$_recovery_head_sha" ] && \
-         [ "$_recovery_base_sha" != "$_recovery_head_sha" ]; then
-        echo "stitchpad: stale journal $(basename "$orphan") base SHA ($_recovery_base_sha) differs from current HEAD ($_recovery_head_sha) — committed work would be reverted; orphan PRESERVED for manual inspection at $orphan" >&2
-        continue
-      fi
-    fi
-    echo "stitchpad: recovering stale journal $(basename "$orphan") — restoring pre-crash state" >&2
-    # TASK-4: bound recovery attempts per-orphan. If exhausted, preserve the
-    # orphan for manual inspection instead of silently retrying forever.
+
+    # TASK-4: bound recovery attempts per-orphan. Record the attempt EARLY —
+    # before the stale-base check (E2a) — so that repeated refusals eventually
+    # hit the bound and surface a terminal refusal instead of looping forever.
     local _recovery_key="journal:$(basename "$orphan")"
     if type sp_recovery_is_exhausted >/dev/null 2>&1; then
       if sp_recovery_is_exhausted "$PAD_STATE" "$_recovery_key"; then
@@ -830,25 +816,88 @@ sp_session_registry_journal_recover() {
       fi
       sp_recovery_attempt_record "$PAD_STATE" "$_recovery_key"
     fi
-    # R1: temporarily suppress env-resolved sids so _sp_session_registry_journal_files
-    # enumerates ONLY the stamped sid's markers, never the recovering caller's.
-    # Without this, sp_session_registry_sid() inside _sp_session_registry_journal_files
-    # would add the recovering seat's markers to the file list, misaligning the
-    # manifest and corrupting the recovering seat's files.
+
+    # R3: refuse recovery when HEAD has advanced past the stamped base SHA.
+    # The orphan's pad snapshot predates committed work; restoring it would
+    # silently clobber later commits.  Refuse loudly and PRESERVE the orphan
+    # for manual inspection instead of consuming it.
+    #
+    # E2b: if the stamped base SHA is the PARENT of current HEAD, the crash
+    # MAY have happened after the commit landed but before journal_commit
+    # removed the journal — the pad would then be consistent and the orphan
+    # is stale-but-superseded, not a real conflict. But "HEAD advanced by
+    # exactly one commit" is also exactly what an UNRELATED third-party commit
+    # looks like while this orphan sat idle (a live in-progress edit that never
+    # got committed). SHA-adjacency alone cannot distinguish the two.
+    #
+    # Decisive signal: in a genuine crash-after-commit, the operation's own
+    # write is what landed in that commit — so the CURRENT LIVE bytes of the
+    # journaled pad file exactly match what git has at HEAD (nothing left
+    # uncommitted). In the unrelated-commit case, the orphan's own live file
+    # still carries whatever was in flight when it crashed — bytes that were
+    # never committed — so live content diverges from HEAD. Only archive when
+    # live content exactly matches HEAD; otherwise fall through to the loud
+    # refusal (matches R3's crashed-say-content-diverges-from-HEAD shape).
+    if [ -f "$orphan/.base-sha" ] && [ -n "${PAD_DIR:-}" ] && \
+       [ -d "${PAD_DIR}/stitchpad-git" ]; then
+      local _recovery_base_sha _recovery_head_sha _recovery_parent_sha
+      _recovery_base_sha="$(cat "$orphan/.base-sha" 2>/dev/null)" || _recovery_base_sha=""
+      _recovery_head_sha="$(git --git-dir="${PAD_DIR}/stitchpad-git" rev-parse HEAD 2>/dev/null)" || _recovery_head_sha=""
+      if [ -n "$_recovery_base_sha" ] && [ -n "$_recovery_head_sha" ] && \
+         [ "$_recovery_base_sha" != "$_recovery_head_sha" ]; then
+        _recovery_parent_sha="$(git --git-dir="${PAD_DIR}/stitchpad-git" rev-parse HEAD~1 2>/dev/null)" || _recovery_parent_sha=""
+        local _recovery_superseded=0
+        if [ "$_recovery_parent_sha" = "$_recovery_base_sha" ] && [ -n "${PAD_MD:-}" ] && [ -f "$PAD_MD" ]; then
+          local _recovery_relpath _recovery_head_bytes _recovery_live_bytes
+          _recovery_relpath="$(basename "$PAD_MD")"
+          _recovery_head_bytes="$(git --git-dir="${PAD_DIR}/stitchpad-git" show "HEAD:$_recovery_relpath" 2>/dev/null)"
+          _recovery_live_bytes="$(cat "$PAD_MD" 2>/dev/null)"
+          [ "$_recovery_head_bytes" = "$_recovery_live_bytes" ] && _recovery_superseded=1
+        fi
+        if [ "$_recovery_superseded" -eq 1 ]; then
+          # Stale-but-superseded: live content exactly matches the commit at
+          # HEAD — the operation's own write is what landed. Archive it and
+          # reset the counter — the operation SUCCEEDED.
+          echo "stitchpad: stale journal $(basename "$orphan") superseded (base was parent of HEAD, live content matches HEAD exactly — crash-after-commit); archiving orphan" >&2
+          mkdir -p "$PAD_STATE/journal-archive" 2>/dev/null || true
+          mv "$orphan" "$PAD_STATE/journal-archive/$(basename "$orphan")" 2>/dev/null || rm -rf "$orphan" 2>/dev/null || true
+          type sp_recovery_reset >/dev/null 2>&1 && \
+            sp_recovery_reset "$PAD_STATE" "$_recovery_key" || true
+          continue
+        fi
+        echo "stitchpad: stale journal $(basename "$orphan") base SHA ($_recovery_base_sha) differs from current HEAD ($_recovery_head_sha) — committed work would be reverted; orphan PRESERVED for manual inspection at $orphan" >&2
+        continue
+      fi
+    fi
+    echo "stitchpad: recovering stale journal $(basename "$orphan") — restoring pre-crash state" >&2
+    # E3: check rollback rc — only consume the orphan and reset the counter
+    # when rollback actually succeeded. Never delete a journal that rollback
+    # explicitly refused, and never reset the attempt counter on failure.
     local _save_session="${STITCHPAD_SESSION:-}"
     local _save_claude="${CLAUDE_CODE_SESSION_ID:-}"
     local _save_codex="${CODEX_SESSION_ID:-}"
     export STITCHPAD_SESSION="$sid"
     unset CLAUDE_CODE_SESSION_ID CODEX_SESSION_ID
-    sp_session_registry_journal_rollback "$orphan" "$sid" >/dev/null 2>&1
+    # E1: call rollback with the stamped env. But now rollback uses the
+    # manifest-stamped file list (.paths) rather than re-enumerating — so the
+    # sid confusion on the leave path is eliminated.
+    if sp_session_registry_journal_rollback "$orphan" "$sid" 2>&1; then
+      # Success: consume the orphan (rollback already removed jdir, but
+      # double-check for the recovery path where jdir survives).
+      rm -rf "$orphan" 2>/dev/null || true
+      # TASK-4: clear the recovery attempt counter on success.
+      type sp_recovery_reset >/dev/null 2>&1 && \
+        sp_recovery_reset "$PAD_STATE" "$_recovery_key" || true
+    else
+      # E3: rollback FAILED (state-root swap, etc). The journal is PRESERVED.
+      # Do NOT consume the orphan; do NOT reset the counter. Let the attempt
+      # bound eventually surface a terminal refusal.
+      echo "stitchpad: journal rollback FAILED for $(basename "$orphan") — orphan preserved for manual inspection (attempt bound will eventually refuse)" >&2
+    fi
     # Restore env
     if [ -n "$_save_session" ]; then export STITCHPAD_SESSION="$_save_session"; else unset STITCHPAD_SESSION; fi
     if [ -n "$_save_claude" ]; then export CLAUDE_CODE_SESSION_ID="$_save_claude"; else unset CLAUDE_CODE_SESSION_ID; fi
     if [ -n "$_save_codex" ]; then export CODEX_SESSION_ID="$_save_codex"; else unset CODEX_SESSION_ID; fi
-    rm -rf "$orphan" 2>/dev/null || true
-    # TASK-4: clear the recovery attempt counter on success.
-    type sp_recovery_reset >/dev/null 2>&1 && \
-      sp_recovery_reset "$PAD_STATE" "$_recovery_key" || true
   done
   return 0
 }
@@ -904,6 +953,7 @@ sp_session_registry_journal_begin() {
     return 1
   }
   : > "$jdir/manifest" || { rm -rf "$jdir"; return 1; }
+  : > "$jdir/.paths" || { rm -rf "$jdir"; return 1; }
   local i=0 f
   while IFS= read -r f; do
     if [ -L "$f" ]; then
@@ -911,6 +961,9 @@ sp_session_registry_journal_begin() {
       echo "stitchpad: refusing to journal over symlinked state file $(basename "$f")" >&2
       return 1
     fi
+    # E1: stamp the exact file path so rollback doesn't re-enumerate with a
+    # potentially different sid (leave path: operator sid ≠ target sid).
+    printf '%s\n' "$f" >> "$jdir/.paths"
     if [ -f "$f" ]; then
       cp "$f" "$jdir/$i" 2>/dev/null || { rm -rf "$jdir"; return 1; }
       printf '1\n' >> "$jdir/manifest"
@@ -953,7 +1006,20 @@ sp_session_registry_journal_rollback() {
   fi
   [ -d "$jdir" ] && [ ! -L "$jdir" ] || return 0
   local i=0 f existed
+  # E1: use the stamped .paths file (exact paths at journal_begin time) instead
+  # of re-enumerating with _sp_session_registry_journal_files. This eliminates
+  # the leave-path sid confusion where the manifest was written for operator+target
+  # sids but recovery forced a single sid into both slots.
+  local _paths_source
+  if [ -f "$jdir/.paths" ]; then
+    _paths_source="$jdir/.paths"
+  else
+    # Legacy journal without .paths — fall back to re-enumeration (backward compat)
+    _paths_source="$jdir/.paths.$$"
+    _sp_session_registry_journal_files "$sid" > "$_paths_source" 2>/dev/null || true
+  fi
   while IFS= read -r f; do
+    [ -n "$f" ] || continue
     existed="$(sed -n "$(( i + 1 ))p" "$jdir/manifest" 2>/dev/null)"
     if [ "$existed" = "1" ]; then
       # Never write through a symlink: unlink the link itself first.
@@ -972,7 +1038,8 @@ sp_session_registry_journal_rollback() {
       echo "stitchpad: rollback manifest line $(( i + 1 )) unreadable — leaving $(basename "$f") untouched" >&2
     fi
     i=$(( i + 1 ))
-  done < <(_sp_session_registry_journal_files "$sid")
+  done < "$_paths_source"
+  rm -f "$jdir/.paths.$$" 2>/dev/null || true
   rm -rf "$jdir" 2>/dev/null || true
 }
 
