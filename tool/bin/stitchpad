@@ -14,6 +14,7 @@
 #   stitchpad start|stop|status|restart   manage the daemon (background)
 #   stitchpad health [--json] [--deep]    non-mutating local health snapshot
 #   stitchpad roster                      print parsed roster
+#   stitchpad sessions [--json]           read-only session-registry projection
 #   stitchpad rename <old> <new>          rename a member everywhere local state knows them
 #   stitchpad reset [name] [--redeliver N] repair a wedged seat without rewinding its cursor
 #   stitchpad keeper [repo ...]           wake idle Ocean seats for current open tasks
@@ -39,6 +40,8 @@ _src="${BASH_SOURCE[0]}"; while [ -h "$_src" ]; do
 done
 BIN_DIR="$(cd -P "$(dirname "$_src")" && pwd)"
 source "$BIN_DIR/lib.sh"
+source "$BIN_DIR/date-divider.sh"
+source "$BIN_DIR/session-registry.sh"
 
 cmd="${1:-help}"; shift || true
 
@@ -63,7 +66,7 @@ sp_autostart_name() {
 sp_maybe_start_heartbeat() {
   [ "${STITCHPAD_HEARTBEAT_AUTOSTART:-1}" = "0" ] && return 0
   case "$cmd" in
-    init|instructions|prompt-context|doctor|health|status|roster|who|read|heartbeat|hook|bind-session|whoami|leave|stop|daemon|watch|migration-check|reset|keeper|compact|restore-roster|color|help|-h|--help) return 0 ;;
+    init|instructions|prompt-context|doctor|health|status|roster|who|sessions|read|heartbeat|hook|bind-session|whoami|leave|stop|daemon|watch|migration-check|reset|keeper|compact|restore-roster|color|help|-h|--help) return 0 ;;
   esac
   sp_init_paths >/dev/null 2>&1 || return 0
   local who
@@ -216,7 +219,11 @@ EOF
       { print }
     ' "$PAD_MD" > "$tmp" && sp_write_inplace "$tmp" "$PAD_MD"
     sp_system "@$who joined the stitchpad ($adapter)"
-    sp_commit "roster: + $who ($adapter/$wake)"
+    if ! sp_commit "roster: + $who ($adapter/$wake)"; then
+      sp_unlock
+      echo "stitchpad: join failed — roster commit did not complete; worktree may be dirty, @$who may not be in the roster" >&2
+      exit 1
+    fi
     # Persist role/level for bridge profiles push + roster cards.
     [ -n "$_role" ] && printf '%s' "$_role" > "$PAD_STATE/role.$who"
     [ -n "$_level" ] && printf '%s' "$_level" > "$PAD_STATE/level.$who"
@@ -586,6 +593,12 @@ EOF
           echo "stitchpad: refusing to scrub ghost @$g — Ocean outcome is unresolved" >&2
           reset_failures=$((reset_failures + 1))
         elif _reset_kill_ticker "$g"; then
+          # REAL lifecycle projection: evicting a ghost cancels whatever request
+          # its session still had in flight. Record BEFORE the scrub removes the
+          # sessions/<sid> binding (a ghost with no binding stays explicitly
+          # empty). Busy pad → skipped refresh; the scrub still proceeds.
+          STITCHPAD_SESSION="$(sp_session_registry_sid_for_name "$g")" STITCHPAD_NAME="$g" \
+            sp_session_registry_lifecycle_commit cancel || true
           _reset_scrub_ghost "$g"
         else
           reset_failures=$((reset_failures + 1))
@@ -862,6 +875,12 @@ con.execute("INSERT INTO handoffs(agent, at, body) VALUES(?,?,?)",
 con.commit()
 PY
         rm -f "$_handoff"
+        # REAL lifecycle projection: the seat is rotating to a fresh session
+        # identity. Record the rotate against its current durable binding
+        # (forces a NEW request id for whatever comes next) and refresh the
+        # pad header. Busy pad → skipped refresh, handoff still queued.
+        STITCHPAD_SESSION="$(sp_session_registry_sid_for_name "$who")" STITCHPAD_NAME="$who" \
+          sp_session_registry_lifecycle_commit rotate || true
         echo "✓ shift-change queued for @$who — finish your turn now; the bridge clears the session once idle and delivers this into the fresh chat"
         ;;
       --claim)
@@ -917,7 +936,11 @@ PY
       inblk && /^```$/ { print ""; print "---"; exit }
     ' "$PAD_MD" > "$tmp" && sp_write_inplace "$tmp" "$PAD_MD"
     rm -f "$PAD_STATE"/cursor.* 2>/dev/null
-    sp_commit "pad cleared (roster kept)"
+    if ! sp_commit "pad cleared (roster kept)"; then
+      sp_unlock
+      echo "stitchpad: clear failed — pad commit did not complete; worktree may be dirty" >&2
+      exit 1
+    fi
     sp_unlock
     echo "✓ pad cleared (roster + targets kept)"
     ;;
@@ -934,15 +957,52 @@ PY
       exit 1
     fi
     sp_lock || exit 1
+    # Journal the registry/markers/header/pad window BEFORE any mutation — the
+    # roster edit, presence line, terminal record, and roster commit below are
+    # one interlocked unit. The journal must capture the pre-leave pad bytes:
+    # beginning after the roster edit would make rollback restore the already
+    # mutated pad, leaving an uncommitted roster removal behind on failure.
+    _leave_sid="$(sp_session_registry_sid_for_name "$who")"
+    _leave_journal="$(sp_session_registry_journal_begin "$_leave_sid")" || {
+      sp_unlock
+      echo "stitchpad: could not journal pre-leave state — refusing to remove @$who" >&2
+      exit 1
+    }
     tmp="$(sp_stage "$PAD_MD")"
     awk -v who="$who" '
       /^```roster/ { inblk=1; print; next }
       inblk && /^```/ { inblk=0; print; next }
       inblk && tolower($1)==tolower(who) { next }   # drop this roster line
       { print }
-    ' "$PAD_MD" > "$tmp" && sp_write_inplace "$tmp" "$PAD_MD"
+    ' "$PAD_MD" > "$tmp" && sp_write_inplace "$tmp" "$PAD_MD" || {
+      sp_session_registry_journal_rollback "$_leave_journal" "$_leave_sid"
+      sp_unlock
+      echo "stitchpad: roster edit failed for @$who — rolled back pad state; @$who still in roster" >&2
+      exit 1
+    }
     sp_system "@$who left the stitchpad"
-    sp_commit "roster: - $who"
+    # REAL lifecycle projection: leaving ends the seat's session. We already
+    # hold the pad mutation lock — record the terminal event against the seat's
+    # durable session binding (missing binding stays explicitly empty) and
+    # refresh the pad header so the roster commit below carries both.
+    # The journal covers the whole window: a failed terminal record or a failed
+    # roster commit is compensated exactly — never a committed roster edit
+    # without its registry state, never registry state or pad edits for a
+    # commit that failed.
+    if ! STITCHPAD_SESSION="$_leave_sid" STITCHPAD_NAME="$who" \
+      sp_session_registry_lifecycle_locked terminal; then
+      sp_session_registry_journal_rollback "$_leave_journal" "$_leave_sid"
+      sp_unlock
+      echo "stitchpad: terminal event for @$who failed — rolled back; roster unchanged" >&2
+      exit 1
+    fi
+    if ! sp_commit "roster: - $who"; then
+      sp_session_registry_journal_rollback "$_leave_journal" "$_leave_sid"
+      sp_unlock
+      echo "stitchpad: roster commit failed — rolled back pad, registry, and header state for @$who" >&2
+      exit 1
+    fi
+    sp_session_registry_journal_commit "$_leave_journal"
     # also release any file claims and wake state this agent held
     rm -f "$PAD_STATE/seen.$who" "$PAD_STATE/forcewake.$who" 2>/dev/null
     rm -f "$PAD_STATE"/delivery."$who".* 2>/dev/null || true
@@ -988,6 +1048,21 @@ PY
       fi
       printf '%s' "$nm" > "$PAD_STATE/sessions/$sid"
       echo "✓ bound session $sid → @$nm"
+      # REAL lifecycle projection: a first-time binding is a dispatch; binding
+      # a session that already ENDED is a resume (the marker helper clears the
+      # stale end marker). Rebinding an already-active session records NOTHING
+      # — the persisted request identity must stay stable across idempotent
+      # re-joins, never re-minted. Busy pad → skipped refresh, never a failure.
+      _bind_event=""
+      if [ -e "$PAD_STATE/session-end.$sid" ]; then
+        _bind_event="resume"
+      elif [ ! -e "$PAD_STATE/session-start.$sid" ]; then
+        _bind_event="dispatch"
+      fi
+      if [ -n "$_bind_event" ]; then
+        STITCHPAD_SESSION="$sid" STITCHPAD_NAME="$nm" \
+          sp_session_registry_lifecycle_commit "$_bind_event" || true
+      fi
     fi
     # Auto-detect the model from the agent's own env (runs in-process, so each
     # harness's vars are visible). Only writes if we find one — never guesses.
@@ -1082,6 +1157,10 @@ PY
     # Hold the mutation lock while reading the roster and appending. A missing
     # or headerless file must fail closed: appending would recreate a pad with no
     # members, silently strip @all, and make every mention unwakeable.
+    # Capture an epoch snapshot for the date divider (before the lock, so we
+    # record the wall-clock time the operation was authored). Failures are
+    # non-fatal — the message still posts.
+    sp_date_divider_snapshot || true
     sp_lock || exit 1
     if [ ! -f "$PAD_MD" ] || ! grep -q '^```roster[[:space:]]*$' "$PAD_MD" 2>/dev/null; then
       sp_unlock
@@ -1113,9 +1192,64 @@ PY
       cleaned="$(printf '%s' "$text" | sed -E 's/(^|[[:space:]])-@[a-zA-Z0-9_-]+//g; s/(^|[[:space:]])@all([^a-zA-Z0-9_-]|$)/\2/Ig')"
       text="$(printf '%s' "${mentions# } $(printf '%s' "$cleaned" | sed -E 's/^[[:space:]]+//')")"
     fi
-    ts="$(date '+%I:%M %p')"
+    # Derive the message timestamp from the captured epoch (same as the
+    # date divider) so the divider, message HH:MM, and commit timestamp all
+    # originate from the same wall-clock snapshot.
+    ts="$(sp_date_divider_hhmm || date '+%I:%M %p')"
+    # Journal the exact pre-operation bytes of the pad, the session registry,
+    # and every lifecycle marker BEFORE any mutation. The registry and markers
+    # live outside the pad git, so a failed commit cannot be unwound by git —
+    # the journal is the compensation record. Refusing to journal fails closed
+    # before the pad is touched: no committed pad without registry state, no
+    # registry state for an uncommitted pad.
+    _say_sid="$(sp_session_registry_sid)"
+    _say_journal="$(sp_session_registry_journal_begin "$_say_sid")" || {
+      sp_unlock
+      echo "stitchpad: could not journal pre-say state — refusing to post" >&2
+      exit 1
+    }
+    # Insert date divider for the first message on a new canonical date.
+    # Under the lock so exactly one divider is written per date. Divider state
+    # (last-divider-epoch) is inside the journal window: any later failure
+    # restores it too, so a retry sees exactly the pre-say world.
+    sp_date_divider_insert || true
     printf '\n## %s · %s\n\n%s\n' "@$from" "$ts" "$text" >> "$PAD_MD"
-    sp_commit "$from: $(printf '%s' "$text" | tr '\n' ' ' | cut -c1-60)"
+    # Align the git commit timestamp with the same captured epoch ("@<epoch>"
+    # is git's strict epoch form). Scoped to this one sp_commit call — bash
+    # restores prefixed assignments after the function returns, so no ambient
+    # GIT_*_DATE leaks into later commands.
+    _captured_epoch="$(sp_date_divider_epoch)"
+    # Record this operation in the append-only session registry BEFORE the
+    # commit so durable state cannot lag behind a successful sp_commit. All
+    # timestamps derive from the same captured epoch — no second date +%s.
+    # FAIL CLOSED: a failed registry write (or header render) rolls the pad,
+    # markers, and divider state back to the journaled pre-say bytes and aborts
+    # the post — a committed pad can never be left without its registry entry.
+    if ! sp_session_registry_lifecycle_locked activity "$_captured_epoch"; then
+      sp_session_registry_journal_rollback "$_say_journal" "$_say_sid"
+      sp_unlock
+      echo "stitchpad: session registry write failed — rolled back; message NOT posted" >&2
+      exit 1
+    fi
+    _say_subject="$from: $(printf '%s' "$text" | tr '\n' ' ' | cut -c1-60)"
+    _say_commit_rc=0
+    if [ -n "$_captured_epoch" ]; then
+      GIT_COMMITTER_DATE="@$_captured_epoch" GIT_AUTHOR_DATE="@$_captured_epoch" \
+        sp_commit "$_say_subject" || _say_commit_rc=$?
+    else
+      sp_commit "$_say_subject" || _say_commit_rc=$?
+    fi
+    # FAIL CLOSED the other way: a failed pad commit rolls the registry entry,
+    # markers, header, and pad bytes back to the journaled pre-say state, so a
+    # retry emits exactly once — never registry/header state for a message that
+    # never committed.
+    if [ "$_say_commit_rc" -ne 0 ]; then
+      sp_session_registry_journal_rollback "$_say_journal" "$_say_sid"
+      sp_unlock
+      echo "stitchpad: pad commit failed — rolled back registry, header, and pad; message NOT posted" >&2
+      exit 1
+    fi
+    sp_session_registry_journal_commit "$_say_journal"
     # Posting IS the reply — clear both dropped-turn markers (the pending re-block
     # bound AND the delivered_no_reply visibility flag) so a reply resolves them and
     # they can't cause a spurious re-block or stale doctor state later.
@@ -2046,6 +2180,16 @@ except: print("")' 2>/dev/null)"
       fi
     fi
     [ -z "$msgs" ] && exit 0   # nothing for me → stop normally
+    # Blocking the stop IS the delegated request creation: this reply dispatches
+    # the drained messages into the seat's next turn. Record the REAL dispatch
+    # (session id came from the hook's stdin JSON; an unresolvable one stays
+    # explicitly empty) and refresh the pad-header projection under the pad
+    # mutation lock. Relay mode has no local pad/state — `who` is only resolved
+    # on the local branch, so gate on it. A busy pad skips the refresh; the
+    # wake delivery itself is never blocked on projection bookkeeping.
+    if [ -n "${who:-}" ]; then
+      STITCHPAD_NAME="$who" sp_session_registry_lifecycle_commit dispatch || true
+    fi
     esc="$(printf '%s' "$msgs" | python3 -c 'import json,sys; print(json.dumps(sys.stdin.read()))' 2>/dev/null)"
     [ -z "$esc" ] && esc="$(printf '%s' "$msgs" | sed 's/\\/\\\\/g; s/"/\\"/g' | awk 'BEGIN{ORS="\\n"}{print}')" && esc="\"$esc\""
     printf '{"decision":"block","reason":%s}\n' "$esc"
@@ -2452,6 +2596,19 @@ except: print("")' 2>/dev/null)"
     ;;
 
   roster|who)  sp_init_paths_readonly || exit 1; sp_roster ;;
+
+  sessions)
+    # Read-only projection of the session registry: who ran here, on which
+    # provider/model/worktree, how many requests, and derived status
+    # (active/idle/stale/terminal). Mutates nothing — resolves paths through
+    # the readonly initializer and only reads .state.
+    sp_init_paths_readonly || exit 1
+    if [ "${1:-}" = "--json" ]; then
+      sp_session_registry_project
+    else
+      sp_session_registry_list
+    fi
+    ;;
   log)
     sp_init_paths || exit 1
     n=10; [ "${1:-}" = "-n" ] && n="$2"

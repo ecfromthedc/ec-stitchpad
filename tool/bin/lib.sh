@@ -1001,6 +1001,12 @@ sp_ensure_pad_git_exclude() {
 # sp_commit <msg> [path...]  — paths are relative to the pad dir; defaults to
 # the pad file. Passing paths lets a task-only or archive-only change commit
 # just that file instead of the whole conversation.
+#
+# Returns 0 when the commit landed or there was verifiably nothing to commit,
+# nonzero when a git-backed pad FAILED to record staged changes. Callers that
+# interlock durable state with the commit (session registry / pad header) key
+# rollback off this status — the old `|| true` tail let a failed commit look
+# like success. Pads without a git dir keep the historical no-op success.
 sp_commit() {
   local msg="$1"; shift 2>/dev/null || true
   local paths=("$@")
@@ -1010,10 +1016,15 @@ sp_commit() {
   # deletion. Stage first so a file recreated after an older deletion is not
   # invisible as "untracked" to `git diff`, then inspect the staged delta.
   [ -f "$PAD_MD" ] || return 0
+  # Test hook: inject a commit failure BEFORE any git mutation so rollback
+  # paths can be exercised end-to-end with zero git side effects.
+  if [ "${STITCHPAD_TEST_MODE:-}" = "1" ] && [ -n "${STITCHPAD_TEST_COMMIT_FAIL:-}" ]; then
+    return 1
+  fi
   sp_ensure_pad_git_exclude
-  sgit add -A -f -- "${paths[@]}" 2>/dev/null || return 0
+  sgit add -A -f -- "${paths[@]}" 2>/dev/null || return 1
   sgit diff --cached --quiet -- "${paths[@]}" 2>/dev/null && return 0
-  sgit commit -q -m "$msg" 2>/dev/null || true
+  sgit commit -q -m "$msg" 2>/dev/null
 }
 
 # ── Roster parsing (the magic: roster is IN the markdown) ────────────
