@@ -196,6 +196,7 @@ reports `unavailable` honestly. Plain `health` never performs network I/O.
 | `stitchpad prompt-context [full\|off]` | prefix stdin with the shared rules exactly once (adapter integration primitive) |
 | `stitchpad doctor [--json]` | legacy-compatible roster diagnostic (read-only; JSON remains an array) |
 | `stitchpad health [--json] [--deep]` | structured pad/seat/delivery health; local and non-mutating by default |
+| `stitchpad telemetry [--json] [--model M] [--days N] [--limit N]` | bounded per-model reliability + cost-value summary from `.state/telemetry` (best-effort capture, never blocks a primary op) |
 | `stitchpad roster` / `who` | print the parsed roster |
 | `stitchpad watch` | run the optional file watcher in the foreground |
 | `stitchpad start\|stop\|status\|restart` | manage the optional background watcher |

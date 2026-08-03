@@ -2481,3 +2481,15 @@ ensure_watcher() {
   disown %-
   return 0
 }
+
+# TASK-7 per-model telemetry (best-effort; never fails a primary operation).
+# Must load LAST so every consumer (stitchpad, watch.sh, daemon.sh,
+# seat-keeper.sh, tui.sh) gets it without any dependency ordering.
+# Self-derive BIN_DIR when a consumer sources lib.sh directly (tests do this
+# without exporting BIN_DIR) — telemetry must never break that contract.
+_TEL_BIN="${BIN_DIR:-$(cd -P "$(dirname "${BASH_SOURCE[0]}")" && pwd)}"
+if [ -f "$_TEL_BIN/telemetry.sh" ]; then
+  # shellcheck disable=SC1091
+  source "$_TEL_BIN/telemetry.sh"
+fi
+unset _TEL_BIN

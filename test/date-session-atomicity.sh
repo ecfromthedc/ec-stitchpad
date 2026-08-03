@@ -37,6 +37,9 @@ if not os.path.isdir(root):
     h.update(b"MISSING:" + root.encode())
     print(h.hexdigest()); sys.exit(0)
 for dirpath, dirnames, filenames in os.walk(root, followlinks=False):
+    # TASK-7 telemetry is best-effort and outside the journal contract — its
+    # per-second jsonl/drop counter must never break byte-identical digests.
+    dirnames[:] = [d for d in dirnames if d != "telemetry"]
     dirnames.sort()
     for name in sorted(dirnames):
         p = os.path.join(dirpath, name)

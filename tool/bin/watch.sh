@@ -470,6 +470,8 @@ delivery_drop_current() {
   local name="$1" generation="$2" ordinal="$3" message_id="$4" task_id="$5"
   local accepted_at="$6" reason="$7" task_status="${8:--}" turn_id="${9:-}"
   local turn_status="${10:-cancelled}"
+  # TASK-7: record the drop (best-effort; never affects the drop itself).
+  sp_telemetry_record delivery seat="$name" outcome=failed detail="$reason:$task_status" 2>/dev/null || true
   delivery_tombstone "$name" "$generation" "$ordinal" "$message_id" "$task_id" "$reason" "$task_status" "$turn_id" || true
   if delivery_pending_matches "$name" "$generation" "$ordinal" "$message_id"; then
     rm -f "$(delivery_pending_file "$name")"
@@ -491,6 +493,14 @@ delivery_finalize_completed() {
     [ -n "$reason" ] && error_code="completed_after_cancel:$reason"
     delivery_write_state "$name" completed "$generation" "$ordinal" "$message_id" "$task_id" \
       "$accepted_at" "$started_at" "$(delivery_now)" "" "$error_code" "$turn_id" completed
+    # TASK-7: record the successful delivery (best-effort; never fails the
+    # finalize). Duration derives from started_at (epoch seconds) when present.
+    if [ -n "${started_at:-}" ] && printf '%s' "$started_at" | grep -qx '[0-9][0-9]*'; then
+      sp_telemetry_record delivery seat="$name" outcome=delivered \
+        dur_ms=$(( $(sp_telemetry_now_ms) - started_at * 1000 )) detail="$error_code" 2>/dev/null || true
+    else
+      sp_telemetry_record delivery seat="$name" outcome=delivered detail="$error_code" 2>/dev/null || true
+    fi
     DELIVERY_ACTIVE_TURN=""
     return 0
   fi
