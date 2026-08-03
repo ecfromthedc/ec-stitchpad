@@ -18,6 +18,7 @@
 #   stitchpad telemetry [--json] [--model M] [--days N] [--limit N]   per-model reliability + cost-value summary (TASK-7)
 #   stitchpad rename <old> <new>          rename a member everywhere local state knows them
 #   stitchpad reset [name] [--redeliver N] repair a wedged seat without rewinding its cursor
+#   stitchpad operator <keygen|env|grant|revoke|status>   operator credential (root of authority, key lives outside every pad)
 #   stitchpad keeper [repo ...]           wake idle Ocean seats for current open tasks
 #   stitchpad archive [--keep N]          move old messages to .stitchpad/archive/<date>-conversation.md (plain md, no deps)
 #   stitchpad compact [--keep N]          archive old transcript to sqlite, replace with rolling summary block
@@ -67,7 +68,7 @@ sp_autostart_name() {
 sp_maybe_start_heartbeat() {
   [ "${STITCHPAD_HEARTBEAT_AUTOSTART:-1}" = "0" ] && return 0
   case "$cmd" in
-    init|instructions|prompt-context|doctor|health|status|roster|who|sessions|read|heartbeat|hook|bind-session|whoami|leave|stop|daemon|watch|migration-check|reset|keeper|compact|restore-roster|scope|authority|color|help|-h|--help) return 0 ;;
+    init|instructions|prompt-context|doctor|health|status|roster|who|sessions|read|heartbeat|hook|bind-session|whoami|leave|stop|daemon|watch|migration-check|reset|keeper|compact|restore-roster|scope|authority|color|operator|help|-h|--help) return 0 ;;
   esac
   sp_init_paths >/dev/null 2>&1 || return 0
   local who
@@ -409,6 +410,53 @@ EOF
     echo "note: a live agent session/MCP started as @$old keeps its in-memory identity until restarted — hook-side identity follows the renamed binding immediately."
     ;;
 
+  operator)
+    # Operator credential management (authority model redesign, C2/C2b).
+    # The credential is a random 256-bit key OUTSIDE every pad
+    # ($HOME/.stitchpad/operator.key, 0600). Operator-gated commands require
+    # the caller to present it via STITCHPAD_OPERATOR_TOKEN — out-of-band
+    # possession, never an env boolean or roster inference.
+    op_cmd="${1:-status}"
+    case "$op_cmd" in
+      keygen)
+        sp_operator_keygen "${2:-}" || exit 1
+        echo "✓ operator key created at $HOME/.stitchpad/operator.key (0600)"
+        echo "  export STITCHPAD_OPERATOR_TOKEN=$(cat "$HOME/.stitchpad/operator.key")"
+        ;;
+      env)
+        sp_operator_key_present || { echo "stitchpad: no operator key — run 'stitchpad operator keygen'" >&2; exit 1; }
+        echo "export STITCHPAD_OPERATOR_TOKEN=$(cat "$HOME/.stitchpad/operator.key")"
+        ;;
+      grant)
+        sp_init_paths || exit 1
+        g_seat="${2:?usage: stitchpad operator grant <seat> <operation> [--ttl seconds]}"
+        g_op="${3:?usage: stitchpad operator grant <seat> <operation> [--ttl seconds]}"
+        g_ttl=86400
+        [ "${4:-}" = "--ttl" ] && g_ttl="${5:-86400}"
+        sp_operator_grant_create "$g_seat" "$g_op" "$g_ttl" || exit 1
+        echo "✓ sealed one-shot grant: @$g_seat may $g_op (ttl ${g_ttl}s, bound to this pad)"
+        ;;
+      revoke)
+        sp_init_paths || exit 1
+        g_seat="${2:?usage: stitchpad operator revoke <seat> <operation>}"
+        g_op="${3:?usage: stitchpad operator revoke <seat> <operation>}"
+        rm -f "$PAD_STATE/operator-grant.$g_seat.$g_op" && echo "✓ grant revoked: @$g_seat $g_op"
+        ;;
+      status)
+        if sp_operator_key_present; then
+          echo "operator key: present ($HOME/.stitchpad/operator.key)"
+          if sp_operator_ok; then echo "credential: PRESENTED (token matches)"; else echo "credential: not presented (export STITCHPAD_OPERATOR_TOKEN — see 'stitchpad operator env')"; fi
+        else
+          echo "operator key: MISSING — run 'stitchpad operator keygen'"
+        fi
+        ;;
+      *)
+        echo "usage: stitchpad operator <keygen [--force]|env|grant <seat> <op> [--ttl s]|revoke <seat> <op>|status>" >&2
+        exit 1
+        ;;
+    esac
+    ;;
+
   reset)
     # Repair a wedged seat — or the whole pad. Kills zombie heartbeat tickers,
     # scrubs state left behind by renamed/evicted names, drops stale terminal
@@ -633,7 +681,15 @@ PY
           sp_authority_consume_grant "$_reset_caller" reset-others
           ;;
         *)
-          # Non-roster caller: the human operator (N3 pattern) — allowed.
+          # Non-roster caller: possibly the human operator — but a seat can
+          # edit itself OUT of the roster (C2b), so non-roster-ness proves
+          # nothing. Require the operator credential.
+          if ! sp_operator_ok; then
+            _reset_audit reset-denied "${who:-*}" "" 2>/dev/null || true
+            echo "stitchpad: AUTHORITY VIOLATION — cross-seat reset requires the operator credential (a non-roster name is not proof: the roster is seat-editable)" >&2
+            echo "  Run 'stitchpad operator keygen' once, then export STITCHPAD_OPERATOR_TOKEN." >&2
+            exit 1
+          fi
           ;;
       esac
     fi
@@ -642,9 +698,10 @@ PY
     # never clear its own counters — that would defeat the bound. The caller's
     # identity must not be a roster member, exactly like the authority grant
     # path. H4: the previous gate trusted STITCHPAD_NAME only (env-asserted) —
-    # any seat exporting STITCHPAD_NAME=<non-roster> bypassed it. Now requires
-    # the explicit --i-am-operator flag (operator intent acknowledgment) AND
-    # the name must not be a roster member. The flag is never set by agents.
+    # any seat exporting STITCHPAD_NAME=<non-roster> bypassed it. The
+    # --i-am-operator flag (H4's interim mechanism) has since been SUPERSEDED
+    # by the C2 redesign: operator-ness is now proven by the operator
+    # credential (sp_operator_ok), and the roster-member denial stands.
     if [ "$recovery_counters" -eq 1 ]; then
       _rc_grantor="${STITCHPAD_NAME:-}"
       _rc_roster_names="$(sp_roster 2>/dev/null | cut -d'|' -f1 | tr '\n' ' ')"
@@ -656,13 +713,11 @@ PY
           exit 1
           ;;
       esac
-      # H4: require explicit operator acknowledgment. An env-asserted non-roster
-      # name alone is insufficient — any process can set STITCHPAD_NAME. The
-      # --i-am-operator flag proves the caller knows this is an operator-only
-      # action and is NOT an automated agent (agents never set it).
-      if [ "${STITCHPAD_I_AM_OPERATOR:-}" != "1" ]; then
-        echo "stitchpad: --recovery-counters requires explicit operator confirmation." >&2
-        echo "  Set STITCHPAD_I_AM_OPERATOR=1 if you are the human operator." >&2
+      # C2: operator-ness is PROVEN by the credential, never asserted by env
+      # or inferred from the (seat-editable) roster.
+      if ! sp_operator_ok; then
+        echo "stitchpad: --recovery-counters requires the operator credential." >&2
+        echo "  Run 'stitchpad operator keygen' once, then export STITCHPAD_OPERATOR_TOKEN (see 'stitchpad operator env')." >&2
         exit 1
       fi
       if [ -n "$who" ]; then
@@ -1075,6 +1130,13 @@ PY
           read|write|deploy) ;;
           *) echo "invalid authority level: $level (use read|write|deploy)" >&2; exit 1 ;;
         esac
+        # C2: authority elevation is an operator-only surface — a seat must
+        # not elevate itself. Requires the operator credential.
+        if ! sp_operator_ok; then
+          echo "stitchpad: AUTHORITY VIOLATION — 'authority set' requires the operator credential" >&2
+          echo "  Run 'stitchpad operator keygen' once, then export STITCHPAD_OPERATOR_TOKEN." >&2
+          exit 1
+        fi
         printf '%s' "$level" > "$PAD_STATE/authority.$who"
         echo "✓ authority for @$who: $level"
         ;;
@@ -1096,8 +1158,12 @@ PY
       grant)
         who="${2:?usage: authority grant <seat> <operation>}"
         op="${3:?usage: authority grant <seat> <operation>}"
-        # TASK-5: a seat may NEVER create its own operator grant.
-        # Only the operator (no STITCHPAD_NAME matching a roster seat) may grant.
+        # TASK-5: a seat may NEVER create an operator grant (roster deny kept
+        # as best-effort) — and C2/C2b: non-roster-ness is not proof either,
+        # because the roster is seat-editable. The grant is minted ONLY with
+        # the operator credential and sealed (sp-auth-v1 HMAC bound to this
+        # pad + seat + operation + expiry) so a hand-written or copied grant
+        # verifies nowhere.
         _grantor="${STITCHPAD_NAME:-}"
         _roster_names="$(sp_roster 2>/dev/null | cut -d'|' -f1 | tr '\n' ' ')"
         case " $_roster_names " in
@@ -1107,9 +1173,8 @@ PY
             exit 1
             ;;
         esac
-        grant_file="$PAD_STATE/operator-grant.$who.$op"
-        printf '%s %s\n' "$_grantor" "$(date '+%Y-%m-%dT%H:%M:%S')" > "$grant_file"
-        echo "✓ operator grant created: @$who may perform: $op (one-time)"
+        sp_operator_grant_create "$who" "$op" 86400 || exit 1
+        echo "✓ operator grant created: @$who may perform: $op (one-time, sealed, bound to this pad)"
         ;;
       check)
         who="${2:?usage: authority check <seat> <operation>}"

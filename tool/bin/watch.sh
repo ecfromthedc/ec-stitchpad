@@ -915,6 +915,17 @@ delivery_start_worker() {
   token="$(date +%s)-$$-$RANDOM-$RANDOM"
   printf '%s' "$token" > "$lock/token"; date +%s > "$lock/born"
   [ -n "${SP_DELIVERY_TEST_PRE_SPAWN_DELAY:-}" ] && sleep "$SP_DELIVERY_TEST_PRE_SPAWN_DELAY"
+  # Test-only deterministic gate: when set, wait (bounded) for this file to
+  # appear before the stop-requested check. Lets a test synchronize the
+  # spawn on a REAL state transition (e.g. the stop CLI marking this worker)
+  # instead of a fixed sleep racing phases of unknown duration (fx3 root
+  # cause: fixed delay vs stop's watcher-first ordering was load-dependent).
+  if [ -n "${SP_DELIVERY_TEST_PRE_SPAWN_GATE:-}" ]; then
+    _sp_gate=0
+    while [ ! -f "$SP_DELIVERY_TEST_PRE_SPAWN_GATE" ] && [ "$_sp_gate" -lt 3000 ]; do
+      _sp_gate=$((_sp_gate + 1)); sleep 0.01
+    done
+  fi
   [ ! -f "$lock/stop-requested" ] || { delivery_worker_cleanup "$name" "$token"; return 0; }
   STITCHPAD_PAD_DIR="$PAD_DIR" SP_DELIVERY_RETRY_SECONDS="${SP_DELIVERY_RETRY_SECONDS:-2}" \
     bash "$BIN_DIR/watch.sh" --delivery-worker "$name" "$token" </dev/null \
