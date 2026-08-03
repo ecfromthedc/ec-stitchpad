@@ -67,7 +67,10 @@ fire_adapter() {
   # in — without this, pad mentions to randy chronically defer and never land.
   local force=0
   [ -f "$PAD_STATE/forcewake.$name" ] && force=1
-  SP_WAKE="$wake" SP_TARGET="$target" SP_PAD_DIR="$PAD_DIR" SP_PAD_MD="$PAD_MD" STITCHPAD_FORCE_WAKE="$force" \
+  # Optional per-seat model from the roster's model column; empty when unannotated,
+  # in which case the adapter falls back to the daemon/runtime default as before.
+  local model; model="$(sp_model_for "$name")"
+  SP_WAKE="$wake" SP_TARGET="$target" SP_MODEL="$model" SP_PAD_DIR="$PAD_DIR" SP_PAD_MD="$PAD_MD" STITCHPAD_FORCE_WAKE="$force" \
     bash "$script" mention "$name" "$PAD_MD" "$taskfile" </dev/null || rc=$?
   rm -f "$taskfile"
   # Return the adapter's exit code so the caller can distinguish DELIVERED (0) from

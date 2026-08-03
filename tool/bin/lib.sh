@@ -36,12 +36,26 @@ ADAPTER_DIR="$STITCHPAD_HOME/adapters"
 
 # ── Pad resolution ──────────────────────────────────────────────────
 # Find the pad dir: explicit $PAD_DIR, else nearest .stitchpad up the tree.
+# The install home is ~/.stitchpad -> <checkout>/tool, which matches the very
+# marker name this walk-up looks for — and the checkout ships tool/stitchpad.md,
+# so it reads as a fully valid pad. Without this guard every directory under
+# $HOME resolves to it: writes land in the tracked repo file, and the claim hook
+# denies Write/Edit machine-wide. Never treat the install home as a pad.
+sp_is_install_home() {
+  local cand="$1" home
+  home="$(cd "${STITCHPAD_HOME:-$HOME/.stitchpad}" 2>/dev/null && pwd -P)" || return 1
+  cand="$(cd "$cand" 2>/dev/null && pwd -P)" || return 1
+  [ "$cand" = "$home" ]
+}
+
 sp_find_pad() {
   if [ -n "${PAD_DIR:-}" ]; then echo "$PAD_DIR"; return; fi
   local d="${1:-$PWD}"
   while [ "$d" != "/" ]; do
-    [ -d "$d/.pasture" ] && { echo "$d/.pasture"; return; }     # migrated pad wins
-    [ -d "$d/.stitchpad" ] && { echo "$d/.stitchpad"; return; } # legacy accepted
+    [ -d "$d/.pasture" ] && ! sp_is_install_home "$d/.pasture" \
+      && { echo "$d/.pasture"; return; }     # migrated pad wins
+    [ -d "$d/.stitchpad" ] && ! sp_is_install_home "$d/.stitchpad" \
+      && { echo "$d/.stitchpad"; return; }   # legacy accepted
     d="$(dirname "$d")"
   done
   return 1
@@ -347,6 +361,28 @@ sp_roster() {
       }
     }
   ' "$PAD_MD"
+}
+
+# Model annotation for one roster member, or empty when unannotated.
+# The roster tolerates a 3rd model column (name|adapter|MODEL|wake|target) but
+# sp_roster deliberately drops it to keep its 4-field contract stable for every
+# consumer. Adapters that can pin a model (ocean) read it through here instead.
+sp_model_for() {
+  local want="$1"
+  awk -v want="$want" '
+    /^```roster/ { inblk=1; next }
+    /^```/       { inblk=0 }
+    inblk {
+      line=$0
+      gsub(/^[ \t]+|[ \t]+$/, "", line)
+      if (line == "" || line ~ /^#/) next
+      n=split(line, f, /[ \t]*\|[ \t]*/)
+      if (n>=5 && f[3] !~ /^(push|pull)$/) {
+        name=f[1]; gsub(/^[ \t]+|[ \t]+$/, "", name)
+        if (name == want) { print f[3]; exit }
+      }
+    }
+  ' "$PAD_MD" 2>/dev/null
 }
 
 # Roster filtered to LIVE sessions: an agent is shown only if its heartbeat
