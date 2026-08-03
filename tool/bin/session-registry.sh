@@ -1041,20 +1041,31 @@ _sp_session_registry_journal_path_contained() {
   # against the git dir's — same directory on disk ⇒ same identity regardless
   # of case.  This is the primary gate; the string checks below are defense
   # in depth (also made case-insensitive).
-  if [ -d "${PAD_DIR:-/nonexistent}/stitchpad-git" ]; then
-    _gd_identity="$(python3 -c "import os,sys; s=os.stat(sys.argv[1]); print(s.st_dev,s.st_ino)" "${PAD_DIR}/stitchpad-git" 2>/dev/null)" || _gd_identity=""
-    _rd_identity="$(python3 -c "import os,sys; s=os.stat(sys.argv[1]); print(s.st_dev,s.st_ino)" "$real_dir" 2>/dev/null)" || _rd_identity=""
-    if [ -n "$_gd_identity" ] && [ "$_rd_identity" = "$_gd_identity" ]; then
-      return 1  # target directory IS the git dir (any case variant)
+  #
+  # P1 SEVERE: the dev/inode gate checked ONLY stitchpad-git by name. On a
+  # migrated .pasture pad the git dir is pasture-git/, so the gate was skipped
+  # entirely — journal paths into pasture-git passed containment (open DoS/RCE).
+  # Fix: resolve the actual git dir by checking for each known name, do a
+  # dev/inode compare against whichever exists.  By construction covers any
+  # future rename as long as the name is added to the list.
+  local _git_candidate
+  for _git_candidate in stitchpad-git pasture-git; do
+    if [ -d "${PAD_DIR:-/nonexistent}/${_git_candidate}" ]; then
+      _gd_identity="$(python3 -c "import os,sys; s=os.stat(sys.argv[1]); print(s.st_dev,s.st_ino)" "${PAD_DIR}/${_git_candidate}" 2>/dev/null)" || _gd_identity=""
+      _rd_identity="$(python3 -c "import os,sys; s=os.stat(sys.argv[1]); print(s.st_dev,s.st_ino)" "$real_dir" 2>/dev/null)" || _rd_identity=""
+      if [ -n "$_gd_identity" ] && [ "$_rd_identity" = "$_gd_identity" ]; then
+        return 1  # target directory IS the git dir (any case variant)
+      fi
+      break  # Only one git dir can exist per pad
     fi
-  fi
+  done
   # Defense in depth: case-insensitive string checks for .git / hooks /
   # stitchpad-git subdirectory patterns — catches deep paths the dev/inode
   # ancestor check above misses (e.g. .paths → stitchpad-git/hooks/pre-commit
   # where real_dir is inside the git dir but not the git dir root).
   _flow="$(printf '%s' "$f" | tr '[:upper:]' '[:lower:]')"
   case "$_flow" in
-    */.git/*|*/.git|*/hooks/*|*/stitchpad-git/*|*/stitchpad-git)
+	    */.git/*|*/.git|*/hooks/*|*/stitchpad-git/*|*/stitchpad-git|*/pasture-git/*|*/pasture-git)
       return 1
       ;;
   esac

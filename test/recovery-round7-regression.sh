@@ -321,6 +321,241 @@ fi
 rm -rf "$C4_WORK"
 
 # ============================================================================
+# P1: pasture-git containment hole (flash re-attack, SEVERE)
+# ============================================================================
+echo ""
+echo "--- P1: pasture-git containment (SEVERE) ---"
+
+P1_WORK="$(mktemp -d "${TMPDIR:-/tmp}/sp-r7-p1.XXXXXX")"
+
+# Create a MIGRATED .pasture pad with pasture-git (not stitchpad-git)
+mkdir -p "$P1_WORK/pad/.pasture/.state/sessions" "$P1_WORK/pad/.pasture/pasture-git"
+cat > "$P1_WORK/pad/.pasture/pasture.md" <<'EOPAD'
+```roster
+alice | claude | pull | -
+```
+EOPAD
+git --git-dir="$P1_WORK/pad/.pasture/pasture-git" --work-tree="$P1_WORK/pad/.pasture" init -q
+git --git-dir="$P1_WORK/pad/.pasture/pasture-git" --work-tree="$P1_WORK/pad/.pasture" config user.email "t@t"
+git --git-dir="$P1_WORK/pad/.pasture/pasture-git" --work-tree="$P1_WORK/pad/.pasture" config user.name "t"
+git --git-dir="$P1_WORK/pad/.pasture/pasture-git" --work-tree="$P1_WORK/pad/.pasture" add pasture.md
+git --git-dir="$P1_WORK/pad/.pasture/pasture-git" --work-tree="$P1_WORK/pad/.pasture" commit -q -m "init"
+
+# Set up containment variables as a .pasture pad
+export STITCHPAD_PAD_DIR="$P1_WORK/pad/.pasture"
+unset STITCHPAD_SESSION CLAUDE_CODE_SESSION_ID CODEX_SESSION_ID 2>/dev/null || true
+
+source "$ROOT/tool/bin/lib.sh"
+source "$ROOT/tool/bin/session-registry.sh"
+
+PAD_DIR="$P1_WORK/pad/.pasture"
+PAD_MD="$P1_WORK/pad/.pasture/pasture.md"
+PAD_STATE="$P1_WORK/pad/.pasture/.state"
+
+# P1a: pasture-git/config MUST be refused by containment
+P1A_PATH="$P1_WORK/pad/.pasture/pasture-git/config"
+if _sp_session_registry_journal_path_contained "$P1A_PATH"; then
+  bad "P1a: pasture-git/config passed containment — OPEN DOOR for git-dir write!"
+else
+  ok "P1a: pasture-git/config REFUSED by containment (P1 fixed)"
+fi
+
+# P1b: pasture-git/hooks/pre-commit MUST be refused (RCE-adjacent)
+P1B_PATH="$P1_WORK/pad/.pasture/pasture-git/hooks/pre-commit"
+if _sp_session_registry_journal_path_contained "$P1B_PATH"; then
+  bad "P1b: pasture-git/hooks/pre-commit passed containment — OPEN DOOR for RCE-adjacent!"
+else
+  ok "P1b: pasture-git/hooks/pre-commit REFUSED by containment (P1 fixed)"
+fi
+
+# P1c: stitchpad-git/config still refused (legacy pad, no regression)
+P1C_WORK="$(mktemp -d "${TMPDIR:-/tmp}/sp-r7-p1c.XXXXXX")"
+make_pad "$P1C_WORK/test-pad" "p1c-pad"
+P1C_PAD_DIR="$P1C_WORK/test-pad/.stitchpad"
+PAD_DIR="$P1C_PAD_DIR"
+PAD_MD="$P1C_PAD_DIR/stitchpad.md"
+PAD_STATE="$P1C_PAD_DIR/.state"
+P1C_PATH="$P1C_PAD_DIR/stitchpad-git/config"
+if _sp_session_registry_journal_path_contained "$P1C_PATH"; then
+  bad "P1c: stitchpad-git/config passed containment — legacy regression!"
+else
+  ok "P1c: stitchpad-git/config still REFUSED (legacy pad, no regression)"
+fi
+rm -rf "$P1C_WORK"
+
+rm -rf "$P1_WORK"
+
+# ============================================================================
+# Z1: C3-fix bypass — staged unrelated file, pad write excluded
+# ============================================================================
+echo ""
+echo "--- Z1: C3-fix bypass (staged unrelated file) ---"
+
+Z1_WORK="$(mktemp -d "${TMPDIR:-/tmp}/sp-r7-z1.XXXXXX")"
+make_pad "$Z1_WORK/test-pad" "z1-pad"
+
+Z1_PAD_DIR="$Z1_WORK/test-pad/.stitchpad"
+Z1_PAD_MD="$Z1_PAD_DIR/stitchpad.md"
+Z1_PAD_GIT="$Z1_PAD_DIR/stitchpad-git"
+
+# Hook: removes stitchpad.md from the index, stages an unrelated file,
+# then exits 0.  The commit succeeds but stitchpad.md is NOT in HEAD.
+mkdir -p "$Z1_PAD_GIT/hooks"
+cat > "$Z1_PAD_GIT/hooks/pre-commit" <<'HOOK'
+#!/usr/bin/env bash
+# Remove the real pad file from index
+git rm --cached -q stitchpad.md 2>/dev/null || git reset -q HEAD stitchpad.md 2>/dev/null || true
+# Stage an unrelated file so diff-tree is non-empty
+echo "unrelated" > /tmp/z1-unrelated.txt
+git add /tmp/z1-unrelated.txt 2>/dev/null || {
+  # Can't add outside worktree — add it inside instead
+  echo "unrelated" > "$(git rev-parse --show-toplevel 2>/dev/null || echo .)/.z1-unrelated"
+  git add .z1-unrelated 2>/dev/null
+}
+exit 0
+HOOK
+chmod +x "$Z1_PAD_GIT/hooks/pre-commit"
+
+# Set up sp_commit variables
+PAD_DIR="$Z1_PAD_DIR"
+PAD_MD="$Z1_PAD_MD"
+PAD_STATE="$Z1_PAD_DIR/.state"
+PAD_GIT="$Z1_PAD_GIT"
+
+# Write to the pad and commit
+echo "" >> "$Z1_PAD_MD"
+echo "Z1 test write — should be verified in HEAD" >> "$Z1_PAD_MD"
+
+Z1_HEAD_BEFORE="$(git --git-dir="$Z1_PAD_GIT" rev-parse HEAD 2>/dev/null)"
+Z1_OUT="$(sp_commit "Z1 bypass test" 2>&1)" || Z1_RC=$?
+if [ "${Z1_RC:-0}" -ne 0 ]; then
+  # Verify the diagnostic mentions staged paths
+  if echo "$Z1_OUT" | grep -qi "staged paths\|NOT in HEAD"; then
+    ok "Z1a: staged-unrelated-file bypass detected, diagnostic emitted (rc=$Z1_RC)"
+  else
+    ok "Z1a: commit refused (rc=$Z1_RC) — diagnostic may differ: $(printf '%s' "$Z1_OUT" | head -c 120)"
+  fi
+else
+  bad "Z1a: sp_commit returned 0 on staged-unrelated-file bypass — write NOT verified in HEAD!"
+fi
+
+# Verify the pad write is NOT in HEAD
+Z1_HEAD_HAS="$(git --git-dir="$Z1_PAD_GIT" --work-tree="$Z1_WORK/test-pad/.stitchpad" show HEAD:stitchpad.md 2>/dev/null | grep "Z1 test write" || true)"
+if [ -z "$Z1_HEAD_HAS" ]; then
+  ok "Z1b: pad write NOT in HEAD (correctly refused)"
+else
+  bad "Z1b: pad write IS in HEAD — but sp_commit failed? (ambiguous)"
+fi
+
+rm -rf "$Z1_WORK"
+
+# ============================================================================
+# C5: Unborn-HEAD pad uncommittable
+# ============================================================================
+echo ""
+echo "--- C5: unborn-HEAD pad ---"
+
+C5_SKIP=0
+C5_WORK="$(mktemp -d "${TMPDIR:-/tmp}/sp-r7-c5.XXXXXX")"
+
+# Create a pad with NO commits (unborn HEAD)
+mkdir -p "$C5_WORK/pad/.stitchpad/.state/sessions" "$C5_WORK/pad/.stitchpad/stitchpad-git"
+cat > "$C5_WORK/pad/.stitchpad/stitchpad.md" <<'EOPAD'
+```roster
+alice | claude | pull | -
+```
+EOPAD
+git --git-dir="$C5_WORK/pad/.stitchpad/stitchpad-git" --work-tree="$C5_WORK/pad/.stitchpad" init -q
+git --git-dir="$C5_WORK/pad/.stitchpad/stitchpad-git" --work-tree="$C5_WORK/pad/.stitchpad" config user.email "t@t"
+git --git-dir="$C5_WORK/pad/.stitchpad/stitchpad-git" --work-tree="$C5_WORK/pad/.stitchpad" config user.name "t"
+
+# Verify HEAD is unborn — rev-parse writes "HEAD" to stdout even on failure,
+# so suppress all output and just check exit code.
+if git --git-dir="$C5_WORK/pad/.stitchpad/stitchpad-git" rev-parse --verify HEAD >/dev/null 2>&1; then
+  bad "C5_setup: HEAD exists (pad wasn't unborn)"
+  C5_SKIP=1
+else
+  C5_SKIP=0
+fi
+
+if [ "$C5_SKIP" -eq 0 ]; then
+  # Set up sp_commit variables
+  PAD_DIR="$C5_WORK/pad/.stitchpad"
+  PAD_MD="$C5_WORK/pad/.stitchpad/stitchpad.md"
+  PAD_STATE="$C5_WORK/pad/.stitchpad/.state"
+  PAD_GIT="$C5_WORK/pad/.stitchpad/stitchpad-git"
+
+  # C5a: normal first commit on unborn HEAD works
+  echo "" >> "$PAD_MD"
+  echo "C5 first write" >> "$PAD_MD"
+  if sp_commit "C5 first commit" >/dev/null 2>&1; then
+    C5_FIRST="$(git --git-dir="$PAD_GIT" --work-tree="$PAD_DIR" show HEAD:stitchpad.md 2>/dev/null | grep "C5 first write" || true)"
+    if [ -n "$C5_FIRST" ]; then
+      ok "C5a: first commit on unborn HEAD succeeds, write in HEAD"
+    else
+      bad "C5a: first commit succeeded but write not in HEAD"
+    fi
+  else
+    bad "C5a: first commit on unborn HEAD failed — regression!"
+  fi
+fi
+
+rm -rf "$C5_WORK"
+
+# C5b: empty first commit on unborn HEAD must be refused (new pad, hook
+# clears index). Create a fresh unborn pad for this.
+C5B_WORK="$(mktemp -d "${TMPDIR:-/tmp}/sp-r7-c5b.XXXXXX")"
+mkdir -p "$C5B_WORK/pad/.stitchpad/.state/sessions" "$C5B_WORK/pad/.stitchpad/stitchpad-git/hooks"
+cat > "$C5B_WORK/pad/.stitchpad/stitchpad.md" <<'EOPAD'
+```roster
+alice | claude | pull | -
+```
+EOPAD
+git --git-dir="$C5B_WORK/pad/.stitchpad/stitchpad-git" --work-tree="$C5B_WORK/pad/.stitchpad" init -q
+git --git-dir="$C5B_WORK/pad/.stitchpad/stitchpad-git" --work-tree="$C5B_WORK/pad/.stitchpad" config user.email "t@t"
+git --git-dir="$C5B_WORK/pad/.stitchpad/stitchpad-git" --work-tree="$C5B_WORK/pad/.stitchpad" config user.name "t"
+
+# Hook: create an empty-tree commit, then clear the index so git
+# commit sees nothing to commit on top of it. Exits 0 — git commit
+# succeeds with HEAD at the empty-tree commit, write dropped.
+# Uses --verify -q to avoid rev-parse stdout pollution on unborn HEAD.
+cat > "$C5B_WORK/pad/.stitchpad/stitchpad-git/hooks/pre-commit" <<'HOOK'
+#!/usr/bin/env bash
+parent_tree=$(git rev-parse --verify -q HEAD^{tree} 2>/dev/null)
+if [ -z "$parent_tree" ]; then
+  # Unborn HEAD — create an empty tree commit
+  empty_tree=$(echo -n | git hash-object -t tree --stdin 2>/dev/null)
+  new_commit=$(echo "hook empty" | git commit-tree ${empty_tree} 2>/dev/null)
+  [ -n "$new_commit" ] && git update-ref HEAD "$new_commit" 2>/dev/null
+fi
+# Clear the index so git commit has nothing to land on top of the hook commit
+git reset -q HEAD 2>/dev/null || true
+exit 0
+HOOK
+chmod +x "$C5B_WORK/pad/.stitchpad/stitchpad-git/hooks/pre-commit"
+
+PAD_DIR="$C5B_WORK/pad/.stitchpad"
+PAD_MD="$C5B_WORK/pad/.stitchpad/stitchpad.md"
+PAD_STATE="$C5B_WORK/pad/.stitchpad/.state"
+PAD_GIT="$C5B_WORK/pad/.stitchpad/stitchpad-git"
+
+echo "" >> "$PAD_MD"
+echo "C5b should be refused" >> "$PAD_MD"
+
+C5B_OUT="$(sp_commit "C5b empty first commit" 2>&1)" || C5B_RC=$?
+if [ "${C5B_RC:-0}" -ne 0 ]; then
+  if echo "$C5B_OUT" | grep -qi "empty tree"; then
+    ok "C5b: empty first commit on unborn HEAD refused (empty tree detected)"
+  else
+    ok "C5b: empty first commit refused (rc=$C5B_RC)"
+  fi
+else
+  bad "C5b: empty first commit on unborn HEAD returned 0 — data lost!"
+fi
+
+rm -rf "$C5B_WORK"
+
+# ============================================================================
 # Summary
 # ============================================================================
 echo ""

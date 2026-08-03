@@ -1036,9 +1036,14 @@ sp_commit() {
     echo "stitchpad: git repository is broken (rev-parse failed on $PAD_GIT) — commit refused" >&2
     return 1
   fi
-  if ! sgit cat-file -t HEAD >/dev/null 2>&1; then
-    echo "stitchpad: git repository is broken (HEAD unreachable) — commit refused" >&2
-    return 1
+  # C5: check HEAD reachability ONLY if HEAD exists.  An unborn HEAD
+  # (fresh repo before first commit) is benign — skip so the first commit
+  # can proceed.  A repo where HEAD exists but isn't a valid commit is broken.
+  if sgit rev-parse --verify HEAD >/dev/null 2>&1; then
+    if ! sgit cat-file -t HEAD >/dev/null 2>&1; then
+      echo "stitchpad: git repository is broken (HEAD unreachable) — commit refused" >&2
+      return 1
+    fi
   fi
   [ -f "$PAD_MD" ] || return 0
   if [ "${STITCHPAD_TEST_MODE:-}" = "1" ] && [ -n "${STITCHPAD_TEST_COMMIT_FAIL:-}" ]; then
@@ -1067,36 +1072,77 @@ sp_commit() {
   fi
   sgit add -A -f -- "${paths[@]}" 2>/dev/null || return 1
   sgit diff --cached --quiet -- "${paths[@]}" 2>/dev/null && return 0
-  # H5b: capture HEAD BEFORE the commit attempt. On failure, verify HEAD
-  # actually moved (bytes landed), not just that the index looks clean
-  # (a pre-commit hook can empty the index → diff --cached clean but
-  # write NOT in HEAD → journal dropped → permanent data loss).
+  # H5b: capture HEAD BEFORE the commit attempt.  Use --verify -q to avoid
+  # rev-parse polluting stdout with "HEAD" on an unborn HEAD.
   local _head_before=""
-  _head_before="$(sgit rev-parse HEAD 2>/dev/null || echo "")"
+  _head_before="$(sgit rev-parse --verify -q HEAD 2>/dev/null || echo "")"
   if sgit commit -q -m "$msg" >/dev/null 2>/dev/null; then
     # C3: commit exited 0, but a pre-commit hook that empties the index
     # makes git produce an EMPTY commit — HEAD advances, index is clean,
     # but our write bytes are in neither HEAD nor HEAD~1.  Journaled
     # callers (lifecycle_commit, rollback) treat rc=0 as success and drop
     # the journal → write permanently lost.
-    # Verify our staged content actually landed: diff-tree HEAD~1..HEAD
-    # must list at least one changed file.
     local _head_after=""
-    _head_after="$(sgit rev-parse HEAD 2>/dev/null || echo "")"
+    _head_after="$(sgit rev-parse --verify -q HEAD 2>/dev/null || echo "")"
+    # --- Empty-tree guard (success branch) ---
     if [ -n "$_head_before" ] && [ -n "$_head_after" ] && [ "$_head_before" != "$_head_after" ]; then
       if [ -z "$(sgit diff-tree --name-only "${_head_before}" "$_head_after" 2>/dev/null)" ]; then
         echo "stitchpad: commit produced an empty tree (hook may have cleared the index) — write NOT committed" >&2
         return 1
       fi
     fi
+    # C5: unborn HEAD — no prior commit. Compare against empty tree.
+    if [ -z "$_head_before" ] && [ -n "$_head_after" ]; then
+      local _empty_tree=""
+      _empty_tree="$(echo -n | sgit hash-object -t tree --stdin 2>/dev/null)" || _empty_tree=""
+      if [ -n "$_empty_tree" ] && [ -z "$(sgit diff-tree --name-only "${_empty_tree}" "$_head_after" 2>/dev/null)" ]; then
+        echo "stitchpad: first commit produced an empty tree (hook may have cleared the index) — write NOT committed" >&2
+        return 1
+      fi
+    fi
+    # Z1: C3-fix bypass — hook can exclude our staged file while leaving
+    # an unrelated file in HEAD (diff-tree non-empty, passes empty-tree check).
+    # Verify the staged paths specifically appear in HEAD as added/modified.
+    if [ -n "$_head_before" ] && [ -n "$_head_after" ] && [ "$_head_before" != "$_head_after" ]; then
+      if [ -z "$(sgit diff --name-only --diff-filter=AM "${_head_before}" "${_head_after}" -- "${paths[@]}" 2>/dev/null)" ]; then
+        echo "stitchpad: commit succeeded but staged paths NOT in HEAD — write NOT committed (hook may have excluded them)" >&2
+        return 1
+      fi
+    fi
+    if [ -z "$_head_before" ] && [ -n "$_head_after" ]; then
+      if [ -z "$(sgit diff --name-only --diff-filter=AM "${_empty_tree:-$(echo -n | sgit hash-object -t tree --stdin 2>/dev/null)}" "$_head_after" -- "${paths[@]}" 2>/dev/null)" ]; then
+        echo "stitchpad: first commit succeeded but staged paths NOT in HEAD — write NOT committed (hook may have excluded them)" >&2
+        return 1
+      fi
+    fi
     return 0
   fi
-  # H5b: commit failed (exit ≠ 0). Check HEAD moved AND index is clean.
+  # H5b: commit failed (exit != 0). Check HEAD moved AND index is clean.
   local _head_after=""
-  _head_after="$(sgit rev-parse HEAD 2>/dev/null || echo "")"
+  _head_after="$(sgit rev-parse --verify -q HEAD 2>/dev/null || echo "")"
   if [ -n "$_head_before" ] && [ -n "$_head_after" ] && [ "$_head_before" != "$_head_after" ]; then
     if [ -z "$(sgit diff-tree --name-only "${_head_before}" "$_head_after" 2>/dev/null)" ]; then
       echo "stitchpad: git commit failed but HEAD advanced with an empty tree — write NOT committed" >&2
+      return 1
+    fi
+    # Z1 failure branch: same staged-paths verification
+    if [ -z "$(sgit diff --name-only --diff-filter=AM "${_head_before}" "$_head_after" -- "${paths[@]}" 2>/dev/null)" ]; then
+      echo "stitchpad: git commit failed but staged paths NOT in HEAD — write NOT committed (hook may have excluded them)" >&2
+      return 1
+    fi
+    sgit diff --cached --quiet -- "${paths[@]}" 2>/dev/null && return 0
+  fi
+  # C5 failure branch: unborn HEAD, commit rc != 0 but HEAD advanced.
+  if [ -z "$_head_before" ] && [ -n "$_head_after" ]; then
+    local _empty_tree=""
+    _empty_tree="$(echo -n | sgit hash-object -t tree --stdin 2>/dev/null)" || _empty_tree=""
+    if [ -n "$_empty_tree" ] && [ -z "$(sgit diff-tree --name-only "${_empty_tree}" "$_head_after" 2>/dev/null)" ]; then
+      echo "stitchpad: git commit failed but HEAD advanced with an empty tree (hook on unborn HEAD) — write NOT committed" >&2
+      return 1
+    fi
+    # Z1 failure branch on unborn HEAD
+    if [ -z "$(sgit diff --name-only --diff-filter=AM "${_empty_tree}" "$_head_after" -- "${paths[@]}" 2>/dev/null)" ]; then
+      echo "stitchpad: git commit failed but staged paths NOT in HEAD (hook on unborn HEAD) — write NOT committed" >&2
       return 1
     fi
     sgit diff --cached --quiet -- "${paths[@]}" 2>/dev/null && return 0
