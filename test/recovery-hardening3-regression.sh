@@ -463,6 +463,301 @@ grep -q '^RC_AFTER_RESET=0$' "$E7_WORK/e7g.out" && \
   || bad "E7g3: reset did not clear the counter (got: $(grep RC_AFTER_RESET "$E7_WORK/e7g.out"))"
 
 # ============================================================================
+# Round-4: N1 (path containment), N2 (archive no-follow), N3 (CLI reset),
+#           E5a (poisoned counter), sp_commit race (nothing-to-commit)
+# ============================================================================
+echo ""
+echo "--- Round-4: flash re-attack 3 fixes ---"
+
+# ── N1: crafted .paths cannot write outside PAD_STATE ────────────────────
+echo "  N1: crafted orphan .paths containment..."
+N1_WORK="$(mktemp -d "${TMPDIR:-/tmp}/sp-h4-n1.XXXXXX")"
+make_pad "$N1_WORK/pad" "n1-pad"
+N1_PAD_DIR="$N1_WORK/pad/.stitchpad"
+N1_OUTSIDE="$N1_WORK/outside-target.txt"
+rm -f "$N1_OUTSIDE"
+
+(
+  export STITCHPAD_PAD_DIR="$N1_PAD_DIR"
+  unset STITCHPAD_SESSION CLAUDE_CODE_SESSION_ID CODEX_SESSION_ID 2>/dev/null || true
+  STITCHPAD_WATCH_LIB_ONLY=1
+  source "$ROOT/tool/bin/lib.sh"
+  sp_init_paths >/dev/null 2>&1
+  source "$ROOT/tool/bin/recovery-policy.sh"
+  source "$ROOT/tool/bin/session-registry.sh" >/dev/null 2>&1
+
+  # Craft a fake orphan journal with a .paths entry pointing OUTSIDE PAD_STATE
+  local_jdir="$N1_PAD_DIR/.registry-journal.CRAFTED"
+  mkdir -p "$local_jdir"
+  printf 'session-fake' > "$local_jdir/.sid"
+  printf '%s\n' "$N1_OUTSIDE" > "$local_jdir/.paths"
+  printf '1\n' > "$local_jdir/manifest"
+  printf 'PWNED' > "$local_jdir/0"
+  # Stamp .state-root using PAD_STATE (set by sp_init_paths), not the raw
+  # path — otherwise the state-root guard fires before the path-containment
+  # check and masks the diagnostic we're testing for.
+  python3 -c "import os,sys; s=os.lstat(sys.argv[1]); print(s.st_dev,s.st_ino)" \
+    "$PAD_STATE" > "$local_jdir/.state-root"
+
+  # Attempt rollback — must REFUSE, not write the outside file
+  sp_session_registry_journal_rollback "$local_jdir" "session-fake" > "$N1_WORK/n1-rollback.out" 2>&1
+  echo "RC=$?"
+) > "$N1_WORK/n1-result.out" 2>&1
+
+[ -f "$N1_OUTSIDE" ] && \
+  bad "N1: crafted .paths wrote outside PAD_STATE (arbitrary file write not contained)" \
+  || ok "N1: crafted .paths refused — no file written outside PAD_STATE"
+
+_n1_diag="$(cat "$N1_WORK/n1-rollback.out" "$N1_WORK/n1-result.out" 2>/dev/null)"
+printf '%s' "$_n1_diag" | grep -qi 'PATH ESCAPE' && \
+  ok "N1: path escape diagnostic printed" \
+  || bad "N1: no path escape diagnostic (output: $_n1_diag)"
+
+# ── N2: journal-archive symlink is refused ───────────────────────────────
+echo "  N2: journal-archive symlink containment..."
+N2_WORK="$(mktemp -d "${TMPDIR:-/tmp}/sp-h4-n2.XXXXXX")"
+make_pad "$N2_WORK/pad" "n2-pad"
+N2_PAD_DIR="$N2_WORK/pad/.stitchpad"
+N2_OUTSIDE_DIR="$N2_WORK/outside-archive"
+mkdir -p "$N2_OUTSIDE_DIR"
+
+(
+  export STITCHPAD_PAD_DIR="$N2_PAD_DIR"
+  unset STITCHPAD_SESSION CLAUDE_CODE_SESSION_ID CODEX_SESSION_ID 2>/dev/null || true
+  STITCHPAD_WATCH_LIB_ONLY=1
+  source "$ROOT/tool/bin/lib.sh"
+  sp_init_paths >/dev/null 2>&1
+  source "$ROOT/tool/bin/recovery-policy.sh"
+  source "$ROOT/tool/bin/session-registry.sh" >/dev/null 2>&1
+
+  # Pre-plant a symlink at journal-archive
+  ln -s "$N2_OUTSIDE_DIR" "$N2_PAD_DIR/.state/journal-archive"
+
+  # Trigger recover via journal_begin (which calls recover first).
+  # First plant a valid-looking orphan that triggers the archive path.
+  local_orphan="$N2_PAD_DIR/.state/.registry-journal.ORPHAN"
+  mkdir -p "$local_orphan"
+  printf 'session-orphan' > "$local_orphan/.sid"
+  python3 -c "import os,sys; s=os.lstat(sys.argv[1]); print(s.st_dev,s.st_ino)" \
+    "$PAD_STATE" > "$local_orphan/.state-root"
+
+  # Stamp base-sha as parent of HEAD so the E2b archive path fires
+  local_parent_sha="$(git --git-dir="$N2_PAD_DIR/stitchpad-git" rev-parse HEAD~1 2>/dev/null || echo "")"
+  [ -n "$local_parent_sha" ] && printf '%s' "$local_parent_sha" > "$local_orphan/.base-sha"
+
+  sp_session_registry_journal_recover > "$N2_WORK/n2-recover.out" 2>&1
+  echo "RECOVER_RC=$?"
+  echo "ORPHAN_EXISTS=$([ -d "$local_orphan" ] && echo yes || echo no)"
+  echo "SYMLINK_INTACT=$([ -L "$N2_PAD_DIR/.state/journal-archive" ] && echo yes || echo no)"
+) > "$N2_WORK/n2-result.out" 2>&1
+
+# The orphan should NOT be moved into the symlinked archive
+_n2_files_outside="$(find "$N2_OUTSIDE_DIR" -type f 2>/dev/null | wc -l | tr -d ' ')"
+[ "$_n2_files_outside" = "0" ] && \
+  ok "N2: journal-archive symlink refused — orphan not exfiltrated outside PAD_STATE" \
+  || bad "N2: orphan moved through symlinked archive to outside PAD_STATE"
+
+grep -qi 'symlink' "$N2_WORK/n2-recover.out" "$N2_WORK/n2-result.out" 2>/dev/null && \
+  ok "N2: symlink refusal diagnostic printed" \
+  || bad "N2: no symlink refusal diagnostic"
+
+# ── N3: CLI reset --recovery-counters works + authority gate ──────────────
+echo "  N3: CLI reset --recovery-counters..."
+N3_WORK="$(mktemp -d "${TMPDIR:-/tmp}/sp-h4-n3.XXXXXX")"
+make_pad "$N3_WORK/pad" "n3-pad"
+N3_PAD_DIR="$N3_WORK/pad/.stitchpad"
+
+# Seed a recovery counter
+mkdir -p "$N3_PAD_DIR/.state/recovery-attempts"
+printf '5|%d' "$(date +%s)" > "$N3_PAD_DIR/.state/recovery-attempts/journal:test-orphan"
+
+# N3a: operator can clear all counters
+STITCHPAD_PAD_DIR="$N3_PAD_DIR" STITCHPAD_NAME="operator-human" \
+  "$STITCHPAD" reset --recovery-counters > "$N3_WORK/n3a.out" 2>&1
+_n3a_rc=$?
+_n3a_remaining="$(find "$N3_PAD_DIR/.state/recovery-attempts" -type f 2>/dev/null | wc -l | tr -d ' ')"
+[ "$_n3a_rc" -eq 0 ] && [ "$_n3a_remaining" = "0" ] && \
+  ok "N3a: operator reset --recovery-counters clears all counters" \
+  || bad "N3a: reset --recovery-counters failed (rc=$_n3a_rc, remaining=$_n3a_remaining)"
+
+# Re-seed for the per-seat + authority-gate test
+printf '5|%d' "$(date +%s)" > "$N3_PAD_DIR/.state/recovery-attempts/journal:test-orphan"
+
+# N3b: a roster seat is DENIED
+STITCHPAD_PAD_DIR="$N3_PAD_DIR" STITCHPAD_NAME="alice" \
+  "$STITCHPAD" reset --recovery-counters > "$N3_WORK/n3b.out" 2>&1
+_n3b_rc=$?
+[ "$_n3b_rc" -ne 0 ] && grep -qi 'AUTHORITY VIOLATION' "$N3_WORK/n3b.out" && \
+  ok "N3b: roster seat denied from reset --recovery-counters (authority gate)" \
+  || bad "N3b: seat was NOT denied (rc=$_n3b_rc)"
+
+# Counter should still exist (seat couldn't clear it)
+[ -f "$N3_PAD_DIR/.state/recovery-attempts/journal:test-orphan" ] && \
+  ok "N3c: seat denial left the counter intact" \
+  || bad "N3c: counter was cleared despite seat denial"
+
+# ── E5a: poisoned counter does not wedge recovery ────────────────────────
+echo "  E5a: poisoned counter ordering..."
+E5A_WORK="$(mktemp -d "${TMPDIR:-/tmp}/sp-h4-e5a.XXXXXX")"
+make_pad "$E5A_WORK/pad" "e5a-pad"
+E5A_PAD_DIR="$E5A_WORK/pad/.stitchpad"
+
+# Seed a poisoned counter (999999)
+mkdir -p "$E5A_PAD_DIR/.state/recovery-attempts"
+printf '999999|%d' "$(date +%s)" > "$E5A_PAD_DIR/.state/recovery-attempts/journal:poison-test"
+
+(
+  export STITCHPAD_PAD_DIR="$E5A_PAD_DIR"
+  unset STITCHPAD_SESSION CLAUDE_CODE_SESSION_ID CODEX_SESSION_ID 2>/dev/null || true
+  source "$ROOT/tool/bin/recovery-policy.sh"
+
+  SP_RECOVERY_MAX_ATTEMPTS=3
+
+  # E5a: is_exhausted should NOT return exhausted for a poisoned count
+  if sp_recovery_is_exhausted "$E5A_PAD_DIR/.state" "journal:poison-test" 2>/dev/null; then
+    echo "EXHAUSTED_ON_POISONED=yes"
+  else
+    echo "EXHAUSTED_ON_POISONED=no"
+  fi
+
+  # attempt_record should sanitize the poisoned count
+  sp_recovery_attempt_record "$E5A_PAD_DIR/.state" "journal:poison-test" 2>/dev/null
+  echo "AFTER_RECORD=$(sp_recovery_attempt_count "$E5A_PAD_DIR/.state" "journal:poison-test")"
+) > "$E5A_WORK/e5a.out" 2>&1
+
+grep -q '^EXHAUSTED_ON_POISONED=no$' "$E5A_WORK/e5a.out" && \
+  ok "E5a1: poisoned counter (999999) does NOT trigger premature exhaustion" \
+  || bad "E5a1: poisoned counter still wedges recovery"
+
+grep -q '^AFTER_RECORD=1$' "$E5A_WORK/e5a.out" && \
+  ok "E5a2: attempt_record sanitizes poisoned count to 1 (0+1)" \
+  || bad "E5a2: attempt_record did not sanitize (got: $(grep AFTER_RECORD "$E5A_WORK/e5a.out"))"
+
+# ── sp_commit race: nothing-to-commit is benign, not a hard failure ───────
+echo "  sp_commit: nothing-to-commit race..."
+RACE_WORK="$(mktemp -d "${TMPDIR:-/tmp}/sp-h4-race.XXXXXX")"
+make_pad "$RACE_WORK/pad" "race-pad"
+RACE_PAD_DIR="$RACE_WORK/pad/.stitchpad"
+
+(
+  export STITCHPAD_PAD_DIR="$RACE_PAD_DIR"
+  unset STITCHPAD_SESSION CLAUDE_CODE_SESSION_ID CODEX_SESSION_ID 2>/dev/null || true
+  source "$ROOT/tool/bin/lib.sh"
+  sp_init_paths >/dev/null 2>&1
+
+  # Commit once to get content into git
+  sp_commit "initial" >/dev/null 2>&1
+
+  # Now call sp_commit again with NO changes — this is the race shape:
+  # a concurrent committer already committed these bytes. Must return 0.
+  sp_commit "noop-race" 2>/dev/null
+  echo "COMMIT_NOOP_RC=$?"
+
+  # Verify no output leaked to stdout (the "nothing to commit" message)
+  sp_commit "noop-race-check" > "$RACE_WORK/stdout-check.txt" 2>/dev/null
+  echo "STDOUT_LEAK=$(wc -c < "$RACE_WORK/stdout-check.txt" | tr -d ' ')"
+) > "$RACE_WORK/race.out" 2>&1
+
+grep -q '^COMMIT_NOOP_RC=0$' "$RACE_WORK/race.out" && \
+  ok "RACE1: sp_commit returns 0 when nothing to commit (benign race)" \
+  || bad "RACE1: sp_commit returns nonzero on nothing-to-commit (got: $(grep COMMIT_NOOP_RC "$RACE_WORK/race.out"))"
+
+grep -q '^STDOUT_LEAK=0$' "$RACE_WORK/race.out" && \
+  ok "RACE2: no stdout leak from nothing-to-commit message" \
+  || bad "RACE2: stdout leaked (got: $(grep STDOUT_LEAK "$RACE_WORK/race.out"))"
+
+# ── sp_commit: real failure still returns 1 ──────────────────────────────
+echo "  sp_commit: real commit failure still returns 1..."
+FAIL_WORK="$(mktemp -d "${TMPDIR:-/tmp}/sp-h4-fail.XXXXXX")"
+make_pad "$FAIL_WORK/pad" "fail-pad"
+FAIL_PAD_DIR="$FAIL_WORK/pad/.stitchpad"
+
+(
+  export STITCHPAD_PAD_DIR="$FAIL_PAD_DIR"
+  export STITCHPAD_TEST_MODE=1
+  export STITCHPAD_TEST_COMMIT_FAIL=1
+  unset STITCHPAD_SESSION CLAUDE_CODE_SESSION_ID CODEX_SESSION_ID 2>/dev/null || true
+  source "$ROOT/tool/bin/lib.sh"
+  sp_init_paths >/dev/null 2>&1
+
+  sp_commit "should-fail" 2>/dev/null
+  echo "COMMIT_FAIL_RC=$?"
+) > "$FAIL_WORK/fail.out" 2>&1
+
+grep -q '^COMMIT_FAIL_RC=1$' "$FAIL_WORK/fail.out" && \
+  ok "FAIL1: sp_commit returns 1 on real failure (test-injected)" \
+  || bad "FAIL1: sp_commit did not return 1 on real failure (got: $(grep COMMIT_FAIL_RC "$FAIL_WORK/fail.out"))"
+
+# ── Join-after-heartbeat: the nothing-to-commit freeze blocker ────────────
+# Captain's repro: init, join alice, heartbeat start, sleep 3, heartbeat --stop,
+# join sleeper -> previously failed with "roster commit did not complete"
+# because lifecycle_commit's sp_commit returned rc=1 on git's benign
+# "nothing to commit" (a concurrent watcher or the previous operation already
+# committed the exact staged bytes). Now sp_commit re-checks diff --cached
+# --quiet and returns 0 if the desired state is already committed.
+echo "  Join-after-heartbeat (nothing-to-commit freeze blocker)..."
+JH_WORK="$(mktemp -d "${TMPDIR:-/tmp}/sp-h4-jh.XXXXXX")"
+make_pad "$JH_WORK/pad" "jh-pad"
+JH_PAD_DIR="$JH_WORK/pad/.stitchpad"
+
+# Bind a session, join alice, simulate a heartbeat start/stop cycle (which
+# writes and commits lifecycle events), then join a second seat. The second
+# join must succeed even if the pad bytes were already committed by the
+# heartbeat lifecycle events (nothing new to commit).
+T1="jh-alice-$$"; T2="jh-sleeper-$$"
+
+# Step 1: bind session + join alice
+STITCHPAD_PAD_DIR="$JH_PAD_DIR" STITCHPAD_HEARTBEAT_AUTOSTART=0 \
+  "$STITCHPAD" bind-session session-jh alice > /dev/null 2>&1
+
+STITCHPAD_PAD_DIR="$JH_PAD_DIR" STITCHPAD_HEARTBEAT_AUTOSTART=0 \
+  STITCHPAD_SESSION=session-jh STITCHPAD_NAME=alice \
+  "$STITCHPAD" join alice claude pull "$T1" > "$JH_WORK/join1.out" 2>&1
+_jh_join1_rc=$?
+
+# Step 2: heartbeat start
+STITCHPAD_PAD_DIR="$JH_PAD_DIR" STITCHPAD_NAME=alice STITCHPAD_SESSION=session-jh \
+  "$STITCHPAD" heartbeat start alice > "$JH_WORK/hb-start.out" 2>&1
+_jh_hb_rc=$?
+
+# Step 3: sleep 3 (let ticker write at least once)
+sleep 3
+
+# Step 4: heartbeat stop
+STITCHPAD_PAD_DIR="$JH_PAD_DIR" STITCHPAD_NAME=alice STITCHPAD_SESSION=session-jh \
+  "$STITCHPAD" heartbeat --stop alice > "$JH_WORK/hb-stop.out" 2>&1
+
+# Step 5: bind + join sleeper — this is the step that failed pre-fix
+STITCHPAD_PAD_DIR="$JH_PAD_DIR" STITCHPAD_HEARTBEAT_AUTOSTART=0 \
+  "$STITCHPAD" bind-session session-sleeper sleeper > /dev/null 2>&1
+
+STITCHPAD_PAD_DIR="$JH_PAD_DIR" STITCHPAD_HEARTBEAT_AUTOSTART=0 \
+  STITCHPAD_SESSION=session-sleeper STITCHPAD_NAME=sleeper \
+  "$STITCHPAD" join sleeper claude pull "$T2" > "$JH_WORK/join2.out" 2>&1
+_jh_join2_rc=$?
+
+# Clean up any heartbeat processes
+pkill -f "alive.alice.*$JH_WORK" 2>/dev/null || true
+
+[ "$_jh_join1_rc" -eq 0 ] && \
+  ok "JH1: first join (alice) succeeded" \
+  || bad "JH1: first join failed (rc=$_jh_join1_rc)"
+
+# Check that sleeper is actually in the roster
+grep -q 'sleeper' "$JH_PAD_DIR/stitchpad.md" && \
+  ok "JH2: join-after-heartbeat (sleeper) succeeded — no freeze blocker" \
+  || bad "JH2: join-after-heartbeat failed (sleeper not in roster, rc=$_jh_join2_rc)"
+
+# Verify no "nothing to commit" or "did not complete" leak
+grep -qi 'nothing to commit' "$JH_WORK/join2.out" && \
+  bad "JH3: 'nothing to commit' leaked to join output" \
+  || ok "JH3: no 'nothing to commit' leak on join"
+
+grep -qi 'did not complete' "$JH_WORK/join2.out" && \
+  bad "JH4: 'roster commit did not complete' error on join" \
+  || ok "JH4: no 'commit did not complete' error"
+
+# ============================================================================
 # Results
 # ============================================================================
 echo ""
