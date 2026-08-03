@@ -804,17 +804,22 @@ sp_session_registry_journal_recover() {
       sid="${STITCHPAD_SESSION:-}"
     fi
 
-    # TASK-4: bound recovery attempts per-orphan. Record the attempt EARLY —
-    # before the stale-base check (E2a) — so that repeated refusals eventually
-    # hit the bound and surface a terminal refusal instead of looping forever.
+    # TASK-4: bound recovery attempts per-orphan. E5a fix: record the attempt
+    # FIRST (which sanitizes a poisoned/corrupt count to a clean value), THEN
+    # check exhaustion. The previous order (is_exhausted → attempt_record) let
+    # a poisoned 999999 counter trigger terminal refusal on pass 1 before the
+    # count cap in attempt_record could ever run. Now: attempt_record sanitizes
+    # first, is_exhausted sees a clean count, and the bound engages correctly.
+    # The attempt is still recorded before the stale-base check (E2a) so
+    # repeated refusals accumulate toward the bound.
     local _recovery_key="journal:$(basename "$orphan")"
-    if type sp_recovery_is_exhausted >/dev/null 2>&1; then
+    if type sp_recovery_attempt_record >/dev/null 2>&1; then
+      sp_recovery_attempt_record "$PAD_STATE" "$_recovery_key"
       if sp_recovery_is_exhausted "$PAD_STATE" "$_recovery_key"; then
         type sp_recovery_terminal_refuse >/dev/null 2>&1 && \
           sp_recovery_terminal_refuse "system" "journal-recovery" "$_recovery_key"
         continue
       fi
-      sp_recovery_attempt_record "$PAD_STATE" "$_recovery_key"
     fi
 
     # R3: refuse recovery when HEAD has advanced past the stamped base SHA.

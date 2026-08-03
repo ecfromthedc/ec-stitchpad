@@ -547,17 +547,20 @@ EOF
       echo "  · @$who: queued exact redelivery ordinal $ordinal (seen cursor unchanged)"
     }
 
-    who=""; redeliver=""
+    who=""; redeliver=""; recovery_counters=0
     reset_failures=0
     while [ $# -gt 0 ]; do
       case "$1" in
+        --recovery-counters)
+          recovery_counters=1; shift
+          ;;
         --redeliver)
-          [ $# -ge 2 ] || { echo "usage: stitchpad reset <name> --redeliver <positive-ordinal>" >&2; exit 1; }
+          [ $# -ge 2 ] || { echo "usage: stitchpad reset [name] [--redeliver N] [--recovery-counters]" >&2; exit 1; }
           redeliver="$2"; shift 2
           ;;
         --*) echo "stitchpad: unknown reset option: $1" >&2; exit 1 ;;
         *)
-          [ -z "$who" ] || { echo "usage: stitchpad reset [name] [--redeliver N]" >&2; exit 1; }
+          [ -z "$who" ] || { echo "usage: stitchpad reset [name] [--redeliver N] [--recovery-counters]" >&2; exit 1; }
           who="$1"; shift
           ;;
       esac
@@ -568,6 +571,29 @@ EOF
       case "$redeliver" in
         0|0[0-9]*|*[!0-9]*) echo "stitchpad: --redeliver requires a positive mention ordinal (never 0)" >&2; exit 1;;
       esac
+    fi
+    # N3: --recovery-counters is an operator-only surface (TASK-5 authority)
+    # to clear poisoned or exhausted recovery attempt counters. A seat may
+    # never clear its own counters — that would defeat the bound. The caller's
+    # identity must not be a roster member, exactly like the authority grant
+    # path. Uses sp_recovery_reset_all from recovery-policy.sh.
+    if [ "$recovery_counters" -eq 1 ]; then
+      _rc_grantor="${STITCHPAD_NAME:-}"
+      _rc_roster_names="$(sp_roster 2>/dev/null | cut -d'|' -f1 | tr '\n' ' ')"
+      case " $_rc_roster_names " in
+        *" $_rc_grantor "*)
+          echo "stitchpad: AUTHORITY VIOLATION — a seat (@$_rc_grantor) may not clear recovery counters" >&2
+          echo "  Only the human operator may reset recovery state." >&2
+          exit 1
+          ;;
+      esac
+      if [ -n "$who" ]; then
+        sp_recovery_reset_all "$PAD_STATE" "$who"
+        echo "✓ recovery counters cleared for @$who"
+      else
+        sp_recovery_reset_all "$PAD_STATE"
+        echo "✓ all recovery counters cleared"
+      fi
     fi
     if [ -n "$who" ]; then
       sp_user_exists "$who" || { echo "stitchpad: @$who not in roster" >&2; exit 1; }

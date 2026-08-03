@@ -86,8 +86,16 @@ sp_recovery_attempt_record() {
     first_epoch="$(cat "$file" 2>/dev/null | cut -d'|' -f2)"
     case "$count" in *[!0-9]*|'') count=0;; esac
     case "$first_epoch" in *[!0-9]*|'') first_epoch="$now";; esac
-    # E5a: cap count at a sane ceiling to prevent poisoned huge values
-    [ "$count" -gt 999 ] 2>/dev/null && count=0
+    # E5a: a stored count outside the sane range [0, 999] is corrupt — either
+    # poisoned (999999) or garbage. Reset it to 0 instead of capping, so the
+    # record itself (count+1 below) produces a clean 1 rather than carrying
+    # forward a huge value. The real guard against poisoning lives in
+    # is_exhausted (see below): an out-of-range stored count is treated as
+    # corrupt there too, so it can never cause a premature terminal refusal.
+    if [ "$count" -gt 999 ] 2>/dev/null || [ "$count" -lt 0 ] 2>/dev/null; then
+      echo "stitchpad: recovery counter for $key is corrupt (count=$count); resetting to 0" >&2
+      count=0
+    fi
     count=$((count + 1))
   else
     count=1
@@ -121,6 +129,10 @@ sp_recovery_first_attempt() {
 # Return 0 (true) if the recovery key is exhausted — either the attempt count
 # has hit the max OR the time budget has elapsed since the first attempt.
 # Return 1 (false) if budget remains.
+# E5a: an out-of-range stored count (> 999) is corrupt/poisoned, NOT a legit
+# exhaustion. Treat it as 0 (budget remains) so a poisoned counter can never
+# wedge recovery permanently on the first pass. The CLI reset surface
+# (stitchpad reset --recovery-counters) handles operator-initiated clears.
 sp_recovery_is_exhausted() {
   local state_file="$1" key="$2"
   local count first_epoch now max budget
@@ -128,6 +140,13 @@ sp_recovery_is_exhausted() {
   budget="$(_sp_recovery_effective_budget)"
   count="$(sp_recovery_attempt_count "$state_file" "$key")"
   first_epoch="$(sp_recovery_first_attempt "$state_file" "$key")"
+  # E5a: corrupted/poisoned count (e.g. 999999 seeded by an attacker) must NOT
+  # trigger exhaustion. Clamp to 0 and warn so the caller proceeds normally;
+  # the count will be sanitized to a clean value on the next attempt_record.
+  if [ "$count" -gt 999 ] 2>/dev/null; then
+    echo "stitchpad: recovery counter for $key is corrupt (count=$count > 999); treating as 0, not exhausted" >&2
+    count=0
+  fi
   [ "$count" -ge "$max" ] && return 0
   if [ "$first_epoch" -gt 0 ]; then
     now="$(date +%s)"
