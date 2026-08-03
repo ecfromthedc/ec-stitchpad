@@ -195,6 +195,48 @@ out="$(run_sp STITCHPAD_NAME=victim -- reset victim 2>&1)"; rc=$?
 [ "$rc" -eq 0 ] && ok 'H1: seat self-reset still ungated (stop-hook recovery flow)' \
   || bad "H1: self-reset broke (rc=$rc)"
 
+# ── I. fx2 mutation-round-3 gates (G-A1/A5/A8/A9/A10): contract assertions ──
+# fx2 proved the guards WORK (mutant probes) but the suite was silent on them.
+HOME2="$tmp/home-symlink"; mkdir -p "$HOME2/.stitchpad"
+
+# G-A1: symlinked operator.key must be refused even with the CORRECT token
+mkdir -p "$tmp/elsewhere"
+run_sp -- operator keygen >/dev/null 2>&1  # ensure real key exists in $HOME first? no — fresh: build a real key file elsewhere
+SECRET="$tmp/elsewhere/operator.key.real"
+run_sp -- operator keygen >/dev/null; TOK2="$(cat "$HOME/.stitchpad/operator.key")"
+cp "$HOME/.stitchpad/operator.key" "$SECRET"
+rm "$HOME/.stitchpad/operator.key"
+ln -s "$SECRET" "$HOME/.stitchpad/operator.key"
+out="$(run_sp STITCHPAD_OPERATOR_TOKEN="$TOK2" -- reset --recovery-counters 2>&1)"; rc=$?
+[ "$rc" -ne 0 ] && ok 'G-A1: symlinked operator.key refused even with correct token'   || bad 'G-A1: symlinked key accepted (TOCTOU contract broken)'
+rm "$HOME/.stitchpad/operator.key"; cp "$SECRET" "$HOME/.stitchpad/operator.key"; chmod 600 "$HOME/.stitchpad/operator.key"
+
+# G-A5: key exists but NO token presented → grant mint must refuse
+rm -f "$STATE/operator-grant.probe.reset-others"
+out="$(env -i PATH="$PATH" HOME="$HOME" TMPDIR="${TMPDIR:-/tmp}" STITCHPAD_PAD_DIR="$PAD" STITCHPAD_HEARTBEAT_AUTOSTART=0 "$SP" operator grant probe reset-others 2>&1)"; rc=$?
+[ "$rc" -ne 0 ] && [ ! -f "$STATE/operator-grant.probe.reset-others" ]   && ok 'G-A5: grant mint refused with key-exists-but-no-token (the C2 scenario)'   || bad "G-A5: grant minted without token (rc=$rc)"
+
+# G-A8: symlinked grant file must fail verification (one-shot under swap)
+run_sp STITCHPAD_OPERATOR_TOKEN="$TOK" -- operator grant probe reset-others >/dev/null
+mv "$STATE/operator-grant.probe.reset-others" "$tmp/grant.aside"
+ln -s "$tmp/grant.aside" "$STATE/operator-grant.probe.reset-others"
+out="$(run_sp STITCHPAD_NAME=probe -- reset victim 2>&1)"; rc=$?
+[ "$rc" -ne 0 ] && ok 'G-A8: symlinked grant refused (verify reads no symlink)'   || bad 'G-A8: symlinked grant accepted (TOCTOU/swap contract broken)'
+rm -f "$STATE/operator-grant.probe.reset-others"
+
+# G-A9: ~/.stitchpad itself a symlink → keygen must refuse
+rm -rf "$HOME/.stitchpad"
+mkdir -p "$tmp/a9-target"
+ln -s "$tmp/a9-target" "$HOME/.stitchpad"
+out="$(run_sp -- operator keygen --force 2>&1)"; rc=$?
+[ "$rc" -ne 0 ] && [ ! -f "$tmp/a9-target/operator.key" ]   && ok 'G-A9: keygen refuses to write through a symlinked ~/.stitchpad'   || bad 'G-A9: keygen wrote through symlinked dir'
+rm "$HOME/.stitchpad"; mkdir -p "$HOME/.stitchpad"; cp "$SECRET" "$HOME/.stitchpad/operator.key"; chmod 600 "$HOME/.stitchpad/operator.key"
+
+# G-A10: traversal seat/op names refused at mint (sanitize contract)
+out="$(run_sp STITCHPAD_OPERATOR_TOKEN="$TOK" -- operator grant '../../tmp/kimi2-a10' owned 2>&1)"; rc=$?
+[ "$rc" -ne 0 ] && ok 'G-A10: traversal seat name refused at grant mint'   || bad "G-A10: traversal seat minted (rc=$rc)"
+[ ! -e "$tmp/tmp/kimi2-a10" ] && ok 'G-A10b: no file landed outside PAD_STATE'   || bad 'G-A10b: file escaped PAD_STATE'
+
 echo ""
 echo "Passed:  $pass"
 echo "Failed:  $fail"
