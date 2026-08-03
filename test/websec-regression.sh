@@ -29,7 +29,7 @@ ok()  { printf "  ${GREEN}PASS${NC} %s\n" "$1"; pass=$((pass+1)); }
 bad() { printf "  ${RED}FAIL${NC} %s\n" "$1"; fail=$((fail+1)); }
 
 tmp="$(mktemp -d "${TMPDIR:-/tmp}/stitchpad-websec.XXXXXX")"
-trap 'rm -rf "$tmp"' EXIT
+trap 'rm -rf "$tmp"; rm -f /tmp/websec-deep~bob.sqlite' EXIT  # fx2 F-W6/W7: mutant traversal writes OUTSIDE $tmp — clean it or later runs false-fail
 unset HERDR_PANE_ID HERDR_TAB_ID HERDR_ENV HERDR_SOCKET_PATH HERDR_WORKSPACE_ID 2>/dev/null || true
 export STITCHPAD_HEARTBEAT_AUTOSTART=0
 export HOME="$tmp/home"; mkdir -p "$HOME"
