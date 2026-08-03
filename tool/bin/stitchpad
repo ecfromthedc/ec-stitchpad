@@ -204,8 +204,9 @@ EOF
     wake="${3:-pull}"; target="${4:--}"
     # ONE TERMINAL = ONE PAD: claim the target terminal before touching the
     # roster; a terminal live in another pad refuses the join outright.
-    if [ "$target" != "-" ]; then sp_term_lock_claim "$target" "$who" || exit 1
-    else _jsurf="$(sp_this_surface)"; [ -n "$_jsurf" ] && { sp_term_lock_claim "$_jsurf" "$who" || exit 1; }; fi
+    _owner_pid="${STITCHPAD_HEARTBEAT_PARENT_PID:-$PPID}"
+    if [ "$target" != "-" ]; then sp_term_lock_claim "$target" "$who" "$_owner_pid" || exit 1
+    else _jsurf="$(sp_this_surface)"; [ -n "$_jsurf" ] && { sp_term_lock_claim "$_jsurf" "$who" "$_owner_pid" || exit 1; }; fi
     sp_lock || exit 1
     if sp_user_exists "$who"; then
       sp_unlock
@@ -287,7 +288,7 @@ EOF
     fi
     # ONE TERMINAL = ONE PAD: refuse pointing a wake at a terminal that is live
     # in a different pad (this also stops the bridge auto-heal from stealing).
-    if [ "$target" != "-" ]; then sp_term_lock_claim "$target" "$who" || exit 1; fi
+    if [ "$target" != "-" ]; then sp_term_lock_claim "$target" "$who" "${STITCHPAD_HEARTBEAT_PARENT_PID:-$PPID}" || exit 1; fi
     sp_lock || exit 1
     tmp="$(sp_stage "$PAD_MD")"
     awk -v who="$who" -v wake="$wake" -v target="$target" -v adapter="$adapter" '
@@ -1363,6 +1364,11 @@ PY
     # ONE TERMINAL = ONE PAD: if this terminal holds a live identity lock for a
     # DIFFERENT pad, refuse to post here — the resolver (cwd walk-up, stale MCP
     # server, wrong env) picked the wrong pad. Kills cross-pad ghost posts.
+    # sp_this_surface resolves herdr terminal ids, then the pane-id fallback,
+    # then session-env ids — so non-herdr agent shells are still guarded. A
+    # fully identity-less shell (no herdr, no pane, no session env) cannot be
+    # bound to a terminal and stays permissive BY DESIGN: claims are
+    # per-terminal, and one name in two pads from two terminals is legitimate.
     _ssurf="$(sp_this_surface)"
     if [ -n "$_ssurf" ]; then
       _holder="$(sp_term_lock_check "$_ssurf" "$from")" || {
@@ -2212,8 +2218,33 @@ except Exception:
       # Temporarily override PAD_MD to the downloaded relay pad so the local
       # engagement/wake machinery runs unchanged against it.
       PAD_MD="$tmpmd"
-      # Track seen cursor against relay, not local pad
-      seen_file="$PAD_STATE/seen.relay.$who"
+      # MULTI-PAD (F4): key relay state PER PAD. The relay state dir is
+      # shared by every pad on this machine; one global seen.relay.<who>
+      # cursor lets pad A's delivery swallow pad B's open mention (the
+      # cross-pad henry bug), and one global telemetry bucket merges every
+      # pad's events with no discriminator. Derive a stable per-pad key from
+      # the relay pad name (sanitized slug + content hash; collision-safe,
+      # path-clean). (Ported from kimi2's 3244256 F4 fix.)
+      _pad_slug="$(printf '%s' "$pad" | tr -cd 'A-Za-z0-9._-' | cut -c1-24)"
+      _pad_hash="$(printf '%s' "$pad" | shasum -a 256 2>/dev/null | cut -c1-12)"
+      case "$_pad_hash" in ''|*[!0-9a-f]*) _pad_hash="000000000000" ;; esac
+      [ -n "$_pad_slug" ] || _pad_slug="pad"
+      relay_pad_key="${_pad_slug}-${_pad_hash}"
+      # Track seen cursor against relay, not local pad — per pad.
+      seen_file="$PAD_STATE/seen.relay.$relay_pad_key.$who"
+      # One-time migration: seed the per-pad cursor from the legacy shared
+      # cursor so the upgrade never mass-replays history the shared cursor
+      # had already consumed. (A mention already swallowed by the shared
+      # cursor stays swallowed — replay-by-default would be worse.)
+      if [ ! -f "$seen_file" ] && [ ! -L "$seen_file" ] \
+         && [ -f "$PAD_STATE/seen.relay.$who" ] \
+         && [ ! -L "$PAD_STATE/seen.relay.$who" ]; then
+        cp "$PAD_STATE/seen.relay.$who" "$seen_file" 2>/dev/null || true
+      fi
+      # F4: relay telemetry is per-pad for the same reason.
+      STITCHPAD_TELEMETRY_ROOT="$PAD_STATE/telemetry.pads/$relay_pad_key"
+      export STITCHPAD_TELEMETRY_ROOT
+      mkdir -p "$STITCHPAD_TELEMETRY_ROOT" 2>/dev/null || true
     fi
     # The whole rule, one condition: I'm blocked iff a mention addressed TO me is
     # newer than my last ADDRESSED reply. Both are commit indices (each say is one
@@ -2228,9 +2259,10 @@ except Exception:
     # FIFO cursor: pass `seen` as the `since` parameter — returns the oldest
     # unanswered mention after the current delivery cursor, stepping one ordinal
     # per delivery instead of jumping past burst middles.
-    # NOTE: relay mode already set seen_file to seen.relay.<who> above — do NOT
-    # overwrite it back to the local cursor, or the remote wake collides with the
-    # local one and silently never fires (the henry bug). Only default if unset.
+    # NOTE: relay mode already set seen_file to the per-pad relay cursor
+    # (seen.relay.<padkey>.<who>) above — do NOT overwrite it back to the
+    # local cursor, or the remote wake collides with the local one and
+    # silently never fires (the henry bug). Only default if unset.
     [ -n "${seen_file:-}" ] || seen_file="$PAD_STATE/seen.$who"
     seen=0; [ -f "$seen_file" ] && seen="$(cat "$seen_file" 2>/dev/null || echo 0)"
     # --force bypasses the seen cursor: pass since=0 (find first open mention)
@@ -2359,16 +2391,31 @@ except: print("")' 2>/dev/null)"
     # hook env lets remote agents wake via the same Stop hook without users
     # hand-exporting relay vars in the runtime shell.
     if [ -z "${STITCHPAD_RELAY:-}" ] || [ -z "${STITCHPAD_TOKEN:-}" ] || [ -z "${STITCHPAD_PAD:-}" ]; then
-      for _relay_env in \
-        "${sid:+${STITCHPAD_HOME:-$HOME/.stitchpad}/.state/relay-hook.$sid.env}" \
-        "${STITCHPAD_HOME:-$HOME/.stitchpad}/.state/relay-hook.env"
-      do
-        [ -n "$_relay_env" ] || continue
-        [ -f "$_relay_env" ] || continue
+      # MULTI-PAD (H2): the shared relay-hook.env is machine-global — a second
+      # pad's relay join OVERWRITES it (mcp/server.mjs persistRelayHookEnv).
+      # When this Stop hook carries a session id, only that session's own
+      # per-sid env file is authority; falling back to the shared file would
+      # source a DIFFERENT pad's relay credentials and wake the wrong pad's
+      # mentions into this session. The shared file is consulted only when
+      # there is no session id (legacy hooks).
+      if [ -n "$sid" ]; then
+        _relay_env="${STITCHPAD_HOME:-$HOME/.stitchpad}/.state/relay-hook.$sid.env"
+      else
+        _relay_env="${STITCHPAD_HOME:-$HOME/.stitchpad}/.state/relay-hook.env"
+      fi
+      # single authoritative file, always quoted — never word-split a list
+      # (TMPDIR with spaces must not shatter the path)
+      if [ -f "$_relay_env" ] && [ ! -L "$_relay_env" ]; then
         # shellcheck disable=SC1090
         . "$_relay_env" 2>/dev/null || true
-        [ -n "${STITCHPAD_RELAY:-}" ] && [ -n "${STITCHPAD_TOKEN:-}" ] && [ -n "${STITCHPAD_PAD:-}" ] && break
-      done
+      fi
+      # Sourced assignments are shell-local; the relay wake below runs as a
+      # SUBPROCESS ("$0" wake --relay) and never sees unexported vars — the
+      # wake silently no-ops without this (caught by multipad-isolation P2).
+      [ -n "${STITCHPAD_RELAY:-}" ] && export STITCHPAD_RELAY
+      [ -n "${STITCHPAD_TOKEN:-}" ] && export STITCHPAD_TOKEN
+      [ -n "${STITCHPAD_PAD:-}" ] && export STITCHPAD_PAD
+      [ -n "${STITCHPAD_NAME:-}" ] && export STITCHPAD_NAME
     fi
     # Don't re-block a turn we already continued (avoids an infinite Stop loop).
     if printf '%s' "$input" | grep -q '"stop_hook_active"[[:space:]]*:[[:space:]]*true'; then exit 0; fi

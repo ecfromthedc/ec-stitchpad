@@ -2,6 +2,9 @@
 # telemetry.sh — per-model reliability + cost-value telemetry (TASK-7).
 #
 # Append-only JSONL under $PAD_STATE/telemetry/<model>/<date>.jsonl.
+# The root may be redirected per caller with STITCHPAD_TELEMETRY_ROOT (relay
+# mode keys it per pad — multi-pad F4 — so one machine's relay state never
+# merges several pads' events into an undiscriminated bucket).
 # BEST-EFFORT BY DESIGN: sp_telemetry_record can never fail a primary
 # operation. Every failure path is silent; a drop counter in
 # $PAD_STATE/telemetry/.drops records skipped writes when possible.
@@ -79,12 +82,25 @@ _sp_tel_utc_date() {
   date -u +%F 2>/dev/null || printf 'unknown'
 }
 
+# Telemetry root: per-pad by default ($PAD_STATE/telemetry); relay mode and
+# other multi-pad callers redirect with STITCHPAD_TELEMETRY_ROOT. Sanitized:
+# only an absolute path is honored; anything else falls back to per-pad.
+_sp_tel_root() {
+  local root="${STITCHPAD_TELEMETRY_ROOT:-}"
+  case "$root" in
+    /*) printf '%s' "$root"; return 0 ;;
+  esac
+  printf '%s' "$PAD_STATE/telemetry"
+}
+
 # Best-effort drop counter. If even this fails, silence is the contract.
 _sp_tel_bump_drop() {
   [ -n "${PAD_STATE:-}" ] && [ -d "$PAD_STATE" ] && [ ! -L "$PAD_STATE" ] || return 0
-  mkdir -p "$PAD_STATE/telemetry" 2>/dev/null || return 0
-  [ ! -L "$PAD_STATE/telemetry" ] || return 0
-  printf '1\n' >> "$PAD_STATE/telemetry/.drops" 2>/dev/null || true
+  local root
+  root="$(_sp_tel_root)"
+  mkdir -p "$root" 2>/dev/null || return 0
+  [ ! -L "$root" ] || return 0
+  printf '1\n' >> "$root/.drops" 2>/dev/null || true
 }
 
 # sp_telemetry_record <event> [k=v ...]  — never fails, never prints,
@@ -100,10 +116,12 @@ sp_telemetry_record() {
     *) return 0 ;;
   esac
   [ -n "${PAD_STATE:-}" ] && [ -d "$PAD_STATE" ] && [ ! -L "$PAD_STATE" ] || return 0
-  if [ ! -d "$PAD_STATE/telemetry" ]; then
-    mkdir -p "$PAD_STATE/telemetry" 2>/dev/null || { _sp_tel_bump_drop; return 0; }
+  local tel_root
+  tel_root="$(_sp_tel_root)"
+  if [ ! -d "$tel_root" ]; then
+    mkdir -p "$tel_root" 2>/dev/null || { _sp_tel_bump_drop; return 0; }
   fi
-  [ ! -L "$PAD_STATE/telemetry" ] || { _sp_tel_bump_drop; return 0; }
+  [ ! -L "$tel_root" ] || { _sp_tel_bump_drop; return 0; }
 
   # Parse k=v pairs
   local seat="" model="" provider="" outcome="" verdict="" dur_ms="" count="" \
@@ -198,7 +216,7 @@ print(json.dumps(fields, separators=(",", ":")))
     return 0
   fi
 
-  local sub="$PAD_STATE/telemetry/$model" day
+  local sub="$(_sp_tel_root)/$model" day
   mkdir -p "$sub" 2>/dev/null || { _sp_tel_bump_drop; return 0; }
   [ ! -L "$sub" ] || { _sp_tel_bump_drop; return 0; }
   day="$(_sp_tel_utc_date)"
@@ -228,7 +246,7 @@ sp_telemetry_summary() {
   case "$days" in *[!0-9]*) days=14 ;; esac
   case "$limit" in *[!0-9]*) limit=100000 ;; esac
 
-  local root="$PAD_STATE/telemetry"
+  local root="$(_sp_tel_root)"
   if [ ! -d "$root" ] || [ -L "$root" ]; then
     if [ "$json" -eq 1 ]; then printf '{"models":[],"scanned":0,"drops":0}\n'; else echo "no telemetry yet (nothing recorded)"; fi
     return 0

@@ -1639,41 +1639,120 @@ if [ -d "$HOME/.pasture-terminals" ]; then SP_TERMDIR="$HOME/.pasture-terminals"
 sp_term_surface_of() { printf '%s' "$1"; }   # Herdr terminal ids and Ocean session ids are direct targets
 # The terminal id of THIS shell's Herdr pane. Herdr exports a pane id, so
 # resolve it to the stable terminal id used by roster targets and isolation locks.
+# MULTI-PAD (H3): when Herdr can't resolve a surface (non-herdr shell), fall
+# back to a session-env identity so the one-terminal-one-pad guard still has a
+# stable key instead of silently disabling itself. Session ids are already
+# first-class lock targets ("Ocean session ids are direct targets"). The key
+# is namespaced (sess-) so it can never collide with a Herdr term_* id.
 sp_this_surface() {
+  local _s=""
   if [ -n "${HERDR_PANE_ID:-}" ] && command -v herdr >/dev/null 2>&1; then
-    herdr pane get "$HERDR_PANE_ID" 2>/dev/null \
-      | sed -n 's/.*"terminal_id"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' | head -1
+    _s="$(herdr pane get "$HERDR_PANE_ID" 2>/dev/null \
+      | sed -n 's/.*"terminal_id"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' | head -1)"
+  fi
+  if [ -z "$_s" ] && [ -n "${HERDR_PANE_ID:-}" ]; then
+    # herdr binary absent/unreachable but the pane id is exported: key on the
+    # pane id directly (rc7's F3 fix direction). Consistent between join and
+    # say inside the same pane; namespaced so it can never alias a term_* id.
+    local _p
+    _p="$(printf '%s' "$HERDR_PANE_ID" | tr -cd 'A-Za-z0-9._:-' | cut -c1-64)"
+    [ -n "$_p" ] && _s="pane-$_p"
+  fi
+  if [ -z "$_s" ]; then
+    local _cand
+    for _cand in "${STITCHPAD_SESSION:-}" "${CLAUDE_CODE_SESSION_ID:-}" "${CODEX_SESSION_ID:-}"; do
+      # path-clean, bounded, never "." / ".." / hidden
+      _cand="$(printf '%s' "$_cand" | tr -cd 'A-Za-z0-9._-' | cut -c1-64)"
+      case "$_cand" in ''|.*) continue ;; esac
+      _s="sess-$_cand"; break
+    done
+  fi
+  printf '%s' "$_s"
+  return 0
+}
+_sp_term_mutex_acquire() { # $1=surface — mkdir mutex for atomic claim (H4)
+  local m="$SP_TERMDIR/.mutex.$1" i mnow mtime
+  for i in $(seq 1 30); do
+    mkdir "$m" 2>/dev/null && return 0
+    mnow="$(date +%s)"; mtime="$(stat -f %m "$m" 2>/dev/null || stat -c %Y "$m" 2>/dev/null || echo 0)"
+    case "$mtime" in ''|*[!0-9]*) mtime=0 ;; esac
+    # stale-break: a claimant that died mid-claim never wedges the surface
+    if [ $((mnow - mtime)) -gt 10 ]; then rm -rf "$m" 2>/dev/null || true; continue; fi
+    python3 -c 'import time; time.sleep(0.1)' 2>/dev/null || sleep 1
+  done
+  return 1
+}
+_sp_term_mutex_release() { rm -rf "$SP_TERMDIR/.mutex.$1" 2>/dev/null || true; }
+# A claim line is "pad|name|epoch[|owner_pid|owner_start]". The 3-field form is
+# the legacy shape; the 5-field form lets a steal attempt distinguish a DEAD
+# owner (heartbeat gap → claim is fair game) from a LIVE one whose heartbeat
+# merely hiccuped (rc7 F4: timestamp-only steal evicts live owners).
+_sp_term_claim_honored() { # $1=claim-line → 0 if the claim must still be honored
+  local pad name ts pid pstart now
+  IFS='|' read -r pad name ts pid pstart <<<"$1"
+  now="$(date +%s)"
+  [ $((now - ${ts:-0})) -lt 300 ] && return 0
+  # Stale timestamp: honor the claim anyway when the recorded owner process is
+  # demonstrably alive (kill -0 + start-time match against pid reuse). A claim
+  # with no owner identity (legacy 3-field) falls back to timestamp-only.
+  case "$pid" in ''|*[!0-9]*) return 1 ;; esac
+  kill -0 "$pid" 2>/dev/null || return 1
+  if [ -n "$pstart" ]; then
+    [ "$(sp_process_start "$pid" 2>/dev/null)" = "$pstart" ] || return 1
   fi
   return 0
 }
-sp_term_lock_claim() { # $1=target/surface $2=name — refuses on a live foreign claim
-  local surface who cur pad name ts now
-  surface="$(sp_term_surface_of "$1")"; who="$2"
+sp_term_lock_claim() { # $1=target/surface $2=name [$3=owner_pid] — refuses on a live foreign claim
+  local surface who opid cur pad name ts now
+  surface="$(sp_term_surface_of "$1")"; who="$2"; opid="${3:-}"
   [ -n "$surface" ] && [ "$surface" != "-" ] || return 0
+  case "$opid" in ''|*[!0-9]*) opid="" ;; esac
+  [ -n "$opid" ] && ! kill -0 "$opid" 2>/dev/null && opid=""
   mkdir -p "$SP_TERMDIR"
+  # H4: the check-then-write below is only safe under the per-surface mutex;
+  # without it two pads claiming one surface concurrently both pass the check
+  # and both write (TOCTOU double-claim). Failure to take the mutex fails
+  # CLOSED — a claim that might not be exclusive must never succeed silently.
+  _sp_term_mutex_acquire "$surface" || {
+    echo "stitchpad: REFUSED — could not take the terminal-claim mutex for $surface (contention); retry." >&2
+    return 1
+  }
   cur="$(cat "$SP_TERMDIR/$surface" 2>/dev/null || true)"
   if [ -n "$cur" ]; then
     IFS='|' read -r pad name ts <<<"$cur"
-    now="$(date +%s)"
     if { [ "$pad" != "$PAD_DIR" ] || [ "$name" != "$who" ]; } \
-       && [ $((now - ${ts:-0})) -lt 300 ] && [ "${STITCHPAD_STEAL:-0}" != "1" ]; then
+       && _sp_term_claim_honored "$cur" && [ "${STITCHPAD_STEAL:-0}" != "1" ]; then
+      _sp_term_mutex_release "$surface"
       echo "stitchpad: REFUSED — terminal $surface is live as @$name in $pad. One terminal = one pad. 'stitchpad leave $name' there first, or STITCHPAD_STEAL=1 to take it over." >&2
       return 1
     fi
   fi
-  printf '%s|%s|%s' "$PAD_DIR" "$who" "$(date +%s)" > "$SP_TERMDIR/$surface"
+  if [ -n "$opid" ]; then
+    printf '%s|%s|%s|%s|%s' "$PAD_DIR" "$who" "$(date +%s)" "$opid" \
+      "$(sp_process_start "$opid" 2>/dev/null)" > "$SP_TERMDIR/$surface"
+  else
+    printf '%s|%s|%s' "$PAD_DIR" "$who" "$(date +%s)" > "$SP_TERMDIR/$surface"
+  fi
+  _sp_term_mutex_release "$surface"
+  return 0
 }
 sp_term_lock_touch() { # heartbeat path: refresh ours / claim vacant — NEVER steal
-  local surface who cur pad name ts
+  local surface who cur pad name ts pid pstart
   surface="$(sp_term_surface_of "$1")"; who="$2"
   [ -n "$surface" ] && [ "$surface" != "-" ] || return 0
   cur="$(cat "$SP_TERMDIR/$surface" 2>/dev/null || true)"
   if [ -n "$cur" ]; then
-    IFS='|' read -r pad name ts <<<"$cur"
+    IFS='|' read -r pad name ts pid pstart <<<"$cur"
     { [ "$pad" = "$PAD_DIR" ] && [ "$name" = "$who" ]; } || return 0
   fi
   mkdir -p "$SP_TERMDIR"
-  printf '%s|%s|%s' "$PAD_DIR" "$who" "$(date +%s)" > "$SP_TERMDIR/$surface"
+  # preserve owner identity across refreshes (never downgrade a 5-field claim)
+  if [ -n "${pid:-}" ]; then
+    printf '%s|%s|%s|%s|%s' "$PAD_DIR" "$who" "$(date +%s)" "$pid" "${pstart:-}" > "$SP_TERMDIR/$surface"
+  else
+    printf '%s|%s|%s' "$PAD_DIR" "$who" "$(date +%s)" > "$SP_TERMDIR/$surface"
+  fi
+  return 0
 }
 sp_term_lock_release() { # drop every claim this (pad, name) holds
   local who="$1" f pad name ts
@@ -1689,8 +1768,9 @@ sp_term_lock_check() { # $1=target $2=name → 0 ok; 1 = LIVE claim by someone e
   surface="$(sp_term_surface_of "$1")"; who="$2"
   [ -n "$surface" ] && [ "$surface" != "-" ] || return 0
   cur="$(cat "$SP_TERMDIR/$surface" 2>/dev/null || true)"; [ -n "$cur" ] || return 0
-  IFS='|' read -r pad name ts <<<"$cur"; now="$(date +%s)"
-  [ $((now - ${ts:-0})) -ge 300 ] && return 0
+  IFS='|' read -r pad name ts <<<"$cur"
+  # honored = fresh timestamp OR live owner process (rc7 F4); neither → expired
+  _sp_term_claim_honored "$cur" || return 0
   if [ "$pad" != "$PAD_DIR" ] || [ "$name" != "$who" ]; then printf '%s' "$cur"; return 1; fi
   return 0
 }
