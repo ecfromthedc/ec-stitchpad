@@ -134,7 +134,7 @@ BEFORE_LOG_LINES=$(git --git-dir="$PAD_GIT" log --oneline | wc -l | tr -d ' ')
 
 SAY_RC=0
 SAY_OUT="$(STITCHPAD_SESSION="$TEST_SID" STITCHPAD_NAME=alice \
-  STITCHPAD_TEST_COMMIT_FAIL=1 \
+  STITCHPAD_TEST_MODE=1 STITCHPAD_TEST_COMMIT_FAIL=1 \
   "$STITCHPAD" say "this message should not survive" 2>&1)" || SAY_RC=$?
 
 [ "$SAY_RC" -eq 1 ] && ok "1a: say with commit fail exits 1" \
@@ -175,7 +175,7 @@ BEFORE2_LOG_LINES=$(git --git-dir="$PAD_GIT" log --oneline | wc -l | tr -d ' ')
 BEFORE2_ROSTER=$(grep -c '^bob' "$PAD_MD" || true)
 
 LEAVE_RC=0
-LEAVE_OUT="$(STITCHPAD_TEST_COMMIT_FAIL=1 \
+LEAVE_OUT="$(STITCHPAD_TEST_MODE=1 STITCHPAD_TEST_COMMIT_FAIL=1 \
   "$STITCHPAD" leave bob 2>&1)" || LEAVE_RC=$?
 
 [ "$LEAVE_RC" -eq 1 ] && ok "2a: leave with commit fail exits 1" \
@@ -265,7 +265,7 @@ BEFORE_AMB_LOG=$(git --git-dir="$PAD_GIT" log --oneline | wc -l | tr -d ' ')
 
 AMB_RC=0
 AMB_OUT="$(CLAUDE_CODE_SESSION_ID="$AMBIENT_SID" STITCHPAD_NAME=glm \
-  STITCHPAD_TEST_COMMIT_FAIL=1 \
+  STITCHPAD_TEST_MODE=1 STITCHPAD_TEST_COMMIT_FAIL=1 \
   "$STITCHPAD" leave bob 2>&1)" || AMB_RC=$?
 
 [ "$AMB_RC" -eq 1 ] && ok "4c1: leave+ambient-sid with commit fail exits 1" \
