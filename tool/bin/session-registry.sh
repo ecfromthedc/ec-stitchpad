@@ -859,8 +859,23 @@ sp_session_registry_journal_recover() {
           # HEAD — the operation's own write is what landed. Archive it and
           # reset the counter — the operation SUCCEEDED.
           echo "stitchpad: stale journal $(basename "$orphan") superseded (base was parent of HEAD, live content matches HEAD exactly — crash-after-commit); archiving orphan" >&2
-          mkdir -p "$PAD_STATE/journal-archive" 2>/dev/null || true
-          mv "$orphan" "$PAD_STATE/journal-archive/$(basename "$orphan")" 2>/dev/null || rm -rf "$orphan" 2>/dev/null || true
+          # N2: the archive dir must not be a symlink — a pre-planted link
+          # would move the orphan (pre-op pad/registry/marker snapshots) OUT
+          # of PAD_STATE, the same containment discipline the rest of the
+          # journal stack already enforces (_sp_recovery_safe_mkdir, the
+          # journal_begin/rollback symlink refusals). Refuse loudly instead
+          # of silently exfiltrating; the orphan stays untouched and the
+          # attempt bound still applies on the next pass.
+          if [ -L "$PAD_STATE/journal-archive" ]; then
+            echo "stitchpad: refusing to archive into symlinked journal-archive dir: $PAD_STATE/journal-archive; orphan preserved at $orphan" >&2
+          else
+            mkdir -p "$PAD_STATE/journal-archive" 2>/dev/null || true
+            if [ -L "$PAD_STATE/journal-archive" ]; then
+              echo "stitchpad: journal-archive became a symlink during mkdir (race) — orphan preserved at $orphan" >&2
+            else
+              mv "$orphan" "$PAD_STATE/journal-archive/$(basename "$orphan")" 2>/dev/null || rm -rf "$orphan" 2>/dev/null || true
+            fi
+          fi
           type sp_recovery_reset >/dev/null 2>&1 && \
             sp_recovery_reset "$PAD_STATE" "$_recovery_key" || true
           continue
@@ -975,6 +990,28 @@ sp_session_registry_journal_begin() {
   printf '%s' "$jdir"
 }
 
+# N1: containment check for journal-replayed paths. `.paths` is trusted
+# content written by journal_begin from the fixed, code-controlled
+# _sp_session_registry_journal_files enumerator — but a CRAFTED or corrupted
+# orphan directory (same trust domain as any other pad writer: anyone who can
+# drop a directory under PAD_STATE) can carry an attacker-chosen `.paths`
+# file. Rollback used to `cat "$jdir/$i" > "$f"` for whatever path was listed,
+# with zero validation — an arbitrary-file-write primitive (flash's N1 probe:
+# a crafted .paths entry pointing outside PAD_STATE got written verbatim).
+# Require every path to resolve (parent-dir realpath, no symlink hops) under
+# PAD_DIR or PAD_STATE before any journal replay touches it.
+_sp_session_registry_journal_path_contained() {
+  local f="$1" real_dir pad_dir_real pad_state_real
+  pad_dir_real="$(cd "${PAD_DIR:-/nonexistent}" 2>/dev/null && pwd -P)" || return 1
+  pad_state_real="$(cd "${PAD_STATE:-/nonexistent}" 2>/dev/null && pwd -P)" || return 1
+  real_dir="$(cd "$(dirname "$f")" 2>/dev/null && pwd -P)" || return 1
+  case "$real_dir" in
+    "$pad_dir_real"|"$pad_dir_real"/*) return 0 ;;
+    "$pad_state_real"|"$pad_state_real"/*) return 0 ;;
+  esac
+  return 1
+}
+
 # Restore exact pre-operation bytes. Files that existed are rewritten with
 # their journaled content (in place, preserving the pad inode); files the
 sp_session_registry_journal_rollback() {
@@ -1018,8 +1055,21 @@ sp_session_registry_journal_rollback() {
     _paths_source="$jdir/.paths.$$"
     _sp_session_registry_journal_files "$sid" > "$_paths_source" 2>/dev/null || true
   fi
+  # N1: validate EVERY path before touching ANY file. A single out-of-bounds
+  # entry means the journal is crafted or corrupt — fail closed on the whole
+  # rollback (preserve the journal for manual inspection) rather than perform
+  # a partial restore and skip just the bad line.
   while IFS= read -r f; do
     [ -n "$f" ] || continue
+    if ! _sp_session_registry_journal_path_contained "$f"; then
+      echo "stitchpad: JOURNAL PATH ESCAPE DETECTED — $(basename "$jdir") references a path outside PAD_DIR/PAD_STATE ($f); refusing rollback, journal preserved for manual inspection" >&2
+      rm -f "$jdir/.paths.$$" 2>/dev/null || true
+      return 1
+    fi
+  done < "$_paths_source"
+  while IFS= read -r f; do
+    [ -n "$f" ] || continue
+
     existed="$(sed -n "$(( i + 1 ))p" "$jdir/manifest" 2>/dev/null)"
     if [ "$existed" = "1" ]; then
       # Never write through a symlink: unlink the link itself first.

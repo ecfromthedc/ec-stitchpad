@@ -1021,7 +1021,23 @@ sp_commit() {
   sp_ensure_pad_git_exclude
   sgit add -A -f -- "${paths[@]}" 2>/dev/null || return 1
   sgit diff --cached --quiet -- "${paths[@]}" 2>/dev/null && return 0
-  sgit commit -q -m "$msg" 2>/dev/null
+  # A concurrent, unserialized committer — watch.sh's own periodic auto-commit
+  # (called from the fswatch-triggered loop with NO sp_lock, since it reacts
+  # to bytes someone else already wrote under lock) — can commit these exact
+  # staged bytes in the window between the diff-cached check above and this
+  # commit call. That is a benign race, not a real failure: the desired state
+  # (bytes committed) is already true. `git commit -q` still prints "nothing
+  # to commit, working tree clean" to STDOUT even under -q (verified: -q only
+  # suppresses the summary, not the clean-tree notice), so redirect BOTH
+  # streams to stop the leak, and re-check before surfacing a hard failure —
+  # a lock-holding caller (e.g. session-registry's journaled lifecycle_commit)
+  # must never roll back a real, already-committed write just because it lost
+  # this race.
+  if sgit commit -q -m "$msg" >/dev/null 2>/dev/null; then
+    return 0
+  fi
+  sgit diff --cached --quiet -- "${paths[@]}" 2>/dev/null && return 0
+  return 1
 }
 
 # ── Roster parsing (the magic: roster is IN the markdown) ────────────
