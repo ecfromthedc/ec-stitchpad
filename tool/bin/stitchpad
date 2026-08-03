@@ -572,14 +572,18 @@ EOF
         0|0[0-9]*|*[!0-9]*) echo "stitchpad: --redeliver requires a positive mention ordinal (never 0)" >&2; exit 1;;
       esac
     fi
-    # N3: --recovery-counters is an operator-only surface (TASK-5 authority)
+    # N3+H4: --recovery-counters is an operator-only surface (TASK-5 authority)
     # to clear poisoned or exhausted recovery attempt counters. A seat may
     # never clear its own counters — that would defeat the bound. The caller's
     # identity must not be a roster member, exactly like the authority grant
-    # path. Uses sp_recovery_reset_all from recovery-policy.sh.
+    # path. H4: the previous gate trusted STITCHPAD_NAME only (env-asserted) —
+    # any seat exporting STITCHPAD_NAME=<non-roster> bypassed it. Now requires
+    # the explicit --i-am-operator flag (operator intent acknowledgment) AND
+    # the name must not be a roster member. The flag is never set by agents.
     if [ "$recovery_counters" -eq 1 ]; then
       _rc_grantor="${STITCHPAD_NAME:-}"
       _rc_roster_names="$(sp_roster 2>/dev/null | cut -d'|' -f1 | tr '\n' ' ')"
+      # H4: deny roster members
       case " $_rc_roster_names " in
         *" $_rc_grantor "*)
           echo "stitchpad: AUTHORITY VIOLATION — a seat (@$_rc_grantor) may not clear recovery counters" >&2
@@ -587,6 +591,15 @@ EOF
           exit 1
           ;;
       esac
+      # H4: require explicit operator acknowledgment. An env-asserted non-roster
+      # name alone is insufficient — any process can set STITCHPAD_NAME. The
+      # --i-am-operator flag proves the caller knows this is an operator-only
+      # action and is NOT an automated agent (agents never set it).
+      if [ "${STITCHPAD_I_AM_OPERATOR:-}" != "1" ]; then
+        echo "stitchpad: --recovery-counters requires explicit operator confirmation." >&2
+        echo "  Set STITCHPAD_I_AM_OPERATOR=1 if you are the human operator." >&2
+        exit 1
+      fi
       if [ -n "$who" ]; then
         sp_recovery_reset_all "$PAD_STATE" "$who"
         echo "✓ recovery counters cleared for @$who"

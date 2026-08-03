@@ -871,18 +871,32 @@ sp_session_registry_journal_recover() {
           # journal_begin/rollback symlink refusals). Refuse loudly instead
           # of silently exfiltrating; the orphan stays untouched and the
           # attempt bound still applies on the next pass.
+          # N2+H6+H10: archive dir must not be symlink or regular file.
+          # H10: if journal-archive is a regular FILE, mkdir/mv fail and old
+          # code's `|| rm -rf` SILENTLY DESTROYED the orphan. Now preserve.
+          # H6: only reset counter on successful archive.
+          local _archive_ok=0
           if [ -L "$PAD_STATE/journal-archive" ]; then
             echo "stitchpad: refusing to archive into symlinked journal-archive dir: $PAD_STATE/journal-archive; orphan preserved at $orphan" >&2
+          elif [ -f "$PAD_STATE/journal-archive" ]; then
+            echo "stitchpad: journal-archive exists as a regular file (not a directory); orphan preserved at $orphan" >&2
           else
             mkdir -p "$PAD_STATE/journal-archive" 2>/dev/null || true
             if [ -L "$PAD_STATE/journal-archive" ]; then
               echo "stitchpad: journal-archive became a symlink during mkdir (race) — orphan preserved at $orphan" >&2
+            elif [ -f "$PAD_STATE/journal-archive" ]; then
+              echo "stitchpad: journal-archive became a regular file during mkdir — orphan preserved at $orphan" >&2
+            elif mv "$orphan" "$PAD_STATE/journal-archive/$(basename "$orphan")" 2>/dev/null; then
+              _archive_ok=1
             else
-              mv "$orphan" "$PAD_STATE/journal-archive/$(basename "$orphan")" 2>/dev/null || rm -rf "$orphan" 2>/dev/null || true
+              echo "stitchpad: could not archive orphan (mv failed); orphan preserved at $orphan" >&2
             fi
           fi
-          type sp_recovery_reset >/dev/null 2>&1 && \
-            sp_recovery_reset "$PAD_STATE" "$_recovery_key" || true
+          # H6: only reset on success
+          if [ "$_archive_ok" -eq 1 ]; then
+            type sp_recovery_reset >/dev/null 2>&1 && \
+              sp_recovery_reset "$PAD_STATE" "$_recovery_key" || true
+          fi
           continue
         fi
         echo "stitchpad: stale journal $(basename "$orphan") base SHA ($_recovery_base_sha) differs from current HEAD ($_recovery_head_sha) — committed work would be reverted; orphan PRESERVED for manual inspection at $orphan" >&2
@@ -1006,15 +1020,36 @@ sp_session_registry_journal_begin() {
 # Require every path to resolve (parent-dir realpath, no symlink hops) under
 # PAD_DIR or PAD_STATE before any journal replay touches it.
 _sp_session_registry_journal_path_contained() {
-  local f="$1" real_dir pad_dir_real pad_state_real
+  local f="$1" real_dir pad_dir_real pad_state_real git_dir_real
   pad_dir_real="$(cd "${PAD_DIR:-/nonexistent}" 2>/dev/null && pwd -P)" || return 1
   pad_state_real="$(cd "${PAD_STATE:-/nonexistent}" 2>/dev/null && pwd -P)" || return 1
   real_dir="$(cd "$(dirname "$f")" 2>/dev/null && pwd -P)" || return 1
+  # H1 SEVERE: the pad git dir ($PAD_DIR/stitchpad-git/) lives under PAD_DIR
+  # but must NEVER be writable through journal replay. A crafted orphan with
+  # .paths → stitchpad-git/config corrupts the git config (permanent DoS), and
+  # .paths → stitchpad-git/hooks/pre-commit overwrites an executable hook
+  # (RCE on the next commit). Exclude the git dir entirely.
+  git_dir_real="$(cd "${PAD_DIR:-/nonexistent}/stitchpad-git" 2>/dev/null && pwd -P)" || git_dir_real=""
   case "$real_dir" in
-    "$pad_dir_real"|"$pad_dir_real"/*) return 0 ;;
-    "$pad_state_real"|"$pad_state_real"/*) return 0 ;;
+    "$pad_dir_real"|"$pad_dir_real"/*) ;;
+    "$pad_state_real"|"$pad_state_real"/*) ;;
+    *) return 1 ;;
   esac
-  return 1
+  # H1: exclude anything under the git dir
+  if [ -n "$git_dir_real" ]; then
+    case "$real_dir" in
+      "$git_dir_real"|"$git_dir_real"/*)
+        return 1
+        ;;
+    esac
+  fi
+  # H1: also exclude any path containing .git or hooks — defense in depth
+  case "$f" in
+    */.git/*|*/.git|*/hooks/*|*/stitchpad-git/*|*/stitchpad-git)
+      return 1
+      ;;
+  esac
+  return 0
 }
 
 # Restore exact pre-operation bytes. Files that existed are rewritten with
@@ -1082,7 +1117,25 @@ sp_session_registry_journal_rollback() {
       if [ -d "$f" ]; then
         echo "stitchpad: rollback refusing to overwrite directory $(basename "$f")" >&2
       else
-        cat "$jdir/$i" > "$f" 2>/dev/null || cp "$jdir/$i" "$f" 2>/dev/null || true
+        # H2+H9b: refuse to write through a hardlink. A hardlink inside PAD_STATE
+        # to an outside file shares the inode; cat> writes through the inode
+        # into the aliased file. flash proved this works on the LEGIT journal
+        # path (pre-plant hardlink at a session-activity marker, crash, recover:
+        # victim file clobbered with journaled bytes). Refuse st_nlink>1 so the
+        # rollback never writes through a shared inode. Remove the hardlink and
+        # create a fresh regular file in its place, then write.
+        local _nlink=""
+        _nlink="$(python3 -c "import os,sys; print(os.lstat(sys.argv[1]).st_nlink)" "$f" 2>/dev/null || echo 1)" 2>/dev/null
+        if [ "$_nlink" -gt 1 ] 2>/dev/null; then
+          echo "stitchpad: rollback refusing to write through hardlinked file $f (nlink=$_nlink) — removing link, creating fresh file" >&2
+          local _mode=""
+          _mode="$(python3 -c "import os,sys; print(oct(os.lstat(sys.argv[1]).st_mode & 0o777))" "$f" 2>/dev/null || echo 0o644)" 2>/dev/null
+          rm -f "$f" 2>/dev/null
+          cat "$jdir/$i" > "$f" 2>/dev/null || cp "$jdir/$i" "$f" 2>/dev/null || true
+          [ -n "$_mode" ] && chmod "$_mode" "$f" 2>/dev/null || true
+        else
+          cat "$jdir/$i" > "$f" 2>/dev/null || cp "$jdir/$i" "$f" 2>/dev/null || true
+        fi
       fi
     elif [ "$existed" = "0" ]; then
       # rm -f unlinks the path itself — it never follows a symlink target.

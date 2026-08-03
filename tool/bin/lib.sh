@@ -1023,35 +1023,39 @@ sp_commit() {
   local msg="$1"; shift 2>/dev/null || true
   local paths=("$@")
   [ "${#paths[@]}" -eq 0 ] && paths=("$(basename "$PAD_MD")")
-  sgit rev-parse --git-dir >/dev/null 2>&1 || return 0
-  # Never turn a transient outer-repo stash/clean window into a durable pad
-  # deletion. Stage first so a file recreated after an older deletion is not
-  # invisible as "untracked" to `git diff`, then inspect the staged delta.
+  # H11b: distinguish absent git-dir (benign — no git backing, return 0) from
+  # broken git-dir (fatal — config corruption, missing objects, return 1).
+  if ! sgit rev-parse --git-dir >/dev/null 2>&1; then
+    return 0  # No git dir at all — benign
+  fi
+  # H11b: git dir exists — verify it's not broken
+  if ! sgit cat-file -t HEAD >/dev/null 2>&1; then
+    echo "stitchpad: git repository is broken (HEAD unreachable) — commit refused" >&2
+    return 1
+  fi
   [ -f "$PAD_MD" ] || return 0
-  # Test hook: inject a commit failure BEFORE any git mutation so rollback
-  # paths can be exercised end-to-end with zero git side effects.
   if [ "${STITCHPAD_TEST_MODE:-}" = "1" ] && [ -n "${STITCHPAD_TEST_COMMIT_FAIL:-}" ]; then
     return 1
   fi
   sp_ensure_pad_git_exclude
   sgit add -A -f -- "${paths[@]}" 2>/dev/null || return 1
   sgit diff --cached --quiet -- "${paths[@]}" 2>/dev/null && return 0
-  # A concurrent, unserialized committer — watch.sh's own periodic auto-commit
-  # (called from the fswatch-triggered loop with NO sp_lock, since it reacts
-  # to bytes someone else already wrote under lock) — can commit these exact
-  # staged bytes in the window between the diff-cached check above and this
-  # commit call. That is a benign race, not a real failure: the desired state
-  # (bytes committed) is already true. `git commit -q` still prints "nothing
-  # to commit, working tree clean" to STDOUT even under -q (verified: -q only
-  # suppresses the summary, not the clean-tree notice), so redirect BOTH
-  # streams to stop the leak, and re-check before surfacing a hard failure —
-  # a lock-holding caller (e.g. session-registry's journaled lifecycle_commit)
-  # must never roll back a real, already-committed write just because it lost
-  # this race.
+  # H5b: capture HEAD BEFORE the commit attempt. On failure, verify HEAD
+  # actually moved (bytes landed), not just that the index looks clean
+  # (a pre-commit hook can empty the index → diff --cached clean but
+  # write NOT in HEAD → journal dropped → permanent data loss).
+  local _head_before=""
+  _head_before="$(sgit rev-parse HEAD 2>/dev/null || echo "")"
   if sgit commit -q -m "$msg" >/dev/null 2>/dev/null; then
     return 0
   fi
-  sgit diff --cached --quiet -- "${paths[@]}" 2>/dev/null && return 0
+  # H5b: commit failed. Check HEAD moved AND index is clean.
+  local _head_after=""
+  _head_after="$(sgit rev-parse HEAD 2>/dev/null || echo "")"
+  if [ -n "$_head_before" ] && [ -n "$_head_after" ] && [ "$_head_before" != "$_head_after" ]; then
+    sgit diff --cached --quiet -- "${paths[@]}" 2>/dev/null && return 0
+  fi
+  # H5b: HEAD didn't move — real failure, write NOT committed.
   return 1
 }
 
