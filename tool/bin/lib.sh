@@ -25,6 +25,9 @@ for _pv_name in NAME SESSION PAD_DIR STEAL HOME CWD RELAY TOKEN PAD HANDLE INVIT
 done
 unset _pv_name _pv_val
 
+# TASK-5: scope manifests and deployment authority
+[ -n "${BIN_DIR:-}" ] && [ -f "$BIN_DIR/scope-authority.sh" ] && source "$BIN_DIR/scope-authority.sh" || true
+
 # STITCHPAD_HOME is the checkout's tool/ dir (holds bin/ + adapters/). If the
 # caller already resolved BIN_DIR (via the symlink-safe header), derive HOME from
 # it so install-by-symlink works without anyone exporting STITCHPAD_HOME.
