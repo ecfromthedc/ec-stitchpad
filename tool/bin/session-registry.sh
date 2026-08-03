@@ -788,14 +788,49 @@ sp_session_registry_journal_recover() {
   local orphan sid
   for orphan in $(_sp_session_registry_journal_orphans 2>/dev/null); do
     [ -d "$orphan" ] || continue
-    # Resolve a plausible sid from the state that was journaled (the
-    # session-registry.jsonl snapshot carries the last-sid for every
-    # active seat; use an empty sid as a reasonable fallback — the journal
-    # file list regenerates from the caller-supplied + env sids and the
-    # restore path tolerates extra files the snapshot doesn't cover).
-    sid="${STITCHPAD_SESSION:-}"
+    # R1/R2: read the stamped sid from the journal, NOT from the recovering
+    # caller's env.  The crashed operation stamped its own sid at journal_begin;
+    # recovery must interpret the orphan with THAT sid so marker files are
+    # enumerated and restored for the correct seat — never the recovering
+    # seat's markers, and never empty (anonymous recovery still restores the
+    # crashed seat's markers because the stamped sid is authoritative).
+    if [ -f "$orphan/.sid" ]; then
+      sid="$(cat "$orphan/.sid" 2>/dev/null)" || sid=""
+    else
+      # Legacy orphan with no stamped sid — fall back to env, but warn.
+      sid="${STITCHPAD_SESSION:-}"
+    fi
+    # R3: refuse recovery when HEAD has advanced past the stamped base SHA.
+    # The orphan's pad snapshot predates committed work; restoring it would
+    # silently clobber later commits.  Refuse loudly and PRESERVE the orphan
+    # for manual inspection instead of consuming it.
+    if [ -f "$orphan/.base-sha" ] && [ -n "${PAD_DIR:-}" ] && \
+       [ -d "${PAD_DIR}/stitchpad-git" ]; then
+      local _recovery_base_sha _recovery_head_sha
+      _recovery_base_sha="$(cat "$orphan/.base-sha" 2>/dev/null)" || _recovery_base_sha=""
+      _recovery_head_sha="$(git --git-dir="${PAD_DIR}/stitchpad-git" rev-parse HEAD 2>/dev/null)" || _recovery_head_sha=""
+      if [ -n "$_recovery_base_sha" ] && [ -n "$_recovery_head_sha" ] && \
+         [ "$_recovery_base_sha" != "$_recovery_head_sha" ]; then
+        echo "stitchpad: stale journal $(basename "$orphan") base SHA ($_recovery_base_sha) differs from current HEAD ($_recovery_head_sha) — committed work would be reverted; orphan PRESERVED for manual inspection at $orphan" >&2
+        continue
+      fi
+    fi
     echo "stitchpad: recovering stale journal $(basename "$orphan") — restoring pre-crash state" >&2
+    # R1: temporarily suppress env-resolved sids so _sp_session_registry_journal_files
+    # enumerates ONLY the stamped sid's markers, never the recovering caller's.
+    # Without this, sp_session_registry_sid() inside _sp_session_registry_journal_files
+    # would add the recovering seat's markers to the file list, misaligning the
+    # manifest and corrupting the recovering seat's files.
+    local _save_session="${STITCHPAD_SESSION:-}"
+    local _save_claude="${CLAUDE_CODE_SESSION_ID:-}"
+    local _save_codex="${CODEX_SESSION_ID:-}"
+    export STITCHPAD_SESSION="$sid"
+    unset CLAUDE_CODE_SESSION_ID CODEX_SESSION_ID
     sp_session_registry_journal_rollback "$orphan" "$sid" >/dev/null 2>&1
+    # Restore env
+    if [ -n "$_save_session" ]; then export STITCHPAD_SESSION="$_save_session"; else unset STITCHPAD_SESSION; fi
+    if [ -n "$_save_claude" ]; then export CLAUDE_CODE_SESSION_ID="$_save_claude"; else unset CLAUDE_CODE_SESSION_ID; fi
+    if [ -n "$_save_codex" ]; then export CODEX_SESSION_ID="$_save_codex"; else unset CODEX_SESSION_ID; fi
     rm -rf "$orphan" 2>/dev/null || true
   done
   return 0
@@ -835,6 +870,16 @@ sp_session_registry_journal_begin() {
   sp_session_registry_journal_recover
   local jdir
   jdir="$(mktemp -d "$PAD_STATE/.registry-journal.XXXXXX")" || return 1
+  # R1/R2: stamp the owning sid so recovery interprets the orphan with the
+  # CRASHED caller's sid, never the recovering caller's env.
+  printf '%s' "$sid" > "$jdir/.sid" || { rm -rf "$jdir"; return 1; }
+  # R3: stamp the pad git HEAD SHA so recovery can refuse when HEAD has
+  # advanced past the base — never silently restore old bytes over committed
+  # content.
+  if [ -n "${PAD_DIR:-}" ] && [ -d "${PAD_DIR}/stitchpad-git" ]; then
+    printf '%s' "$(git --git-dir="${PAD_DIR}/stitchpad-git" rev-parse HEAD 2>/dev/null)" \
+      > "$jdir/.base-sha" 2>/dev/null || true
+  fi
   # C2: capture state-root identity for rollback-time validation.
   python3 -c "import os,sys; s=os.lstat(sys.argv[1]); print(s.st_dev,s.st_ino)" \
     "$PAD_STATE" > "$jdir/.state-root" 2>/dev/null || {
@@ -881,13 +926,13 @@ sp_session_registry_journal_rollback() {
       return 1
     fi
   else
-    # Journal unreachable — PAD_STATE may have been swapped. journal_begin
-    # refuses symlinked PAD_STATE (line 833), so a now-symlinked or missing
-    # PAD_STATE proves the state root changed mid-operation.
-    if [ -L "$PAD_STATE" ] || [ ! -d "$PAD_STATE" ]; then
-      echo "stitchpad: STATE-ROOT SWAP DETECTED — PAD_STATE is not the directory journaled at begin; rollback aborted" >&2
-      return 1
-    fi
+    # R4: journal unreachable — PAD_STATE was swapped mid-operation. The
+    # state-root pin file is inside the journal dir which is now unreachable,
+    # so we CANNOT validate identity.  Fail closed: a swapped root (symlink,
+    # missing, OR a fresh regular directory) is a LOUD refusal.  The previous
+    # -L/-d-only check let a rename-swap to a fresh regular dir pass silently.
+    echo "stitchpad: STATE-ROOT SWAP DETECTED — journal unreachable after PAD_STATE changed mid-operation (symlink, missing, or directory node swapped); rollback aborted, journal preserved at $jdir" >&2
+    return 1
   fi
   [ -d "$jdir" ] && [ ! -L "$jdir" ] || return 0
   local i=0 f existed

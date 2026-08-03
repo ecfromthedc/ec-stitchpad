@@ -1078,6 +1078,9 @@ fi
 
 # Recover accepted/busy/error work once at watcher start. Only current pending
 # generations are considered; completed history and tombstones are never replayed.
+# E3: defensively unset test-mode env so a leak in the launch environment can
+# never wedge the watcher's auto-commits.
+unset STITCHPAD_TEST_MODE STITCHPAD_TEST_COMMIT_FAIL
 for _m in "${SEED[@]}"; do
   IFS='|' read -r _name _adapter _wake _target <<< "$_m"
   [ -n "$_name" ] && [ "$_wake" != "pull" ] && [ -f "$(delivery_pending_file "$_name")" ] \
