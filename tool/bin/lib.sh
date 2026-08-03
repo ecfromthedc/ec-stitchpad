@@ -1315,12 +1315,6 @@ sp_commit() {
      && sgit diff --quiet HEAD -- "${paths[@]}" 2>/dev/null; then
     return 0
   fi
-  if [ -n "$_head_after" ] \
-     && sgit diff --quiet HEAD -- "${paths[@]}" 2>/dev/null; then
-    echo "FALLTHROUGH-BENIGN wt==HEAD hb=${_head_before:0:7} ha=${_head_after:0:7} msg=$msg" >> /private/tmp/stitchpad-authrebase-km2/spcommit.debug
-    return 0
-  fi
-  echo "FALLTHROUGH-REAL wt!=HEAD hb=${_head_before:0:7} ha=${_head_after:0:7} msg=$msg" >> /private/tmp/stitchpad-authrebase-km2/spcommit.debug
   # H5b: HEAD didn't move and our bytes are not in HEAD — real failure.
   return 1
 }
