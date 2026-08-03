@@ -15,6 +15,7 @@
 #   stitchpad health [--json] [--deep]    non-mutating local health snapshot
 #   stitchpad roster                      print parsed roster
 #   stitchpad sessions [--json]           read-only session-registry projection
+#   stitchpad telemetry [--json] [--model M] [--days N] [--limit N]   per-model reliability + cost-value summary (TASK-7)
 #   stitchpad rename <old> <new>          rename a member everywhere local state knows them
 #   stitchpad reset [name] [--redeliver N] repair a wedged seat without rewinding its cursor
 #   stitchpad keeper [repo ...]           wake idle Ocean seats for current open tasks
@@ -1103,6 +1104,12 @@ PY
     #   stitchpad say [--image <path>] <text...>
     from="$(sp_me)"
     [ -z "$from" ] && { echo "stitchpad: no identity — call the MCP join tool first (or set STITCHPAD_NAME for CLI/testing)" >&2; exit 1; }
+    # TASK-7: record say outcome (best-effort; never affects the post).
+    _tel_start="$(date +%s)"
+    _say_record() {  # $1=outcome
+      sp_telemetry_record say seat="$from" outcome="${1:-posted}" \
+        dur_ms=$(( $(sp_telemetry_now_ms) - _tel_start * 1000 )) 2>/dev/null || true
+    }
     # ONE TERMINAL = ONE PAD: if this terminal holds a live identity lock for a
     # DIFFERENT pad, refuse to post here — the resolver (cwd walk-up, stale MCP
     # server, wrong env) picked the wrong pad. Kills cross-pad ghost posts.
@@ -1205,6 +1212,7 @@ PY
     _say_sid="$(sp_session_registry_sid)"
     _say_journal="$(sp_session_registry_journal_begin "$_say_sid")" || {
       sp_unlock
+      _say_record failed
       echo "stitchpad: could not journal pre-say state — refusing to post" >&2
       exit 1
     }
@@ -1228,6 +1236,7 @@ PY
     if ! sp_session_registry_lifecycle_locked activity "$_captured_epoch"; then
       sp_session_registry_journal_rollback "$_say_journal" "$_say_sid"
       sp_unlock
+      _say_record failed
       echo "stitchpad: session registry write failed — rolled back; message NOT posted" >&2
       exit 1
     fi
@@ -1246,6 +1255,7 @@ PY
     if [ "$_say_commit_rc" -ne 0 ]; then
       sp_session_registry_journal_rollback "$_say_journal" "$_say_sid"
       sp_unlock
+      _say_record failed
       echo "stitchpad: pad commit failed — rolled back registry, header, and pad; message NOT posted" >&2
       exit 1
     fi
@@ -1255,6 +1265,7 @@ PY
     # they can't cause a spurious re-block or stale doctor state later.
     rm -f "$PAD_STATE/pending.$from" "$PAD_STATE/delivered_no_reply.$from" 2>/dev/null
     sp_unlock
+    _say_record posted
     echo "✓ posted as @$from"
     ;;
 
@@ -1886,6 +1897,9 @@ PY
     #   stitchpad wake [name] [--peek] [--relay]
     # name defaults to the joined identity. Relay mode may run on a coworker's
     # machine with no local .stitchpad checkout, so it uses global hook state.
+    # TASK-7: every delivery decision is recorded to per-model telemetry
+    # (best-effort — never changes the outcome or exit code).
+    _tel_start="$(date +%s)"
     relay_mode=0; peek=0; ordinal_only=0; force=0; force_ord=0; who=""
     while [ $# -gt 0 ]; do
       case "$1" in
@@ -1918,6 +1932,16 @@ PY
     # Identity: explicit arg, else this terminal's pinned STITCHPAD_NAME.
     [ -z "$who" ] && who="$(sp_me)"
     [ -z "$who" ] && exit 0   # unidentified → nothing to wake
+    # TASK-7: record the wake outcome (best-effort) then exit. Never changes
+    # the primary op's result — the record runs after unlock, in a locked-free
+    # append, and every failure inside it is silent.
+    _wake_record() {  # $1=outcome $2=exitcode
+      local _oc="${1:-}" _rc="${2:-0}"
+      sp_telemetry_record wake seat="$who" outcome="$_oc" \
+        dur_ms=$(( $(sp_telemetry_now_ms) - _tel_start * 1000 )) \
+        exit="$_rc" 2>/dev/null || true
+      exit "$_rc"
+    }
     # Relay-mode wake: download pad from relay, run local wake logic against it
     if [ "$relay_mode" -eq 1 ]; then
       relay="${STITCHPAD_RELAY:-}"; token="${STITCHPAD_TOKEN:-}"; pad="${STITCHPAD_PAD:-}"
@@ -1970,30 +1994,30 @@ except Exception:
       fi
     fi
     read -r oldest_mention_to_me mention_sender last_reply_by_me reply_target <<<"$(sp_engagement "$who" "$_since")"
-    [ "${oldest_mention_to_me:-0}" -eq 0 ] && exit 0   # no unanswered mention after seen → nothing to do
+    [ "${oldest_mention_to_me:-0}" -eq 0 ] && _wake_record zero_run 0   # no unanswered mention after seen → nothing to do
     # REPLY-CLEARS-GATE narrowed to same-sender: my reply only clears the gate
     # when it's directed at the SAME sender who mentioned me. Replying to X no
     # longer swallows Y's unanswered mention.
     if [ "${last_reply_by_me:-0}" -gt "$oldest_mention_to_me" ] \
        && [ -n "${mention_sender:-}" ] && [ -n "${reply_target:-}" ] \
        && [ "$reply_target" = "$mention_sender" ]; then
-      exit 0   # my reply to the SAME sender is newer than their mention → handled
+      _wake_record noop 0   # my reply to the SAME sender is newer than their mention → handled
     fi
     # --peek-ordinal: gate is open (mention unanswered) → print the ordinal, done.
     # Uses the already-computed oldest_mention_to_me from sp_engagement; independent
     # of the seen cursor on purpose. Pending stamps answer "owes a reply" while
     # seen answers "already nudged". They answer different questions.
-    if [ "$ordinal_only" -eq 1 ]; then printf '%s' "$oldest_mention_to_me"; exit 0; fi
+    if [ "$ordinal_only" -eq 1 ]; then printf '%s' "$oldest_mention_to_me"; _wake_record peek 0; fi
     # WAKE-ONCE with FIFO stepping: the seen cursor was already passed as `since`
     # to sp_engagement, which returned the first mention > seen. When we deliver
     # (non-peek), advance seen to exactly this mention's ordinal. The next wake
     # will find the next mention > this one. --peek never advances seen.
     # --force bypasses the seen gate (delivers even if already seen).
     if [ "$force" -eq 0 ] && [ "$oldest_mention_to_me" -le "${seen:-0}" ]; then
-      exit 0   # already delivered this mention; not nagging (--force bypasses this)
+      _wake_record noop 0   # already delivered this mention; not nagging (--force bypasses this)
     fi
     if sp_dnd_is_on "$who"; then
-      exit 0   # muted locally; leave seen untouched so the mention queues
+      _wake_record deferred 0   # muted locally; leave seen untouched so the mention queues
     fi
     # Unanswered → compact one-liner wake message (no "untrusted" alarm noise).
     _latest="$(sp_latest_to "$who" "$_since")"
@@ -2026,7 +2050,7 @@ $_ticket_line"
     # it) while still attaching the canonical instruction block once.
     printf '%s\n' "$_wake_text" | sp_prompt_with_ponytail append
     [ "$peek" -eq 0 ] && printf '%s' "$oldest_mention_to_me" > "$seen_file"   # mark delivered: FIFO steps one ordinal per delivery
-    exit 0
+    _wake_record delivered 0
     ;;
 
   claim-hook)
@@ -3140,6 +3164,13 @@ sys.exit(1)
       echo "${_mc_red}$_mc_fail/$(( _mc_pass + _mc_fail )) GATES FAILED — @$_mc_pilot is not reachable.${_mc_reset}"
       exit 1
     fi
+    ;;
+
+  telemetry)
+    # TASK-7: bounded per-model reliability + cost-value reader.
+    #   stitchpad telemetry [--json] [--model M] [--days N] [--limit N]
+    sp_init_paths_readonly || exit 1
+    sp_telemetry_summary "$@"
     ;;
 
   help|-h|--help)
