@@ -750,35 +750,50 @@ PY
 }
 
 sp_lock() {
-  local lock="$PAD_STATE/.lock" waited=0 age now mtime observed pid_capture
+  local lock="$PAD_STATE/.lock" age now mtime observed pid_capture _jitter
+  local _start _elapsed
+  _start=$(date +%s)
   while ! mkdir "$lock" 2>/dev/null; do
-    # Break a stale lock only when its exact recorded owner is no longer live.
+    # Break a stale lock when its exact recorded owner is no longer live.
     # A long-running but live writer is never evicted merely because the lock's
     # directory mtime is old.
     if [ -d "$lock" ]; then
       now=$(date +%s)
       mtime=$(stat -f %m "$lock" 2>/dev/null || stat -c %Y "$lock" 2>/dev/null || echo "$now")
       age=$(( now - mtime ))
-      if [ "$age" -ge "$SP_LOCK_STALE" ]; then
-        if [ -f "$lock/owner" ]; then
-          if sp_lock_owner_is_valid "$lock" && ! sp_lock_owner_is_live "$lock"; then
-            observed="$(cat "$lock/owner" 2>/dev/null || true)"
-            [ -n "$observed" ] && [ "$(cat "$lock/owner" 2>/dev/null || true)" = "$observed" ] \
-              && rm -f "$lock/owner" 2>/dev/null || true
-            rmdir "$lock" 2>/dev/null || true
-            [ -d "$lock" ] || continue
-          fi
-        else
-          # Compatibility for an empty pre-generation lock. Non-empty unknown
-          # locks fail closed because their contents are not ownership proof.
+      # F2: proactive dead-holder reclaim. Before waiting out SP_LOCK_STALE,
+      # check if the owner manifest is valid AND the owner PID is provably
+      # dead (kill -0 fails or processStart/command mismatch). A SIGKILL'd
+      # holder is dead immediately — there's no reason to wait 30s for the
+      # stale window. This runs on EVERY loop iteration (every ~0.05s).
+      # Falls through to the age-based check below for empty/unknown locks.
+      if [ -f "$lock/owner" ] && sp_lock_owner_is_valid "$lock"; then
+        if ! sp_lock_owner_is_live "$lock"; then
+          observed="$(cat "$lock/owner" 2>/dev/null || true)"
+          [ -n "$observed" ] && [ "$(cat "$lock/owner" 2>/dev/null || true)" = "$observed" ] \
+            && rm -f "$lock/owner" 2>/dev/null || true
           rmdir "$lock" 2>/dev/null || true
           [ -d "$lock" ] || continue
         fi
+      elif [ "$age" -ge "$SP_LOCK_STALE" ]; then
+        # Fallback: age-based stale-break for pre-generation or empty locks.
+        # Non-empty unknown locks fail closed because their contents are not
+        # ownership proof.
+        rmdir "$lock" 2>/dev/null || true
+        [ -d "$lock" ] || continue
       fi
     fi
-    waited=$(( waited + 1 ))
-    [ "$waited" -ge $(( SP_LOCK_TIMEOUT * 10 )) ] && { echo "stitchpad: pad busy (lock timeout)" >&2; return 1; }
-    sleep 0.1
+    # F1: track elapsed wall-clock time (not iteration count) since jitter
+    # makes each iteration variable-length.
+    now=$(date +%s)
+    _elapsed=$(( now - _start ))
+    [ "$_elapsed" -ge "$SP_LOCK_TIMEOUT" ] && { echo "stitchpad: pad busy (lock timeout)" >&2; return 1; }
+    # F1: jittered backoff instead of fixed 0.1s. Under N>=10 concurrent
+    # writers, a fixed sleep causes thundering-herd: all losers retry on the
+    # same tick and the winner is one mkdir among N. Jitter spreads the
+    # retries across the interval, increasing the effective admission rate.
+    _jitter=$(( (RANDOM % 10) + 1 ))   # 1-10 centiseconds (0.01-0.10s)
+    sleep 0.${_jitter}
   done
   _SP_LOCK_DIR="$lock"
   # `$$` does not change in a Bash 3.2 subshell. Ask a direct child for its
@@ -1130,35 +1145,156 @@ sp_commit() {
   local msg="$1"; shift 2>/dev/null || true
   local paths=("$@")
   [ "${#paths[@]}" -eq 0 ] && paths=("$(basename "$PAD_MD")")
-  sgit rev-parse --git-dir >/dev/null 2>&1 || return 0
-  # Never turn a transient outer-repo stash/clean window into a durable pad
-  # deletion. Stage first so a file recreated after an older deletion is not
-  # invisible as "untracked" to `git diff`, then inspect the staged delta.
+  # C4 / H11b: distinguish absent git-dir (benign — no git backing, return 0)
+  # from a git-dir that exists but is broken (fatal — config corruption,
+  # missing objects, return 1).  rev-parse --git-dir itself exits 128 on a
+  # corrupt config, so the original H11b guard returned 0 before cat-file -t
+  # HEAD was ever reached.  Check -d first, then let each failure be honest.
+  if [ ! -d "$PAD_GIT" ]; then
+    return 0  # No git dir at all — benign
+  fi
+  # H11b: git dir exists — verify it's reachable
+  if ! sgit rev-parse --git-dir >/dev/null 2>&1; then
+    echo "stitchpad: git repository is broken (rev-parse failed on $PAD_GIT) — commit refused" >&2
+    return 1
+  fi
+  # C5: check HEAD reachability ONLY if HEAD exists.  An unborn HEAD
+  # (fresh repo before first commit) is benign — skip so the first commit
+  # can proceed.  A repo where HEAD exists but isn't a valid commit is broken.
+  if sgit rev-parse --verify HEAD >/dev/null 2>&1; then
+    if ! sgit cat-file -t HEAD >/dev/null 2>&1; then
+      echo "stitchpad: git repository is broken (HEAD unreachable) — commit refused" >&2
+      return 1
+    fi
+  fi
   [ -f "$PAD_MD" ] || return 0
-  # Test hook: inject a commit failure BEFORE any git mutation so rollback
-  # paths can be exercised end-to-end with zero git side effects.
   if [ "${STITCHPAD_TEST_MODE:-}" = "1" ] && [ -n "${STITCHPAD_TEST_COMMIT_FAIL:-}" ]; then
     return 1
   fi
   sp_ensure_pad_git_exclude
+  # N2: a SIGKILLed writer (ours or, historically, an external git process)
+  # can leave $PAD_GIT/index.lock behind. Git refuses every future add/commit
+  # while it exists, so with no self-heal this becomes a PERMANENT pad wedge
+  # ("commit failed... message NOT posted" forever, confirmed by fx3 repro).
+  # sgit is not always called under our own sp_lock (watch.sh's periodic
+  # auto-commit runs unlocked by design), so a fresh index.lock COULD be a
+  # genuinely concurrent writer — never remove on sight. Only break it after
+  # an age threshold well beyond any realistic commit duration on this small
+  # pad file, and log loudly so a real double-writer bug is still visible.
+  local _idxlock="$PAD_GIT/index.lock"
+  if [ -f "$_idxlock" ]; then
+    local _lock_age now_ts mtime_ts
+    now_ts="$(date +%s)"
+    mtime_ts="$(stat -f %m "$_idxlock" 2>/dev/null || stat -c %Y "$_idxlock" 2>/dev/null || echo "$now_ts")"
+    _lock_age=$(( now_ts - mtime_ts ))
+    if [ "$_lock_age" -ge 15 ]; then
+      echo "stitchpad: stale git index.lock (age ${_lock_age}s) — breaking to unwedge pad (N2)" >&2
+      rm -f "$_idxlock" 2>/dev/null || true
+    fi
+  fi
   sgit add -A -f -- "${paths[@]}" 2>/dev/null || return 1
   sgit diff --cached --quiet -- "${paths[@]}" 2>/dev/null && return 0
-  # A concurrent, unserialized committer — watch.sh's own periodic auto-commit
-  # (called from the fswatch-triggered loop with NO sp_lock, since it reacts
-  # to bytes someone else already wrote under lock) — can commit these exact
-  # staged bytes in the window between the diff-cached check above and this
-  # commit call. That is a benign race, not a real failure: the desired state
-  # (bytes committed) is already true. `git commit -q` still prints "nothing
-  # to commit, working tree clean" to STDOUT even under -q (verified: -q only
-  # suppresses the summary, not the clean-tree notice), so redirect BOTH
-  # streams to stop the leak, and re-check before surfacing a hard failure —
-  # a lock-holding caller (e.g. session-registry's journaled lifecycle_commit)
-  # must never roll back a real, already-committed write just because it lost
-  # this race.
+  # H5b: capture HEAD BEFORE the commit attempt.  Use --verify -q to avoid
+  # rev-parse polluting stdout with "HEAD" on an unborn HEAD.
+  local _head_before=""
+  _head_before="$(sgit rev-parse --verify -q HEAD 2>/dev/null || echo "")"
+  # RP-2: capture staged blob hashes BEFORE commit for post-commit byte
+  # verification.  A hook that keeps the path but replaces content passes
+  # Z1 but commits tampered bytes — we verify exact blob match vs HEAD.
+  local _rp2_hashes="" _p _ph
+  for _p in "${paths[@]}"; do
+    _ph="$(sgit ls-files --stage -- "$_p" 2>/dev/null | awk '{print $2}')" || _ph=""
+    [ -n "$_ph" ] && _rp2_hashes="${_rp2_hashes}${_p}:${_ph}"$'\n'
+  done
+  _rp2_hashes="${_rp2_hashes%$'\n'}"
   if sgit commit -q -m "$msg" >/dev/null 2>/dev/null; then
+    # C3: commit exited 0, but a pre-commit hook that empties the index
+    # makes git produce an EMPTY commit — HEAD advances, index is clean,
+    # but our write bytes are in neither HEAD nor HEAD~1.  Journaled
+    # callers (lifecycle_commit, rollback) treat rc=0 as success and drop
+    # the journal → write permanently lost.
+    local _head_after=""
+    _head_after="$(sgit rev-parse --verify -q HEAD 2>/dev/null || echo "")"
+    # --- Empty-tree guard (success branch) ---
+    if [ -n "$_head_before" ] && [ -n "$_head_after" ] && [ "$_head_before" != "$_head_after" ]; then
+      if [ -z "$(sgit diff-tree --name-only "${_head_before}" "$_head_after" 2>/dev/null)" ]; then
+        echo "stitchpad: commit produced an empty tree (hook may have cleared the index) — write NOT committed" >&2
+        return 1
+      fi
+    fi
+    # C5: unborn HEAD — no prior commit. Compare against empty tree.
+    if [ -z "$_head_before" ] && [ -n "$_head_after" ]; then
+      local _empty_tree=""
+      _empty_tree="$(echo -n | sgit hash-object -t tree --stdin 2>/dev/null)" || _empty_tree=""
+      if [ -n "$_empty_tree" ] && [ -z "$(sgit diff-tree --name-only "${_empty_tree}" "$_head_after" 2>/dev/null)" ]; then
+        echo "stitchpad: first commit produced an empty tree (hook may have cleared the index) — write NOT committed" >&2
+        return 1
+      fi
+    fi
+    # Z1: C3-fix bypass — hook can exclude our staged file while leaving
+    # an unrelated file in HEAD (diff-tree non-empty, passes empty-tree check).
+    # Verify the staged paths specifically appear in HEAD as added/modified.
+    if [ -n "$_head_before" ] && [ -n "$_head_after" ] && [ "$_head_before" != "$_head_after" ]; then
+      if [ -z "$(sgit diff --name-only --diff-filter=AM "${_head_before}" "${_head_after}" -- "${paths[@]}" 2>/dev/null)" ]; then
+        echo "stitchpad: commit succeeded but staged paths NOT in HEAD — write NOT committed (hook may have excluded them)" >&2
+        return 1
+      fi
+    fi
+    if [ -z "$_head_before" ] && [ -n "$_head_after" ]; then
+      if [ -z "$(sgit diff --name-only --diff-filter=AM "${_empty_tree:-$(echo -n | sgit hash-object -t tree --stdin 2>/dev/null)}" "$_head_after" -- "${paths[@]}" 2>/dev/null)" ]; then
+        echo "stitchpad: first commit succeeded but staged paths NOT in HEAD — write NOT committed (hook may have excluded them)" >&2
+        return 1
+      fi
+    fi
+    # RP-2: verify exact bytes in HEAD match what we staged before the
+    # hook ran.  A hook that keeps the path but replaces content leaves
+    # the path in HEAD (Z1 passes) but with tampered content.
+    if [ -n "$_rp2_hashes" ]; then
+      local _rp2_line _rp2_path _rp2_staged _rp2_head_hash _rp2_ok=1
+      while IFS=: read -r _rp2_path _rp2_staged; do
+        [ -n "$_rp2_path" ] && [ -n "$_rp2_staged" ] || continue
+        _rp2_head_hash="$(sgit ls-tree "$_head_after" -- "$_rp2_path" 2>/dev/null | awk '{print $3}')" || _rp2_head_hash=""
+        if [ -n "$_rp2_head_hash" ] && [ "$_rp2_staged" != "$_rp2_head_hash" ]; then
+          echo "stitchpad: commit succeeded but staged bytes differ from HEAD for $_rp2_path (hook may have altered content) — write NOT committed" >&2
+          _rp2_ok=0
+          break
+        fi
+      done <<< "$_rp2_hashes"
+      [ "$_rp2_ok" -eq 1 ] || return 1
+    fi
     return 0
   fi
-  sgit diff --cached --quiet -- "${paths[@]}" 2>/dev/null && return 0
+  # H5b: commit failed (exit != 0). Check HEAD moved AND index is clean.
+  local _head_after=""
+  _head_after="$(sgit rev-parse --verify -q HEAD 2>/dev/null || echo "")"
+  if [ -n "$_head_before" ] && [ -n "$_head_after" ] && [ "$_head_before" != "$_head_after" ]; then
+    if [ -z "$(sgit diff-tree --name-only "${_head_before}" "$_head_after" 2>/dev/null)" ]; then
+      echo "stitchpad: git commit failed but HEAD advanced with an empty tree — write NOT committed" >&2
+      return 1
+    fi
+    # Z1 failure branch: same staged-paths verification
+    if [ -z "$(sgit diff --name-only --diff-filter=AM "${_head_before}" "$_head_after" -- "${paths[@]}" 2>/dev/null)" ]; then
+      echo "stitchpad: git commit failed but staged paths NOT in HEAD — write NOT committed (hook may have excluded them)" >&2
+      return 1
+    fi
+    sgit diff --cached --quiet -- "${paths[@]}" 2>/dev/null && return 0
+  fi
+  # C5 failure branch: unborn HEAD, commit rc != 0 but HEAD advanced.
+  if [ -z "$_head_before" ] && [ -n "$_head_after" ]; then
+    local _empty_tree=""
+    _empty_tree="$(echo -n | sgit hash-object -t tree --stdin 2>/dev/null)" || _empty_tree=""
+    if [ -n "$_empty_tree" ] && [ -z "$(sgit diff-tree --name-only "${_empty_tree}" "$_head_after" 2>/dev/null)" ]; then
+      echo "stitchpad: git commit failed but HEAD advanced with an empty tree (hook on unborn HEAD) — write NOT committed" >&2
+      return 1
+    fi
+    # Z1 failure branch on unborn HEAD
+    if [ -z "$(sgit diff --name-only --diff-filter=AM "${_empty_tree}" "$_head_after" -- "${paths[@]}" 2>/dev/null)" ]; then
+      echo "stitchpad: git commit failed but staged paths NOT in HEAD (hook on unborn HEAD) — write NOT committed" >&2
+      return 1
+    fi
+    sgit diff --cached --quiet -- "${paths[@]}" 2>/dev/null && return 0
+  fi
+  # H5b: HEAD didn't move — real failure, write NOT committed.
   return 1
 }
 

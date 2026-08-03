@@ -660,7 +660,7 @@ sp_session_registry_sid_for_name() {
       printf '%s' "$sid"
       return 0
     fi
-  done
+  done < <(_sp_session_registry_journal_orphans 2>/dev/null)
   return 0
 }
 
@@ -789,8 +789,8 @@ _sp_session_registry_journal_orphans() {
 # ensuring crash residue never compounds.
 sp_session_registry_journal_recover() {
   local orphan sid
-  for orphan in $(_sp_session_registry_journal_orphans 2>/dev/null); do
-    [ -d "$orphan" ] || continue
+  while IFS= read -r orphan; do
+    [ -n "$orphan" ] || continue
     # R1/R2: read the stamped sid from the journal, NOT from the recovering
     # caller's env.  The crashed operation stamped its own sid at journal_begin;
     # recovery must interpret the orphan with THAT sid so marker files are
@@ -871,18 +871,32 @@ sp_session_registry_journal_recover() {
           # journal_begin/rollback symlink refusals). Refuse loudly instead
           # of silently exfiltrating; the orphan stays untouched and the
           # attempt bound still applies on the next pass.
+          # N2+H6+H10: archive dir must not be symlink or regular file.
+          # H10: if journal-archive is a regular FILE, mkdir/mv fail and old
+          # code's `|| rm -rf` SILENTLY DESTROYED the orphan. Now preserve.
+          # H6: only reset counter on successful archive.
+          local _archive_ok=0
           if [ -L "$PAD_STATE/journal-archive" ]; then
             echo "stitchpad: refusing to archive into symlinked journal-archive dir: $PAD_STATE/journal-archive; orphan preserved at $orphan" >&2
+          elif [ -f "$PAD_STATE/journal-archive" ]; then
+            echo "stitchpad: journal-archive exists as a regular file (not a directory); orphan preserved at $orphan" >&2
           else
             mkdir -p "$PAD_STATE/journal-archive" 2>/dev/null || true
             if [ -L "$PAD_STATE/journal-archive" ]; then
               echo "stitchpad: journal-archive became a symlink during mkdir (race) — orphan preserved at $orphan" >&2
+            elif [ -f "$PAD_STATE/journal-archive" ]; then
+              echo "stitchpad: journal-archive became a regular file during mkdir — orphan preserved at $orphan" >&2
+            elif mv "$orphan" "$PAD_STATE/journal-archive/$(basename "$orphan")" 2>/dev/null; then
+              _archive_ok=1
             else
-              mv "$orphan" "$PAD_STATE/journal-archive/$(basename "$orphan")" 2>/dev/null || rm -rf "$orphan" 2>/dev/null || true
+              echo "stitchpad: could not archive orphan (mv failed); orphan preserved at $orphan" >&2
             fi
           fi
-          type sp_recovery_reset >/dev/null 2>&1 && \
-            sp_recovery_reset "$PAD_STATE" "$_recovery_key" || true
+          # H6: only reset on success
+          if [ "$_archive_ok" -eq 1 ]; then
+            type sp_recovery_reset >/dev/null 2>&1 && \
+              sp_recovery_reset "$PAD_STATE" "$_recovery_key" || true
+          fi
           continue
         fi
         echo "stitchpad: stale journal $(basename "$orphan") base SHA ($_recovery_base_sha) differs from current HEAD ($_recovery_head_sha) — committed work would be reverted; orphan PRESERVED for manual inspection at $orphan" >&2
@@ -918,7 +932,7 @@ sp_session_registry_journal_recover() {
     if [ -n "$_save_session" ]; then export STITCHPAD_SESSION="$_save_session"; else unset STITCHPAD_SESSION; fi
     if [ -n "$_save_claude" ]; then export CLAUDE_CODE_SESSION_ID="$_save_claude"; else unset CLAUDE_CODE_SESSION_ID; fi
     if [ -n "$_save_codex" ]; then export CODEX_SESSION_ID="$_save_codex"; else unset CODEX_SESSION_ID; fi
-  done
+  done < <(_sp_session_registry_journal_orphans 2>/dev/null)
   return 0
 }
 _sp_session_registry_journal_files() {
@@ -1005,16 +1019,62 @@ sp_session_registry_journal_begin() {
 # a crafted .paths entry pointing outside PAD_STATE got written verbatim).
 # Require every path to resolve (parent-dir realpath, no symlink hops) under
 # PAD_DIR or PAD_STATE before any journal replay touches it.
+# C1 SEVERE: case-insensitive filesystem bypass protection.  The git-dir
+# exclusion uses dev/inode comparison as the primary gate (same directory
+# on disk → same identity regardless of filename case) and case-insensitive
+# string checks as defense in depth for subdirectory patterns.
 _sp_session_registry_journal_path_contained() {
-  local f="$1" real_dir pad_dir_real pad_state_real
+  local f="$1" real_dir pad_dir_real pad_state_real _gd_path _flow
   pad_dir_real="$(cd "${PAD_DIR:-/nonexistent}" 2>/dev/null && pwd -P)" || return 1
   pad_state_real="$(cd "${PAD_STATE:-/nonexistent}" 2>/dev/null && pwd -P)" || return 1
   real_dir="$(cd "$(dirname "$f")" 2>/dev/null && pwd -P)" || return 1
+  # PAD_DIR / PAD_STATE scope check
   case "$real_dir" in
-    "$pad_dir_real"|"$pad_dir_real"/*) return 0 ;;
-    "$pad_state_real"|"$pad_state_real"/*) return 0 ;;
+    "$pad_dir_real"|"$pad_dir_real"/*) ;;
+    "$pad_state_real"|"$pad_state_real"/*) ;;
+    *) return 1 ;;
   esac
-  return 1
+  # C1 + P1 + RP-1: git-dir containment BY IDENTITY (structural discovery).
+  # Names are NOT reliable — macOS APFS is case-insensitive, and renamed git
+  # dirs (stitchpad-git → pasture-git on migration, or a third name entirely)
+  # defeat name-based gates.  Instead, structurally discover the pad's actual
+  # git dir: any directory under PAD_DIR that contains HEAD + objects/ + refs/
+  # is a git repository.  Compare dev/inode against real_dir — same identity
+  # regardless of name, case, or rename.  This gate replaces the old name-loop
+  # (which missed pasture-git on migrated pads and would miss any third name).
+  # Also blocks deep subpaths of the git dir (real_dir inside the git dir tree,
+  # not just the root).
+  if [ -d "${PAD_DIR:-/nonexistent}" ]; then
+    for _gd_path in "$PAD_DIR"/*/; do
+      [ -d "$_gd_path" ] || continue
+      [ -f "$_gd_path/HEAD" ] && [ -d "$_gd_path/objects" ] && [ -d "$_gd_path/refs" ] || continue
+      # This directory is a git repository — verify identity
+      local _gd_identity _rd_identity
+      _gd_identity="$(python3 -c "import os,sys; s=os.stat(sys.argv[1]); print(s.st_dev,s.st_ino)" "$_gd_path" 2>/dev/null)" || _gd_identity=""
+      _rd_identity="$(python3 -c "import os,sys; s=os.stat(sys.argv[1]); print(s.st_dev,s.st_ino)" "$real_dir" 2>/dev/null)" || _rd_identity=""
+      if [ -n "$_gd_identity" ] && [ "$_rd_identity" = "$_gd_identity" ]; then
+        return 1  # real_dir IS the git dir root (identity match)
+      fi
+      # Also check: is real_dir a subdirectory of this git dir?
+      # Use canonical (pwd -P) paths to survive symlinks like /tmp → /private/tmp.
+      local _gd_canon
+      _gd_canon="$(cd "$_gd_path" 2>/dev/null && pwd -P)" || _gd_canon="$_gd_path"
+      case "$real_dir" in
+        "$_gd_canon"|"$_gd_canon"/*) return 1 ;;
+      esac
+    done
+  fi
+  # Defense in depth: generic string checks for .git / hooks subpaths plus
+  # any path that looks like a git-internal file (catches edge cases the
+  # structural discovery might miss — e.g. a crafted .paths listing a git
+  # object file whose parent isn't a git dir but the path pattern matches).
+  _flow="$(printf '%s' "$f" | tr '[:upper:]' '[:lower:]')"
+  case "$_flow" in
+    */.git/*|*/.git|*/hooks/*)
+      return 1
+      ;;
+  esac
+  return 0
 }
 
 # Restore exact pre-operation bytes. Files that existed are rewritten with
@@ -1082,7 +1142,25 @@ sp_session_registry_journal_rollback() {
       if [ -d "$f" ]; then
         echo "stitchpad: rollback refusing to overwrite directory $(basename "$f")" >&2
       else
-        cat "$jdir/$i" > "$f" 2>/dev/null || cp "$jdir/$i" "$f" 2>/dev/null || true
+        # H2+H9b: refuse to write through a hardlink. A hardlink inside PAD_STATE
+        # to an outside file shares the inode; cat> writes through the inode
+        # into the aliased file. flash proved this works on the LEGIT journal
+        # path (pre-plant hardlink at a session-activity marker, crash, recover:
+        # victim file clobbered with journaled bytes). Refuse st_nlink>1 so the
+        # rollback never writes through a shared inode. Remove the hardlink and
+        # create a fresh regular file in its place, then write.
+        local _nlink=""
+        _nlink="$(python3 -c "import os,sys; print(os.lstat(sys.argv[1]).st_nlink)" "$f" 2>/dev/null || echo 1)" 2>/dev/null
+        if [ "$_nlink" -gt 1 ] 2>/dev/null; then
+          echo "stitchpad: rollback refusing to write through hardlinked file $f (nlink=$_nlink) — removing link, creating fresh file" >&2
+          local _mode=""
+          _mode="$(python3 -c "import os,sys; print(oct(os.lstat(sys.argv[1]).st_mode & 0o777))" "$f" 2>/dev/null || echo 0o644)" 2>/dev/null
+          rm -f "$f" 2>/dev/null
+          cat "$jdir/$i" > "$f" 2>/dev/null || cp "$jdir/$i" "$f" 2>/dev/null || true
+          [ -n "$_mode" ] && chmod "$_mode" "$f" 2>/dev/null || true
+        else
+          cat "$jdir/$i" > "$f" 2>/dev/null || cp "$jdir/$i" "$f" 2>/dev/null || true
+        fi
       fi
     elif [ "$existed" = "0" ]; then
       # rm -f unlinks the path itself — it never follows a symlink target.

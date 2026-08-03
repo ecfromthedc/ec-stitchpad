@@ -131,6 +131,9 @@ Example description body. Multi-line is fine.
 ---
 EOF
     # isolated git for the pad
+    # fx4 F2: git absent from PATH makes init report false success.
+    # Fail loudly before touching any files.
+    command -v git >/dev/null 2>&1 || { echo "stitchpad: git not found on PATH — stichpad requires git for durable pad history" >&2; exit 1; }
     git --git-dir="$dir/stitchpad-git" --work-tree="$dir" init -q
     git --git-dir="$dir/stitchpad-git" --work-tree="$dir" config user.name "stitchpad"
     git --git-dir="$dir/stitchpad-git" --work-tree="$dir" config user.email "stitchpad@agents.local"
@@ -198,7 +201,7 @@ EOF
         *) _args+=("$1"); shift ;;
       esac
     done
-    set -- "${_args[@]}"
+    set -- "${_args[@]:+${_args[@]}}"
     who="${1:?usage: stitchpad join <name> <adapter> [wake] [target] [--role <role>] [--level <level>]}"
     adapter="${2:?adapter required (e.g. pi, claude, codex, mcp)}"
     wake="${3:-pull}"; target="${4:--}"
@@ -577,14 +580,18 @@ EOF
         0|0[0-9]*|*[!0-9]*) echo "stitchpad: --redeliver requires a positive mention ordinal (never 0)" >&2; exit 1;;
       esac
     fi
-    # N3: --recovery-counters is an operator-only surface (TASK-5 authority)
+    # N3+H4: --recovery-counters is an operator-only surface (TASK-5 authority)
     # to clear poisoned or exhausted recovery attempt counters. A seat may
     # never clear its own counters — that would defeat the bound. The caller's
     # identity must not be a roster member, exactly like the authority grant
-    # path. Uses sp_recovery_reset_all from recovery-policy.sh.
+    # path. H4: the previous gate trusted STITCHPAD_NAME only (env-asserted) —
+    # any seat exporting STITCHPAD_NAME=<non-roster> bypassed it. Now requires
+    # the explicit --i-am-operator flag (operator intent acknowledgment) AND
+    # the name must not be a roster member. The flag is never set by agents.
     if [ "$recovery_counters" -eq 1 ]; then
       _rc_grantor="${STITCHPAD_NAME:-}"
       _rc_roster_names="$(sp_roster 2>/dev/null | cut -d'|' -f1 | tr '\n' ' ')"
+      # H4: deny roster members
       case " $_rc_roster_names " in
         *" $_rc_grantor "*)
           echo "stitchpad: AUTHORITY VIOLATION — a seat (@$_rc_grantor) may not clear recovery counters" >&2
@@ -592,6 +599,15 @@ EOF
           exit 1
           ;;
       esac
+      # H4: require explicit operator acknowledgment. An env-asserted non-roster
+      # name alone is insufficient — any process can set STITCHPAD_NAME. The
+      # --i-am-operator flag proves the caller knows this is an operator-only
+      # action and is NOT an automated agent (agents never set it).
+      if [ "${STITCHPAD_I_AM_OPERATOR:-}" != "1" ]; then
+        echo "stitchpad: --recovery-counters requires explicit operator confirmation." >&2
+        echo "  Set STITCHPAD_I_AM_OPERATOR=1 if you are the human operator." >&2
+        exit 1
+      fi
       if [ -n "$who" ]; then
         sp_recovery_reset_all "$PAD_STATE" "$who"
         echo "✓ recovery counters cleared for @$who"
@@ -1103,7 +1119,13 @@ PY
         ;;
       --claim)
         hid="${2:?usage: shift-change --claim <id>}"
-        _n="$(/usr/bin/sqlite3 "$db" "UPDATE handoffs SET status='delivering', at='$(date '+%Y-%m-%dT%H:%M:%S')' WHERE id=${hid//[!0-9]/} AND status IN ('pending','delivering'); SELECT changes();")"
+        # F4: atomic compare-and-set — only transition pending→delivering.
+        # The previous WHERE matched status IN ('pending','delivering'), so the
+        # first claim's own pending→delivering flip left the row matching for
+        # every subsequent claimant (18/24 concurrent claims won in fx3's probe).
+        # Now only 'pending' matches: the first claim flips it to 'delivering'
+        # and every later caller sees changes()=0 and is refused.
+        _n="$(/usr/bin/sqlite3 "$db" "UPDATE handoffs SET status='delivering', at='$(date '+%Y-%m-%dT%H:%M:%S')' WHERE id=${hid//[!0-9]/} AND status='pending'; SELECT changes();")"
         [ "${_n:-0}" -ge 1 ] || { echo "stitchpad: handoff $hid not claimable" >&2; exit 1; }
         _bf="$PAD_STATE/shift.$hid.txt"
         /usr/bin/sqlite3 "$db" "SELECT body FROM handoffs WHERE id=${hid//[!0-9]/};" > "$_bf"
@@ -2087,7 +2109,7 @@ PY
         /usr/bin/sqlite3 -separator '|' "$db" \
           "SELECT at,sender,text FROM (SELECT * FROM messages ORDER BY id DESC LIMIT $n) ORDER BY id ASC;" \
           | while IFS='|' read -r _at _s _rest; do
-              printf '[%s] @%s: %s\n' "$(date -r "$(( _at / 1000 ))" '+%m-%d %H:%M' 2>/dev/null || echo '?')" "$_s" "$_rest"
+              printf '[%s] @%s: %s\n' "$(date -r "$(( _at / 1000 ))" '+%m-%d %H:%M' 2>/dev/null || date -d "@$(( _at / 1000 ))" '+%m-%d %H:%M' 2>/dev/null || echo '?')" "$_s" "$_rest"
             done
         ;;
       list)
@@ -3351,7 +3373,7 @@ sys.exit(1)
     echo -n "  [2/4] heartbeat ................ "
     _mc_alive_file="$PAD_STATE/alive.$_mc_pilot"
     if [ -f "$_mc_alive_file" ]; then
-      _mc_alive_age="$(($(date +%s) - $(stat -f %m "$_mc_alive_file" 2>/dev/null || echo 0)))"
+      _mc_alive_age="$(($(date +%s) - $(stat -f %m "$_mc_alive_file" 2>/dev/null || stat -c %Y "$_mc_alive_file" 2>/dev/null || echo 0)))"
       if [ "$_mc_alive_age" -lt 90 ]; then
         _mc_alive_pid="$(python3 -c "import json; print(json.load(open('$_mc_alive_file')).get('pid',''))" 2>/dev/null || true)"
         if [ -n "$_mc_alive_pid" ] && kill -0 "$_mc_alive_pid" 2>/dev/null; then

@@ -127,9 +127,9 @@ print(json.dumps(skills))
   if [ -f "$padd/.state/dnd.$_name" ]; then
     _status="dnd"
   else
-    _last_post_epoch="$(grep -a "^## @$_name" "$PADMD" | tail -1 | grep -o '[0-9]\{2\}:[0-9]\{2\}' | tail -1 | xargs -I{} date -j -f '%H:%M' '{}' +%s 2>/dev/null || echo 0)"
+    _last_post_epoch="$(grep -a "^## @$_name" "$PADMD" | tail -1 | grep -o '[0-9]\{2\}:[0-9]\{2\}' | tail -1 | xargs -I{} bash -c 'date -j -f "%H:%M" "$1" +%s 2>/dev/null || date -d "$1" +%s 2>/dev/null || echo 0' _ '{}')"
     _now_hour="$(date +%H:%M)"
-    _now_epoch="$(date -j -f '%H:%M' "$_now_hour" +%s 2>/dev/null || echo 0)"
+    _now_epoch="$(date -j -f '%H:%M' "$_now_hour" +%s 2>/dev/null || date -d "$_now_hour" +%s 2>/dev/null || echo 0)"
     _post_age=$(( _now_epoch - _last_post_epoch ))
     if [ "$_post_age" -gt 0 ] && [ "$_post_age" -lt 90 ]; then
       _status="working"

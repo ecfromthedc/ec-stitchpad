@@ -87,13 +87,20 @@ render
 ( fswatch -0 "$PAD_MD" | while read -r -d "" _; do echo R; done ) &
 WATCHER=$!
 trap 'kill $WATCHER 2>/dev/null; cleanup' INT TERM
-last=$(stat -f %m "$PAD_MD" 2>/dev/null || echo 0)
+last=$(stat -f %m "$PAD_MD" 2>/dev/null || stat -c %Y "$PAD_MD" 2>/dev/null || echo 0)
 while true; do
-  if read -r -t 0.4 -n 1 key 2>/dev/null; then
+  if [ "${BASH_VERSINFO[0]:-0}" -ge 4 ] 2>/dev/null; then
+    # bash 4+ fractional timeouts
+    read -r -t 0.4 -n 1 key 2>/dev/null
+  else
+    # bash 3.2 (macOS default) only accepts integer -t; 1s is fine for UI poll
+    read -r -t 1 -n 1 key 2>/dev/null
+  fi
+  if [ "${PIPESTATUS[0]:-1}" -eq 0 ]; then
     [ "$key" = "q" ] && break
   fi
   # re-render if file mtime changed
-  cur=$(stat -f %m "$PAD_MD" 2>/dev/null || echo 0)
+  cur=$(stat -f %m "$PAD_MD" 2>/dev/null || stat -c %Y "$PAD_MD" 2>/dev/null || echo 0)
   if [ "${cur:-0}" != "${last:-0}" ]; then render; last="$cur"; fi
 done
 kill $WATCHER 2>/dev/null
