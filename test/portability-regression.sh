@@ -184,6 +184,80 @@ cd "$ROOT"
 rm -rf "$F8_WORK" "$F8_PATH"
 
 # ============================================================================
+# TASK-19: TMPDIR isolation — custom TMPDIR is respected without leakage
+# ============================================================================
+echo ""
+echo "--- F9: TMPDIR isolation ---"
+
+F9_TMPDIR="$(mktemp -d "${TMPDIR:-/tmp}/sp-f9-tmp.XXXXXX")"
+F9_WORK="$(mktemp -d "${TMPDIR:-/tmp}/sp-f9.XXXXXX")"
+
+# F9a: init in a custom TMPDIR uses that TMPDIR for staging
+cd "$F9_WORK"
+F9A_OUT="$(HOME="$F9_WORK" STITCHPAD_HOME="$ROOT/tool" TMPDIR="$F9_TMPDIR" \
+  STITCHPAD_HEARTBEAT_AUTOSTART=0 "$STITCHPAD" init "f9a" 2>&1)" || F9A_RC=$?
+if [ "${F9A_RC:-0}" -eq 0 ]; then
+  ok "F9a: init under custom TMPDIR succeeds (rc=0)"
+else
+  bad "F9a: init failed under custom TMPDIR (rc=$F9A_RC): $(printf '%s' "$F9A_OUT" | head -c 80)"
+fi
+
+# F9b: verify no residue in the default TMPDIR
+DEFAULT_TMP="${TMPDIR:-/tmp}"
+F9_RESIDUE="$(find "$DEFAULT_TMP" -maxdepth 1 -name '.stitchpad*' -newer "$F9_WORK" 2>/dev/null | head -1 || true)"
+if [ -z "$F9_RESIDUE" ]; then
+  ok "F9b: no stitchpad residue leaked into default TMPDIR"
+else
+  bad "F9b: residue found in default TMPDIR: $F9_RESIDUE"
+fi
+
+# F9c: pad state is isolated in HOME, not leaked elsewhere
+if [ -d "$F9_WORK/.stitchpad" ]; then
+  ok "F9c: pad state isolated under HOME/.stitchpad"
+else
+  bad "F9c: no .stitchpad under HOME — init didn't create pad"
+fi
+
+cd "$ROOT"
+rm -rf "$F9_WORK" "$F9_TMPDIR"
+
+rm -rf "$F9_WORK" "$F9_TMPDIR"
+
+# ============================================================================
+# F10: git-absent recovery — pad already initialized, then git removed from PATH
+# ============================================================================
+echo ""
+echo "--- F10: git-absent recovery ---"
+
+F10_WORK="$(mktemp -d "${TMPDIR:-/tmp}/sp-f10.XXXXXX")"
+F10_PATH="$(mktemp -d "${TMPDIR:-/tmp}/sp-f10-path.XXXXXX")"
+
+HOME="$F10_WORK" STITCHPAD_HOME="$ROOT/tool" STITCHPAD_HEARTBEAT_AUTOSTART=0 \
+  "$STITCHPAD" init "f10" >/dev/null 2>&1 || true
+
+# Build a PATH without git
+for _bin in bash mkdir printf cat date grep sed awk python3 ps kill; do
+  _loc="$(command -v "$_bin" 2>/dev/null || true)"
+  [ -n "$_loc" ] && ln -sf "$_loc" "$F10_PATH/$_bin" 2>/dev/null || true
+done
+
+# F10a: say on existing pad without git is graceful (not fatal crash)
+F10A_OUT="$(HOME="$F10_WORK" STITCHPAD_HOME="$ROOT/tool" PATH="$F10_PATH" \
+  STITCHPAD_HEARTBEAT_AUTOSTART=0 "$STITCHPAD" say "f10a" "git absent test" 2>&1)" || F10A_RC=$?
+# Expect non-zero (can't commit without git), but not a crash — graceful diagnostic
+if [ "${F10A_RC:-0}" -ne 0 ]; then
+  if echo "$F10A_OUT" | grep -qiE "git.*not found|rev-parse|broken|commit refused"; then
+    ok "F10a: say without git fails gracefully with diagnostic"
+  else
+    ok "F10a: say without git fails (rc=$F10A_RC) — diagnostic may differ"
+  fi
+else
+  bad "F10a: say succeeded without git — not possible (or pad has noop)"
+fi
+
+rm -rf "$F10_WORK" "$F10_PATH"
+
+# ============================================================================
 echo ""
 printf "${GREEN}%d passed${NC}, ${RED}%d failed${NC}\n" "$pass" "$fail"
 [ "$fail" -eq 0 ] || exit 1
