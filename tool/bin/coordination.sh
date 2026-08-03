@@ -48,7 +48,7 @@ areas and verbs:
   review bind         ID --session UUID --request UUID
   review register-process ID --role ROLE --pid PID --process-token-fd FD
   review cancel-requested ID
-  review refresh      ID [--json]
+  review refresh      ID --provider-rows-fd FD [--json]
   review status       ID [--json]
   review submit-report ID
   review verify       ID
@@ -79,13 +79,15 @@ validate_flags() {
         ;;
       --worktree|--repo|--actor|--base|--old|--new|--head|--commit|\
 --author-actor|--reviewer-actor|--provider|--session|--request|--role|--pid|\
---token-fd|--token-out-fd|--process-token-fd|--process-token-out-fd|--provider-rows-fd)
+--token-fd|--token-out-fd|--process-token-fd|--process-token-out-fd|\
+--provider-rows-fd)
         [ $# -ge 2 ] || die_usage "flag $1 requires a value"
         case "$2" in
           --*) die_usage "flag $1 is missing its value" ;;
         esac
         case "$1" in
-          --token-fd|--token-out-fd|--process-token-fd|--process-token-out-fd|--provider-rows-fd|--pid)
+          --token-fd|--token-out-fd|--process-token-fd|--process-token-out-fd|\
+          --provider-rows-fd|--pid)
             case "$2" in
               ''|*[!0-9]*) die_usage "$1 must be a non-negative integer" ;;
             esac
