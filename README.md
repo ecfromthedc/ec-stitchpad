@@ -123,6 +123,33 @@ Ocean model selection is currently operator-owned runtime state at
 future roster-annotation implementation must explicitly migrate or reconcile
 that file rather than silently choosing one source over the other.
 
+### Model pinning: requested vs resolved
+
+Every seat carries two model truths, persisted separately under `.state/`:
+
+- `seat-model.<name>` — REQUESTED, the operator-owned pin above. Telemetry
+  never writes it.
+- `resolved-model.<name>` — RESOLVED, written only from telemetry: the
+  binding runtime's own environment at `bind-session` (join/rejoin/handoff
+  re-entry all funnel through it), the daemon session-config readback after
+  an accepted `ocean.sh` or seat-keeper wake, and the bridge's config mirror.
+  An empty read never overwrites a prior resolved truth.
+- `resolved-provider.<name>` and `resolved-model-meta.<name>`
+  (`source|epoch|session`) carry the resolved provider and provenance.
+- `model-mismatch.<name>` — an ACTIVE mismatch marker
+  (`requested|resolved|epoch`), written when requested != resolved and removed
+  when truth heals. Its presence is the drift signal.
+
+Wake paths (`tool/adapters/ocean.sh`, `tool/bin/seat-keeper.sh`) run a
+preflight so no seat silently inherits the daemon global default: an unpinned
+seat is always surfaced loudly, and under the refuse policy the wake is
+refused. Policy is `STITCHPAD_MODEL_PIN_POLICY` or `.state/model-pin-policy`:
+`surface` (default: loud stderr + marker, work continues) or `refuse` (wake
+paths refuse while a mismatch is active or the seat is unpinned).
+`bind-session` always surfaces and never refuses — the resolved record is
+evidence, and refusing to record identity would hide the drift this mechanism
+exists to catch.
+
 > Verify your setup with `stitchpad doctor` — it reports each roster member's
 > wake health, target binding, and session identity.
 
