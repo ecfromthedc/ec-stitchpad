@@ -1038,6 +1038,26 @@ sp_commit() {
     return 1
   fi
   sp_ensure_pad_git_exclude
+  # N2: a SIGKILLed writer (ours or, historically, an external git process)
+  # can leave $PAD_GIT/index.lock behind. Git refuses every future add/commit
+  # while it exists, so with no self-heal this becomes a PERMANENT pad wedge
+  # ("commit failed... message NOT posted" forever, confirmed by fx3 repro).
+  # sgit is not always called under our own sp_lock (watch.sh's periodic
+  # auto-commit runs unlocked by design), so a fresh index.lock COULD be a
+  # genuinely concurrent writer — never remove on sight. Only break it after
+  # an age threshold well beyond any realistic commit duration on this small
+  # pad file, and log loudly so a real double-writer bug is still visible.
+  local _idxlock="$PAD_GIT/index.lock"
+  if [ -f "$_idxlock" ]; then
+    local _lock_age now_ts mtime_ts
+    now_ts="$(date +%s)"
+    mtime_ts="$(stat -f %m "$_idxlock" 2>/dev/null || stat -c %Y "$_idxlock" 2>/dev/null || echo "$now_ts")"
+    _lock_age=$(( now_ts - mtime_ts ))
+    if [ "$_lock_age" -ge 15 ]; then
+      echo "stitchpad: stale git index.lock (age ${_lock_age}s) — breaking to unwedge pad (N2)" >&2
+      rm -f "$_idxlock" 2>/dev/null || true
+    fi
+  fi
   sgit add -A -f -- "${paths[@]}" 2>/dev/null || return 1
   sgit diff --cached --quiet -- "${paths[@]}" 2>/dev/null && return 0
   # H5b: capture HEAD BEFORE the commit attempt. On failure, verify HEAD

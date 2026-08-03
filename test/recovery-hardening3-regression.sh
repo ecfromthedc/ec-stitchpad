@@ -24,6 +24,13 @@ HERE="$(cd -P "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 ROOT="$HERE/.."
 STITCHPAD="$ROOT/tool/bin/stitchpad"
 
+# Hermetic guard (fx2 harness-hygiene, fleet standard from tonight's
+# terminal-surface collision finding): never inherit the runner's terminal
+# surface, or fixtures like N2/N3/H4's alice-rostered pads can claim the
+# operator's own ~/.stitchpad-terminals/<surface> and collide with live
+# seats. See fx2-harness-hygiene-1b8eed4.md.
+unset HERDR_PANE_ID HERDR_TAB_ID HERDR_ENV HERDR_SOCKET_PATH HERDR_WORKSPACE_ID 2>/dev/null || true
+
 RED='\033[0;31m'; GREEN='\033[0;32m'; NC='\033[0m'
 pass=0; fail=0
 
@@ -874,6 +881,50 @@ ok "H6: archive-refusal counter reset gated on _archive_ok (code-verified)"
 ok "H10: orphan preserved on all archive failure paths (code-verified)"
 ok "H5b: sp_commit verifies HEAD moved, not just index clean (code-verified)"
 ok "H11b: sp_commit distinguishes broken from absent git-dir (code-verified)"
+
+# N2 (fx3 review2-732d61a): stale git index.lock self-heal
+echo ""
+echo "--- N2: stale git index.lock self-heal (fx3 SIGKILL-in-write repro) ---"
+
+N2_WORK="$(mktemp -d "${TMPDIR:-/tmp}/sp-rh3-n2.XXXXXX")"
+make_pad "$N2_WORK/pad" "n2-pad"
+N2_PAD_DIR="$N2_WORK/pad/.stitchpad"
+N2_GIT_DIR="$N2_PAD_DIR/stitchpad-git"
+
+# N2a: a STALE index.lock (age >= 15s, simulating a SIGKILLed writer) must
+# self-heal — the next commit breaks it and posts successfully.
+touch "$N2_GIT_DIR/index.lock"
+python3 -c "import os,time; os.utime('$N2_GIT_DIR/index.lock', (time.time()-20, time.time()-20))" 2>/dev/null
+STITCHPAD_PAD_DIR="$N2_PAD_DIR" STITCHPAD_NAME=alice \
+  STITCHPAD_HEARTBEAT_AUTOSTART=0 STITCHPAD_STEAL=1 \
+  "$STITCHPAD" say "n2-self-heal" > "$N2_WORK/n2a.out" 2>&1
+_rc=$?
+grep -q "n2-self-heal" "$N2_PAD_DIR/stitchpad.md" 2>/dev/null && \
+  ok "N2a: stale index.lock self-healed — write succeeded (was: permanent wedge)" \
+  || bad "N2a: stale index.lock still wedged the pad (rc=$_rc)"
+
+# N2a-diag: the self-heal must be loud, not silent
+grep -qi "stale git index.lock" "$N2_WORK/n2a.out" && \
+  ok "N2a-diag: self-heal diagnostic printed" \
+  || bad "N2a-diag: self-heal happened silently (no diagnostic)"
+
+rm -rf "$N2_WORK"
+
+# N2b: a FRESH index.lock (age < 15s, a plausible in-flight writer) must
+# NOT be removed — never blindly clobber a potentially live commit.
+N2B_WORK="$(mktemp -d "${TMPDIR:-/tmp}/sp-rh3-n2b.XXXXXX")"
+make_pad "$N2B_WORK/pad" "n2b-pad"
+N2B_PAD_DIR="$N2B_WORK/pad/.stitchpad"
+N2B_GIT_DIR="$N2B_PAD_DIR/stitchpad-git"
+touch "$N2B_GIT_DIR/index.lock"
+STITCHPAD_PAD_DIR="$N2B_PAD_DIR" STITCHPAD_NAME=alice \
+  STITCHPAD_HEARTBEAT_AUTOSTART=0 STITCHPAD_STEAL=1 \
+  "$STITCHPAD" say "n2-fresh-lock" > /dev/null 2>&1
+[ -f "$N2B_GIT_DIR/index.lock" ] && \
+  ok "N2b: fresh index.lock preserved (not blindly removed — real concurrency stays safe)" \
+  || bad "N2b: fresh index.lock was removed (unsafe — could clobber a live writer)"
+
+rm -rf "$N2B_WORK"
 
 # ============================================================================
 # Results
