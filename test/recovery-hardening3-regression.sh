@@ -735,6 +735,15 @@ sleep 3
 STITCHPAD_PAD_DIR="$JH_PAD_DIR" STITCHPAD_NAME=alice STITCHPAD_SESSION=session-jh \
   "$STITCHPAD" heartbeat --stop alice > "$JH_WORK/hb-stop.out" 2>&1
 
+# JH4-FIX: stop the watcher daemon spawned by the ticker's ensure_watcher
+# calls.  The watcher does periodic unlocked auto-commits (watch.sh style,
+# design decision per fx4 increment 17).  After heartbeat --stop kills the
+# ticker, the watcher survives and its next git add/commit races the join's
+# sp_commit on git's index.lock, producing a spurious "roster commit did not
+# complete" error.  Explicit stop makes the test deterministic.
+STITCHPAD_PAD_DIR="$JH_PAD_DIR" STITCHPAD_HEARTBEAT_AUTOSTART=0 \
+  "$STITCHPAD" stop > /dev/null 2>&1 || true
+
 # Step 5: bind + join sleeper — this is the step that failed pre-fix
 STITCHPAD_PAD_DIR="$JH_PAD_DIR" STITCHPAD_HEARTBEAT_AUTOSTART=0 \
   "$STITCHPAD" bind-session session-sleeper sleeper > /dev/null 2>&1
