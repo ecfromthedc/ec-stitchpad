@@ -1332,9 +1332,13 @@ sp_current_to_meta() {
 # The markdown is ground truth. Walks "## @author · time" blocks in order:
 #   - a block authored by someone ELSE that @-mentions me  → a mention TO me
 #   - a block authored by ME that @-mentions anyone else   → an addressed reply
-# Prints "<last_mention_ordinal> <last_reply_ordinal>" (0 if none). Blocked iff
-# last_mention > last_reply. Author-skip is built in: my own blocks never count as
-# mentions to me, killing the self-ack loop too.
+# Prints "<first_open_mention_ordinal> <mention_sender> <last_reply_ordinal>
+# <reply_target>" (0 if none). The scan is two-phase: it buffers every block,
+# then returns the first mention after `since` that is NOT answered — a reply
+# suppresses only the mentions from its target sender that predate it, so later
+# mentions from other senders always deliver FIFO (never starved behind an
+# already-answered oldest mention). Author-skip is built in: my own blocks never
+# count as mentions to me, killing the self-ack loop too.
 # Silent-ack convention: a block whose first content line starts with "." or "[ack]"
 # is invisible to the gate — it neither wakes a mentioned target nor counts as an
 # addressed reply. Lets agents post acknowledgements/status without costing anyone a
@@ -1342,42 +1346,57 @@ sp_current_to_meta() {
 sp_engagement() {
   local who="$1"
   local since="${2:-0}"  # skip mentions with ordinal <= since (FIFO cursor)
+  local raw="${3:-}"     # non-empty: old forward-scan semantics — return the
+                         # first mention > since even when an addressed reply
+                         # closed it (reset --redeliver validation needs to
+                         # distinguish "answered" from "not open")
   # roster names, for the implicit-silent word list below: only AGENT authors get
   # their bare "ack"/"noted" posts silenced. A human operator typing "@pi ack"
   # means "wake pi" — guessing it silent made operator pings vanish (the pi bug).
   local agents
   agents="$(sp_roster 2>/dev/null | cut -d'|' -f1 | tr 'A-Z' 'a-z' | paste -sd, -)"
-  awk -v who="$(printf '%s' "$1" | tr 'A-Z' 'a-z')" -v agents="$agents" -v since="$since" '
+  awk -v who="$(printf '%s' "$1" | tr 'A-Z' 'a-z')" -v agents="$agents" -v since="$since" -v raw="$raw" '
     # An ADDRESS is "@name" at line-start or after whitespace — NOT after punctuation
     # like / ` " (), so a quoted/referenced "@name" (e.g. "the @john/@dale discussion")
     # or a backticked `@name` does not count as addressing someone. buf joins lines with
     # a leading space, so (^|[ \t]) covers block-start, every line-start, and mid-sentence.
     function body_mentions(name,   re) { re="(^|[ \t])@(" name "|all)([^a-z0-9_-]|$)"; return (buf ~ re) }
-    function flush() {
+    # flush() buffers per-block metadata (author/silent/body) so the END scan
+    # runs with COMPLETE reply knowledge: a forward-only pass cannot know about
+    # a reply that appears AFTER the mention it answers.
+    function flush(   i, n_tok, t, name, block_target) {
       if (author=="") return
       n++
+      b_auth[n]=author; b_silent[n]=silent; b_buf[n]=buf
       if (author==who) {                                          # my own block:
         if (silent || buf ~ /(^|[ \t])@[a-z0-9_-]/) {           # a silent ack OR a real @-address reply
-          last_reply=n                                           # last reply ordinal
-          # Try to extract the first @-target: the first non-who agent name address.
-          # This is the sender we replied TO, used for same-sender gate narrowing.
-          # PORTABLE: no gawk match()-with-array; uses substr + sub.
-          split(buf, tokens, /[ \t\n]+/)
-          for (i in tokens) {
-            if (i > 20) break
-            t = tolower(tokens[i])
+          last_reply=n                                           # newest reply ordinal
+          # Extract every @target of this reply. PORTABLE: no gawk
+          # match()-with-array; uses substr + sub. ORDINAL loop, NOT `for (i in
+          # tokens)`: hash-order iteration visits token 2 first and the old
+          # `if (i > 20) break` compared STRINGS ("2" > "20" is true), so only
+          # token 2 was ever examined — reply_target stayed empty for any reply
+          # whose @target was not the second word (Defect A). Per-sender map:
+          # reply[target] = newest reply ordinal, so a reply suppresses ONLY
+          # the mentions from that target sender that predate it (Defect B).
+          n_tok=split(buf, tokens, /[ \t\n]+/)
+          for (i=1; i<=n_tok && i<=20; i++) {
+            t=tolower(tokens[i])
             if (t ~ /^@[a-z0-9_-]+/) {
-              name = substr(t, 2)
+              name=substr(t, 2)
               sub(/[^a-z0-9_-].*$/, "", name)
-              if (name != "" && name != "all" && name != who) { reply_target = name; break }
+              if (name != "" && name != "all" && name != who) {
+                reply[name]=n
+                if (block_target == "") block_target=name
+              }
             }
           }
+          # reply_target = first @target of the newest reply block that has one
+          # (old output semantics preserved; the wake gate same-sender check
+          # is now belt-and-suspenders — the END scan only returns open mentions,
+          # so it can never misfire on one).
+          if (block_target != "") reply_target=block_target
         }
-      } else if (!silent && body_mentions(who)) {
-        # FIFO cursor: record the FIRST mention after `since`, never overwrite.
-        # The seen cursor steps one ordinal per delivery; this returns the next
-        # unanswered mention instead of jumping to the newest.
-        if (!last_mention && n > since) { last_mention=n; mention_sender=author }
       }
     }
     /^## @/ {
@@ -1407,7 +1426,27 @@ sp_engagement() {
     # snippets from counting as an address. Real addresses survive because only the
     # backtick-delimited content is blanked, not the surrounding text.
     { line = tolower($0); gsub(/`[^`]*`/, " ", line); buf = buf " " line }
-    END { flush(); print (last_mention+0) " " (mention_sender) " " (last_reply+0) " " (reply_target) }
+    END {
+      flush()
+      # FIFO scan with complete per-sender reply knowledge. A reply suppresses
+      # ONLY the mentions from its target sender that predate it (reply[sender]
+      # > k). A mention posted AFTER my reply to that sender, and any mention
+      # from a sender I never replied to, stays open — so later mentions from
+      # other senders always deliver instead of starving behind an
+      # already-answered oldest mention (Defect B). raw mode keeps the old
+      # forward-scan contract (first mention > since, answered or not) for
+      # reset --redeliver validation.
+      for (k = 1; k <= n; k++) {
+        if (k <= since) continue
+        if (b_auth[k] == who) continue
+        if (b_silent[k]) continue
+        if (b_buf[k] !~ "(^|[ \t])@(" who "|all)([^a-z0-9_-]|$)") continue
+        if (raw == "" && (b_auth[k] in reply) && (reply[b_auth[k]] > k)) continue
+        last_mention = k; mention_sender = b_auth[k]
+        break
+      }
+      print (last_mention+0) " " (mention_sender) " " (last_reply+0) " " (reply_target)
+    }
   ' "$PAD_MD"
 }
 
