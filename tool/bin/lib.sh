@@ -224,6 +224,108 @@ sp_session_name() {
   fi
 }
 
+# ── Model pinning (requested vs resolved) ───────────────────────────
+# Every seat carries TWO model truths, persisted separately:
+#   .state/seat-model.<name>          REQUESTED — operator-owned pin. Never
+#                                     written by telemetry; roster columns are
+#                                     not a second authority either.
+#   .state/resolved-model.<name>      RESOLVED — written ONLY from telemetry:
+#                                     the binding runtime's own env, or the
+#                                     daemon session-config readback after a
+#                                     wake. An empty read never overwrites.
+#   .state/resolved-provider.<name>   RESOLVED provider (best-effort).
+#   .state/resolved-model-meta.<name> provenance: <source>|<epoch>|<session>
+#   .state/model-mismatch.<name>      ACTIVE mismatch marker:
+#                                     <requested>|<resolved>|<epoch>. Written
+#                                     when requested != resolved, removed when
+#                                     truth heals. Its presence is the signal.
+# Policy (STITCHPAD_MODEL_PIN_POLICY or .state/model-pin-policy):
+#   surface (default) — loud stderr line + marker; work continues.
+#   refuse            — wake paths (ocean adapter, seat-keeper) refuse to wake
+#                       while a mismatch is active or the seat is unpinned.
+# Identity binding (bind-session) always surfaces, never refuses: the resolved
+# record is evidence, and refusing to record identity over metadata would hide
+# exactly the drift this mechanism exists to catch.
+
+sp_model_pin_valid_name() {
+  case "$1" in ''|.*|*/*|*[[:space:]]*) return 1 ;; *) return 0 ;; esac
+}
+
+sp_model_pin_policy() {
+  # $1 = state dir. Prints "refuse" or "surface" (default).
+  local p="${STITCHPAD_MODEL_PIN_POLICY:-}"
+  [ -n "$p" ] || p="$(cat "$1/model-pin-policy" 2>/dev/null || true)"
+  case "$p" in refuse) printf 'refuse\n' ;; *) printf 'surface\n' ;; esac
+}
+
+sp_model_pin_requested() {
+  # $1 = state dir, $2 = name. Prints the operator-pinned model (may be empty).
+  sp_model_pin_valid_name "${2:-}" || return 1
+  cat "$1/seat-model.$2" 2>/dev/null || true
+}
+
+sp_model_pin_record_resolved() {
+  # $1=state $2=name $3=model $4=provider $5=source $6=session(optional).
+  # Telemetry writer. An empty model read NEVER erases a prior resolved truth.
+  local state="$1" name="$2" model="$3" provider="${4:-}" source="$5" session="${6:-}" now
+  sp_model_pin_valid_name "$name" || return 1
+  [ -n "$model" ] || return 0
+  now="$(date +%s)"
+  printf '%s' "$model" > "$state/resolved-model.$name.tmp.$$" \
+    && mv "$state/resolved-model.$name.tmp.$$" "$state/resolved-model.$name" || return 1
+  if [ -n "$provider" ]; then
+    printf '%s' "$provider" > "$state/resolved-provider.$name.tmp.$$" \
+      && mv "$state/resolved-provider.$name.tmp.$$" "$state/resolved-provider.$name"
+  fi
+  printf '%s|%s|%s' "$source" "$now" "$session" > "$state/resolved-model-meta.$name.tmp.$$" \
+    && mv "$state/resolved-model-meta.$name.tmp.$$" "$state/resolved-model-meta.$name"
+}
+
+sp_model_pin_check() {
+  # $1 = state dir, $2 = name. Compares requested vs resolved.
+  # rc 0 = no active mismatch (marker cleared); rc 2 = mismatch (marker
+  # written, loud line on stderr). Never fails closed on missing data:
+  # an unpinned seat or an uninstrumented runtime is not a mismatch.
+  local state="$1" name="$2" req res now
+  sp_model_pin_valid_name "$name" || return 1
+  req="$(sp_model_pin_requested "$state" "$name")"
+  res="$(cat "$state/resolved-model.$name" 2>/dev/null || true)"
+  if [ -n "$req" ] && [ -n "$res" ] && [ "$req" != "$res" ]; then
+    now="$(date +%s)"
+    printf '%s|%s|%s' "$req" "$res" "$now" > "$state/model-mismatch.$name.tmp.$$" \
+      && mv "$state/model-mismatch.$name.tmp.$$" "$state/model-mismatch.$name"
+    echo "[model-pin] MISMATCH @$name: requested '$req' (.state/seat-model.$name) != resolved '$res' — marker .state/model-mismatch.$name" >&2
+    return 2
+  fi
+  rm -f "$state/model-mismatch.$name" 2>/dev/null
+  return 0
+}
+
+sp_model_pin_preflight() {
+  # $1 = state dir, $2 = name. Gate run by wake paths (ocean adapter,
+  # seat-keeper) BEFORE posting a turn. Guarantees no seat silently inherits
+  # the daemon global default: unpinned seats are always surfaced, and under
+  # policy=refuse they (and active mismatches) refuse the wake with rc 2.
+  local state="$1" name="$2" policy req rc
+  sp_model_pin_valid_name "$name" || return 1
+  policy="$(sp_model_pin_policy "$state")"
+  req="$(sp_model_pin_requested "$state" "$name")"
+  if [ -z "$req" ]; then
+    echo "[model-pin] @$name has NO requested pin (.state/seat-model.$name) — a wake would silently inherit the daemon global default" >&2
+    if [ "$policy" = "refuse" ]; then
+      echo "[model-pin] policy=refuse: refusing unpinned wake for @$name" >&2
+      return 2
+    fi
+  fi
+  sp_model_pin_check "$state" "$name"
+  rc=$?
+  if [ "$rc" -eq 2 ] && [ "$policy" = "refuse" ]; then
+    echo "[model-pin] policy=refuse: refusing wake for @$name while a requested/resolved mismatch is active" >&2
+    return 2
+  fi
+  return 0
+}
+
 # ── Do Not Disturb ──────────────────────────────────────────────────
 # DND is a local wake-suppression flag. It never mutates the pad or seen cursor:
 # mentions accumulate behind .state/seen.<name> and can be drained on return.

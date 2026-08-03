@@ -32,6 +32,14 @@ msg="$(head -c 2000 "$taskfile" 2>/dev/null)"
 sp_bin="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)/bin/stitchpad"
 [ -x "$sp_bin" ] || sp_bin="$(command -v stitchpad 2>/dev/null || true)"
 [ -n "$sp_bin" ] && [ -x "$sp_bin" ] || { echo "[ocean.sh] stitchpad CLI not found" >&2; exit 1; }
+# TASK-1 model pinning: requested (.state/seat-model.<name>) vs resolved
+# (.state/resolved-model.<name>) with a refuse/surface policy.
+source "$(cd "$(dirname "${BASH_SOURCE[0]}")/../bin" && pwd)/lib.sh"
+state_dir="$(dirname "$pad")/.state"
+# PREFLIGHT: never let a wake silently inherit the daemon global default.
+# policy=refuse turns an unpinned seat or an active requested/resolved
+# mismatch into a refused wake (loud, never silent).
+sp_model_pin_preflight "$state_dir" "$name" || exit 1
 
 # Ocean-backed seats include Kimi, GLM, and DeepSeek. Build their wake through
 # the same canonical prompt path as Stop/Herdr/Pi rather than maintaining a
@@ -65,13 +73,31 @@ if [ "$active" = "busy" ]; then
   exit 3
 fi
 
-seat_model=""
-_mf="$(dirname "$pad")/.state/seat-model.${name}"
-[ -f "$_mf" ] && seat_model="$(tr -d '[:space:]' < "$_mf" 2>/dev/null || true)"
+seat_model="$(sp_model_pin_requested "$state_dir" "$name")"
 wake_args=(wake --session-id "$session_id" --cwd "$pad_dir" --client-type stitchpad \
   --timeout-seconds 600 --prompt "$prompt")
 [ -n "$seat_model" ] && wake_args+=(--model "$seat_model")
 [ -n "${SP_DELIVERY_ACK_FILE:-}" ] && wake_args+=(--no-wait)
+
+# RESOLVED telemetry: after an accepted wake, read the session's own config
+# back from the daemon and persist it as the resolved truth, then re-check
+# against the requested pin. Best-effort: a daemon that cannot answer leaves
+# the previous resolved record untouched (an empty read never erases truth).
+record_resolved_from_daemon() {
+  local cfg rmodel rprovider
+  cfg="$(curl -sf --max-time 3 "$daemon_url/v1/agent/sessions/$session_id/config" 2>/dev/null || true)"
+  [ -n "$cfg" ] || return 0
+  rmodel="$(printf '%s' "$cfg" | python3 -c 'import json,sys
+try: print(json.load(sys.stdin).get("model") or "")
+except Exception: print("")' 2>/dev/null)"
+  rprovider="$(printf '%s' "$cfg" | python3 -c 'import json,sys
+try: print(json.load(sys.stdin).get("provider") or "")
+except Exception: print("")' 2>/dev/null)"
+  [ -n "$rmodel" ] || return 0
+  sp_model_pin_record_resolved "$state_dir" "$name" "$rmodel" "$rprovider" \
+    "ocean-wake-config-rpc" "$session_id" || true
+  sp_model_pin_check "$state_dir" "$name" || true
+}
 
 if [ -n "${SP_DELIVERY_ACK_FILE:-}" ]; then
   "$bin" "${wake_args[@]}" > "$SP_DELIVERY_ACK_FILE" || exit $?
@@ -79,7 +105,11 @@ if [ -n "${SP_DELIVERY_ACK_FILE:-}" ]; then
 try: print(json.load(open(sys.argv[1])).get("turn_id", ""))
 except Exception: print("")' "$SP_DELIVERY_ACK_FILE" 2>/dev/null)"
   [ -n "$turn_id" ] || { echo '[ocean.sh] accepted wake omitted turn_id' >&2; exit 1; }
+  record_resolved_from_daemon
   cat "$SP_DELIVERY_ACK_FILE"
 else
   "$bin" "${wake_args[@]}"
+  wake_rc=$?
+  [ "$wake_rc" -eq 0 ] && record_resolved_from_daemon
+  exit "$wake_rc"
 fi

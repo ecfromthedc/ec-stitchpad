@@ -275,6 +275,16 @@ except Exception:
 ' 2>/dev/null)"
   [ "$active" = "idle" ] || { keeper_lock_release; return 0; }
 
+  # TASK-1: never wake a seat that would silently inherit the daemon global
+  # default, and (policy=refuse) never wake into an active requested/resolved
+  # mismatch. Surface mode logs loudly and proceeds.
+  if ! sp_model_pin_preflight "$state" "$name"; then
+    echo "seat-keeper: model-pin preflight refused wake for @$name" >&2
+    failures=$((failures + 1))
+    keeper_lock_release
+    return 0
+  fi
+
   args=(wake --session-id "$sid" --cwd "$repo" --client-type stitchpad --no-wait --prompt "$prompt")
   # seat-model is operator-owned scheduling policy. model.<name> is merely
   # runtime-reported metadata and may be overwritten by any rebound session.
@@ -304,6 +314,31 @@ except Exception:
     raise SystemExit(1)
 raise SystemExit(0 if data.get("ok") is True else 1)
 '; then
+    # TASK-1: persist the daemon-resolved model for this seat from the
+    # session's own config readback, then re-check requested vs resolved.
+    # Best-effort: an unanswered RPC leaves prior resolved truth untouched.
+    cfg_json="$(curl -sf -m 4 "$DAEMON/v1/agent/sessions/$sid/config" 2>/dev/null || true)"
+    if [ -n "$cfg_json" ]; then
+      resolved_model="$(printf '%s' "$cfg_json" | python3 -c '
+import json, sys
+try:
+    print(json.load(sys.stdin).get("model") or "")
+except Exception:
+    print("")
+' 2>/dev/null)"
+      resolved_provider="$(printf '%s' "$cfg_json" | python3 -c '
+import json, sys
+try:
+    print(json.load(sys.stdin).get("provider") or "")
+except Exception:
+    print("")
+' 2>/dev/null)"
+      if [ -n "$resolved_model" ]; then
+        sp_model_pin_record_resolved "$state" "$name" "$resolved_model" \
+          "$resolved_provider" "keeper-wake-config-rpc" "$sid" || true
+        sp_model_pin_check "$state" "$name" || true
+      fi
+    fi
     keeper_write_atomic "$reservation" "0|$message_id|accepted|$attempt_id" || {
       echo "seat-keeper: could not persist accepted state for @$name; not retrying" >&2
       failures=$((failures + 1))

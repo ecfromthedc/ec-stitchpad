@@ -1070,6 +1070,12 @@ PY
     if [ -n "$_model" ]; then
       printf '%s' "$_model" > "$PAD_STATE/model.$nm"
       echo "✓ model for @$nm: $_model"
+      # TASK-1: the env readback is RESOLVED telemetry, persisted separately
+      # from the operator's requested pin. A drift (e.g. env reports
+      # claude-fable-5 while seat-model pins gpt-5.6-sol) surfaces loudly and
+      # drops an active mismatch marker; binding itself never refuses.
+      sp_model_pin_record_resolved "$PAD_STATE" "$nm" "$_model" "" "bind-session-env" "$sid" || true
+      sp_model_pin_check "$PAD_STATE" "$nm" || true
     fi
     # Push-target capture is owned by MCP/pi Herdr join and SessionStart repair.
     # Honor the same explicit autostart opt-out as join; tests and maintenance

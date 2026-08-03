@@ -74,6 +74,12 @@ for _name in $(echo "[$roster]" | jq -r '.[].name' 2>/dev/null); do
   if [ "$_adp0" = "ocean" ] && [ -n "$_tgt" ] && [ "$_tgt" != "-" ]; then
     _live="$(curl -sf --max-time 2 "${OCEAN_DAEMON_URL:-http://127.0.0.1:4780}/v1/agent/sessions/$_tgt/config" 2>/dev/null | jq -r '.model // empty' 2>/dev/null)"
     if [ -n "$_live" ]; then _model="$_live"; printf '%s' "$_live" > "$padd/.state/model.$_name" 2>/dev/null; fi
+    # TASK-1: mirror the daemon readback into the resolved record (telemetry
+    # only ever writes resolved-*, never the operator's seat-model pin).
+    if [ -n "$_live" ]; then
+      printf '%s' "$_live" > "$padd/.state/resolved-model.$_name" 2>/dev/null
+      printf 'session-config-rpc|%s|%s' "$(date +%s)" "$_tgt" > "$padd/.state/resolved-model-meta.$_name" 2>/dev/null
+    fi
     # what the session ACTUALLY ran last: clients (TUI/GUI) pass explicit
     # per-turn models that outrank the session default the chip shows
     _last_model="$(tail -c 2000000 /tmp/ocean-daemon.log 2>/dev/null | perl -pe 's/\e\[[0-9;]*m//g' | grep "provider_stream" | grep "$_tgt" | tail -1 | grep -oE 'model=[a-zA-Z0-9._-]+' | head -1 | cut -d= -f2)"
