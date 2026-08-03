@@ -628,35 +628,50 @@ PY
 }
 
 sp_lock() {
-  local lock="$PAD_STATE/.lock" waited=0 age now mtime observed pid_capture
+  local lock="$PAD_STATE/.lock" age now mtime observed pid_capture _jitter
+  local _start _elapsed
+  _start=$(date +%s)
   while ! mkdir "$lock" 2>/dev/null; do
-    # Break a stale lock only when its exact recorded owner is no longer live.
+    # Break a stale lock when its exact recorded owner is no longer live.
     # A long-running but live writer is never evicted merely because the lock's
     # directory mtime is old.
     if [ -d "$lock" ]; then
       now=$(date +%s)
       mtime=$(stat -f %m "$lock" 2>/dev/null || stat -c %Y "$lock" 2>/dev/null || echo "$now")
       age=$(( now - mtime ))
-      if [ "$age" -ge "$SP_LOCK_STALE" ]; then
-        if [ -f "$lock/owner" ]; then
-          if sp_lock_owner_is_valid "$lock" && ! sp_lock_owner_is_live "$lock"; then
-            observed="$(cat "$lock/owner" 2>/dev/null || true)"
-            [ -n "$observed" ] && [ "$(cat "$lock/owner" 2>/dev/null || true)" = "$observed" ] \
-              && rm -f "$lock/owner" 2>/dev/null || true
-            rmdir "$lock" 2>/dev/null || true
-            [ -d "$lock" ] || continue
-          fi
-        else
-          # Compatibility for an empty pre-generation lock. Non-empty unknown
-          # locks fail closed because their contents are not ownership proof.
+      # F2: proactive dead-holder reclaim. Before waiting out SP_LOCK_STALE,
+      # check if the owner manifest is valid AND the owner PID is provably
+      # dead (kill -0 fails or processStart/command mismatch). A SIGKILL'd
+      # holder is dead immediately — there's no reason to wait 30s for the
+      # stale window. This runs on EVERY loop iteration (every ~0.05s).
+      # Falls through to the age-based check below for empty/unknown locks.
+      if [ -f "$lock/owner" ] && sp_lock_owner_is_valid "$lock"; then
+        if ! sp_lock_owner_is_live "$lock"; then
+          observed="$(cat "$lock/owner" 2>/dev/null || true)"
+          [ -n "$observed" ] && [ "$(cat "$lock/owner" 2>/dev/null || true)" = "$observed" ] \
+            && rm -f "$lock/owner" 2>/dev/null || true
           rmdir "$lock" 2>/dev/null || true
           [ -d "$lock" ] || continue
         fi
+      elif [ "$age" -ge "$SP_LOCK_STALE" ]; then
+        # Fallback: age-based stale-break for pre-generation or empty locks.
+        # Non-empty unknown locks fail closed because their contents are not
+        # ownership proof.
+        rmdir "$lock" 2>/dev/null || true
+        [ -d "$lock" ] || continue
       fi
     fi
-    waited=$(( waited + 1 ))
-    [ "$waited" -ge $(( SP_LOCK_TIMEOUT * 10 )) ] && { echo "stitchpad: pad busy (lock timeout)" >&2; return 1; }
-    sleep 0.1
+    # F1: track elapsed wall-clock time (not iteration count) since jitter
+    # makes each iteration variable-length.
+    now=$(date +%s)
+    _elapsed=$(( now - _start ))
+    [ "$_elapsed" -ge "$SP_LOCK_TIMEOUT" ] && { echo "stitchpad: pad busy (lock timeout)" >&2; return 1; }
+    # F1: jittered backoff instead of fixed 0.1s. Under N>=10 concurrent
+    # writers, a fixed sleep causes thundering-herd: all losers retry on the
+    # same tick and the winner is one mkdir among N. Jitter spreads the
+    # retries across the interval, increasing the effective admission rate.
+    _jitter=$(( (RANDOM % 10) + 1 ))   # 1-10 centiseconds (0.01-0.10s)
+    sleep 0.${_jitter}
   done
   _SP_LOCK_DIR="$lock"
   # `$$` does not change in a Bash 3.2 subshell. Ask a direct child for its

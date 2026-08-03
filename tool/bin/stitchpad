@@ -1098,7 +1098,13 @@ PY
         ;;
       --claim)
         hid="${2:?usage: shift-change --claim <id>}"
-        _n="$(/usr/bin/sqlite3 "$db" "UPDATE handoffs SET status='delivering', at='$(date '+%Y-%m-%dT%H:%M:%S')' WHERE id=${hid//[!0-9]/} AND status IN ('pending','delivering'); SELECT changes();")"
+        # F4: atomic compare-and-set — only transition pending→delivering.
+        # The previous WHERE matched status IN ('pending','delivering'), so the
+        # first claim's own pending→delivering flip left the row matching for
+        # every subsequent claimant (18/24 concurrent claims won in fx3's probe).
+        # Now only 'pending' matches: the first claim flips it to 'delivering'
+        # and every later caller sees changes()=0 and is refused.
+        _n="$(/usr/bin/sqlite3 "$db" "UPDATE handoffs SET status='delivering', at='$(date '+%Y-%m-%dT%H:%M:%S')' WHERE id=${hid//[!0-9]/} AND status='pending'; SELECT changes();")"
         [ "${_n:-0}" -ge 1 ] || { echo "stitchpad: handoff $hid not claimable" >&2; exit 1; }
         _bf="$PAD_STATE/shift.$hid.txt"
         /usr/bin/sqlite3 "$db" "SELECT body FROM handoffs WHERE id=${hid//[!0-9]/};" > "$_bf"

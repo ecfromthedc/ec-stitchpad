@@ -74,34 +74,55 @@ _sp_recovery_file() {
 }
 
 # Record an attempt: increment count, stamp first_epoch if new.
+# F3: atomic read-modify-write via kernel-level fcntl.flock. fx3 proved 6/40
+# lost increments under concurrency because the bare cat|cut|count|printf>file
+# RMW raced. The per-key mkdir-atomic lock was insufficient under high
+# contention (timeout at 3s with 40 writers needing ~4s). fcntl.flock is a
+# kernel-level mutex: blocking, zero-contention-loss, auto-released on process
+# death (no stale-lock cleanup needed). The read-increment-write is performed
+# atomically inside the lock in a single Python invocation.
 sp_recovery_attempt_record() {
   local state_file="$1" key="$2"
-  local dir file count first_epoch now
+  local dir file
   dir="$(_sp_recovery_attempts_dir)"
   _sp_recovery_safe_mkdir || return 1
   file="$(_sp_recovery_file "$state_file" "$key")"
-  now="$(date +%s)"
-  if [ -f "$file" ] && [ ! -L "$file" ]; then
-    count="$(cat "$file" 2>/dev/null | cut -d'|' -f1)"
-    first_epoch="$(cat "$file" 2>/dev/null | cut -d'|' -f2)"
-    case "$count" in *[!0-9]*|'') count=0;; esac
-    case "$first_epoch" in *[!0-9]*|'') first_epoch="$now";; esac
-    # E5a: a stored count outside the sane range [0, 999] is corrupt — either
-    # poisoned (999999) or garbage. Reset it to 0 instead of capping, so the
-    # record itself (count+1 below) produces a clean 1 rather than carrying
-    # forward a huge value. The real guard against poisoning lives in
-    # is_exhausted (see below): an out-of-range stored count is treated as
-    # corrupt there too, so it can never cause a premature terminal refusal.
-    if [ "$count" -gt 999 ] 2>/dev/null || [ "$count" -lt 0 ] 2>/dev/null; then
-      echo "stitchpad: recovery counter for $key is corrupt (count=$count); resetting to 0" >&2
-      count=0
-    fi
-    count=$((count + 1))
-  else
-    count=1
-    first_epoch="$now"
-  fi
-  printf '%s|%s' "$count" "$first_epoch" > "$file"
+  python3 - "$file" <<'PYF3'
+import fcntl, os, sys, time
+path = sys.argv[1]
+try:
+    fd = os.open(path, os.O_RDWR | os.O_CREAT, 0o644)
+except OSError as e:
+    print(f"stitchpad: recovery counter open failed: {e}", file=sys.stderr)
+    sys.exit(1)
+fcntl.flock(fd, fcntl.LOCK_EX)
+try:
+    raw = b""
+    try:
+        raw = os.read(fd, 4096)
+    except OSError:
+        pass
+    now = int(time.time())
+    if b'|' in raw:
+        parts = raw.split(b'|', 1)
+        try: count = int(parts[0])
+        except (ValueError, IndexError): count = 0
+        try: first_epoch = int(parts[1].strip())
+        except (ValueError, IndexError): first_epoch = now
+    else:
+        count = 0
+        first_epoch = now
+    if count > 999 or count < 0:
+        print(f"stitchpad: recovery counter corrupt (count={count}); resetting to 0", file=sys.stderr)
+        count = 0
+    count += 1
+    os.lseek(fd, 0, os.SEEK_SET)
+    os.ftruncate(fd, 0)
+    os.write(fd, f"{count}|{first_epoch}".encode())
+finally:
+    fcntl.flock(fd, fcntl.LOCK_UN)
+    os.close(fd)
+PYF3
 }
 
 # Print the current attempt count for a key (0 if none).
