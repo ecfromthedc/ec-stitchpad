@@ -3,7 +3,7 @@ set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 SP="$ROOT/tool/bin/stitchpad"
-tmp="$(mktemp -d /tmp/stitchpad-heartbeat-races.XXXXXX)"
+tmp="$(mktemp -d "${TMPDIR:-/tmp}/stitchpad-heartbeat-races.XXXXXX")"
 bg=""
 foreign=""
 cleanup() {

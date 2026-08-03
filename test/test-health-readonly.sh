@@ -3,7 +3,7 @@ set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 SP="$ROOT/tool/bin/stitchpad"
-TMP="$(mktemp -d /tmp/stitchpad-health-test.XXXXXX)"
+TMP="$(mktemp -d "${TMPDIR:-/tmp}/stitchpad-health-test.XXXXXX")"
 PAD="$TMP/project/.stitchpad"
 STATE="$PAD/.state"
 SERVER_PID=""

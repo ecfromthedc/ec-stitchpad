@@ -7,7 +7,7 @@ export STITCHPAD_HOME="$ROOT/tool"
 
 fail() { printf 'FAIL: %s\n' "$1" >&2; exit 1; }
 
-tmp="$(mktemp -d /tmp/stitchpad-pad-safety.XXXXXX)"
+tmp="$(mktemp -d "${TMPDIR:-/tmp}/stitchpad-pad-safety.XXXXXX")"
 cleanup() {
   if [ -d "$tmp/.stitchpad" ]; then
     STITCHPAD_PAD_DIR="$tmp/.stitchpad" "$SP" daemon stop >/dev/null 2>&1 || true

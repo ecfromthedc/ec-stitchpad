@@ -3,7 +3,7 @@ set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 SP="$ROOT/tool/bin/stitchpad"
-base="$(mktemp -d /tmp/stitchpad-watcher-races.XXXXXX)"
+base="$(mktemp -d "${TMPDIR:-/tmp}/stitchpad-watcher-races.XXXXXX")"
 tmp="$base/pipe | restart"
 ensure_pid=""
 orphan_pid=""

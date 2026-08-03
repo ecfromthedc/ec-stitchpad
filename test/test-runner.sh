@@ -2,7 +2,7 @@
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-tmp="$(mktemp -d /tmp/stitchpad-test-runner.XXXXXX)"
+tmp="$(mktemp -d "${TMPDIR:-/tmp}/stitchpad-test-runner.XXXXXX")"
 canary_pid=""
 cleanup() {
   if [ -n "$canary_pid" ] && kill -0 "$canary_pid" 2>/dev/null; then
@@ -94,5 +94,18 @@ kill -0 "$canary_pid" 2>/dev/null || fail "runner killed a same-command foreign 
 kill "$canary_pid" 2>/dev/null || true
 wait "$canary_pid" 2>/dev/null || true
 canary_pid=""
+
+# A TMPDIR containing spaces must flow through the aggregate runner: per-fixture
+# registry/output staging, fixture discovery, and the summary all keep working,
+# and nothing staged leaks into that TMPDIR afterwards.
+spaced_tmp="$tmp/tmp with spaces"
+mkdir -p "$spaced_tmp"
+: > "$runlog"
+out="$(env -u STITCHPAD_HOME -u PASTURE_HOME RUNNER_LOG="$runlog" TMPDIR="$spaced_tmp" \
+  STITCHPAD_HEARTBEAT_AUTOSTART=0 "$tmp/tool/bin/stitchpad" test)"
+contains "$out" 'Results: 5 passed, 0 failed, 5 total' || fail "spaced-TMPDIR summary is not truthful"
+[ "$(wc -l < "$runlog" | tr -d ' ')" = "5" ] || fail "spaced-TMPDIR run did not execute all fixtures"
+[ -z "$(find "$spaced_tmp" -mindepth 1 -print -quit)" ] \
+  || fail "runner leaked staged registry/output files into a spaced TMPDIR"
 
 echo "test runner ok"

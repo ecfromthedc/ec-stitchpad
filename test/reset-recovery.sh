@@ -3,7 +3,7 @@ set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 SP="$ROOT/tool/bin/stitchpad"
-tmp="$(mktemp -d /tmp/stitchpad-reset-recovery.XXXXXX)"
+tmp="$(mktemp -d "${TMPDIR:-/tmp}/stitchpad-reset-recovery.XXXXXX")"
 foreign_pid=""
 reset_pid=""
 cleanup() {

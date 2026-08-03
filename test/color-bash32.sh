@@ -3,7 +3,7 @@ set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 SP="$ROOT/tool/bin/stitchpad"
-TMP="$(mktemp -d /tmp/stitchpad-color-bash32.XXXXXX)"
+TMP="$(mktemp -d "${TMPDIR:-/tmp}/stitchpad-color-bash32.XXXXXX")"
 cleanup() {
   STITCHPAD_PAD_DIR="$TMP/.stitchpad" "$SP" daemon stop >/dev/null 2>&1 || true
   rm -rf "$TMP"

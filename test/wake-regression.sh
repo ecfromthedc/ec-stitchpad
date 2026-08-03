@@ -50,7 +50,7 @@ wait_for_fswatch() {
 }
 
 HOST_HOME="$HOME"
-tmp="$(mktemp -d /tmp/stitchpad-wake-regression.XXXXXX)"
+tmp="$(mktemp -d "${TMPDIR:-/tmp}/stitchpad-wake-regression.XXXXXX")"
 mkdir -p "$tmp/home"
 export HOME="$tmp/home"
 

@@ -3,7 +3,7 @@ set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 SP="$ROOT/tool/bin/stitchpad"
-tmp="$(mktemp -d /tmp/stitchpad-seat-keeper.XXXXXX)"
+tmp="$(mktemp -d "${TMPDIR:-/tmp}/stitchpad-seat-keeper.XXXXXX")"
 keeper_one=""
 keeper_two=""
 cleanup() {

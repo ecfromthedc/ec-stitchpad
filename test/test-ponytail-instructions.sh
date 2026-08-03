@@ -6,7 +6,7 @@ set -euo pipefail
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 SP="$ROOT/tool/bin/stitchpad"
 export STITCHPAD_HOME="$ROOT/tool"
-TMP="$(mktemp -d /tmp/stitchpad-ponytail-test.XXXXXX)"
+TMP="$(mktemp -d "${TMPDIR:-/tmp}/stitchpad-ponytail-test.XXXXXX")"
 mkdir -p "$TMP/home"
 export HOME="$TMP/home"
 unset HERDR_PANE_ID HERDR_TAB_ID HERDR_ENV HERDR_SOCKET_PATH HERDR_WORKSPACE_ID 2>/dev/null || true
