@@ -104,9 +104,10 @@ sp_scope_record_violation() {
 
 # Check the current seat's scope for a write path. If denied, record a sticky
 # violation and return 1. Call this before any project file write.
+# Optional $2 overrides the seat (for testing/explicit dispatch).
 sp_scope_check_write() {
   local path="$1" seat manifest
-  seat="$(_sp_scope_seat)"
+  seat="${2:-$(_sp_scope_seat)}"
   if sp_scope_allows "$seat" "$path"; then
     return 0
   fi
