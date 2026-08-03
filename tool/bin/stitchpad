@@ -1137,13 +1137,22 @@ PY
       echo "stitchpad: search -n must be a positive integer" >&2; exit 1 ;;
     esac
     echo "— live pad —"
-    grep -in -- "$q" "$PAD_MD" | head -n "$n" || true
+    # C13-GAP (fx1, on km1 1c330ef): the QUERY was interpolated raw into both
+    # sinks — grep read it as a PATTERN (regex metacharacters; a lone trailing
+    # backslash errored the whole live section) and LIKE read % and _ as
+    # wildcards (a '%' query enumerated the ENTIRE archive; '_' false-matched).
+    # Live side: fixed-string match — the query is data, never a pattern.
+    grep -inF -- "$q" "$PAD_MD" | head -n "$n" || true
     db="$PAD_STATE/archive.sqlite"
     if [ -f "$db" ]; then
       echo "— archive —"
-      qq="$(printf '%s' "$q" | sed "s/'/''/g")"
+      # Archive side: escape LIKE wildcards with an explicit ESCAPE clause.
+      # Order matters: backslash first (it is the escape char), then % and _,
+      # then single-quote doubling (SQL literal). '\%' matches a literal
+      # percent; '\\' matches one literal backslash; quotes stay doubled.
+      qq="$(printf '%s' "$q" | sed -e 's/\\/\\\\/g' -e 's/%/\\%/g' -e 's/_/\\_/g' -e "s/'/''/g")"
       /usr/bin/sqlite3 -separator ' | ' "$db" \
-        "SELECT 'gen'||gen, at_label, '@'||author, substr(replace(body, char(10), ' '),1,160) FROM messages WHERE body LIKE '%$qq%' OR author LIKE '%$qq%' ORDER BY id DESC LIMIT $n;"
+        "SELECT 'gen'||gen, at_label, '@'||author, substr(replace(body, char(10), ' '),1,160) FROM messages WHERE body LIKE '%$qq%' ESCAPE '\' OR author LIKE '%$qq%' ESCAPE '\' ORDER BY id DESC LIMIT $n;"
     fi
     ;;
 
