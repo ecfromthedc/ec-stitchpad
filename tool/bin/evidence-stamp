@@ -1,0 +1,119 @@
+#!/usr/bin/env bash
+# evidence-stamp — label a verification artifact with environment facts and the
+# immutable candidate identity (TASK-6).
+#
+# Records what the card demands, nothing more:
+#   environment facts : os, bash version, awk variant, python3 version,
+#                       TMPDIR shape (unset|plain|spaces), ambient session vars
+#                       PRESENT (names only, never values)
+#   candidate identity: git SHA + tree of the checkout under test, dirty flag
+#   context           : auth tier (STITCHPAD_EVIDENCE_AUTH), invoking command
+#                       (STITCHPAD_EVIDENCE_COMMAND or argv), optional --note
+#
+# Usage:
+#   evidence-stamp                     human-readable block
+#   evidence-stamp --canonical         one comparable line (stable, sortable)
+#   evidence-stamp --compare A B       exit 0 iff A == B (canonical lines)
+#   evidence-stamp --note '...'        attach a limitation/context note
+#
+# Deliberately value-free for ambient session vars (presence only): a session
+# id or token must never leak into evidence. Two runs in the SAME environment
+# at the SAME candidate produce byte-identical canonical lines; any environment
+# delta (TMPDIR shape, awk/python variant, session-var presence, OS) or
+# candidate delta (SHA/tree/dirty) changes them. This is the fix for the
+# env-dependent false results class: glm ambient-sid, pro2 stderr-json,
+# glm sliceB 21/9, and flash2 awk-variance.
+set -u
+
+BIN_DIR="$(cd -P "$(dirname "$0")" && pwd)"
+ROOT="$(cd -P "$BIN_DIR/../.." && pwd)"
+
+sanitize() {
+  printf '%s' "$1" | tr '|' ' ' | tr ' \t\n' '_' | cut -c1-120
+}
+
+# ---- immutable candidate identity (SHA + tree + dirty flag) ----
+sha="unknown"; tree="unknown"; dirty="unknown"
+if command -v git >/dev/null 2>&1 && git -C "$ROOT" rev-parse --git-dir >/dev/null 2>&1; then
+  sha="$(git -C "$ROOT" rev-parse HEAD 2>/dev/null || echo unknown)"
+  tree="$(git -C "$ROOT" rev-parse 'HEAD^{tree}' 2>/dev/null || echo unknown)"
+  if [ -n "$(git -C "$ROOT" status --porcelain 2>/dev/null)" ]; then dirty="yes"; else dirty="no"; fi
+fi
+
+# ---- environment facts ----
+os="$(sanitize "$(uname -s 2>/dev/null) $(uname -r 2>/dev/null) $(uname -m 2>/dev/null)")"
+[ -n "$os" ] || os="unknown"
+
+bash_v="$(sanitize "${BASH_VERSION:-unknown}")"
+[ -n "$bash_v" ] || bash_v="unknown"
+
+awk_v="$(awk --version 2>&1 | head -1 | cut -c1-80)"
+awk_v="$(sanitize "${awk_v:-unknown}")"
+[ -n "$awk_v" ] || awk_v="unknown"
+
+py_v="$(python3 --version 2>&1 | head -1 | cut -c1-80)"
+py_v="$(sanitize "${py_v:-unknown}")"
+[ -n "$py_v" ] || py_v="unknown"
+
+tmpdir_shape="unset"
+if [ -n "${TMPDIR:-}" ]; then
+  # `$(printf "\n")` would be stripped by command substitution (trailing
+  # newline removal → empty pattern → matches everything); use ANSI-C quotes.
+  case "$TMPDIR" in
+    *' '*|*$'\t'*|*$'\n'*) tmpdir_shape="spaces" ;;
+    *) tmpdir_shape="plain" ;;
+  esac
+fi
+
+session_vars="none"
+_joined=""
+for _v in HERDR_PANE_ID HERDR_TAB_ID HERDR_ENV HERDR_SOCKET_PATH HERDR_WORKSPACE_ID \
+          STITCHPAD_NAME STITCHPAD_CWD STITCHPAD_SESSION STITCHPAD_PAD_DIR SESSION_ID \
+          SP_DATE_DIVIDER_CLOCK; do
+  if printenv "$_v" >/dev/null 2>&1; then
+    if [ -z "$_joined" ]; then _joined="$_v"; else _joined="$_joined,$_v"; fi
+  fi
+done
+[ -z "$_joined" ] || session_vars="$_joined"
+
+# ---- context ----
+auth="$(sanitize "${STITCHPAD_EVIDENCE_AUTH:-unknown}")"
+command="${STITCHPAD_EVIDENCE_COMMAND:-}"
+if [ -z "$command" ]; then command="$0 $*"; fi
+command="$(sanitize "$command")"
+
+mode="block"
+note=""
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --canonical) mode="canonical"; shift ;;
+    --compare) mode="compare"; shift; [ $# -ge 2 ] || { echo "usage: evidence-stamp --compare A B" >&2; exit 2; }; a="$1"; b="$2"; break ;;
+    --note) shift; note="${1:-}"; shift ;;
+    *) shift ;;
+  esac
+done
+note="$(sanitize "$note")"
+
+canonical="evidence|v1|sha=$sha|tree=$tree|dirty=$dirty|os=$os|bash=$bash_v|awk=$awk_v|python=$py_v|tmpdir_shape=$tmpdir_shape|session_vars=$session_vars|auth=$auth|command=$command|note=$note"
+
+case "$mode" in
+  compare)
+    if [ "$a" = "$b" ]; then
+      echo "equal"
+      exit 0
+    fi
+    echo "differ" >&2
+    exit 1
+    ;;
+  canonical)
+    printf '%s\n' "$canonical"
+    ;;
+  block)
+    printf '%s\n' \
+      "# evidence-stamp v1" \
+      "# candidate: sha=$sha tree=$tree dirty=$dirty" \
+      "# env: os=$os | bash=$bash_v | awk=$awk_v | python=$py_v | tmpdir_shape=$tmpdir_shape | session_vars=$session_vars" \
+      "# context: auth=$auth | command=$command | note=$note"
+    ;;
+esac
+exit 0

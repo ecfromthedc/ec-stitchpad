@@ -489,7 +489,11 @@ EOF
         echo "stitchpad: @$who already has unresolved recovery state; refusing to overwrite it" >&2
         return 1
       fi
-      engagement="$(sp_engagement "$who" "$((ordinal - 1))")"
+      # raw scan (old forward contract): ordinal IS the first mention > ordinal-1
+      # even when a later addressed reply closed it — lets us distinguish
+      # "answered" (open==ordinal and a same-sender reply closed it) from
+      # "not open" (ordinal is not a mention to @$who at all).
+      engagement="$(sp_engagement "$who" "$((ordinal - 1))" raw)"
       read -r open sender last_reply reply_target <<<"$engagement"
       if [ "${open:-0}" != "$ordinal" ]; then
         echo "stitchpad: mention ordinal $ordinal is not currently open for @$who" >&2
@@ -2210,7 +2214,13 @@ except Exception:
       exit 0   # muted locally; leave seen untouched so the mention queues
     fi
     # Unanswered → compact one-liner wake message (no "untrusted" alarm noise).
-    _latest="$(sp_latest_to "$who" "$_since")"
+    # Fetch the delivery block BY the gate ordinal (sp_engagement returns the
+    # first OPEN mention; sp_latest_to's single forward pass would return the
+    # first mention > seen even when that mention was already answered by a
+    # newer same-sender reply, mis-printing the old question instead of the
+    # later sender's). sp_message_ordinal keeps the nudge byte-exact with the
+    # ordinal whose FIFO cursor will advance.
+    _latest="$(sp_message_ordinal "$oldest_mention_to_me")"
     _sender="$(printf '%s\n' "$_latest" | sed -n 's/^## @\([^ ]*\).*/\1/p' | head -1)"
     [ -n "$_sender" ] || _sender="$who"
     _snip="$(printf '%s\n' "$_latest" | grep -v '^## ' | grep -v '^[[:space:]]*$' | head -1 | sed 's/^[[:space:]]*//' | cut -c1-120)"
@@ -2683,6 +2693,15 @@ except: print("")' 2>/dev/null)"
       exit 1
     fi
     echo "=== stitchpad test ==="
+    # TASK-6: label the whole run with environment facts + the immutable
+    # candidate (SHA/tree) so a green/red result can never be mistaken for
+    # one of a different environment or commit. Value-free for session vars.
+    if [ -x "$STITCHPAD_HOME/bin/evidence-stamp" ]; then
+      echo "--- evidence ---"
+      STITCHPAD_EVIDENCE_COMMAND="stitchpad test" \
+        "$STITCHPAD_HOME/bin/evidence-stamp" 2>/dev/null || true
+      echo "--- evidence ---"
+    fi
     echo ""
     for t in "${tests[@]}"; do
       total=$((total + 1))

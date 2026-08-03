@@ -128,6 +128,14 @@ trap cleanup EXIT
 
 export STITCHPAD_HOME="$ROOT/tool"
 
+# TASK-6 evidence label: stamp environment facts + immutable candidate (SHA/
+# tree) into the suite log so a green/red result is bound to the exact
+# environment and commit that produced it. Value-free for ambient session vars.
+if [ -x "$STITCHPAD_HOME/bin/evidence-stamp" ]; then
+  STITCHPAD_EVIDENCE_COMMAND="wake-regression.sh" \
+    "$STITCHPAD_HOME/bin/evidence-stamp" 2>/dev/null || true
+fi
+
 # Startup/stop race: pause a foreground watcher after exact owner publication
 # but before fswatch. Stop must remove that generation, make the signal handler
 # exit (not continue), and leave neither a lock nor an orphan process.
@@ -645,6 +653,61 @@ EOF
 	  || fail 'ocean successful delivery left supervised pending state'
 	[ ! -f "$case13/.stitchpad/.state/pending.agent" ] \
 	  || fail 'ocean successful delivery left replay-causing pending stamp'
+
+	# Regression 14: reply-target extraction must scan ALL reply tokens in
+	# ordinal order, not just the second one. A reply whose @target sits past
+	# token 2 (e.g. "sure thing @alice" — @alice is token 4) must still populate
+	# reply_target so the same-sender gate fires. Pre-fix the awk used
+	# `for (i in tokens)` + `if (i > 20) break` — hash-order iteration visits
+	# token 2 first and the STRING comparison "2" > "20" breaks immediately, so
+	# only token 2 was ever examined; reply_target stayed empty and the
+	# already-answered sender was re-woken forever (flash2 Defect A).
+	case14="$tmp/case14"
+	mkdir "$case14"
+	cd "$case14"
+	"$SP" init --name case14 >/dev/null
+	"$SP" join agent codex >/dev/null
+	"$SP" join alice claude >/dev/null
+	stop_watcher "$case14"
+	STITCHPAD_NAME=alice "$SP" say '@agent question from alice' >/dev/null
+	STITCHPAD_NAME=agent "$SP" say 'sure thing @alice' >/dev/null   # @alice is token 4, not token 2
+	out14="$("$SP" wake agent)"
+	[ -z "$out14" ] || {
+	  printf '%s\n' "$out14" >&2
+	  fail 'reply-target: @target past token 2 did not clear the same-sender gate'
+	}
+
+	# Regression 15: a reply suppresses ONLY the answered mention. When the
+	# FIRST (oldest) mention is already answered by the agent's own reply,
+	# later mentions from OTHER senders must still deliver FIFO — not starve
+	# behind a gate that fires on the answered mention and exits before
+	# advancing the seen cursor. Pre-fix nothing ever delivered charlie's
+	# newer mention (only `wake --force N` could escape) (flash2 Defect B).
+	case15="$tmp/case15"
+	mkdir "$case15"
+	cd "$case15"
+	"$SP" init --name case15 >/dev/null
+	"$SP" join agent codex >/dev/null
+	"$SP" join alice claude >/dev/null
+	"$SP" join charlie claude >/dev/null
+	stop_watcher "$case15"
+	STITCHPAD_NAME=alice "$SP" say '@agent question from alice' >/dev/null      # ord 1
+	STITCHPAD_NAME=agent "$SP" say '@alice answered' >/dev/null                 # ord 2 — clears alice's mention
+	STITCHPAD_NAME=charlie "$SP" say '@agent question from charlie' >/dev/null  # ord 3 — must still deliver
+	out15="$("$SP" wake agent)"
+	contains "$out15" 'question from charlie' \
+	  || fail 'reply-clears-gate starved a later mention from another sender'
+	if contains "$out15" 'question from alice'; then
+	  printf '%s\n' "$out15" >&2
+	  fail 'reply-clears-gate re-delivered the already-answered mention'
+	fi
+	# FIFO cursor consumed charlie's mention (ordinal 3), not alice's (1)
+	_seen15="$(cat "$case15/.stitchpad/.state/seen.agent" 2>/dev/null || echo 0)"
+	[ "$_seen15" -eq 3 ] \
+	  || fail "reply-clears-gate advanced seen to wrong ordinal: $_seen15 (want 3)"
+	# Everything drained → the next wake is silent
+	second15="$("$SP" wake agent)"
+	[ -z "$second15" ] || fail 'reply-clears-gate left an extra mention queued'
 
 	stop_all_fixture_runtime
 	cleanup_fixture_registry
