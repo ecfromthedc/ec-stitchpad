@@ -649,18 +649,32 @@ if data:
 # bind-session into .state/sessions/<sid>). Prints the sid bound to <name>, or
 # nothing when the seat has no binding — a missing identity stays visibly
 # empty, never minted. Read-only.
+#
+# F6: when several bindings name the same seat (a rotation leaves the stale
+# sid's file in place), resolve to the NEWEST binding by file mtime — never
+# the lexicographically first, which attributes rotate/terminal/redeliver to
+# the stale session. Equal mtimes break toward the lexicographically larger
+# sid (deterministic; matches sid-probe-002 > sid-probe-001 ordering).
 sp_session_registry_sid_for_name() {
-  local who="${1:-}" f sid
+  local who="${1:-}" f sid best_sid="" best_mtime=-1 m
   [ -n "$who" ] || return 0
   for f in "$PAD_STATE"/sessions/*; do
     [ -f "$f" ] && [ ! -L "$f" ] || continue
     [ "$(tr -d '[:space:]' < "$f" 2>/dev/null)" = "$who" ] || continue
     sid="$(basename "$f")"
-    if sp_session_registry_validate_sid "$sid"; then
-      printf '%s' "$sid"
-      return 0
+    if ! sp_session_registry_validate_sid "$sid"; then
+      continue
     fi
-  done < <(_sp_session_registry_journal_orphans 2>/dev/null)
+    m="$(stat -f %m "$f" 2>/dev/null || stat -c %Y "$f" 2>/dev/null)"
+    case "$m" in ''|*[!0-9]*) m=0 ;; esac
+    if [ "$m" -gt "$best_mtime" ]; then
+      best_mtime="$m"; best_sid="$sid"
+    elif [ "$m" -eq "$best_mtime" ] && [ -n "$best_sid" ] \
+         && [ "$(printf '%s\n%s\n' "$best_sid" "$sid" | sort | tail -1)" = "$sid" ]; then
+      best_sid="$sid"
+    fi
+  done
+  [ -n "$best_sid" ] && printf '%s' "$best_sid"
   return 0
 }
 

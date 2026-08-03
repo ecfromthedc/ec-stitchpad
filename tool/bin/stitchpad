@@ -463,7 +463,7 @@ EOF
     }
 
     _reset_validate_redelivery() {
-      local who="$1" ordinal="$2" wake_mode binding="" sf identity engagement open sender last_reply reply_target
+      local who="$1" ordinal="$2" wake_mode binding="" identity engagement open sender last_reply reply_target
       case "$ordinal" in
         ''|0|0[0-9]*|*[!0-9]*)
           echo "stitchpad: --redeliver requires a positive mention ordinal (never 0)" >&2
@@ -479,13 +479,9 @@ EOF
         echo "stitchpad: --redeliver is only supported for pull/hook seats; @$who uses ${wake_mode:-unknown} delivery supervision" >&2
         return 1
       fi
-      for sf in "$PAD_STATE"/sessions/*; do
-        [ -f "$sf" ] || continue
-        if [ "$(cat "$sf" 2>/dev/null)" = "$who" ]; then
-          binding="$(basename "$sf")"
-          break
-        fi
-      done
+      # F6: resolve the NEWEST binding for the seat (rotation leaves the stale
+      # sid's file in place; first-match directory order would target it).
+      binding="$(sp_session_registry_sid_for_name "$who")"
       if [ -z "$binding" ]; then
         echo "stitchpad: --redeliver requires a canonical sessions/<id> binding for @$who" >&2
         return 1
@@ -581,6 +577,66 @@ EOF
         0|0[0-9]*|*[!0-9]*) echo "stitchpad: --redeliver requires a positive mention ordinal (never 0)" >&2; exit 1;;
       esac
     fi
+    # F3: a reset of a seat (or the whole pad) is a cross-seat destructive
+    # mutation — it signals the target's delivery worker, cancels its
+    # in-flight Ocean turn, and --redeliver injects a forced replay into
+    # another seat's queue. Gate it: the caller must BE the target seat
+    # (self-repair, the stop-hook recovery flow) or carry TASK-5 operator
+    # authority — either a non-roster caller (the human operator, the N3
+    # pattern) or a deploy-level seat holding a one-shot operator grant for
+    # reset-others. Every gated cross-seat reset and EVERY redeliver
+    # injection is recorded in the append-only audit trail
+    # .state/reset-audit.jsonl; a failed audit write refuses the operation
+    # (fail-closed — an unaudited injection must never land).
+    _reset_audit() {  # $1=op $2=target $3=ordinal-or-empty → rc 0 on durable append
+      local _op="$1" _target="$2" _ord="${3:-}" _actor="${STITCHPAD_NAME:-operator}"
+      [ -n "$PAD_STATE" ] && [ -d "$PAD_STATE" ] && [ ! -L "$PAD_STATE" ] || return 1
+      python3 - "$PAD_STATE/reset-audit.jsonl" "$_op" "$_target" "$_ord" "$_actor" 2>/dev/null <<'PY'
+import json, os, sys, datetime
+path, op, target, ordinal, actor = sys.argv[1:6]
+if os.path.islink(path):
+    sys.exit(1)
+rec = {"t": datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+       "actor": actor, "op": op, "target": target}
+if ordinal:
+    rec["ordinal"] = int(ordinal)
+line = json.dumps(rec, separators=(",", ":"))
+try:
+    fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_APPEND | os.O_NOFOLLOW, 0o600)
+except OSError:
+    sys.exit(1)
+try:
+    os.write(fd, (line + "\n").encode("utf-8"))
+finally:
+    os.close(fd)
+PY
+    }
+    _reset_caller="${STITCHPAD_NAME:-}"
+    _reset_roster_names="$(sp_roster 2>/dev/null | cut -d'|' -f1 | tr '\n' ' ')"
+    _reset_cross_seat=0
+    if [ -n "$who" ]; then
+      [ "$_reset_caller" != "$who" ] && _reset_cross_seat=1
+    else
+      # whole-pad sweep mutates every roster seat's delivery state
+      [ -n "$_reset_roster_names" ] && _reset_cross_seat=1
+    fi
+    if [ "$_reset_cross_seat" -eq 1 ] && [ -n "$_reset_caller" ]; then
+      case " $_reset_roster_names " in
+        *" $_reset_caller "*)
+          # A roster member acting on OTHER seats needs TASK-5 deploy
+          # authority plus a one-shot operator grant for reset-others.
+          if ! sp_authority_check_deploy "$_reset_caller" reset-others; then
+            _reset_audit reset-denied "${who:-*}" "" 2>/dev/null || true
+            echo "stitchpad: AUTHORITY VIOLATION — @$_reset_caller may not reset ${who:+@$who}${who:-the pad} (cross-seat reset needs an operator grant for reset-others)" >&2
+            exit 1
+          fi
+          sp_authority_consume_grant "$_reset_caller" reset-others
+          ;;
+        *)
+          # Non-roster caller: the human operator (N3 pattern) — allowed.
+          ;;
+      esac
+    fi
     # N3+H4: --recovery-counters is an operator-only surface (TASK-5 authority)
     # to clear poisoned or exhausted recovery attempt counters. A seat may
     # never clear its own counters — that would defeat the bound. The caller's
@@ -616,13 +672,28 @@ EOF
         sp_recovery_reset_all "$PAD_STATE"
         echo "✓ all recovery counters cleared"
       fi
+      # F7: --recovery-counters is a counters-ONLY operation. Falling through
+      # into the seat/pad sweep would let a counter clear silently restart
+      # tickers and cancel in-flight turns — a destructive side effect the
+      # operator never asked for.
+      exit 0
     fi
     if [ -n "$who" ]; then
       sp_user_exists "$who" || { echo "stitchpad: @$who not in roster" >&2; exit 1; }
       [ -z "$redeliver" ] || _reset_validate_redelivery "$who" "$redeliver" || exit 1
+      if [ -n "$redeliver" ]; then
+        # F3: every replay injection is audited BEFORE it lands (fail-closed).
+        _reset_audit redeliver "$who" "$redeliver" \
+          || { echo "stitchpad: redeliver audit trail write failed — refusing to inject (fail-closed)" >&2; exit 1; }
+      fi
       echo "reset @$who:"
       _reset_seat "$who" || exit 1
       [ -z "$redeliver" ] || _reset_queue_redelivery "$who" "$redeliver" || exit 1
+      # F3: audit the completed reset (cross-seat only; self-repair is noise).
+      if [ "$_reset_cross_seat" -eq 1 ]; then
+        _reset_audit reset "$who" "" \
+          || echo "stitchpad: WARNING — reset audit trail write failed for @$who" >&2
+      fi
     else
       echo "reset pad ($PAD_DIR):"
       names="$(sp_roster | cut -d'|' -f1 | awk '{gsub(/^[ \t]+|[ \t]+$/,"");print}')"
@@ -679,6 +750,11 @@ EOF
     if [ "$reset_failures" -gt 0 ]; then
       echo "stitchpad: reset left $reset_failures unverified live ticker record(s) untouched" >&2
       exit 1
+    fi
+    # F3: audit a completed whole-pad sweep (cross-seat by definition).
+    if [ -z "$who" ] && [ "${_reset_cross_seat:-0}" -eq 1 ]; then
+      _reset_audit reset "*" "" \
+        || echo "stitchpad: WARNING — reset audit trail write failed for the pad sweep" >&2
     fi
     echo "✓ reset done"
     ;;
@@ -2254,6 +2330,18 @@ PY
         exit="$_rc" 2>/dev/null || true
       exit "$_rc"
     }
+    # F5: --peek-ordinal is a NON-DELIVERY inspection (the bridge doctor and
+    # watch.sh poll it per agent every 30s). Those polls are classified as
+    # `poll` events — kept as their own signal, never deleted — so polling
+    # volume can never inflate wake/delivery outcomes or crowd the bounded
+    # reader with false zero_run rows.
+    _poll_record() {  # $1=outcome $2=exitcode
+      local _oc="${1:-}" _rc="${2:-0}"
+      sp_telemetry_record poll seat="$who" outcome="$_oc" \
+        dur_ms=$(( $(sp_telemetry_now_ms) - _tel_start * 1000 )) \
+        exit="$_rc" 2>/dev/null || true
+      exit "$_rc"
+    }
     # Relay-mode wake: download pad from relay, run local wake logic against it
     if [ "$relay_mode" -eq 1 ]; then
       relay="${STITCHPAD_RELAY:-}"; token="${STITCHPAD_TOKEN:-}"; pad="${STITCHPAD_PAD:-}"
@@ -2332,20 +2420,24 @@ except Exception:
       fi
     fi
     read -r oldest_mention_to_me mention_sender last_reply_by_me reply_target <<<"$(sp_engagement "$who" "$_since")"
-    [ "${oldest_mention_to_me:-0}" -eq 0 ] && _wake_record zero_run 0   # no unanswered mention after seen → nothing to do
+    if [ "${oldest_mention_to_me:-0}" -eq 0 ]; then
+      # no unanswered mention after seen → nothing to do
+      if [ "$ordinal_only" -eq 1 ]; then _poll_record idle 0; else _wake_record zero_run 0; fi
+    fi
     # REPLY-CLEARS-GATE narrowed to same-sender: my reply only clears the gate
     # when it's directed at the SAME sender who mentioned me. Replying to X no
     # longer swallows Y's unanswered mention.
     if [ "${last_reply_by_me:-0}" -gt "$oldest_mention_to_me" ] \
        && [ -n "${mention_sender:-}" ] && [ -n "${reply_target:-}" ] \
        && [ "$reply_target" = "$mention_sender" ]; then
-      _wake_record noop 0   # my reply to the SAME sender is newer than their mention → handled
+      if [ "$ordinal_only" -eq 1 ]; then _poll_record noop 0; else _wake_record noop 0; fi
+      # my reply to the SAME sender is newer than their mention → handled
     fi
     # --peek-ordinal: gate is open (mention unanswered) → print the ordinal, done.
     # Uses the already-computed oldest_mention_to_me from sp_engagement; independent
     # of the seen cursor on purpose. Pending stamps answer "owes a reply" while
     # seen answers "already nudged". They answer different questions.
-    if [ "$ordinal_only" -eq 1 ]; then printf '%s' "$oldest_mention_to_me"; _wake_record peek 0; fi
+    if [ "$ordinal_only" -eq 1 ]; then printf '%s' "$oldest_mention_to_me"; _poll_record peek 0; fi
     # WAKE-ONCE with FIFO stepping: the seen cursor was already passed as `since`
     # to sp_engagement, which returned the first mention > seen. When we deliver
     # (non-peek), advance seen to exactly this mention's ordinal. The next wake
