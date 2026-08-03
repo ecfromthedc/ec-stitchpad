@@ -59,6 +59,9 @@ SESSION_IDLE_SECONDS="${SESSION_IDLE_SECONDS:-900}"
 SESSION_HISTORY_MAX="${SESSION_HISTORY_MAX:-64}"
 SESSION_HISTORY_LINES="${SESSION_HISTORY_LINES:-8}"
 
+# Recovery policy for bounded journal recovery attempts.
+[ -f "${BASH_SOURCE[0]%/*}/recovery-policy.sh" ] && source "${BASH_SOURCE[0]%/*}/recovery-policy.sh" || true
+
 # ── Session ID validation ──────────────────────────────────────────────
 # Session IDs appear in file paths (.state/session-start.$sid, etc).
 # Reject any that contain path traversal, shell metacharacters, or
@@ -816,6 +819,17 @@ sp_session_registry_journal_recover() {
       fi
     fi
     echo "stitchpad: recovering stale journal $(basename "$orphan") — restoring pre-crash state" >&2
+    # TASK-4: bound recovery attempts per-orphan. If exhausted, preserve the
+    # orphan for manual inspection instead of silently retrying forever.
+    local _recovery_key="journal:$(basename "$orphan")"
+    if type sp_recovery_is_exhausted >/dev/null 2>&1; then
+      if sp_recovery_is_exhausted "$PAD_STATE" "$_recovery_key"; then
+        type sp_recovery_terminal_refuse >/dev/null 2>&1 && \
+          sp_recovery_terminal_refuse "system" "journal-recovery" "$_recovery_key"
+        continue
+      fi
+      sp_recovery_attempt_record "$PAD_STATE" "$_recovery_key"
+    fi
     # R1: temporarily suppress env-resolved sids so _sp_session_registry_journal_files
     # enumerates ONLY the stamped sid's markers, never the recovering caller's.
     # Without this, sp_session_registry_sid() inside _sp_session_registry_journal_files
@@ -832,6 +846,9 @@ sp_session_registry_journal_recover() {
     if [ -n "$_save_claude" ]; then export CLAUDE_CODE_SESSION_ID="$_save_claude"; else unset CLAUDE_CODE_SESSION_ID; fi
     if [ -n "$_save_codex" ]; then export CODEX_SESSION_ID="$_save_codex"; else unset CODEX_SESSION_ID; fi
     rm -rf "$orphan" 2>/dev/null || true
+    # TASK-4: clear the recovery attempt counter on success.
+    type sp_recovery_reset >/dev/null 2>&1 && \
+      sp_recovery_reset "$PAD_STATE" "$_recovery_key" || true
   done
   return 0
 }

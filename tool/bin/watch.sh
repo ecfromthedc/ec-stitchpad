@@ -601,9 +601,29 @@ delivery_worker() {
     # of submitting a duplicate request.
     if [ "$adapter" = ocean ] && [ -n "$turn_id" ]; then
       if ! delivery_pending_matches "$name" "$generation" "$ordinal" "$message_id"; then
-        until delivery_cancel_ocean_turn "$name" "$turn_id" superseded_generation; do
+        # TASK-4: bound the cancel retry. The old code looped forever with
+        # `until delivery_cancel_ocean_turn ...; do sleep; done`. Now bounded
+        # by recovery-policy.sh: at most SP_RECOVERY_MAX_ATTEMPTS attempts
+        # (default 3) within the time budget, then terminal refusal.
+        local _cancel_key="cancel:$name:$turn_id:superseded_generation"
+        local _cancel_done=0
+        while ! delivery_cancel_ocean_turn "$name" "$turn_id" superseded_generation; do
+          if type sp_recovery_is_exhausted >/dev/null 2>&1 && \
+             sp_recovery_is_exhausted "$PAD_STATE" "$_cancel_key"; then
+            type sp_recovery_terminal_refuse >/dev/null 2>&1 && \
+              sp_recovery_terminal_refuse "$name" "delivery-cancel" "$_cancel_key"
+            delivery_write_state "$name" errored "$generation" "$ordinal" "$message_id" "$task_id" \
+              "$accepted_at" "$started" "" "$(delivery_now)" "cancel_exhausted" "$turn_id" errored
+            _cancel_done=1
+            break
+          fi
+          type sp_recovery_attempt_record >/dev/null 2>&1 && \
+            sp_recovery_attempt_record "$PAD_STATE" "$_cancel_key"
           sleep "$retry_seconds"
         done
+        type sp_recovery_reset >/dev/null 2>&1 && \
+          sp_recovery_reset "$PAD_STATE" "$_cancel_key" || true
+        [ "$_cancel_done" -eq 1 ] && continue
         case "$DELIVERY_CANCEL_OUTCOME" in
           completed) delivery_finalize_completed "$name" "$generation" "$ordinal" "$message_id" "$task_id" \
             "$accepted_at" "$started" "$turn_id" superseded_generation || true ;;

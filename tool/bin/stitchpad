@@ -863,6 +863,12 @@ PY
       --save)
         who="${2:?usage: shift-change --save <name> --file <path>}"
         [ "${3:-}" = "--file" ] && [ -f "${4:-}" ] || { echo "stitchpad: need --file <path>" >&2; exit 1; }
+        # TASK-4: idempotent rotation — if a pending handoff already exists
+        # for this agent, report truthfully and exit 0 (no double-apply).
+        _existing="$(/usr/bin/sqlite3 "$db" "SELECT COUNT(*) FROM handoffs WHERE agent='$(printf '%s' "$who" | sed "s/'/''/g")' AND status='pending';" 2>/dev/null || echo 0)"
+        if [ "${_existing:-0}" -ge 1 ]; then
+          echo "✓ shift-change already pending for @$who (no-op)"
+        else
         _handoff="$(mktemp)"
         sp_prompt_with_ponytail < "$4" > "$_handoff"
         [ "$(wc -c < "$_handoff")" -le 32768 ] || { rm -f "$_handoff"; echo "stitchpad: handoff too large after shared instructions (32KB cap)" >&2; exit 1; }
@@ -882,6 +888,7 @@ PY
         STITCHPAD_SESSION="$(sp_session_registry_sid_for_name "$who")" STITCHPAD_NAME="$who" \
           sp_session_registry_lifecycle_commit rotate || true
         echo "✓ shift-change queued for @$who — finish your turn now; the bridge clears the session once idle and delivers this into the fresh chat"
+        fi
         ;;
       --claim)
         hid="${2:?usage: shift-change --claim <id>}"
@@ -1046,8 +1053,14 @@ PY
         echo "  If you really mean to rebind, re-run with STITCHPAD_FORCE_BIND=1." >&2
         exit 1
       fi
-      printf '%s' "$nm" > "$PAD_STATE/sessions/$sid"
-      echo "✓ bound session $sid → @$nm"
+      # TASK-4: idempotent reassignment — same sid → same name is a no-op
+      # with a truthful report, never a double-apply.
+      if [ "$_prev" = "$nm" ]; then
+        echo "✓ session $sid already bound to @$nm (no-op)"
+      else
+        printf '%s' "$nm" > "$PAD_STATE/sessions/$sid"
+        echo "✓ bound session $sid → @$nm"
+      fi
       # REAL lifecycle projection: a first-time binding is a dispatch; binding
       # a session that already ENDED is a resume (the marker helper clears the
       # stale end marker). Rebinding an already-active session records NOTHING
