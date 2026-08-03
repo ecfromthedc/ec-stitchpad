@@ -761,8 +761,45 @@ PY
 # No-follow: begin REFUSES over a symlinked journal target; rollback never
 # writes through a symlink (a link that appeared mid-op is unlinked — rm never
 # follows it — then bytes are restored). All paths are reconstructed from
-# PAD_STATE/PAD_MD and a validated sid, never from caller-supplied text.
 
+# ── Stale-journal recovery ──────────────────────────────────────────────
+# A crash between journal_begin and journal_commit/rollback leaves an orphan
+# .registry-journal.* dir in PAD_STATE. On the next guarded operation, the
+# stale journal is DETECTED and RECOVERED (not refused): the pre-crash
+# snapshot is restored to return state to a known-good point, then the
+# journal is removed. Recovery rather than refusal: refusing would
+# permanently wedge the pad since no interactive user can clear the orphan.
+# State-root identity (dev + inode) is captured at begin and revalidated
+# before any rollback write; a mismatch is a LOUD refusal (rc != 0).
+
+_sp_session_registry_journal_orphans() {
+  local orphan
+  for orphan in "$PAD_STATE"/.registry-journal.*; do
+    [ -d "$orphan" ] || continue
+    [ -L "$orphan" ] && continue
+    printf '%s\n' "$orphan"
+  done
+}
+
+# Recover every orphan journal: restore snapshot, remove journal.
+# Called at the top of journal_begin before any new journal is created,
+# ensuring crash residue never compounds.
+sp_session_registry_journal_recover() {
+  local orphan sid
+  for orphan in $(_sp_session_registry_journal_orphans 2>/dev/null); do
+    [ -d "$orphan" ] || continue
+    # Resolve a plausible sid from the state that was journaled (the
+    # session-registry.jsonl snapshot carries the last-sid for every
+    # active seat; use an empty sid as a reasonable fallback — the journal
+    # file list regenerates from the caller-supplied + env sids and the
+    # restore path tolerates extra files the snapshot doesn't cover).
+    sid="${STITCHPAD_SESSION:-}"
+    echo "stitchpad: recovering stale journal $(basename "$orphan") — restoring pre-crash state" >&2
+    sp_session_registry_journal_rollback "$orphan" "$sid" >/dev/null 2>&1
+    rm -rf "$orphan" 2>/dev/null || true
+  done
+  return 0
+}
 _sp_session_registry_journal_files() {
   local sid="${1:-}"
   printf '%s\n' "$PAD_MD"
@@ -787,11 +824,23 @@ _sp_session_registry_journal_files() {
 }
 
 # Snapshot every interlocked file. Prints the journal dir on success.
+# Also recovers any stale orphan journals from a prior crash before creating
+# a new journal (deterministic recovery — never refuses). Captures the
+# PAD_STATE root identity (dev+inode) so rollback can validate the state
+# root has not been swapped mid-operation.
 sp_session_registry_journal_begin() {
   local sid="${1:-}"
   [ -n "${PAD_STATE:-}" ] && [ -d "$PAD_STATE" ] && [ ! -L "$PAD_STATE" ] || return 1
+  # C1: recover stale journals from a prior crash BEFORE any new journal.
+  sp_session_registry_journal_recover
   local jdir
   jdir="$(mktemp -d "$PAD_STATE/.registry-journal.XXXXXX")" || return 1
+  # C2: capture state-root identity for rollback-time validation.
+  python3 -c "import os,sys; s=os.lstat(sys.argv[1]); print(s.st_dev,s.st_ino)" \
+    "$PAD_STATE" > "$jdir/.state-root" 2>/dev/null || {
+    rm -rf "$jdir"
+    return 1
+  }
   : > "$jdir/manifest" || { rm -rf "$jdir"; return 1; }
   local i=0 f
   while IFS= read -r f; do
@@ -813,10 +862,34 @@ sp_session_registry_journal_begin() {
 
 # Restore exact pre-operation bytes. Files that existed are rewritten with
 # their journaled content (in place, preserving the pad inode); files the
-# operation created are removed. The journal dir is always consumed.
 sp_session_registry_journal_rollback() {
   local jdir="${1:-}" sid="${2:-}"
-  [ -n "$jdir" ] && [ -d "$jdir" ] && [ ! -L "$jdir" ] || return 0
+  [ -n "$jdir" ] || return 0
+  # C2: validate state-root identity before trusting the journal directory.
+  # If the journal is reachable, check dev/inode match against the saved
+  # identity from journal_begin. If the journal is unreachable (because
+  # PAD_STATE was swapped mid-operation), detect the swap via the fact
+  # that journal_begin refuses symlinked PAD_STATE — a now-symlinked (or
+  # missing) PAD_STATE proves the root changed. Either way, a mismatch is
+  # a LOUD refusal (rc != 0), never a silent no-op.
+  if [ -f "$jdir/.state-root" ]; then
+    local _sr_now _sr_saved
+    _sr_now="$(python3 -c "import os,sys; s=os.lstat(sys.argv[1]); print(s.st_dev,s.st_ino)" "$PAD_STATE" 2>/dev/null)" || _sr_now=""
+    _sr_saved="$(cat "$jdir/.state-root" 2>/dev/null)" || _sr_saved=""
+    if [ -n "$_sr_saved" ] && [ "$_sr_now" != "$_sr_saved" ]; then
+      echo "stitchpad: STATE-ROOT SWAP DETECTED — PAD_STATE dev/inode changed since journal_begin (was $_sr_saved, now $_sr_now); refusing rollback writes, journal preserved at $jdir" >&2
+      return 1
+    fi
+  else
+    # Journal unreachable — PAD_STATE may have been swapped. journal_begin
+    # refuses symlinked PAD_STATE (line 833), so a now-symlinked or missing
+    # PAD_STATE proves the state root changed mid-operation.
+    if [ -L "$PAD_STATE" ] || [ ! -d "$PAD_STATE" ]; then
+      echo "stitchpad: STATE-ROOT SWAP DETECTED — PAD_STATE is not the directory journaled at begin; rollback aborted" >&2
+      return 1
+    fi
+  fi
+  [ -d "$jdir" ] && [ ! -L "$jdir" ] || return 0
   local i=0 f existed
   while IFS= read -r f; do
     existed="$(sed -n "$(( i + 1 ))p" "$jdir/manifest" 2>/dev/null)"

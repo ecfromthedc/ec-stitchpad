@@ -219,7 +219,11 @@ EOF
       { print }
     ' "$PAD_MD" > "$tmp" && sp_write_inplace "$tmp" "$PAD_MD"
     sp_system "@$who joined the stitchpad ($adapter)"
-    sp_commit "roster: + $who ($adapter/$wake)"
+    if ! sp_commit "roster: + $who ($adapter/$wake)"; then
+      sp_unlock
+      echo "stitchpad: join failed — roster commit did not complete; worktree may be dirty, @$who may not be in the roster" >&2
+      exit 1
+    fi
     # Persist role/level for bridge profiles push + roster cards.
     [ -n "$_role" ] && printf '%s' "$_role" > "$PAD_STATE/role.$who"
     [ -n "$_level" ] && printf '%s' "$_level" > "$PAD_STATE/level.$who"
@@ -932,7 +936,11 @@ PY
       inblk && /^```$/ { print ""; print "---"; exit }
     ' "$PAD_MD" > "$tmp" && sp_write_inplace "$tmp" "$PAD_MD"
     rm -f "$PAD_STATE"/cursor.* 2>/dev/null
-    sp_commit "pad cleared (roster kept)"
+    if ! sp_commit "pad cleared (roster kept)"; then
+      sp_unlock
+      echo "stitchpad: clear failed — pad commit did not complete; worktree may be dirty" >&2
+      exit 1
+    fi
     sp_unlock
     echo "✓ pad cleared (roster + targets kept)"
     ;;
@@ -966,7 +974,12 @@ PY
       inblk && /^```/ { inblk=0; print; next }
       inblk && tolower($1)==tolower(who) { next }   # drop this roster line
       { print }
-    ' "$PAD_MD" > "$tmp" && sp_write_inplace "$tmp" "$PAD_MD"
+    ' "$PAD_MD" > "$tmp" && sp_write_inplace "$tmp" "$PAD_MD" || {
+      sp_session_registry_journal_rollback "$_leave_journal" "$_leave_sid"
+      sp_unlock
+      echo "stitchpad: roster edit failed for @$who — rolled back pad state; @$who still in roster" >&2
+      exit 1
+    }
     sp_system "@$who left the stitchpad"
     # REAL lifecycle projection: leaving ends the seat's session. We already
     # hold the pad mutation lock — record the terminal event against the seat's

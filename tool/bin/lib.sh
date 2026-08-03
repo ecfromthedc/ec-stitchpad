@@ -1012,8 +1012,7 @@ sp_commit() {
   [ -f "$PAD_MD" ] || return 0
   # Test hook: inject a commit failure BEFORE any git mutation so rollback
   # paths can be exercised end-to-end with zero git side effects.
-  if [ -n "${STITCHPAD_TEST_COMMIT_FAIL:-}" ]; then
-    echo "stitchpad: injected commit failure (STITCHPAD_TEST_COMMIT_FAIL)" >&2
+  if [ "${STITCHPAD_TEST_MODE:-}" = "1" ] && [ -n "${STITCHPAD_TEST_COMMIT_FAIL:-}" ]; then
     return 1
   fi
   sp_ensure_pad_git_exclude
