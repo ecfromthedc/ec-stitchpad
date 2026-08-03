@@ -1076,6 +1076,15 @@ sp_commit() {
   # rev-parse polluting stdout with "HEAD" on an unborn HEAD.
   local _head_before=""
   _head_before="$(sgit rev-parse --verify -q HEAD 2>/dev/null || echo "")"
+  # RP-2: capture staged blob hashes BEFORE commit for post-commit byte
+  # verification.  A hook that keeps the path but replaces content passes
+  # Z1 but commits tampered bytes — we verify exact blob match vs HEAD.
+  local _rp2_hashes="" _p _ph
+  for _p in "${paths[@]}"; do
+    _ph="$(sgit ls-files --stage -- "$_p" 2>/dev/null | awk '{print $2}')" || _ph=""
+    [ -n "$_ph" ] && _rp2_hashes="${_rp2_hashes}${_p}:${_ph}"$'\n'
+  done
+  _rp2_hashes="${_rp2_hashes%$'\n'}"
   if sgit commit -q -m "$msg" >/dev/null 2>/dev/null; then
     # C3: commit exited 0, but a pre-commit hook that empties the index
     # makes git produce an EMPTY commit — HEAD advances, index is clean,
@@ -1114,6 +1123,22 @@ sp_commit() {
         echo "stitchpad: first commit succeeded but staged paths NOT in HEAD — write NOT committed (hook may have excluded them)" >&2
         return 1
       fi
+    fi
+    # RP-2: verify exact bytes in HEAD match what we staged before the
+    # hook ran.  A hook that keeps the path but replaces content leaves
+    # the path in HEAD (Z1 passes) but with tampered content.
+    if [ -n "$_rp2_hashes" ]; then
+      local _rp2_line _rp2_path _rp2_staged _rp2_head_hash _rp2_ok=1
+      while IFS=: read -r _rp2_path _rp2_staged; do
+        [ -n "$_rp2_path" ] && [ -n "$_rp2_staged" ] || continue
+        _rp2_head_hash="$(sgit ls-tree "$_head_after" -- "$_rp2_path" 2>/dev/null | awk '{print $3}')" || _rp2_head_hash=""
+        if [ -n "$_rp2_head_hash" ] && [ "$_rp2_staged" != "$_rp2_head_hash" ]; then
+          echo "stitchpad: commit succeeded but staged bytes differ from HEAD for $_rp2_path (hook may have altered content) — write NOT committed" >&2
+          _rp2_ok=0
+          break
+        fi
+      done <<< "$_rp2_hashes"
+      [ "$_rp2_ok" -eq 1 ] || return 1
     fi
     return 0
   fi

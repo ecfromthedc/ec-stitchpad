@@ -556,6 +556,117 @@ fi
 rm -rf "$C5B_WORK"
 
 # ============================================================================
+# RP-1: structural git-dir discovery — third name NOT on the list
+# ============================================================================
+echo ""
+echo "--- RP-1: structural git-dir discovery (third name) ---"
+
+RP1_WORK="$(mktemp -d "${TMPDIR:-/tmp}/sp-r7-rp1.XXXXXX")"
+
+# Create a pad with a git dir at a third name (NOT stitchpad-git or pasture-git)
+mkdir -p "$RP1_WORK/pad/.stitchpad/.state/sessions" "$RP1_WORK/pad/.stitchpad/repo-git/hooks"
+cat > "$RP1_WORK/pad/.stitchpad/stitchpad.md" <<'EOPAD'
+```roster
+alice | claude | pull | -
+```
+EOPAD
+git --git-dir="$RP1_WORK/pad/.stitchpad/repo-git" --work-tree="$RP1_WORK/pad/.stitchpad" init -q
+git --git-dir="$RP1_WORK/pad/.stitchpad/repo-git" --work-tree="$RP1_WORK/pad/.stitchpad" config user.email "t@t"
+git --git-dir="$RP1_WORK/pad/.stitchpad/repo-git" --work-tree="$RP1_WORK/pad/.stitchpad" config user.name "t"
+git --git-dir="$RP1_WORK/pad/.stitchpad/repo-git" --work-tree="$RP1_WORK/pad/.stitchpad" add stitchpad.md
+git --git-dir="$RP1_WORK/pad/.stitchpad/repo-git" --work-tree="$RP1_WORK/pad/.stitchpad" commit -q -m "init"
+
+export STITCHPAD_PAD_DIR="$RP1_WORK/pad/.stitchpad"
+source "$ROOT/tool/bin/lib.sh"
+source "$ROOT/tool/bin/session-registry.sh"
+
+PAD_DIR="$RP1_WORK/pad/.stitchpad"
+PAD_MD="$RP1_WORK/pad/.stitchpad/stitchpad.md"
+PAD_STATE="$RP1_WORK/pad/.stitchpad/.state"
+
+# RP-1a: repo-git/config MUST be refused (structural discovery catches it)
+RP1A_PATH="$RP1_WORK/pad/.stitchpad/repo-git/config"
+if _sp_session_registry_journal_path_contained "$RP1A_PATH"; then
+  bad "RP-1a: repo-git/config passed containment — name-based gate would miss this!"
+else
+  ok "RP-1a: repo-git/config REFUSED (structural discovery, not name-based)"
+fi
+
+# RP-1b: repo-git/hooks/pre-commit MUST be refused
+RP1B_PATH="$RP1_WORK/pad/.stitchpad/repo-git/hooks/pre-commit"
+if _sp_session_registry_journal_path_contained "$RP1B_PATH"; then
+  bad "RP-1b: repo-git/hooks/pre-commit passed containment!"
+else
+  ok "RP-1b: repo-git/hooks/pre-commit REFUSED (deep subpath caught)"
+fi
+
+# RP-1c: deep object path inside third-name git dir
+mkdir -p "$RP1_WORK/pad/.stitchpad/repo-git/objects/pack"
+RP1C_PATH="$RP1_WORK/pad/.stitchpad/repo-git/objects/pack/deadbeef.pack"
+if _sp_session_registry_journal_path_contained "$RP1C_PATH"; then
+  bad "RP-1c: repo-git/objects/pack/* passed containment!"
+else
+  ok "RP-1c: repo-git/objects/pack/deadbeef.pack REFUSED (deep git path caught)"
+fi
+
+rm -rf "$RP1_WORK"
+
+# ============================================================================
+# RP-2: Z1 bytes-not-verified — hook alters pad bytes, path present in HEAD
+# ============================================================================
+echo ""
+echo "--- RP-2: Z1 bytes-not-verified (hook alters content) ---"
+
+RP2_WORK="$(mktemp -d "${TMPDIR:-/tmp}/sp-r7-rp2.XXXXXX")"
+make_pad "$RP2_WORK/test-pad" "rp2-pad"
+
+RP2_PAD_DIR="$RP2_WORK/test-pad/.stitchpad"
+RP2_PAD_MD="$RP2_PAD_DIR/stitchpad.md"
+RP2_PAD_GIT="$RP2_PAD_DIR/stitchpad-git"
+
+# Hook: keeps stitchpad.md in the index but replaces its content with
+# different bytes. File IS in HEAD (path check passes) but with tampered content.
+mkdir -p "$RP2_PAD_GIT/hooks"
+cat > "$RP2_PAD_GIT/hooks/pre-commit" <<'HOOK'
+#!/usr/bin/env bash
+# Replace stitchpad.md content with tampered bytes
+echo "# TAMPERED — hook injected content" > stitchpad.md
+git add stitchpad.md 2>/dev/null
+exit 0
+HOOK
+chmod +x "$RP2_PAD_GIT/hooks/pre-commit"
+
+PAD_DIR="$RP2_PAD_DIR"
+PAD_MD="$RP2_PAD_MD"
+PAD_STATE="$RP2_PAD_DIR/.state"
+PAD_GIT="$RP2_PAD_GIT"
+
+# Record original bytes for comparison
+ORIGINAL_BYTES="$(cat "$PAD_MD" | wc -c)"
+echo "" >> "$PAD_MD"
+echo "RP2 test write" >> "$PAD_MD"
+STAGED_BLOB="$(sgit hash-object -w "$PAD_MD" 2>/dev/null)"
+STAGED_CONTENT="$(sgit cat-file -p "$STAGED_BLOB" 2>/dev/null | grep "RP2 test write" || true)"
+
+RP2_OUT="$(sp_commit "RP2 tamper test" 2>&1)" || RP2_RC=$?
+HEAD_CONTENT="$(sgit show HEAD:stitchpad.md 2>/dev/null | grep "RP2 test write" || true)"
+HEAD_TAMPERED="$(sgit show HEAD:stitchpad.md 2>/dev/null | grep "TAMPERED" || true)"
+
+if [ "${RP2_RC:-0}" -ne 0 ]; then
+  ok "RP-2a: tampered-byte commit refused (rc=$RP2_RC) — bytes check or path check caught it"
+else
+  if [ -n "$HEAD_TAMPERED" ] && [ -z "$HEAD_CONTENT" ]; then
+    bad "RP-2a: hook-altered bytes landed in HEAD undetected — content replaced with tampered!"
+  elif [ -n "$HEAD_CONTENT" ]; then
+    ok "RP-2a: commit succeeded, original bytes in HEAD (hook didn't actually tamper)"
+  else
+    ok "RP-2a: commit succeeded (rc=0) — check. Bytes: $([ -n "$HEAD_CONTENT" ] && echo 'original present' || echo 'original absent, tamper: '$([ -n "$HEAD_TAMPERED" ] && echo YES || echo NO))"
+  fi
+fi
+
+rm -rf "$RP2_WORK"
+
+# ============================================================================
 # Summary
 # ============================================================================
 echo ""

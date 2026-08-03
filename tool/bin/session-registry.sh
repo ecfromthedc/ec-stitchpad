@@ -1024,7 +1024,7 @@ sp_session_registry_journal_begin() {
 # on disk → same identity regardless of filename case) and case-insensitive
 # string checks as defense in depth for subdirectory patterns.
 _sp_session_registry_journal_path_contained() {
-  local f="$1" real_dir pad_dir_real pad_state_real _gd_identity _rd_identity _flow
+  local f="$1" real_dir pad_dir_real pad_state_real _gd_path _flow
   pad_dir_real="$(cd "${PAD_DIR:-/nonexistent}" 2>/dev/null && pwd -P)" || return 1
   pad_state_real="$(cd "${PAD_STATE:-/nonexistent}" 2>/dev/null && pwd -P)" || return 1
   real_dir="$(cd "$(dirname "$f")" 2>/dev/null && pwd -P)" || return 1
@@ -1034,38 +1034,43 @@ _sp_session_registry_journal_path_contained() {
     "$pad_state_real"|"$pad_state_real"/*) ;;
     *) return 1 ;;
   esac
-  # C1 SEVERE: the git-dir string-based exclusion (H1) is bypassable on
-  # case-insensitive APFS (macOS default).  cd Stitchpad-git && pwd -P
-  # returns the TYPED spelling, so a case-sensitive string match against the
-  # canonical "stitchpad-git" misses.  Compare the real directory's dev/inode
-  # against the git dir's — same directory on disk ⇒ same identity regardless
-  # of case.  This is the primary gate; the string checks below are defense
-  # in depth (also made case-insensitive).
-  #
-  # P1 SEVERE: the dev/inode gate checked ONLY stitchpad-git by name. On a
-  # migrated .pasture pad the git dir is pasture-git/, so the gate was skipped
-  # entirely — journal paths into pasture-git passed containment (open DoS/RCE).
-  # Fix: resolve the actual git dir by checking for each known name, do a
-  # dev/inode compare against whichever exists.  By construction covers any
-  # future rename as long as the name is added to the list.
-  local _git_candidate
-  for _git_candidate in stitchpad-git pasture-git; do
-    if [ -d "${PAD_DIR:-/nonexistent}/${_git_candidate}" ]; then
-      _gd_identity="$(python3 -c "import os,sys; s=os.stat(sys.argv[1]); print(s.st_dev,s.st_ino)" "${PAD_DIR}/${_git_candidate}" 2>/dev/null)" || _gd_identity=""
+  # C1 + P1 + RP-1: git-dir containment BY IDENTITY (structural discovery).
+  # Names are NOT reliable — macOS APFS is case-insensitive, and renamed git
+  # dirs (stitchpad-git → pasture-git on migration, or a third name entirely)
+  # defeat name-based gates.  Instead, structurally discover the pad's actual
+  # git dir: any directory under PAD_DIR that contains HEAD + objects/ + refs/
+  # is a git repository.  Compare dev/inode against real_dir — same identity
+  # regardless of name, case, or rename.  This gate replaces the old name-loop
+  # (which missed pasture-git on migrated pads and would miss any third name).
+  # Also blocks deep subpaths of the git dir (real_dir inside the git dir tree,
+  # not just the root).
+  if [ -d "${PAD_DIR:-/nonexistent}" ]; then
+    for _gd_path in "$PAD_DIR"/*/; do
+      [ -d "$_gd_path" ] || continue
+      [ -f "$_gd_path/HEAD" ] && [ -d "$_gd_path/objects" ] && [ -d "$_gd_path/refs" ] || continue
+      # This directory is a git repository — verify identity
+      local _gd_identity _rd_identity
+      _gd_identity="$(python3 -c "import os,sys; s=os.stat(sys.argv[1]); print(s.st_dev,s.st_ino)" "$_gd_path" 2>/dev/null)" || _gd_identity=""
       _rd_identity="$(python3 -c "import os,sys; s=os.stat(sys.argv[1]); print(s.st_dev,s.st_ino)" "$real_dir" 2>/dev/null)" || _rd_identity=""
       if [ -n "$_gd_identity" ] && [ "$_rd_identity" = "$_gd_identity" ]; then
-        return 1  # target directory IS the git dir (any case variant)
+        return 1  # real_dir IS the git dir root (identity match)
       fi
-      break  # Only one git dir can exist per pad
-    fi
-  done
-  # Defense in depth: case-insensitive string checks for .git / hooks /
-  # stitchpad-git subdirectory patterns — catches deep paths the dev/inode
-  # ancestor check above misses (e.g. .paths → stitchpad-git/hooks/pre-commit
-  # where real_dir is inside the git dir but not the git dir root).
+      # Also check: is real_dir a subdirectory of this git dir?
+      # Use canonical (pwd -P) paths to survive symlinks like /tmp → /private/tmp.
+      local _gd_canon
+      _gd_canon="$(cd "$_gd_path" 2>/dev/null && pwd -P)" || _gd_canon="$_gd_path"
+      case "$real_dir" in
+        "$_gd_canon"|"$_gd_canon"/*) return 1 ;;
+      esac
+    done
+  fi
+  # Defense in depth: generic string checks for .git / hooks subpaths plus
+  # any path that looks like a git-internal file (catches edge cases the
+  # structural discovery might miss — e.g. a crafted .paths listing a git
+  # object file whose parent isn't a git dir but the path pattern matches).
   _flow="$(printf '%s' "$f" | tr '[:upper:]' '[:lower:]')"
   case "$_flow" in
-	    */.git/*|*/.git|*/hooks/*|*/stitchpad-git/*|*/stitchpad-git|*/pasture-git/*|*/pasture-git)
+    */.git/*|*/.git|*/hooks/*)
       return 1
       ;;
   esac
