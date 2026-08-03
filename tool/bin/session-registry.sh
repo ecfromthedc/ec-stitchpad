@@ -660,7 +660,7 @@ sp_session_registry_sid_for_name() {
       printf '%s' "$sid"
       return 0
     fi
-  done
+  done < <(_sp_session_registry_journal_orphans 2>/dev/null)
   return 0
 }
 
@@ -789,8 +789,8 @@ _sp_session_registry_journal_orphans() {
 # ensuring crash residue never compounds.
 sp_session_registry_journal_recover() {
   local orphan sid
-  for orphan in $(_sp_session_registry_journal_orphans 2>/dev/null); do
-    [ -d "$orphan" ] || continue
+  while IFS= read -r orphan; do
+    [ -n "$orphan" ] || continue
     # R1/R2: read the stamped sid from the journal, NOT from the recovering
     # caller's env.  The crashed operation stamped its own sid at journal_begin;
     # recovery must interpret the orphan with THAT sid so marker files are
@@ -932,7 +932,7 @@ sp_session_registry_journal_recover() {
     if [ -n "$_save_session" ]; then export STITCHPAD_SESSION="$_save_session"; else unset STITCHPAD_SESSION; fi
     if [ -n "$_save_claude" ]; then export CLAUDE_CODE_SESSION_ID="$_save_claude"; else unset CLAUDE_CODE_SESSION_ID; fi
     if [ -n "$_save_codex" ]; then export CODEX_SESSION_ID="$_save_codex"; else unset CODEX_SESSION_ID; fi
-  done
+  done < <(_sp_session_registry_journal_orphans 2>/dev/null)
   return 0
 }
 _sp_session_registry_journal_files() {

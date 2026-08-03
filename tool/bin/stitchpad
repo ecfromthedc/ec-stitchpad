@@ -130,6 +130,9 @@ Example description body. Multi-line is fine.
 ---
 EOF
     # isolated git for the pad
+    # fx4 F2: git absent from PATH makes init report false success.
+    # Fail loudly before touching any files.
+    command -v git >/dev/null 2>&1 || { echo "stitchpad: git not found on PATH — stichpad requires git for durable pad history" >&2; exit 1; }
     git --git-dir="$dir/stitchpad-git" --work-tree="$dir" init -q
     git --git-dir="$dir/stitchpad-git" --work-tree="$dir" config user.name "stitchpad"
     git --git-dir="$dir/stitchpad-git" --work-tree="$dir" config user.email "stitchpad@agents.local"
@@ -197,7 +200,7 @@ EOF
         *) _args+=("$1"); shift ;;
       esac
     done
-    set -- "${_args[@]}"
+    set -- "${_args[@]:+${_args[@]}}"
     who="${1:?usage: stitchpad join <name> <adapter> [wake] [target] [--role <role>] [--level <level>]}"
     adapter="${2:?adapter required (e.g. pi, claude, codex, mcp)}"
     wake="${3:-pull}"; target="${4:--}"
@@ -2064,7 +2067,7 @@ PY
         /usr/bin/sqlite3 -separator '|' "$db" \
           "SELECT at,sender,text FROM (SELECT * FROM messages ORDER BY id DESC LIMIT $n) ORDER BY id ASC;" \
           | while IFS='|' read -r _at _s _rest; do
-              printf '[%s] @%s: %s\n' "$(date -r "$(( _at / 1000 ))" '+%m-%d %H:%M' 2>/dev/null || echo '?')" "$_s" "$_rest"
+              printf '[%s] @%s: %s\n' "$(date -r "$(( _at / 1000 ))" '+%m-%d %H:%M' 2>/dev/null || date -d "@$(( _at / 1000 ))" '+%m-%d %H:%M' 2>/dev/null || echo '?')" "$_s" "$_rest"
             done
         ;;
       list)
@@ -3170,7 +3173,7 @@ sys.exit(1)
     echo -n "  [2/4] heartbeat ................ "
     _mc_alive_file="$PAD_STATE/alive.$_mc_pilot"
     if [ -f "$_mc_alive_file" ]; then
-      _mc_alive_age="$(($(date +%s) - $(stat -f %m "$_mc_alive_file" 2>/dev/null || echo 0)))"
+      _mc_alive_age="$(($(date +%s) - $(stat -f %m "$_mc_alive_file" 2>/dev/null || stat -c %Y "$_mc_alive_file" 2>/dev/null || echo 0)))"
       if [ "$_mc_alive_age" -lt 90 ]; then
         _mc_alive_pid="$(python3 -c "import json; print(json.load(open('$_mc_alive_file')).get('pid',''))" 2>/dev/null || true)"
         if [ -n "$_mc_alive_pid" ] && kill -0 "$_mc_alive_pid" 2>/dev/null; then

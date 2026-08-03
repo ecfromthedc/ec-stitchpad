@@ -17,6 +17,7 @@ cleanup() {
 }
 trap cleanup EXIT
 fail() { echo "FAIL: $*" >&2; exit 1; }
+sha256() { sha256 "$@" 2>/dev/null || sha256sum "$@" 2>/dev/null || openssl dgst -sha256 "$@" 2>/dev/null | sed 's/^.*= //'; }
 wait_file() {
   local path="$1" i=0
   while [ ! -f "$path" ] && [ "$i" -lt 300 ]; do sleep 0.01; i=$((i + 1)); done
@@ -53,9 +54,9 @@ barrier="$tmp/pre-owner"
 STITCHPAD_HEARTBEAT_TEST_BEFORE_OWNER_BARRIER="$barrier" "$SP" heartbeat start alice >/dev/null 2>&1 &
 bg=$!
 wait_file "$barrier.ready"
-launcher_before="$(shasum -a 256 "$state/heartbeat.alice.lock/launcher")"
+launcher_before="$(sha256 "$state/heartbeat.alice.lock/launcher")"
 "$SP" heartbeat start alice >/dev/null
-[ "$(shasum -a 256 "$state/heartbeat.alice.lock/launcher")" = "$launcher_before" ] \
+[ "$(sha256 "$state/heartbeat.alice.lock/launcher")" = "$launcher_before" ] \
   || fail "concurrent start replaced the admitted launcher"
 touch "$barrier.release"
 wait "$bg" || fail "admitted pre-owner start failed"
@@ -136,11 +137,11 @@ kill -0 "$foreign" 2>/dev/null || fail "valid mismatch signalled a reused PID"
 # Malformed evidence is fail-closed and byte-preserving.
 lock="$state/heartbeat.malformed.lock"
 mkdir "$lock"; printf '%s' "$foreign" > "$lock/pid"; printf '%s' '{bad-json' > "$lock/owner"
-before="$(find "$lock" -type f -maxdepth 1 -print0 | sort -z | xargs -0 shasum -a 256)"
+before="$(find "$lock" -type f -maxdepth 1 -print0 | sort -z | xargs -0 sha256)"
 if "$SP" heartbeat --stop malformed >/dev/null 2>&1; then
   fail "malformed live ownership was accepted"
 fi
-after="$(find "$lock" -type f -maxdepth 1 -print0 | sort -z | xargs -0 shasum -a 256)"
+after="$(find "$lock" -type f -maxdepth 1 -print0 | sort -z | xargs -0 sha256)"
 [ "$after" = "$before" ] || fail "malformed evidence was partially mutated"
 kill "$foreign" 2>/dev/null || true; wait "$foreign" 2>/dev/null || true; foreign=""
 rm -f "$lock/pid" "$lock/owner"; rmdir "$lock"
@@ -150,12 +151,12 @@ barrier="$tmp/reaper-pre-owner"
 STITCHPAD_HEARTBEAT_TEST_BEFORE_OWNER_BARRIER="$barrier" "$SP" heartbeat start reaper >/dev/null 2>&1 &
 bg=$!
 wait_file "$barrier.ready"
-launcher_before="$(shasum -a 256 "$state/heartbeat.reaper.lock/launcher")"
+launcher_before="$(sha256 "$state/heartbeat.reaper.lock/launcher")"
 printf '%s' '{"pid":99999993}' > "$state/alive.reaper"
 touch -t 200001010000 "$state/alive.reaper"
 STITCHPAD_PAD_DIR="$tmp/.stitchpad" bash -c 'source "$1"; sp_init_paths; sp_reap_dead' _ "$ROOT/tool/bin/lib.sh"
 [ -d "$state/heartbeat.reaper.lock" ] \
-  && [ "$(shasum -a 256 "$state/heartbeat.reaper.lock/launcher")" = "$launcher_before" ] \
+  && [ "$(sha256 "$state/heartbeat.reaper.lock/launcher")" = "$launcher_before" ] \
   || fail "dead-presence reaper destroyed a live pre-owner generation"
 "$SP" heartbeat --stop reaper >/dev/null
 wait "$bg" 2>/dev/null || true; bg=""

@@ -26,7 +26,7 @@ test_process_start() {
 }
 
 test_command_proof() {
-  printf '%s' "$1" | shasum -a 256 | awk '{print $1}'
+  printf '%s' "$1" | (shasum -a 256 2>/dev/null || sha256sum 2>/dev/null || openssl dgst -sha256 2>/dev/null | sed 's/^.* //') | awk '{print $1}'
 }
 
 register_fixture_pid() {
@@ -172,7 +172,7 @@ set -u
 if [ -n "${STITCHPAD_TEST_PID_REGISTRY:-}" ]; then
   start="$(ps -p "$$" -o lstart= 2>/dev/null | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')"
   command="$(ps -p "$$" -o command= 2>/dev/null || true)"
-  command_proof="$(printf '%s' "$command" | shasum -a 256 | awk '{print $1}')"
+  command_proof="$(test_command_proof "$command")"
   [ -n "$start" ] && printf '%s|%s|adapter|%s|%s\n' "$$" "$start" "$0" "$command_proof" \
     >> "$STITCHPAD_TEST_PID_REGISTRY"
 fi
@@ -426,7 +426,7 @@ cat > "$ocean_bin/ocean-heartbeat" <<'HEARTBEAT'
 if [ -n "${STITCHPAD_TEST_PID_REGISTRY:-}" ]; then
   start="$(ps -p "$$" -o lstart= 2>/dev/null | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')"
   command="$(ps -p "$$" -o command= 2>/dev/null || true)"
-  command_proof="$(printf '%s' "$command" | shasum -a 256 | awk '{print $1}')"
+  command_proof="$(test_command_proof "$command")"
   [ -n "$start" ] && printf '%s|%s|adapter|%s|%s\n' "$$" "$start" "$0" "$command_proof" \
     >> "$STITCHPAD_TEST_PID_REGISTRY"
 fi
