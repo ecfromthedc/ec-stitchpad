@@ -2039,8 +2039,17 @@ PY
     #   stitchpad dm list                        pairs you have history with
     #   stitchpad dm record <from> <to> <text>   internal: bridge writes inbound
     sp_init_paths || exit 1
+    # C3 (rc1): handles reach this path UNVALIDATED from the wire (relay /dm
+    # → bridge → dm record) and from MCP dm_say — '../../evil' traversed out
+    # of .state/dm and wrote sqlite files at attacker-chosen paths. Strict
+    # allowlist BEFORE any path construction; same grammar as join names.
+    _dm_handle_ok() { printf '%s' "$1" | grep -qE '^[A-Za-z0-9][A-Za-z0-9_-]{0,31}$'; }
     _dm_db() {  # sorted pair → one canonical db per conversation
       local a="$1" b="$2" lo hi
+      if ! _dm_handle_ok "$a" || ! _dm_handle_ok "$b"; then
+        echo "stitchpad: invalid DM handle (allowed: [A-Za-z0-9_-], 1-32 chars, no path characters)" >&2
+        return 1
+      fi
       if [ "$a" \< "$b" ]; then lo="$a"; hi="$b"; else lo="$b"; hi="$a"; fi
       mkdir -p "$PAD_STATE/dm"
       printf '%s' "$PAD_STATE/dm/$lo~$hi.sqlite"
@@ -2065,7 +2074,8 @@ PY
         text="$*"
         [ -z "$text" ] && { echo "stitchpad: empty message" >&2; exit 1; }
         _at="$(date +%s)000"
-        _dm_insert "$(_dm_db "$who" "$to")" "$_at" "$who" "$to" "$text"
+        _db="$(_dm_db "$who" "$to")" || exit 1
+        _dm_insert "$_db" "$_at" "$who" "$to" "$text"
         jq -nc --arg f "$who" --arg t "$to" --arg x "$text" '{from:$f,to:$t,text:$x,at:(now*1000|floor)}' >> "$PAD_STATE/dmout.jsonl" \
           && echo "✓ DM → @$to (private — recorded locally, relayed to their surface; NOT on the pad)"
         ;;
@@ -2074,7 +2084,8 @@ PY
         _to="${1:?usage: stitchpad dm record <from> <to> <text...>}"; shift || true
         _text="$*"
         [ -z "$_text" ] && exit 0
-        _dm_insert "$(_dm_db "$_from" "$_to")" "$(date +%s)000" "$_from" "$_to" "$_text"
+        _db="$(_dm_db "$_from" "$_to")" || exit 1
+        _dm_insert "$_db" "$(date +%s)000" "$_from" "$_to" "$_text"
         ;;
       read)
         who="$(sp_me)"
@@ -2082,7 +2093,7 @@ PY
         with="${1:?usage: stitchpad dm read <@handle> [-n N]}"; shift || true
         with="${with#@}"
         n=30; [ "${1:-}" = "-n" ] && n="${2:-30}"
-        db="$(_dm_db "$who" "$with")"
+        db="$(_dm_db "$who" "$with")" || exit 1
         [ -f "$db" ] || { echo "(no DM history with @$with)"; exit 0; }
         /usr/bin/sqlite3 -separator '|' "$db" \
           "SELECT at,sender,text FROM (SELECT * FROM messages ORDER BY id DESC LIMIT $n) ORDER BY id ASC;" \

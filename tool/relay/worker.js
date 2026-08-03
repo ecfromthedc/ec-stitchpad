@@ -238,6 +238,19 @@ export default {
     // WS can't set headers from the browser — accept the bearer as ?token= there.
     const tok = (req.headers.get("authorization") || "").replace(/^Bearer\s+/i, "") || (url.searchParams.get("token") || "");
     if (!tok || !(tok === legacyToken || Object.values(TOKENS).includes(tok))) return json({ error: "unauthorized" }, 401);
+    // C4 (rc1): a per-person token may only speak AS its own handle — the
+    // relay binds `from` to the authenticated identity instead of trusting
+    // the body (a forged from=captain injects operator-impersonating DMs
+    // into agent sessions, and a forged from=<seat> phishes the operator's
+    // phone). The legacy token is the owner/bridge channel (the bridge
+    // relays many seats' traffic) and stays unrestricted — scoping it is
+    // the invite/token-model lane (rc1 C1).
+    const callerHandle = Object.keys(TOKENS).find(h => TOKENS[h] === tok) || null;
+    const bindFrom = (from) => {
+      if (!callerHandle) return from;                       // legacy owner/bridge token
+      if (from && from !== callerHandle) return null;       // forged identity
+      return callerHandle;                                  // absent or matching → bind
+    };
 
     const pad = (url.searchParams.get("pad") || "").trim();
 
@@ -306,7 +319,9 @@ export default {
     if (url.pathname === "/dm-in" && req.method === "POST") {
       const { from, to, text, at } = await req.json();
       if (!from || !to || !text) return json({ error: "need from + to + text" }, 400);
-      await tryDeliver(env, pad, "dm-in", { from, to, text, at: at || Date.now() });
+      const boundInFrom = bindFrom(from);
+      if (boundInFrom === null) return json({ error: "from does not match the authenticated handle" }, 403);
+      await tryDeliver(env, pad, "dm-in", { from: boundInFrom, to, text, at: at || Date.now() });
       return json({ ok: true });
     }
     // kanban ops from the PWA → bridge runs the task CLI (new/move/edit)
@@ -346,7 +361,9 @@ export default {
     if (url.pathname === "/say" && req.method === "POST") {
       const { from, text } = await req.json();
       if (!text) return json({ error: "empty" }, 400);
-      const msg = { from: from || "smaths", text, at: Date.now() };
+      const boundSayFrom = bindFrom(from);
+      if (boundSayFrom === null) return json({ error: "from does not match the authenticated handle" }, 403);
+      const msg = { from: boundSayFrom || "smaths", text, at: Date.now() };
       if (await tryDeliver(env, pad, "say", msg)) return json({ ok: true, delivered: "ws" });
       const qk = `outbox:${pad}`;
       const q = JSON.parse((await env.STITCHPAD.get(qk)) || "[]");
@@ -365,9 +382,11 @@ export default {
     if (url.pathname === "/dm" && req.method === "POST") {
       const { from, to, text } = await req.json();
       if (!to || !text) return json({ error: "need to + text" }, 400);
+      const boundDmFrom = bindFrom(from);
+      if (boundDmFrom === null) return json({ error: "from does not match the authenticated handle" }, 403);
       // id = the delivery-receipt key: the bridge reports the outcome on
       // /dm-status with it, and the phone anchors the receipt to the bubble.
-      const msg = { from: from || "smaths", to, text, at: Date.now(), id: crypto.randomUUID().slice(0, 8) };
+      const msg = { from: boundDmFrom || "smaths", to, text, at: Date.now(), id: crypto.randomUUID().slice(0, 8) };
       if (await tryDeliver(env, pad, "dm", msg)) return json({ ok: true, delivered: "ws", id: msg.id });
       const qk = `dmbox:${pad}`;
       const q = JSON.parse((await env.STITCHPAD.get(qk)) || "[]");
