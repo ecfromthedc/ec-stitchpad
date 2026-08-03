@@ -949,6 +949,17 @@ PY
       exit 1
     fi
     sp_lock || exit 1
+    # Journal the registry/markers/header/pad window BEFORE any mutation — the
+    # roster edit, presence line, terminal record, and roster commit below are
+    # one interlocked unit. The journal must capture the pre-leave pad bytes:
+    # beginning after the roster edit would make rollback restore the already
+    # mutated pad, leaving an uncommitted roster removal behind on failure.
+    _leave_sid="$(sp_session_registry_sid_for_name "$who")"
+    _leave_journal="$(sp_session_registry_journal_begin "$_leave_sid")" || {
+      sp_unlock
+      echo "stitchpad: could not journal pre-leave state — refusing to remove @$who" >&2
+      exit 1
+    }
     tmp="$(sp_stage "$PAD_MD")"
     awk -v who="$who" '
       /^```roster/ { inblk=1; print; next }
@@ -961,9 +972,24 @@ PY
     # hold the pad mutation lock — record the terminal event against the seat's
     # durable session binding (missing binding stays explicitly empty) and
     # refresh the pad header so the roster commit below carries both.
-    STITCHPAD_SESSION="$(sp_session_registry_sid_for_name "$who")" STITCHPAD_NAME="$who" \
-      sp_session_registry_lifecycle_locked terminal || true
-    sp_commit "roster: - $who"
+    # The journal covers the whole window: a failed terminal record or a failed
+    # roster commit is compensated exactly — never a committed roster edit
+    # without its registry state, never registry state or pad edits for a
+    # commit that failed.
+    if ! STITCHPAD_SESSION="$_leave_sid" STITCHPAD_NAME="$who" \
+      sp_session_registry_lifecycle_locked terminal; then
+      sp_session_registry_journal_rollback "$_leave_journal" "$_leave_sid"
+      sp_unlock
+      echo "stitchpad: terminal event for @$who failed — rolled back; roster unchanged" >&2
+      exit 1
+    fi
+    if ! sp_commit "roster: - $who"; then
+      sp_session_registry_journal_rollback "$_leave_journal" "$_leave_sid"
+      sp_unlock
+      echo "stitchpad: roster commit failed — rolled back pad, registry, and header state for @$who" >&2
+      exit 1
+    fi
+    sp_session_registry_journal_commit "$_leave_journal"
     # also release any file claims and wake state this agent held
     rm -f "$PAD_STATE/seen.$who" "$PAD_STATE/forcewake.$who" 2>/dev/null
     rm -f "$PAD_STATE"/delivery."$who".* 2>/dev/null || true
@@ -1157,8 +1183,22 @@ PY
     # date divider) so the divider, message HH:MM, and commit timestamp all
     # originate from the same wall-clock snapshot.
     ts="$(sp_date_divider_hhmm || date '+%I:%M %p')"
+    # Journal the exact pre-operation bytes of the pad, the session registry,
+    # and every lifecycle marker BEFORE any mutation. The registry and markers
+    # live outside the pad git, so a failed commit cannot be unwound by git —
+    # the journal is the compensation record. Refusing to journal fails closed
+    # before the pad is touched: no committed pad without registry state, no
+    # registry state for an uncommitted pad.
+    _say_sid="$(sp_session_registry_sid)"
+    _say_journal="$(sp_session_registry_journal_begin "$_say_sid")" || {
+      sp_unlock
+      echo "stitchpad: could not journal pre-say state — refusing to post" >&2
+      exit 1
+    }
     # Insert date divider for the first message on a new canonical date.
-    # Under the lock so exactly one divider is written per date.
+    # Under the lock so exactly one divider is written per date. Divider state
+    # (last-divider-epoch) is inside the journal window: any later failure
+    # restores it too, so a retry sees exactly the pre-say world.
     sp_date_divider_insert || true
     printf '\n## %s · %s\n\n%s\n' "@$from" "$ts" "$text" >> "$PAD_MD"
     # Align the git commit timestamp with the same captured epoch ("@<epoch>"
@@ -1169,18 +1209,34 @@ PY
     # Record this operation in the append-only session registry BEFORE the
     # commit so durable state cannot lag behind a successful sp_commit. All
     # timestamps derive from the same captured epoch — no second date +%s.
-    # A failed registry write rolls back (no partial visible state) and is
-    # non-fatal to the post itself. We already hold the pad mutation lock, so
-    # the lifecycle helper also refreshes the sentinel-bounded Active Sessions
-    # + Session History header in place; the say commit below carries both.
-    sp_session_registry_lifecycle_locked activity "$_captured_epoch" || true
+    # FAIL CLOSED: a failed registry write (or header render) rolls the pad,
+    # markers, and divider state back to the journaled pre-say bytes and aborts
+    # the post — a committed pad can never be left without its registry entry.
+    if ! sp_session_registry_lifecycle_locked activity "$_captured_epoch"; then
+      sp_session_registry_journal_rollback "$_say_journal" "$_say_sid"
+      sp_unlock
+      echo "stitchpad: session registry write failed — rolled back; message NOT posted" >&2
+      exit 1
+    fi
     _say_subject="$from: $(printf '%s' "$text" | tr '\n' ' ' | cut -c1-60)"
+    _say_commit_rc=0
     if [ -n "$_captured_epoch" ]; then
       GIT_COMMITTER_DATE="@$_captured_epoch" GIT_AUTHOR_DATE="@$_captured_epoch" \
-        sp_commit "$_say_subject"
+        sp_commit "$_say_subject" || _say_commit_rc=$?
     else
-      sp_commit "$_say_subject"
+      sp_commit "$_say_subject" || _say_commit_rc=$?
     fi
+    # FAIL CLOSED the other way: a failed pad commit rolls the registry entry,
+    # markers, header, and pad bytes back to the journaled pre-say state, so a
+    # retry emits exactly once — never registry/header state for a message that
+    # never committed.
+    if [ "$_say_commit_rc" -ne 0 ]; then
+      sp_session_registry_journal_rollback "$_say_journal" "$_say_sid"
+      sp_unlock
+      echo "stitchpad: pad commit failed — rolled back registry, header, and pad; message NOT posted" >&2
+      exit 1
+    fi
+    sp_session_registry_journal_commit "$_say_journal"
     # Posting IS the reply — clear both dropped-turn markers (the pending re-block
     # bound AND the delivered_no_reply visibility flag) so a reply resolves them and
     # they can't cause a spurious re-block or stale doctor state later.

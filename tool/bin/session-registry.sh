@@ -48,7 +48,10 @@
 #   sp_session_registry_lifecycle_locked → record event + markers + header
 #                                  refresh, caller already holds the pad lock
 #   sp_session_registry_lifecycle_commit → same, but acquires the pad lock and
-#                                  commits the header refresh
+#                                  commits the header refresh (all-or-nothing)
+#   sp_session_registry_journal_begin/rollback/commit → pre-op byte snapshot
+#                                  and exact compensation for the registry ⟷
+#                                  pad-commit interlock (no symlinks, no temps)
 
 SESSION_REGISTRY_MAX="${SESSION_REGISTRY_MAX:-1024}"
 SESSION_STALE_SECONDS="${SESSION_STALE_SECONDS:-3600}"
@@ -744,6 +747,106 @@ PY
   return "$rc"
 }
 
+# ── Pre-commit journal (atomicity / rollback) ──────────────────────────
+# The say path and lifecycle_commit interlock THREE durable artifacts with one
+# git commit: the registry jsonl, the lifecycle markers (session-start/end/
+# activity, request-id, request-counter), the last-divider epoch, and the pad
+# bytes themselves (message + refreshed header). The registry and markers live
+# OUTSIDE the pad git — only the pad is committed — so a failed commit cannot
+# be unwound by git. The journal captures exact pre-operation bytes so a
+# failure anywhere in the window is compensated exactly:
+#   journal_begin    → snapshot pad + registry + markers into a temp dir
+#   journal_rollback → restore exact bytes / delete files the op created
+#   journal_commit   → success: drop the journal
+# No-follow: begin REFUSES over a symlinked journal target; rollback never
+# writes through a symlink (a link that appeared mid-op is unlinked — rm never
+# follows it — then bytes are restored). All paths are reconstructed from
+# PAD_STATE/PAD_MD and a validated sid, never from caller-supplied text.
+
+_sp_session_registry_journal_files() {
+  local sid="${1:-}"
+  printf '%s\n' "$PAD_MD"
+  printf '%s\n' "$PAD_STATE/session-registry.jsonl"
+  printf '%s\n' "$PAD_STATE/last-divider-epoch"
+  printf '%s\n' "$PAD_STATE/request-counter"
+  # Cover marker files for the caller-supplied sid (the leave path passes the
+  # seat's bound session id) AND for the env-resolved sid (the say path and
+  # lifecycle_locked both call sp_session_registry_sid internally, which may
+  # resolve a DIFFERENT id from CLAUDE_CODE_SESSION_ID/CODEX_SESSION_ID). When
+  # the two differ, the guarded operation can write markers under either or
+  # both — the journal must snapshot and restore the full set.
+  local _j_sid
+  for _j_sid in "$sid" "$(sp_session_registry_sid)"; do
+    [ -n "$_j_sid" ] || continue
+    sp_session_registry_validate_sid "$_j_sid" || continue
+    printf '%s\n' "$PAD_STATE/session-start.$_j_sid"
+    printf '%s\n' "$PAD_STATE/session-end.$_j_sid"
+    printf '%s\n' "$PAD_STATE/session-activity.$_j_sid"
+    printf '%s\n' "$PAD_STATE/request-id.$_j_sid"
+  done
+}
+
+# Snapshot every interlocked file. Prints the journal dir on success.
+sp_session_registry_journal_begin() {
+  local sid="${1:-}"
+  [ -n "${PAD_STATE:-}" ] && [ -d "$PAD_STATE" ] && [ ! -L "$PAD_STATE" ] || return 1
+  local jdir
+  jdir="$(mktemp -d "$PAD_STATE/.registry-journal.XXXXXX")" || return 1
+  : > "$jdir/manifest" || { rm -rf "$jdir"; return 1; }
+  local i=0 f
+  while IFS= read -r f; do
+    if [ -L "$f" ]; then
+      rm -rf "$jdir"
+      echo "stitchpad: refusing to journal over symlinked state file $(basename "$f")" >&2
+      return 1
+    fi
+    if [ -f "$f" ]; then
+      cp "$f" "$jdir/$i" 2>/dev/null || { rm -rf "$jdir"; return 1; }
+      printf '1\n' >> "$jdir/manifest"
+    else
+      printf '0\n' >> "$jdir/manifest"
+    fi
+    i=$(( i + 1 ))
+  done < <(_sp_session_registry_journal_files "$sid")
+  printf '%s' "$jdir"
+}
+
+# Restore exact pre-operation bytes. Files that existed are rewritten with
+# their journaled content (in place, preserving the pad inode); files the
+# operation created are removed. The journal dir is always consumed.
+sp_session_registry_journal_rollback() {
+  local jdir="${1:-}" sid="${2:-}"
+  [ -n "$jdir" ] && [ -d "$jdir" ] && [ ! -L "$jdir" ] || return 0
+  local i=0 f existed
+  while IFS= read -r f; do
+    existed="$(sed -n "$(( i + 1 ))p" "$jdir/manifest" 2>/dev/null)"
+    if [ "$existed" = "1" ]; then
+      # Never write through a symlink: unlink the link itself first.
+      [ -L "$f" ] && rm -f "$f" 2>/dev/null
+      if [ -d "$f" ]; then
+        echo "stitchpad: rollback refusing to overwrite directory $(basename "$f")" >&2
+      else
+        cat "$jdir/$i" > "$f" 2>/dev/null || cp "$jdir/$i" "$f" 2>/dev/null || true
+      fi
+    elif [ "$existed" = "0" ]; then
+      # rm -f unlinks the path itself — it never follows a symlink target.
+      rm -f "$f" 2>/dev/null || true
+    else
+      # An unreadable/truncated manifest line is not proof the file was
+      # created by the operation — fail closed and leave it untouched.
+      echo "stitchpad: rollback manifest line $(( i + 1 )) unreadable — leaving $(basename "$f") untouched" >&2
+    fi
+    i=$(( i + 1 ))
+  done < <(_sp_session_registry_journal_files "$sid")
+  rm -rf "$jdir" 2>/dev/null || true
+}
+
+# Success path: the operation committed durably, drop the journal.
+sp_session_registry_journal_commit() {
+  local jdir="${1:-}"
+  [ -n "$jdir" ] && rm -rf "$jdir" 2>/dev/null || true
+}
+
 # ── Lifecycle wiring (product call sites) ──────────────────────────────
 # Record a REAL lifecycle event and refresh the pad-header projection in one
 # step, for callers that ALREADY hold the pad mutation lock (say/join/leave).
@@ -786,20 +889,42 @@ sp_session_registry_lifecycle_locked() {
     esac
   fi
 
-  sp_session_registry_render_pad_header || true
+  # The header refresh is part of the interlocked unit: a stale header riding
+  # a successful pad commit is exactly the divergence the journal protects
+  # against, so a render failure fails the whole event (caller rolls back).
+  sp_session_registry_render_pad_header || return 1
   return 0
 }
 
 # Same recording + header refresh for call sites that do NOT already hold the
 # pad mutation lock (bind-session, shift-change, reset): acquires the lock,
-# records + renders, commits the header refresh, releases. A busy pad returns
-# nonzero; callers decide whether a missed projection refresh is fatal.
+# journals pre-operation state, records + renders, commits the header refresh,
+# releases. ALL-OR-NOTHING: a failed record/render rolls back journal state
+# before the commit; a failed commit rolls back registry, markers, and pad
+# bytes. A busy pad returns nonzero before any mutation; callers decide
+# whether a missed projection refresh is fatal — it is never left half-done.
 sp_session_registry_lifecycle_commit() {
   local event="${1:-activity}" epoch="${2:-}"
   sp_lock || return 1
-  local rc=0
-  sp_session_registry_lifecycle_locked "$event" "$epoch" || rc=1
-  sp_commit "sessions: $event"
+  local sid jdir rc=0
+  sid="$(sp_session_registry_sid)"
+  jdir="$(sp_session_registry_journal_begin "$sid")" || {
+    sp_unlock
+    echo "stitchpad: could not journal pre-lifecycle state — event not recorded" >&2
+    return 1
+  }
+  if ! sp_session_registry_lifecycle_locked "$event" "$epoch"; then
+    sp_session_registry_journal_rollback "$jdir" "$sid"
+    sp_unlock
+    return 1
+  fi
+  sp_commit "sessions: $event" || rc=1
+  if [ "$rc" -ne 0 ]; then
+    sp_session_registry_journal_rollback "$jdir" "$sid"
+    sp_unlock
+    return 1
+  fi
+  sp_session_registry_journal_commit "$jdir"
   sp_unlock
-  return "$rc"
+  return 0
 }
