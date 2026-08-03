@@ -1026,31 +1026,48 @@ PY
       --save)
         who="${2:?usage: shift-change --save <name> --file <path>}"
         [ "${3:-}" = "--file" ] && [ -f "${4:-}" ] || { echo "stitchpad: need --file <path>" >&2; exit 1; }
-        # TASK-4: idempotent rotation — if a pending handoff already exists
-        # for this agent, report truthfully and exit 0 (no double-apply).
-        _existing="$(/usr/bin/sqlite3 "$db" "SELECT COUNT(*) FROM handoffs WHERE agent='$(printf '%s' "$who" | sed "s/'/''/g")' AND status='pending';" 2>/dev/null || echo 0)"
-        if [ "${_existing:-0}" -ge 1 ]; then
-          echo "✓ shift-change already pending for @$who (no-op)"
-        else
         _handoff="$(mktemp)"
         sp_prompt_with_ponytail < "$4" > "$_handoff"
         [ "$(wc -c < "$_handoff")" -le 32768 ] || { rm -f "$_handoff"; echo "stitchpad: handoff too large after shared instructions (32KB cap)" >&2; exit 1; }
-        python3 - "$db" "$who" "$_handoff" <<'PY'
+        # E4: uniqueness guard at the DB level instead of check-then-act.
+        # A partial UNIQUE index on (agent) WHERE status='pending' makes two
+        # concurrent --save calls for the same agent race at the SQLite layer,
+        # not in shell: only one INSERT can win; the loser gets a real
+        # IntegrityError, which we translate into the same truthful no-op
+        # report TASK-4 promised. busy_timeout absorbs writer contention
+        # instead of surfacing "database is locked".
+        _save_result="$(python3 - "$db" "$who" "$_handoff" <<'PY'
 import sqlite3, sys, datetime
 db, who, f = sys.argv[1:4]
-con = sqlite3.connect(db)
-con.execute("INSERT INTO handoffs(agent, at, body) VALUES(?,?,?)",
-            (who, datetime.datetime.now().isoformat(timespec="seconds"), open(f, encoding="utf-8", errors="replace").read()))
-con.commit()
+con = sqlite3.connect(db, timeout=10)
+con.execute("PRAGMA busy_timeout=10000")
+con.execute("CREATE UNIQUE INDEX IF NOT EXISTS idx_handoffs_pending_agent ON handoffs(agent) WHERE status='pending'")
+try:
+    con.execute("BEGIN IMMEDIATE")
+    con.execute("INSERT INTO handoffs(agent, at, body) VALUES(?,?,?)",
+                (who, datetime.datetime.now().isoformat(timespec="seconds"),
+                 open(f, encoding="utf-8", errors="replace").read()))
+    con.commit()
+    print("inserted")
+except sqlite3.IntegrityError:
+    con.rollback()
+    print("duplicate")
 PY
+)"
         rm -f "$_handoff"
-        # REAL lifecycle projection: the seat is rotating to a fresh session
-        # identity. Record the rotate against its current durable binding
-        # (forces a NEW request id for whatever comes next) and refresh the
-        # pad header. Busy pad → skipped refresh, handoff still queued.
-        STITCHPAD_SESSION="$(sp_session_registry_sid_for_name "$who")" STITCHPAD_NAME="$who" \
-          sp_session_registry_lifecycle_commit rotate || true
-        echo "✓ shift-change queued for @$who — finish your turn now; the bridge clears the session once idle and delivers this into the fresh chat"
+        if [ "$_save_result" = "duplicate" ]; then
+          echo "✓ shift-change already pending for @$who (no-op)"
+        elif [ "$_save_result" = "inserted" ]; then
+          # REAL lifecycle projection: the seat is rotating to a fresh session
+          # identity. Record the rotate against its current durable binding
+          # (forces a NEW request id for whatever comes next) and refresh the
+          # pad header. Busy pad → skipped refresh, handoff still queued.
+          STITCHPAD_SESSION="$(sp_session_registry_sid_for_name "$who")" STITCHPAD_NAME="$who" \
+            sp_session_registry_lifecycle_commit rotate || true
+          echo "✓ shift-change queued for @$who — finish your turn now; the bridge clears the session once idle and delivers this into the fresh chat"
+        else
+          echo "stitchpad: could not persist shift-change handoff for @$who" >&2
+          exit 1
         fi
         ;;
       --claim)
@@ -1205,12 +1222,21 @@ PY
     if [ "$sid" = "-" ]; then
       echo "✓ no session id — set STITCHPAD_NAME=$nm or run inside a Herdr pane to pin identity" >&2
     else
+      # E4: serialize the check-then-act (read _prev, decide, write) under the
+      # pad lock. Two concurrent binders racing on the same sid could both pass
+      # the collision guard and both `printf >` the binding file — an
+      # interleaved write produces torn garbage (e.g. "bobce") that is not a
+      # valid roster name. The lock makes the whole decide+write sequence one
+      # atomic critical section; the write itself is also mktemp+rename so a
+      # reader never observes a partial file even mid-write.
+      sp_lock || { echo "stitchpad: pad busy (lock timeout) — could not bind session" >&2; exit 1; }
       # Collision guard: if this session id is ALREADY bound to a DIFFERENT name,
       # blindly clobbering is the identity-bleed bug (one session id rebound to
       # whoever posted last → CLI posts mis-stamped). Refuse unless --force, so a
       # crossed binding is loud, not silent. Same name = idempotent, always ok.
       _prev="$(cat "$PAD_STATE/sessions/$sid" 2>/dev/null || true)"
       if [ -n "$_prev" ] && [ "$_prev" != "$nm" ] && [ "${STITCHPAD_FORCE_BIND:-0}" != "1" ]; then
+        sp_unlock
         echo "✗ session $sid is already bound to @$_prev (not @$nm)." >&2
         echo "  Two runtimes may be sharing one session id, or this is a stale cross-bind." >&2
         echo "  If you really mean to rebind, re-run with STITCHPAD_FORCE_BIND=1." >&2
@@ -1219,10 +1245,22 @@ PY
       # TASK-4: idempotent reassignment — same sid → same name is a no-op
       # with a truthful report, never a double-apply.
       if [ "$_prev" = "$nm" ]; then
+        sp_unlock
         echo "✓ session $sid already bound to @$nm (no-op)"
       else
-        printf '%s' "$nm" > "$PAD_STATE/sessions/$sid"
-        echo "✓ bound session $sid → @$nm"
+        # E4: atomic write — mktemp in the same dir (same filesystem, so
+        # rename is atomic) then rename over the target. A reader either
+        # sees the old content or the new content in full, never a torn mix.
+        _bind_tmp="$PAD_STATE/sessions/.$sid.tmp.$$"
+        if printf '%s' "$nm" > "$_bind_tmp" 2>/dev/null && mv -f "$_bind_tmp" "$PAD_STATE/sessions/$sid" 2>/dev/null; then
+          sp_unlock
+          echo "✓ bound session $sid → @$nm"
+        else
+          rm -f "$_bind_tmp" 2>/dev/null || true
+          sp_unlock
+          echo "✗ could not persist session binding for $sid" >&2
+          exit 1
+        fi
       fi
       # REAL lifecycle projection: a first-time binding is a dispatch; binding
       # a session that already ENDED is a resume (the marker helper clears the
