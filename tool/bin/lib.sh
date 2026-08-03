@@ -159,6 +159,20 @@ sp_init_paths() {
   fi
 }
 
+# Evidence label (TASK-6): stamp the current environment + immutable candidate
+# for a verification artifact. Delegates to tool/bin/evidence-stamp when
+# present and never fails the caller when the helper is unavailable — the
+# stamp is a label on evidence, not a gate.
+sp_evidence_stamp() {
+  local _stamp
+  _stamp="$(cd -P "$(dirname "${BASH_SOURCE[0]}")" && pwd)/evidence-stamp"
+  if [ -x "$_stamp" ]; then
+    "$_stamp" "$@"
+  else
+    echo "# evidence-stamp: unavailable"
+  fi
+}
+
 # ── Identity ─────────────────────────────────────────────────────────
 # Identity is bound to the agent's SESSION, declared once via the MCP `join` tool
 # (which calls `stitchpad bind-session <id> <name>`, writing .state/sessions/<id>).
