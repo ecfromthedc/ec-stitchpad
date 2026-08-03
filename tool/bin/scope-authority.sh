@@ -146,9 +146,16 @@ _sp_authority_seal() { # $1=seat $2=operation $3=expiry
 sp_operator_grant_create() { # $1=seat $2=operation $3=ttl-seconds(0=none)
   local seat="$1" op="$2" ttl="${3:-86400}" expiry seal grant tmp
   sp_operator_ok || { echo "stitchpad: operator credential required — run 'stitchpad operator keygen' and export STITCHPAD_OPERATOR_TOKEN" >&2; return 1; }
-  seat="$(printf '%s' "$seat" | tr -cd 'a-zA-Z0-9._-')"
-  op="$(printf '%s' "$op" | tr -cd 'a-zA-Z0-9._-')"
-  [ -n "$seat" ] && [ -n "$op" ] || return 1
+  # fx2 G-A10: REFUSE invalid names — never silently munge. The previous
+  # tr-strip turned a request for one seat into a grant for a DIFFERENT
+  # (mangled) seat while the CLI echoed the original string with a ✓ —
+  # a lying confirmation (TASK-13 class) and a write-target confusion.
+  case "$seat" in ''|*[!a-zA-Z0-9._-]*)
+    echo "stitchpad: invalid seat name for grant (allowed: [a-zA-Z0-9._-])" >&2; return 1 ;;
+  esac
+  case "$op" in ''|*[!a-zA-Z0-9._-]*)
+    echo "stitchpad: invalid operation name for grant (allowed: [a-zA-Z0-9._-])" >&2; return 1 ;;
+  esac
   case "$ttl" in ''|*[!0-9]*) ttl=86400 ;; esac
   [ "$ttl" -eq 0 ] && expiry=0 || expiry=$(( $(date +%s) + ttl ))
   seal="$(_sp_authority_seal "$seat" "$op" "$expiry")" || return 1
