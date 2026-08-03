@@ -66,7 +66,7 @@ sp_autostart_name() {
 sp_maybe_start_heartbeat() {
   [ "${STITCHPAD_HEARTBEAT_AUTOSTART:-1}" = "0" ] && return 0
   case "$cmd" in
-    init|instructions|prompt-context|doctor|health|status|roster|who|sessions|read|heartbeat|hook|bind-session|whoami|leave|stop|daemon|watch|migration-check|reset|keeper|compact|restore-roster|color|help|-h|--help) return 0 ;;
+    init|instructions|prompt-context|doctor|health|status|roster|who|sessions|read|heartbeat|hook|bind-session|whoami|leave|stop|daemon|watch|migration-check|reset|keeper|compact|restore-roster|scope|authority|color|help|-h|--help) return 0 ;;
   esac
   sp_init_paths >/dev/null 2>&1 || return 0
   local who
@@ -846,6 +846,169 @@ PY
     printf '%s\n' "$_sum"
     ;;
 
+  scope)
+    # TASK-5: scope manifest management.
+    #   stitchpad scope set <seat> <path-glob>...   add paths to a seat's manifest
+    #   stitchpad scope show [seat]                 show manifest (or all seats)
+    #   stitchpad scope check <path>                check current seat's scope
+    #   stitchpad scope clear <seat>                clear a seat's scope manifest
+    #   stitchpad scope violations [seat]           show sticky violation records
+    #   stitchpad scope clear-violation <seat>      clear a sticky violation
+    sp_init_paths || exit 1
+    case "${1:-}" in
+      set)
+        who="${2:?usage: scope set <seat> <glob>...}"
+        shift 2
+        [ $# -ge 1 ] || { echo "usage: scope set <seat> <glob>..." >&2; exit 1; }
+        manifest="$PAD_STATE/scope.$who"
+        for glob in "$@"; do
+          # TASK-5: a seat may not add operator-grant paths to its own manifest.
+          if [ "$who" = "$(sp_me 2>/dev/null || true)" ]; then
+            sp_authority_guard_grant_write "$who" "$glob" || exit 1
+          fi
+          grep -qxF "$glob" "$manifest" 2>/dev/null || printf '%s\n' "$glob" >> "$manifest"
+        done
+        echo "✓ scope manifest for @$who: $(wc -l < "$manifest" 2>/dev/null || echo 0) entries"
+        ;;
+      show)
+        who="${2:-}"
+        if [ -n "$who" ]; then
+          manifest="$PAD_STATE/scope.$who"
+          [ -f "$manifest" ] && { echo "@$who:"; cat "$manifest"; } || echo "@$who: (no manifest — unrestricted)"
+        else
+          found=0
+          for m in "$PAD_STATE"/scope.*; do
+            [ -f "$m" ] || continue
+            found=1
+            seat="${m##*.scope.}"
+            echo "@$seat:"
+            cat "$m"
+            echo ""
+          done
+          [ "$found" -eq 0 ] && echo "(no scope manifests — all seats unrestricted)"
+        fi
+        ;;
+      check)
+        path="${2:?usage: scope check <path>}"
+        seat="$(_sp_scope_seat)"
+        if sp_scope_allows "$seat" "$path"; then
+          echo "✓ @$seat may write: $path"
+        else
+          sp_scope_record_violation "$seat" "$path" "$PAD_STATE/scope.$seat"
+          echo "✗ SCOPE VIOLATION: @$seat may NOT write: $path" >&2
+          echo "  Violation recorded sticky in $PAD_STATE/scope-violation.$seat" >&2
+          exit 1
+        fi
+        ;;
+      clear)
+        who="${2:?usage: scope clear <seat>}"
+        rm -f "$PAD_STATE/scope.$who"
+        echo "✓ scope manifest cleared for @$who"
+        ;;
+      violations)
+        who="${2:-}"
+        if [ -n "$who" ]; then
+          viol="$PAD_STATE/scope-violation.$who"
+          [ -f "$viol" ] && { echo "@$who:"; cat "$viol"; } || echo "@$who: (no violations)"
+        else
+          found=0
+          for v in "$PAD_STATE"/scope-violation.*; do
+            [ -f "$v" ] || continue
+            found=1
+            seat="${v##*.scope-violation.}"
+            echo "@$seat:"
+            cat "$v"
+            echo ""
+          done
+          [ "$found" -eq 0 ] && echo "(no scope violations)"
+        fi
+        ;;
+      clear-violation)
+        who="${2:?usage: scope clear-violation <seat>}"
+        rm -f "$PAD_STATE/scope-violation.$who" "$PAD_STATE/scope-cleared.$who"
+        : > "$PAD_STATE/scope-cleared.$who"
+        echo "✓ scope violation cleared for @$who"
+        ;;
+      *)
+        echo "usage: stitchpad scope <set|show|check|clear|violations|clear-violation> ..." >&2
+        exit 1
+        ;;
+    esac
+    ;;
+
+  authority)
+    # TASK-5: deployment authority management.
+    #   stitchpad authority set <seat> <read|write|deploy>
+    #   stitchpad authority show [seat]
+    #   stitchpad authority grant <seat> <operation>   create operator grant (human only)
+    #   stitchpad authority check <seat> <operation>   check deploy authority
+    sp_init_paths || exit 1
+    case "${1:-}" in
+      set)
+        who="${2:?usage: authority set <seat> <read|write|deploy>}"
+        level="${3:?usage: authority set <seat> <read|write|deploy>}"
+        case "$level" in
+          read|write|deploy) ;;
+          *) echo "invalid authority level: $level (use read|write|deploy)" >&2; exit 1 ;;
+        esac
+        printf '%s' "$level" > "$PAD_STATE/authority.$who"
+        echo "✓ authority for @$who: $level"
+        ;;
+      show)
+        who="${2:-}"
+        if [ -n "$who" ]; then
+          sp_authority_level "$who"
+        else
+          found=0
+          for a in "$PAD_STATE"/authority.*; do
+            [ -f "$a" ] || continue
+            found=1
+            seat="${a##*.authority.}"
+            echo "@$seat: $(cat "$a")"
+          done
+          [ "$found" -eq 0 ] && echo "(no authority files — all seats default to write)"
+        fi
+        ;;
+      grant)
+        who="${2:?usage: authority grant <seat> <operation>}"
+        op="${3:?usage: authority grant <seat> <operation>}"
+        # TASK-5: a seat may NEVER create its own operator grant.
+        # Only the operator (no STITCHPAD_NAME matching a roster seat) may grant.
+        _grantor="${STITCHPAD_NAME:-}"
+        _roster_names="$(sp_roster 2>/dev/null | cut -d'|' -f1 | tr '\n' ' ')"
+        case " $_roster_names " in
+          *" $_grantor "*)
+            echo "stitchpad: AUTHORITY VIOLATION — a seat (@$_grantor) may not create operator grants" >&2
+            echo "  Only the human operator may grant deployment authority." >&2
+            exit 1
+            ;;
+        esac
+        grant_file="$PAD_STATE/operator-grant.$who.$op"
+        printf '%s %s\n' "$_grantor" "$(date '+%Y-%m-%dT%H:%M:%S')" > "$grant_file"
+        echo "✓ operator grant created: @$who may perform: $op (one-time)"
+        ;;
+      check)
+        who="${2:?usage: authority check <seat> <operation>}"
+        op="${3:?usage: authority check <seat> <operation>}"
+        if sp_authority_check_deploy "$who" "$op"; then
+          echo "✓ @$seat is authorized for: $op"
+        else
+          exit 1
+        fi
+        ;;
+      consume)
+        who="${2:?usage: authority consume <seat> <operation>}"
+        op="${3:?usage: authority consume <seat> <operation>}"
+        sp_authority_consume_grant "$who" "$op"
+        echo "✓ operator grant consumed for @$who: $op"
+        ;;
+      *)
+        echo "usage: stitchpad authority <set|show|grant|check|consume> ..." >&2
+        exit 1
+        ;;
+    esac
+    ;;
+
   shift-change)
     # Fresh-context handoff, compact-smooth. An agent writes its own next-session
     # invocation as its LAST act; we store it durably in the pad's sqlite; the
@@ -866,22 +1029,46 @@ PY
         _handoff="$(mktemp)"
         sp_prompt_with_ponytail < "$4" > "$_handoff"
         [ "$(wc -c < "$_handoff")" -le 32768 ] || { rm -f "$_handoff"; echo "stitchpad: handoff too large after shared instructions (32KB cap)" >&2; exit 1; }
-        python3 - "$db" "$who" "$_handoff" <<'PY'
+        # E4: uniqueness guard at the DB level instead of check-then-act.
+        # A partial UNIQUE index on (agent) WHERE status='pending' makes two
+        # concurrent --save calls for the same agent race at the SQLite layer,
+        # not in shell: only one INSERT can win; the loser gets a real
+        # IntegrityError, which we translate into the same truthful no-op
+        # report TASK-4 promised. busy_timeout absorbs writer contention
+        # instead of surfacing "database is locked".
+        _save_result="$(python3 - "$db" "$who" "$_handoff" <<'PY'
 import sqlite3, sys, datetime
 db, who, f = sys.argv[1:4]
-con = sqlite3.connect(db)
-con.execute("INSERT INTO handoffs(agent, at, body) VALUES(?,?,?)",
-            (who, datetime.datetime.now().isoformat(timespec="seconds"), open(f, encoding="utf-8", errors="replace").read()))
-con.commit()
+con = sqlite3.connect(db, timeout=10)
+con.execute("PRAGMA busy_timeout=10000")
+con.execute("CREATE UNIQUE INDEX IF NOT EXISTS idx_handoffs_pending_agent ON handoffs(agent) WHERE status='pending'")
+try:
+    con.execute("BEGIN IMMEDIATE")
+    con.execute("INSERT INTO handoffs(agent, at, body) VALUES(?,?,?)",
+                (who, datetime.datetime.now().isoformat(timespec="seconds"),
+                 open(f, encoding="utf-8", errors="replace").read()))
+    con.commit()
+    print("inserted")
+except sqlite3.IntegrityError:
+    con.rollback()
+    print("duplicate")
 PY
+)"
         rm -f "$_handoff"
-        # REAL lifecycle projection: the seat is rotating to a fresh session
-        # identity. Record the rotate against its current durable binding
-        # (forces a NEW request id for whatever comes next) and refresh the
-        # pad header. Busy pad → skipped refresh, handoff still queued.
-        STITCHPAD_SESSION="$(sp_session_registry_sid_for_name "$who")" STITCHPAD_NAME="$who" \
-          sp_session_registry_lifecycle_commit rotate || true
-        echo "✓ shift-change queued for @$who — finish your turn now; the bridge clears the session once idle and delivers this into the fresh chat"
+        if [ "$_save_result" = "duplicate" ]; then
+          echo "✓ shift-change already pending for @$who (no-op)"
+        elif [ "$_save_result" = "inserted" ]; then
+          # REAL lifecycle projection: the seat is rotating to a fresh session
+          # identity. Record the rotate against its current durable binding
+          # (forces a NEW request id for whatever comes next) and refresh the
+          # pad header. Busy pad → skipped refresh, handoff still queued.
+          STITCHPAD_SESSION="$(sp_session_registry_sid_for_name "$who")" STITCHPAD_NAME="$who" \
+            sp_session_registry_lifecycle_commit rotate || true
+          echo "✓ shift-change queued for @$who — finish your turn now; the bridge clears the session once idle and delivers this into the fresh chat"
+        else
+          echo "stitchpad: could not persist shift-change handoff for @$who" >&2
+          exit 1
+        fi
         ;;
       --claim)
         hid="${2:?usage: shift-change --claim <id>}"
@@ -1035,19 +1222,46 @@ PY
     if [ "$sid" = "-" ]; then
       echo "✓ no session id — set STITCHPAD_NAME=$nm or run inside a Herdr pane to pin identity" >&2
     else
+      # E4: serialize the check-then-act (read _prev, decide, write) under the
+      # pad lock. Two concurrent binders racing on the same sid could both pass
+      # the collision guard and both `printf >` the binding file — an
+      # interleaved write produces torn garbage (e.g. "bobce") that is not a
+      # valid roster name. The lock makes the whole decide+write sequence one
+      # atomic critical section; the write itself is also mktemp+rename so a
+      # reader never observes a partial file even mid-write.
+      sp_lock || { echo "stitchpad: pad busy (lock timeout) — could not bind session" >&2; exit 1; }
       # Collision guard: if this session id is ALREADY bound to a DIFFERENT name,
       # blindly clobbering is the identity-bleed bug (one session id rebound to
       # whoever posted last → CLI posts mis-stamped). Refuse unless --force, so a
       # crossed binding is loud, not silent. Same name = idempotent, always ok.
       _prev="$(cat "$PAD_STATE/sessions/$sid" 2>/dev/null || true)"
       if [ -n "$_prev" ] && [ "$_prev" != "$nm" ] && [ "${STITCHPAD_FORCE_BIND:-0}" != "1" ]; then
+        sp_unlock
         echo "✗ session $sid is already bound to @$_prev (not @$nm)." >&2
         echo "  Two runtimes may be sharing one session id, or this is a stale cross-bind." >&2
         echo "  If you really mean to rebind, re-run with STITCHPAD_FORCE_BIND=1." >&2
         exit 1
       fi
-      printf '%s' "$nm" > "$PAD_STATE/sessions/$sid"
-      echo "✓ bound session $sid → @$nm"
+      # TASK-4: idempotent reassignment — same sid → same name is a no-op
+      # with a truthful report, never a double-apply.
+      if [ "$_prev" = "$nm" ]; then
+        sp_unlock
+        echo "✓ session $sid already bound to @$nm (no-op)"
+      else
+        # E4: atomic write — mktemp in the same dir (same filesystem, so
+        # rename is atomic) then rename over the target. A reader either
+        # sees the old content or the new content in full, never a torn mix.
+        _bind_tmp="$PAD_STATE/sessions/.$sid.tmp.$$"
+        if printf '%s' "$nm" > "$_bind_tmp" 2>/dev/null && mv -f "$_bind_tmp" "$PAD_STATE/sessions/$sid" 2>/dev/null; then
+          sp_unlock
+          echo "✓ bound session $sid → @$nm"
+        else
+          rm -f "$_bind_tmp" 2>/dev/null || true
+          sp_unlock
+          echo "✗ could not persist session binding for $sid" >&2
+          exit 1
+        fi
+      fi
       # REAL lifecycle projection: a first-time binding is a dispatch; binding
       # a session that already ENDED is a resume (the marker helper clears the
       # stale end marker). Rebinding an already-active session records NOTHING
