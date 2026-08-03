@@ -11,7 +11,16 @@ import { html, render, useState, useEffect, useLayoutEffect, useRef } from "./ve
 
 // ── helpers (unchanged from the vanilla app) ─────────────────
 const RELAY = location.origin;
-const esc = s => (s || "").replace(/[&<>]/g, c => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;" }[c]));
+// C2/C5 (rc1): esc() is used in ATTRIBUTE contexts too (data-n, img alt,
+// href) — it must escape quotes or an attacker-chosen " breaks out of the
+// attribute into a live event handler (stored XSS via /say text, roster
+// names, and the pushed colors blob). Escape at the sink, always.
+const esc = s => (s || "").replace(/[&<>"']/g, c => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]));
+// Colors arrive over the wire (roster colors blob, /push) and land in
+// style="..." interpolations — a value like red;background:url(evil) is CSS
+// injection (exfil/UI redress). Hex-only at the sink; anything else falls
+// back to a neutral gray.
+const safeColor = c => (/^#[0-9a-fA-F]{3,8}$/.test(c || "") ? c : "#888888");
 const initials = n => (n || "?").slice(0, 2).toUpperCase();
 const OVR = { smaths: "#f1ece4", randy: "#0d9488", dale: "#00d000", larry: "#e01010", ernie: "#9b30ff", dennis: "#ff8c00", Jill: "#ff1493", mark: "#ffd700",
   codex: "#a8a3ff", fable: "#d97757", claude: "#d97757", "claude-main": "#c96442", pi: "#aeb8c4", "kimi-pi": "#1783ff", kimi: "#1783ff", ocean: "#38bdf8", deepseek: "#4d6bfe" };
@@ -23,7 +32,7 @@ function setRelayColors(c) {
   else if (c && typeof c === "object") Object.assign(m, c);
   RELAY_COLORS = m;
 }
-const colorFor = n => RELAY_COLORS[n] || OVR[n] || (typeof harnessOf === "function" && HARNESS_COLOR[harnessOf(n)]) || PAL[[...(n || "")].reduce((s, c) => s + c.charCodeAt(0), 0) % PAL.length];
+const colorFor = n => safeColor(RELAY_COLORS[n] || OVR[n] || (typeof harnessOf === "function" && HARNESS_COLOR[harnessOf(n)]) || PAL[[...(n || "")].reduce((s, c) => s + c.charCodeAt(0), 0) % PAL.length]);
 const lum = h => { const c = h.replace("#", ""); return (0.299 * parseInt(c.slice(0, 2), 16) + 0.587 * parseInt(c.slice(2, 4), 16) + 0.114 * parseInt(c.slice(4, 6), 16)) / 255; };
 const onLight = n => lum(colorFor(n)) > 0.85;
 const nameColor = n => onLight(n) ? "#e7e9ec" : colorFor(n);
