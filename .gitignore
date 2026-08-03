@@ -21,3 +21,6 @@ tool/mcp/package-lock.json
 tool/relay/.wrangler/
 
 tool/stitchpad-git/
+
+# stitchpad runtime (isolated history)
+.stitchpad/
