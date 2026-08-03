@@ -1023,12 +1023,19 @@ sp_commit() {
   local msg="$1"; shift 2>/dev/null || true
   local paths=("$@")
   [ "${#paths[@]}" -eq 0 ] && paths=("$(basename "$PAD_MD")")
-  # H11b: distinguish absent git-dir (benign — no git backing, return 0) from
-  # broken git-dir (fatal — config corruption, missing objects, return 1).
-  if ! sgit rev-parse --git-dir >/dev/null 2>&1; then
+  # C4 / H11b: distinguish absent git-dir (benign — no git backing, return 0)
+  # from a git-dir that exists but is broken (fatal — config corruption,
+  # missing objects, return 1).  rev-parse --git-dir itself exits 128 on a
+  # corrupt config, so the original H11b guard returned 0 before cat-file -t
+  # HEAD was ever reached.  Check -d first, then let each failure be honest.
+  if [ ! -d "$PAD_GIT" ]; then
     return 0  # No git dir at all — benign
   fi
-  # H11b: git dir exists — verify it's not broken
+  # H11b: git dir exists — verify it's reachable
+  if ! sgit rev-parse --git-dir >/dev/null 2>&1; then
+    echo "stitchpad: git repository is broken (rev-parse failed on $PAD_GIT) — commit refused" >&2
+    return 1
+  fi
   if ! sgit cat-file -t HEAD >/dev/null 2>&1; then
     echo "stitchpad: git repository is broken (HEAD unreachable) — commit refused" >&2
     return 1
@@ -1067,12 +1074,31 @@ sp_commit() {
   local _head_before=""
   _head_before="$(sgit rev-parse HEAD 2>/dev/null || echo "")"
   if sgit commit -q -m "$msg" >/dev/null 2>/dev/null; then
+    # C3: commit exited 0, but a pre-commit hook that empties the index
+    # makes git produce an EMPTY commit — HEAD advances, index is clean,
+    # but our write bytes are in neither HEAD nor HEAD~1.  Journaled
+    # callers (lifecycle_commit, rollback) treat rc=0 as success and drop
+    # the journal → write permanently lost.
+    # Verify our staged content actually landed: diff-tree HEAD~1..HEAD
+    # must list at least one changed file.
+    local _head_after=""
+    _head_after="$(sgit rev-parse HEAD 2>/dev/null || echo "")"
+    if [ -n "$_head_before" ] && [ -n "$_head_after" ] && [ "$_head_before" != "$_head_after" ]; then
+      if [ -z "$(sgit diff-tree --name-only "${_head_before}" "$_head_after" 2>/dev/null)" ]; then
+        echo "stitchpad: commit produced an empty tree (hook may have cleared the index) — write NOT committed" >&2
+        return 1
+      fi
+    fi
     return 0
   fi
-  # H5b: commit failed. Check HEAD moved AND index is clean.
+  # H5b: commit failed (exit ≠ 0). Check HEAD moved AND index is clean.
   local _head_after=""
   _head_after="$(sgit rev-parse HEAD 2>/dev/null || echo "")"
   if [ -n "$_head_before" ] && [ -n "$_head_after" ] && [ "$_head_before" != "$_head_after" ]; then
+    if [ -z "$(sgit diff-tree --name-only "${_head_before}" "$_head_after" 2>/dev/null)" ]; then
+      echo "stitchpad: git commit failed but HEAD advanced with an empty tree — write NOT committed" >&2
+      return 1
+    fi
     sgit diff --cached --quiet -- "${paths[@]}" 2>/dev/null && return 0
   fi
   # H5b: HEAD didn't move — real failure, write NOT committed.

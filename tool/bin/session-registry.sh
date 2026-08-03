@@ -1019,32 +1019,41 @@ sp_session_registry_journal_begin() {
 # a crafted .paths entry pointing outside PAD_STATE got written verbatim).
 # Require every path to resolve (parent-dir realpath, no symlink hops) under
 # PAD_DIR or PAD_STATE before any journal replay touches it.
+# C1 SEVERE: case-insensitive filesystem bypass protection.  The git-dir
+# exclusion uses dev/inode comparison as the primary gate (same directory
+# on disk → same identity regardless of filename case) and case-insensitive
+# string checks as defense in depth for subdirectory patterns.
 _sp_session_registry_journal_path_contained() {
-  local f="$1" real_dir pad_dir_real pad_state_real git_dir_real
+  local f="$1" real_dir pad_dir_real pad_state_real _gd_identity _rd_identity _flow
   pad_dir_real="$(cd "${PAD_DIR:-/nonexistent}" 2>/dev/null && pwd -P)" || return 1
   pad_state_real="$(cd "${PAD_STATE:-/nonexistent}" 2>/dev/null && pwd -P)" || return 1
   real_dir="$(cd "$(dirname "$f")" 2>/dev/null && pwd -P)" || return 1
-  # H1 SEVERE: the pad git dir ($PAD_DIR/stitchpad-git/) lives under PAD_DIR
-  # but must NEVER be writable through journal replay. A crafted orphan with
-  # .paths → stitchpad-git/config corrupts the git config (permanent DoS), and
-  # .paths → stitchpad-git/hooks/pre-commit overwrites an executable hook
-  # (RCE on the next commit). Exclude the git dir entirely.
-  git_dir_real="$(cd "${PAD_DIR:-/nonexistent}/stitchpad-git" 2>/dev/null && pwd -P)" || git_dir_real=""
+  # PAD_DIR / PAD_STATE scope check
   case "$real_dir" in
     "$pad_dir_real"|"$pad_dir_real"/*) ;;
     "$pad_state_real"|"$pad_state_real"/*) ;;
     *) return 1 ;;
   esac
-  # H1: exclude anything under the git dir
-  if [ -n "$git_dir_real" ]; then
-    case "$real_dir" in
-      "$git_dir_real"|"$git_dir_real"/*)
-        return 1
-        ;;
-    esac
+  # C1 SEVERE: the git-dir string-based exclusion (H1) is bypassable on
+  # case-insensitive APFS (macOS default).  cd Stitchpad-git && pwd -P
+  # returns the TYPED spelling, so a case-sensitive string match against the
+  # canonical "stitchpad-git" misses.  Compare the real directory's dev/inode
+  # against the git dir's — same directory on disk ⇒ same identity regardless
+  # of case.  This is the primary gate; the string checks below are defense
+  # in depth (also made case-insensitive).
+  if [ -d "${PAD_DIR:-/nonexistent}/stitchpad-git" ]; then
+    _gd_identity="$(python3 -c "import os,sys; s=os.stat(sys.argv[1]); print(s.st_dev,s.st_ino)" "${PAD_DIR}/stitchpad-git" 2>/dev/null)" || _gd_identity=""
+    _rd_identity="$(python3 -c "import os,sys; s=os.stat(sys.argv[1]); print(s.st_dev,s.st_ino)" "$real_dir" 2>/dev/null)" || _rd_identity=""
+    if [ -n "$_gd_identity" ] && [ "$_rd_identity" = "$_gd_identity" ]; then
+      return 1  # target directory IS the git dir (any case variant)
+    fi
   fi
-  # H1: also exclude any path containing .git or hooks — defense in depth
-  case "$f" in
+  # Defense in depth: case-insensitive string checks for .git / hooks /
+  # stitchpad-git subdirectory patterns — catches deep paths the dev/inode
+  # ancestor check above misses (e.g. .paths → stitchpad-git/hooks/pre-commit
+  # where real_dir is inside the git dir but not the git dir root).
+  _flow="$(printf '%s' "$f" | tr '[:upper:]' '[:lower:]')"
+  case "$_flow" in
     */.git/*|*/.git|*/hooks/*|*/stitchpad-git/*|*/stitchpad-git)
       return 1
       ;;
