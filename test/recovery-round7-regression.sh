@@ -8,6 +8,9 @@
 #   C3: empty-commit detection.  A pre-commit hook that empties the index makes
 #       git produce an empty commit (HEAD advances, index clean).  sp_commit
 #       detects this via diff-tree and returns 1, not 0.
+#       C3a drives the SUCCESS branch (hook exits 0, empty commit created).
+#       C3b drives the FAILURE branch (hook exits 1 but silently advances HEAD
+#       to an empty tree — the fx2 mu4 survivor).
 #   C4: broken-git-dir reachability.  rev-parse failure on a corrupt config is
 #       no longer conflated with "no git dir" — it returns 1, not 0.
 #
@@ -185,7 +188,80 @@ else
   bad "C3c: normal commit (no hook) failed — regression!"
 fi
 
-rm -rf "$C3_WORK"
+# C3b: C3 FAILURE BRANCH — commit rc≠0 but HEAD advanced with identical tree.
+# The C3a hook exits 0 and HEAD advances to an empty commit (success branch).
+# C3b drives the FAILURE branch: a pre-commit hook that creates a new commit
+# with the SAME tree as HEAD (so diff-tree is empty — no files changed),
+# advances HEAD to it, then exits 1.  sp_commit must detect that HEAD advanced
+# with an empty diff and return 1, not fall through to the diff --cached --quiet
+# return-0 path (which would tell journaled callers "success" and drop the journal).
+echo ""
+echo "--- C3b: failure-branch empty-tree detection (fx2 mutation survivor) ---"
+
+C3B_WORK="$(mktemp -d "${TMPDIR:-/tmp}/sp-r7-c3b.XXXXXX")"
+make_pad "$C3B_WORK/test-pad" "c3b-pad"
+
+C3B_PAD_DIR="$C3B_WORK/test-pad/.stitchpad"
+C3B_PAD_MD="$C3B_PAD_DIR/stitchpad.md"
+C3B_PAD_GIT="$C3B_PAD_DIR/stitchpad-git"
+
+# Hook: creates a commit with the SAME tree as current HEAD (diff-tree will
+# be empty), advances HEAD to it, then exits 1. Uses --git-dir explicitly.
+mkdir -p "$C3B_PAD_GIT/hooks"
+cat > "$C3B_PAD_GIT/hooks/pre-commit" <<'HOOK'
+#!/usr/bin/env bash
+# Grab current HEAD's tree — use the caller's GIT_DIR from the environment
+parent_tree=$(git rev-parse HEAD^{tree} 2>/dev/null)
+[ -n "$parent_tree" ] || exit 1
+new_commit=$(echo "hook empty" | git commit-tree ${parent_tree} -p HEAD 2>/dev/null)
+[ -n "$new_commit" ] && git update-ref HEAD "$new_commit" 2>/dev/null
+exit 1
+HOOK
+chmod +x "$C3B_PAD_GIT/hooks/pre-commit"
+
+# Set up PAD variables for sp_commit
+PAD_DIR="$C3B_PAD_DIR"
+PAD_MD="$C3B_PAD_MD"
+PAD_STATE="$C3B_PAD_DIR/.state"
+PAD_GIT="$C3B_PAD_GIT"
+
+# Create a real staged change so commit is attempted
+echo "" >> "$C3B_PAD_MD"
+echo "C3b test write — failure branch" >> "$C3B_PAD_MD"
+
+# Record HEAD before the commit attempt
+C3B_HEAD_BEFORE="$(git --git-dir="$C3B_PAD_GIT" rev-parse HEAD 2>/dev/null)"
+
+# Run sp_commit — hook exits 1 (commit fails), but HEAD already advanced via hook
+C3B_OUT="$(sp_commit "C3b failure branch test" 2>&1)" || C3B_RC=$?
+if [ "${C3B_RC:-0}" -ne 0 ]; then
+  # Verify the diagnostic was emitted
+  if echo "$C3B_OUT" | grep -q "HEAD advanced with an empty tree"; then
+    ok "C3d: failure branch empty-tree detected, diagnostic emitted (rc=$C3B_RC)"
+  else
+    bad "C3d: commit failed (rc=$C3B_RC) but missing 'HEAD advanced with an empty tree' diagnostic — got: $(printf '%s' "$C3B_OUT" | head -c 120)"
+  fi
+else
+  bad "C3d: sp_commit returned 0 on failure-branch empty-tree — journal would be dropped, data lost!"
+fi
+
+# Verify HEAD actually moved (hook did its job)
+C3B_HEAD_AFTER="$(git --git-dir="$C3B_PAD_GIT" rev-parse HEAD 2>/dev/null)"
+if [ "$C3B_HEAD_BEFORE" != "$C3B_HEAD_AFTER" ]; then
+  ok "C3e: HEAD advanced by hook (scenario was realistic)"
+else
+  bad "C3e: HEAD did NOT advance — hook didn't work, test inconclusive"
+fi
+
+# Verify the write is NOT in HEAD
+C3B_HEAD_HAS="$(git --git-dir="$C3B_PAD_GIT" --work-tree="$C3B_WORK/test-pad/.stitchpad" show HEAD:stitchpad.md 2>/dev/null | grep "C3b test write" || true)"
+if [ -z "$C3B_HEAD_HAS" ]; then
+  ok "C3f: write NOT in HEAD (correctly refused)"
+else
+  bad "C3f: write IS in HEAD — failure-branch empty commit landed in HEAD!"
+fi
+
+rm -rf "$C3B_WORK"
 
 # ============================================================================
 # C4: broken-git-dir reachability — rev-parse failure returns 1, not 0
