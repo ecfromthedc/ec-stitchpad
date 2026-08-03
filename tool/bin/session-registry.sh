@@ -42,6 +42,13 @@
 #   sp_session_registry_cap      → trim oldest entries to max
 #   sp_session_registry_validate_sid → validate a session id for path safety
 #   sp_session_registry_pad_header → render active sessions + bounded history as markdown lines
+#   sp_session_registry_sid_for_name → resolve a seat's durable session binding
+#   sp_session_registry_render_pad_header → write the sentinel-bounded header
+#                                  block into the pad file (requires held lock)
+#   sp_session_registry_lifecycle_locked → record event + markers + header
+#                                  refresh, caller already holds the pad lock
+#   sp_session_registry_lifecycle_commit → same, but acquires the pad lock and
+#                                  commits the header refresh
 
 SESSION_REGISTRY_MAX="${SESSION_REGISTRY_MAX:-1024}"
 SESSION_STALE_SECONDS="${SESSION_STALE_SECONDS:-3600}"
@@ -629,4 +636,170 @@ if data:
         sid = (e.get('session_id', '') or '')[:12]
         print(f'> [{evt}] @{name} — {provider}/{model} sid={sid}')
 " <<< "$hist" 2>/dev/null || true
+}
+
+# ── Durable seat identity lookup ───────────────────────────────────────
+# Resolve the durable session binding for a roster name (written by
+# bind-session into .state/sessions/<sid>). Prints the sid bound to <name>, or
+# nothing when the seat has no binding — a missing identity stays visibly
+# empty, never minted. Read-only.
+sp_session_registry_sid_for_name() {
+  local who="${1:-}" f sid
+  [ -n "$who" ] || return 0
+  for f in "$PAD_STATE"/sessions/*; do
+    [ -f "$f" ] && [ ! -L "$f" ] || continue
+    [ "$(tr -d '[:space:]' < "$f" 2>/dev/null)" = "$who" ] || continue
+    sid="$(basename "$f")"
+    if sp_session_registry_validate_sid "$sid"; then
+      printf '%s' "$sid"
+      return 0
+    fi
+  done
+  return 0
+}
+
+# ── Pad header write-back ──────────────────────────────────────────────
+# Write the sentinel-bounded Active Sessions + Session History block into the
+# pad file itself, from the REAL recorded events. Idempotent: an identical
+# rendering is a no-op (no write, no mtime bump, no commit churn).
+#
+# MUST be called while holding the pad mutation lock — sp_write_inplace
+# enforces exact lock ownership and refuses an unlocked write. The block lives
+# between HTML-comment sentinels directly after the roster fence, before any
+# authored "## @name" block, so it can never trip mention detection or the
+# engagement gate. A torn block (missing end sentinel) is healed without
+# swallowing any following pad content.
+sp_session_registry_render_pad_header() {
+  [ -n "${PAD_MD:-}" ] && [ -f "$PAD_MD" ] && [ ! -L "$PAD_MD" ] || return 0
+  # Only render once real events exist — never stamp an empty block onto a pad
+  # that has recorded no session lifecycle at all.
+  [ -f "$PAD_STATE/session-registry.jsonl" ] && [ ! -L "$PAD_STATE/session-registry.jsonl" ] || return 0
+
+  local body tmp rc=0
+  body="$(sp_session_registry_pad_header 2>/dev/null || true)"
+  tmp="$(sp_stage "$PAD_MD")" || return 1
+  if ! SP_SESSIONS_HEADER_BODY="$body" python3 - "$PAD_MD" "$tmp" <<'PY'
+import os, sys
+
+pad_path, out_path = sys.argv[1], sys.argv[2]
+BEGIN = '<!-- stitchpad:sessions:begin -->'
+END = '<!-- stitchpad:sessions:end -->'
+body = os.environ.get('SP_SESSIONS_HEADER_BODY', '').strip('\n')
+
+with open(pad_path, encoding='utf-8', errors='surrogateescape') as f:
+    lines = f.read().split('\n')
+
+block = [BEGIN] + (body.split('\n') if body else []) + [END]
+
+out = []
+i = 0
+replaced = False
+while i < len(lines):
+    if not replaced and lines[i].strip() == BEGIN:
+        j = i + 1
+        while j < len(lines) and lines[j].strip() != END:
+            j += 1
+        out.extend(block)
+        replaced = True
+        if j < len(lines):
+            i = j + 1      # healthy block: consumed through the end sentinel
+        else:
+            i = i + 1      # torn block (no end sentinel): keep following lines
+        continue
+    out.append(lines[i])
+    i += 1
+
+if not replaced:
+    ins = []
+    in_roster = False
+    inserted = False
+    for line in out:
+        ins.append(line)
+        if not inserted:
+            if line.startswith('```roster'):
+                in_roster = True
+            elif in_roster and line.strip() == '```':
+                ins.append('')
+                ins.extend(block)
+                inserted = True
+                in_roster = False
+    if not inserted:
+        # No roster fence — refuse to guess a position; leave the pad as-is.
+        raise SystemExit(3)
+    out = ins
+
+result = '\n'.join(out)
+if not result.endswith('\n'):
+    result += '\n'
+with open(out_path, 'w', encoding='utf-8', errors='surrogateescape') as f:
+    f.write(result)
+PY
+  then
+    rm -f "$tmp" 2>/dev/null || true
+    return 1
+  fi
+  sp_write_inplace "$tmp" "$PAD_MD"
+  rc=$?
+  [ "$rc" -eq 2 ] && rc=0   # identical content: idempotent no-op is success
+  return "$rc"
+}
+
+# ── Lifecycle wiring (product call sites) ──────────────────────────────
+# Record a REAL lifecycle event and refresh the pad-header projection in one
+# step, for callers that ALREADY hold the pad mutation lock (say/join/leave).
+# Also maintains the durable start/end markers the status projection derives
+# from:
+#   dispatch|resume  → ensure session-start.<sid> exists; clear stale
+#                      session-end.<sid> so a resumed session is active again
+#   terminal|cancel  → write session-end.<sid> so status derives terminal
+# One epoch is captured up front and flows into the registry entry AND the
+# markers — never a second `date +%s` inside the same operation.
+sp_session_registry_lifecycle_locked() {
+  local event="${1:-activity}" epoch="${2:-}"
+  [ -n "$epoch" ] || epoch="$(_sp_session_registry_now)"
+
+  local sid
+  sid="$(sp_session_registry_sid)"
+  if [ -n "$sid" ]; then
+    case "$event" in
+      dispatch|resume)
+        if [ ! -e "$PAD_STATE/session-start.$sid" ]; then
+          mkdir -p "$PAD_STATE" 2>/dev/null || true
+          printf '%s' "$epoch" > "$PAD_STATE/session-start.$sid" 2>/dev/null || true
+        fi
+        if [ -e "$PAD_STATE/session-end.$sid" ] && [ ! -L "$PAD_STATE/session-end.$sid" ]; then
+          rm -f "$PAD_STATE/session-end.$sid" 2>/dev/null || true
+        fi
+        ;;
+    esac
+  fi
+
+  sp_session_registry_record_event "$event" "$epoch" || return 1
+
+  if [ -n "$sid" ]; then
+    case "$event" in
+      terminal|cancel)
+        if [ ! -L "$PAD_STATE/session-end.$sid" ]; then
+          printf '%s' "$epoch" > "$PAD_STATE/session-end.$sid" 2>/dev/null || true
+        fi
+        ;;
+    esac
+  fi
+
+  sp_session_registry_render_pad_header || true
+  return 0
+}
+
+# Same recording + header refresh for call sites that do NOT already hold the
+# pad mutation lock (bind-session, shift-change, reset): acquires the lock,
+# records + renders, commits the header refresh, releases. A busy pad returns
+# nonzero; callers decide whether a missed projection refresh is fatal.
+sp_session_registry_lifecycle_commit() {
+  local event="${1:-activity}" epoch="${2:-}"
+  sp_lock || return 1
+  local rc=0
+  sp_session_registry_lifecycle_locked "$event" "$epoch" || rc=1
+  sp_commit "sessions: $event"
+  sp_unlock
+  return "$rc"
 }
