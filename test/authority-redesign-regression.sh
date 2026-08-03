@@ -156,9 +156,12 @@ out="$(run_sp STITCHPAD_NAME=probe -- reset victim 2>&1)"; rc=$?
 [ ! -f "$STATE/operator-grant.probe.reset-others" ] \
   && ok 'F3: sealed grant consumed (one-shot)' || bad 'F3: sealed grant not consumed'
 
-# F4: tampered seal refuses
+# F4: tampered seal refuses. Tamper DETERMINISTICALLY: replacing only the
+# first hex char with 0 is a no-op 1/16 of the time (seal already starts
+# with 0) — a flake, not a gate. Overwrite the whole seal with a fixed
+# wrong value.
 run_sp STITCHPAD_OPERATOR_TOKEN="$TOK" -- operator grant probe reset-others >/dev/null
-sed -i '' 's/^seal=./seal=0/' "$STATE/operator-grant.probe.reset-others"
+sed -i '' 's/^seal=.*/seal=0000000000000000000000000000000000000000000000000000000000000000/' "$STATE/operator-grant.probe.reset-others"
 out="$(run_sp STITCHPAD_NAME=probe -- reset victim 2>&1)"; rc=$?
 [ "$rc" -ne 0 ] && ok 'F4: tampered seal refuses' || bad 'F4: tampered seal PASSED'
 rm -f "$STATE/operator-grant.probe.reset-others"

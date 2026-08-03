@@ -866,13 +866,22 @@ _rc=$?
 [ "$_rc" -ne 0 ] && ok "H4a: non-roster name without operator flag denied" \
   || bad "H4a: non-roster name cleared counters without operator flag (spoof)"
 
-# H4b: with operator flag → allowed
+# H4b: with operator flag but NO credential → denied (C2 redesign superseded
+# the H4 flag: operator-ness is proven by the credential, never asserted by
+# an env flag — see the 1a9fc14 integration resolution).
 STITCHPAD_PAD_DIR="$H4_PAD_DIR" STITCHPAD_NAME="operator-human" \
   STITCHPAD_I_AM_OPERATOR=1 STITCHPAD_HEARTBEAT_AUTOSTART=0 STITCHPAD_STEAL=1 \
   "$STITCHPAD" reset --recovery-counters > /dev/null 2>&1
 _rc=$?
-[ "$_rc" -eq 0 ] && ok "H4b: operator with flag can clear counters" \
-  || bad "H4b: operator with flag denied (regression)"
+[ "$_rc" -ne 0 ] && ok "H4b: operator flag WITHOUT credential denied (flag superseded by C2 credential gate)" \
+  || bad "H4b: flag-only operator cleared counters (env-asserted operator-ness accepted)"
+# H4b2: with the credential → allowed
+STITCHPAD_PAD_DIR="$H4_PAD_DIR" STITCHPAD_NAME="operator-human" \
+  STITCHPAD_OPERATOR_TOKEN="$OP_TOK" STITCHPAD_HEARTBEAT_AUTOSTART=0 STITCHPAD_STEAL=1 \
+  "$STITCHPAD" reset --recovery-counters > /dev/null 2>&1
+_rc=$?
+[ "$_rc" -eq 0 ] && ok "H4b2: operator with credential can clear counters" \
+  || bad "H4b2: credentialed operator denied (regression)"
 
 # H4c: roster seat WITH operator flag → still denied
 STITCHPAD_PAD_DIR="$H4_PAD_DIR" STITCHPAD_NAME="alice" \
