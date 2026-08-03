@@ -73,6 +73,7 @@ export STITCHPAD_HEARTBEAT_AUTOSTART=0
 export HOME="$WORK/home"
 # A-4/A-5 fix: explicit override keeps this fixture off the real operator key
 export STITCHPAD_OPERATOR_KEY_PATH="$WORK/home/.stitchpad/operator.key"
+export STITCHPAD_OPERATOR_KEY_OVERRIDE_ACK=1
 mkdir -p "$HOME"
 # Authority model (C2/C2b): operator flows require the credential.
 "$STITCHPAD" operator keygen >/dev/null 2>&1 || true

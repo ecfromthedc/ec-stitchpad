@@ -86,13 +86,23 @@ _sp_operator_key_path() {
   # verifies from a seat running under another (A-5 intended-flow breakage).
   # Root the credential in the PASSWD-database home (a same-uid child cannot
   # set it), with an explicit override for hermetic test harnesses.
-  # Residual (documented): STITCHPAD_OPERATOR_KEY_PATH is env and therefore
-  # subject-controlled too — but every op this credential gates is a same-uid
-  # operation the subject can already perform directly (kill, file writes);
-  # the credential exists to stop ACCIDENTAL/automated overreach and to make
-  # deliberate bypass a multi-step, auditable act.
+  # Override contract (captain: fix the residual, don't document it): the
+  # override is honored ONLY with an explicit acknowledgment —
+  # STITCHPAD_OPERATOR_KEY_OVERRIDE_ACK=1 alongside the path. A seat that
+  # accidentally INHERITS a leaked override from a harness environment can
+  # no longer silently keygen/verify against the wrong root: without the
+  # ack the override is ignored (and the ignoring is LOUD on operator
+  # verbs). Hermetic suites set both. Remaining residual (fundamental at
+  # same-uid): a seat deliberately setting BOTH vars can still point at its
+  # own key — but every op this credential gates is a same-uid operation
+  # the subject can already perform directly (kill, file writes); the
+  # credential exists to stop accidental/automated overreach, and the ack
+  # makes deliberate bypass a two-env, greppable, auditable act.
   if [ -n "${STITCHPAD_OPERATOR_KEY_PATH:-}" ]; then
-    printf '%s' "$STITCHPAD_OPERATOR_KEY_PATH"; return 0
+    if [ "${STITCHPAD_OPERATOR_KEY_OVERRIDE_ACK:-}" = "1" ]; then
+      printf '%s' "$STITCHPAD_OPERATOR_KEY_PATH"; return 0
+    fi
+    echo "stitchpad: STITCHPAD_OPERATOR_KEY_PATH is set WITHOUT STITCHPAD_OPERATOR_KEY_OVERRIDE_ACK=1 — ignoring the override (set both for hermetic harnesses)" >&2
   fi
   local realhome
   realhome="$(python3 -c 'import os,pwd; print(pwd.getpwuid(os.getuid()).pw_dir)' 2>/dev/null)"

@@ -46,6 +46,7 @@ export HOME="$tmp/home"
 # (passwd-home by default) — fixtures MUST point the explicit override at
 # their isolated HOME so they never touch the real operator key.
 export STITCHPAD_OPERATOR_KEY_PATH="$tmp/home/.stitchpad/operator.key"
+export STITCHPAD_OPERATOR_KEY_OVERRIDE_ACK=1
 mkdir -p "$HOME"
 
 PAD="$tmp/pad/.stitchpad"
@@ -67,7 +68,8 @@ run_sp() { # env-pairs... -- args...
   # bash 3.2: guard empty-array expansion under set -u
   env -i PATH="$PATH" HOME="$HOME" TMPDIR="${TMPDIR:-/tmp}" ${envs[@]+"${envs[@]}"} \
     STITCHPAD_PAD_DIR="$PAD" STITCHPAD_HEARTBEAT_AUTOSTART=0 \
-    STITCHPAD_OPERATOR_KEY_PATH="$STITCHPAD_OPERATOR_KEY_PATH" "$SP" "$@"
+    STITCHPAD_OPERATOR_KEY_PATH="$STITCHPAD_OPERATOR_KEY_PATH" \
+    STITCHPAD_OPERATOR_KEY_OVERRIDE_ACK="$STITCHPAD_OPERATOR_KEY_OVERRIDE_ACK" "$SP" "$@"
 }
 
 echo "=== authority redesign regression (C2/C2b) ==="
@@ -222,7 +224,7 @@ rm "$HOME/.stitchpad/operator.key"; cp "$SECRET" "$HOME/.stitchpad/operator.key"
 
 # G-A5: key exists but NO token presented → grant mint must refuse
 rm -f "$STATE/operator-grant.probe.reset-others"
-out="$(env -i PATH="$PATH" HOME="$HOME" TMPDIR="${TMPDIR:-/tmp}" STITCHPAD_PAD_DIR="$PAD" STITCHPAD_HEARTBEAT_AUTOSTART=0 STITCHPAD_OPERATOR_KEY_PATH="$STITCHPAD_OPERATOR_KEY_PATH" "$SP" operator grant probe reset-others 2>&1)"; rc=$?
+out="$(env -i PATH="$PATH" HOME="$HOME" TMPDIR="${TMPDIR:-/tmp}" STITCHPAD_PAD_DIR="$PAD" STITCHPAD_HEARTBEAT_AUTOSTART=0 STITCHPAD_OPERATOR_KEY_PATH="$STITCHPAD_OPERATOR_KEY_PATH" STITCHPAD_OPERATOR_KEY_OVERRIDE_ACK="$STITCHPAD_OPERATOR_KEY_OVERRIDE_ACK" "$SP" operator grant probe reset-others 2>&1)"; rc=$?
 [ "$rc" -ne 0 ] && [ ! -f "$STATE/operator-grant.probe.reset-others" ]   && ok 'G-A5: grant mint refused with key-exists-but-no-token (the C2 scenario)'   || bad "G-A5: grant minted without token (rc=$rc)"
 
 # G-A8: symlinked grant file must fail verification (one-shot under swap)

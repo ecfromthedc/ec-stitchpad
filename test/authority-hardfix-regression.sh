@@ -21,6 +21,7 @@ export STITCHPAD_HEARTBEAT_AUTOSTART=0
 # A-4/A-5 fixture discipline: the operator root is explicit, isolated, and
 # never the real passwd-home key.
 export STITCHPAD_OPERATOR_KEY_PATH="$tmp/operator-root/operator.key"
+export STITCHPAD_OPERATOR_KEY_OVERRIDE_ACK=1
 unset HERDR_PANE_ID HERDR_TAB_ID HERDR_ENV HERDR_SOCKET_PATH HERDR_WORKSPACE_ID 2>/dev/null || true
 unset STITCHPAD_SESSION CLAUDE_CODE_SESSION_ID CODEX_SESSION_ID 2>/dev/null || true
 
@@ -91,6 +92,17 @@ out="$( cd "$tmp/pad" && env -u STITCHPAD_OPERATOR_KEY_PATH HOME="$tmp/fake-home
 check 'R8 A-4: fake-HOME self-minted key cannot elevate' '1' "$([ $rc -ne 0 ] && echo 1 || echo 0)"
 check 'R8b bob level untouched by the fake-universe attempt' 'write' \
   "$( cd "$tmp/pad" && "$SP" authority show bob 2>/dev/null )"
+
+printf '\n=== Override contract: ack required, ignoring is loud ===\n'
+kp2="$( env -u STITCHPAD_OPERATOR_KEY_OVERRIDE_ACK STITCHPAD_OPERATOR_KEY_PATH="$tmp/leaked-operator.key" HOME="$tmp/home" PAD_DIR="$PAD" PAD_STATE="$PAD/.state" bash -c \
+  '. "'"$ROOT"'/tool/bin/scope-authority.sh" >/dev/null 2>&1; _sp_operator_key_path' 2>/dev/null )"
+case "$kp2" in *leaked-operator*) bad 'R10 override without ack is IGNORED' "$kp2" ;; *) ok 'R10 override without ack is IGNORED' ;; esac
+warn="$( env -u STITCHPAD_OPERATOR_KEY_OVERRIDE_ACK STITCHPAD_OPERATOR_KEY_PATH="$tmp/leaked-operator.key" HOME="$tmp/home" PAD_DIR="$PAD" PAD_STATE="$PAD/.state" bash -c \
+  '. "'"$ROOT"'/tool/bin/scope-authority.sh" >/dev/null 2>&1; _sp_operator_key_path >/dev/null' 2>&1 )"
+case "$warn" in *OVERRIDE_ACK*) ok 'R10b ignoring the override is LOUD' ;; *) bad 'R10b ignoring the override is LOUD' "$warn" ;; esac
+kp3="$( env STITCHPAD_OPERATOR_KEY_OVERRIDE_ACK=1 STITCHPAD_OPERATOR_KEY_PATH="$tmp/harness-operator.key" HOME="$tmp/home" PAD_DIR="$PAD" PAD_STATE="$PAD/.state" bash -c \
+  '. "'"$ROOT"'/tool/bin/scope-authority.sh" >/dev/null 2>&1; _sp_operator_key_path' 2>/dev/null )"
+case "$kp3" in *harness-operator*) ok 'R10c override WITH ack is honored' ;; *) bad 'R10c override WITH ack is honored' "$kp3" ;; esac
 
 printf '\n=== A-4 hardening: rotation is an operator act ===\n'
 out="$( cd "$tmp/pad" && "$SP" operator keygen --force 2>&1 )"; rc=$?

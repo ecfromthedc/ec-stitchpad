@@ -37,6 +37,7 @@ H3_HOME="$(mktemp -d "${TMPDIR:-/tmp}/sp-h3-home.XXXXXX")"
 export HOME="$H3_HOME"
 # A-4/A-5 fix: explicit override keeps this fixture off the real operator key
 export STITCHPAD_OPERATOR_KEY_PATH="$H3_HOME/.stitchpad/operator.key"
+export STITCHPAD_OPERATOR_KEY_OVERRIDE_ACK=1
 trap 'rm -rf "$H3_HOME"' EXIT
 "$STITCHPAD" operator keygen >/dev/null 2>&1 || true
 OP_TOK="$(cat "$HOME/.stitchpad/operator.key" 2>/dev/null)"

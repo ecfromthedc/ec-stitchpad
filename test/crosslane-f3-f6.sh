@@ -29,6 +29,7 @@ mkdir -p "$tmp/home"
 export HOME="$tmp/home"
 # A-4/A-5 fix: explicit override keeps this fixture off the real operator key
 export STITCHPAD_OPERATOR_KEY_PATH="$tmp/home/.stitchpad/operator.key"
+export STITCHPAD_OPERATOR_KEY_OVERRIDE_ACK=1
 mkdir -p "$HOME"
 # Authority model (C2/C2b): operator flows require the credential — a key
 # OUTSIDE the pad (isolated fixture HOME) presented via env token.
