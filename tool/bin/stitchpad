@@ -1365,14 +1365,20 @@ PY
     # DIFFERENT pad, refuse to post here — the resolver (cwd walk-up, stale MCP
     # server, wrong env) picked the wrong pad. Kills cross-pad ghost posts.
     # sp_this_surface resolves herdr terminal ids, then the pane-id fallback,
-    # then session-env ids — so non-herdr agent shells are still guarded. A
-    # fully identity-less shell (no herdr, no pane, no session env) cannot be
-    # bound to a terminal and stays permissive BY DESIGN: claims are
-    # per-terminal, and one name in two pads from two terminals is legitimate.
+    # then session-env ids — so non-herdr agent shells are still guarded.
     _ssurf="$(sp_this_surface)"
     if [ -n "$_ssurf" ]; then
       _holder="$(sp_term_lock_check "$_ssurf" "$from")" || {
         echo "stitchpad: REFUSED — this terminal is bound to ${_holder%%|*} (as @$(echo "$_holder" | cut -d'|' -f2)), not $PAD_DIR. cd there or 'stitchpad leave' first." >&2; exit 1; }
+    else
+      # MP-2 fail-closed: identity env is fully process-controlled, so a
+      # ghost-poster clears it to disable the surface guard above. With no
+      # resolvable identity, consult the reverse name index instead: a LIVE
+      # identity-backed claim for @$from in a DIFFERENT pad is positive
+      # cross-pad evidence — refuse. No entry / stale / dead-owner = no
+      # evidence = permissive (never locks out the operator or fixtures).
+      _holder="$(sp_term_byname_check "$from")" || {
+        echo "stitchpad: REFUSED — @$from is live-bound to ${_holder}, not $PAD_DIR (no terminal identity resolvable — env cleared?). cd there or 'stitchpad leave' first." >&2; exit 1; }
     fi
     image_path=""
     if [ "${1:-}" = "--image" ]; then

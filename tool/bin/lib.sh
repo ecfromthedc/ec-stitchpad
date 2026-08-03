@@ -357,7 +357,12 @@ sp_dnd_is_on() { [ -f "$(sp_dnd_file "$1")" ]; }
 # sending any signal.  Legacy locks without this record deliberately fail
 # closed while their recorded PID is live.
 sp_process_start() {
-  ps -p "$1" -o lstart= 2>/dev/null | sed 's/^[[:space:]]*//;s/[[:space:]]*$//'
+  # MP-1: lstart output is LOCALE-DEPENDENT (%a %b localize — C: "Mon Aug  3",
+  # de_DE: "Mo.  3 Aug."). Claim start tokens are written once and compared
+  # byte-for-byte by later checks possibly running under a different locale;
+  # force LC_ALL=C so writer and checker always see the same format (flash
+  # re-attack MP-1; TASK-14 env-invariance applied to production code).
+  LC_ALL=C ps -p "$1" -o lstart= 2>/dev/null | sed 's/^[[:space:]]*//;s/[[:space:]]*$//'
 }
 
 sp_process_command() {
@@ -1636,14 +1641,19 @@ sp_open_mention_identity() {
 # migrated machines use ~/.pasture-terminals (stage 2 moves the registry whole);
 # until then the legacy dir remains the single source of truth
 if [ -d "$HOME/.pasture-terminals" ]; then SP_TERMDIR="$HOME/.pasture-terminals"; else SP_TERMDIR="$HOME/.stitchpad-terminals"; fi
-sp_term_surface_of() { printf '%s' "$1"; }   # Herdr terminal ids and Ocean session ids are direct targets
+sp_term_surface_of() { # sanitize: a surface is a FILENAME under $SP_TERMDIR
+  # — refuse anything that could escape it (flash re-attack recommendation;
+  # the mutex mkdir caught "../" only incidentally).
+  case "$1" in ''|.|..|*/*|*".."*) return 1 ;; esac
+  printf '%s' "$1"
+}   # Herdr terminal ids and Ocean session ids are direct targets
 # The terminal id of THIS shell's Herdr pane. Herdr exports a pane id, so
 # resolve it to the stable terminal id used by roster targets and isolation locks.
 # MULTI-PAD (H3): when Herdr can't resolve a surface (non-herdr shell), fall
 # back to a session-env identity so the one-terminal-one-pad guard still has a
 # stable key instead of silently disabling itself. Session ids are already
-# first-class lock targets ("Ocean session ids are direct targets"). The key
-# is namespaced (sess-) so it can never collide with a Herdr term_* id.
+# first-class lock targets ("Ocean session ids are direct targets") and are
+# used RAW so the guard intersects with roster-target claims.
 sp_this_surface() {
   local _s=""
   if [ -n "${HERDR_PANE_ID:-}" ] && command -v herdr >/dev/null 2>&1; then
@@ -1664,7 +1674,8 @@ sp_this_surface() {
       # path-clean, bounded, never "." / ".." / hidden
       _cand="$(printf '%s' "$_cand" | tr -cd 'A-Za-z0-9._-' | cut -c1-64)"
       case "$_cand" in ''|.*) continue ;; esac
-      _s="sess-$_cand"; break
+      _s="$_cand"; break   # RAW id: Ocean roster targets ARE session ids —
+                           # claim and say-guard must key identically
     done
   fi
   printf '%s' "$_s"
@@ -1687,6 +1698,31 @@ _sp_term_mutex_release() { rm -rf "$SP_TERMDIR/.mutex.$1" 2>/dev/null || true; }
 # the legacy shape; the 5-field form lets a steal attempt distinguish a DEAD
 # owner (heartbeat gap → claim is fair game) from a LIVE one whose heartbeat
 # merely hiccuped (rc7 F4: timestamp-only steal evicts live owners).
+# identity-less posting evidence: prints the owning pad and returns 1 when
+# $1=name holds a LIVE identity-backed claim in a DIFFERENT pad; else 0.
+# Fresh index entries whose surface claim is mid-rotation (missing) also
+# count; stale entries are residue and never block.
+sp_term_byname_check() { # $1=name
+  local bk bf bpad bsurf bts now
+  bk="$(_sp_term_byname_key "$1")" || return 0
+  bf="$SP_TERMDIR/.byname.$bk"
+  [ -f "$bf" ] || return 0
+  IFS='|' read -r bpad bsurf bts < "$bf"
+  [ -n "$bpad" ] && [ -n "$bsurf" ] || return 0
+  [ "$bpad" = "$PAD_DIR" ] && return 0
+  now="$(date +%s)"
+  case "$bts" in ''|*[!0-9]*) bts=0 ;; esac
+  if _sp_term_claim_honored "$(cat "$SP_TERMDIR/$bsurf" 2>/dev/null)"; then
+    printf '%s' "$bpad"
+    return 1
+  fi
+  if [ ! -f "$SP_TERMDIR/$bsurf" ] && [ $((now - bts)) -lt 300 ]; then
+    printf '%s' "$bpad"
+    return 1
+  fi
+  return 0
+}
+
 _sp_term_claim_honored() { # $1=claim-line → 0 if the claim must still be honored
   local pad name ts pid pstart now
   IFS='|' read -r pad name ts pid pstart <<<"$1"
@@ -1702,6 +1738,45 @@ _sp_term_claim_honored() { # $1=claim-line → 0 if the claim must still be hono
   fi
   return 0
 }
+# Reverse name index (MP-2 fail-closed evidence): identity-shaped claims also
+# record $SP_TERMDIR/.byname.<name> = "pad|surface|epoch". A shell with NO
+# resolvable identity (env cleared — the trivial MP-2 bypass) consults this
+# index before posting: a LIVE identity-backed claim for the same name in a
+# DIFFERENT pad is positive ghost-post evidence and refuses. Only
+# IDENTITY-SHAPED surfaces index (herdr term_* ids, pane- fallbacks, session
+# ids/uuids) — arbitrary routing labels ("target-123", fixture names) do not,
+# so sequential same-name fixture moves stay legal.
+_sp_term_byname_key() { # $1=name → sanitized key (empty if unusable)
+  local k
+  k="$(printf '%s' "$1" | tr -cd 'A-Za-z0-9._-' | cut -c1-64)"
+  case "$k" in ''|.*) return 1 ;; esac
+  printf '%s' "$k"
+}
+_sp_term_surface_is_identity() { # $1=surface → 0 if identity-shaped
+  case "$1" in
+    term_[0-9a-fA-F]*)           return 0 ;;  # herdr terminal id
+    pane-*)                       return 0 ;;  # pane-id fallback
+    ????????-????-????-????-*)    return 0 ;;  # session-id / uuid roster target
+  esac
+  return 1
+}
+_sp_term_byname_write() { # $1=surface $2=name (best-effort; identity-shaped only)
+  _sp_term_surface_is_identity "$1" || return 0
+  local bk
+  bk="$(_sp_term_byname_key "$2")" || return 0
+  printf '%s|%s|%s' "$PAD_DIR" "$1" "$(date +%s)" > "$SP_TERMDIR/.byname.$bk" 2>/dev/null
+}
+_sp_term_byname_drop() { # $1=name — remove only if the entry is ours
+  local bk bf bpad bsurf bts
+  bk="$(_sp_term_byname_key "$1")" || return 0
+  bf="$SP_TERMDIR/.byname.$bk"
+  if [ -f "$bf" ]; then
+    IFS='|' read -r bpad bsurf bts < "$bf"
+    [ "$bpad" = "$PAD_DIR" ] && rm -f "$bf"
+  fi
+  return 0
+}
+
 sp_term_lock_claim() { # $1=target/surface $2=name [$3=owner_pid] — refuses on a live foreign claim
   local surface who opid cur pad name ts now
   surface="$(sp_term_surface_of "$1")"; who="$2"; opid="${3:-}"
@@ -1734,6 +1809,7 @@ sp_term_lock_claim() { # $1=target/surface $2=name [$3=owner_pid] — refuses on
     printf '%s|%s|%s' "$PAD_DIR" "$who" "$(date +%s)" > "$SP_TERMDIR/$surface"
   fi
   _sp_term_mutex_release "$surface"
+  _sp_term_byname_write "$surface" "$who"
   return 0
 }
 sp_term_lock_touch() { # heartbeat path: refresh ours / claim vacant — NEVER steal
@@ -1752,6 +1828,7 @@ sp_term_lock_touch() { # heartbeat path: refresh ours / claim vacant — NEVER s
   else
     printf '%s|%s|%s' "$PAD_DIR" "$who" "$(date +%s)" > "$SP_TERMDIR/$surface"
   fi
+  _sp_term_byname_write "$surface" "$who"
   return 0
 }
 sp_term_lock_release() { # drop every claim this (pad, name) holds
@@ -1761,6 +1838,7 @@ sp_term_lock_release() { # drop every claim this (pad, name) holds
     IFS='|' read -r pad name ts < "$f"
     [ "$pad" = "$PAD_DIR" ] && [ "$name" = "$who" ] && rm -f "$f"
   done
+  _sp_term_byname_drop "$who"
   return 0
 }
 sp_term_lock_check() { # $1=target $2=name → 0 ok; 1 = LIVE claim by someone else (prints holder)
