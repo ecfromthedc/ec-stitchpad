@@ -3340,15 +3340,18 @@ def _validate_author_lease(state, repo, git_home, commit, author_actor):
 
 
 def cmd_review_create(args):
-    ctx = open_context(args)
-    fds, base, git_home, repo, state = (
-        ctx["fds"], ctx["base"], ctx["git_home"], ctx["repo"], ctx["state"])
-
+    # Actor validation BEFORE any payload/git work: a self-review is refused
+    # with its own distinct code before opening the coordination context,
+    # so no expensive tree extraction or git plumbing runs for a doomed call.
     require_match(ACTOR_RE, args.author_actor, "actor_invalid", "author actor")
     require_match(ACTOR_RE, args.reviewer_actor, "actor_invalid", "reviewer actor")
     if args.author_actor == args.reviewer_actor:
-        fail("actor_not_distinct",
+        fail("actor_self",
              "the author and reviewer actors must be distinct")
+
+    ctx = open_context(args)
+    fds, base, git_home, repo, state = (
+        ctx["fds"], ctx["base"], ctx["git_home"], ctx["repo"], ctx["state"])
     require_native_commit(repo, args.commit, git_home, "review commit")
     tree_oid = git_line(
         ["-C", repo["top"], "rev-parse", "--verify", "--quiet",
@@ -3616,6 +3619,35 @@ def _read_facts(payload_fd):
                             "review facts", allow_missing=True)
 
 
+# Bound on the cross-review identity-uniqueness scan at bind time.  Beyond it
+# the bind refuses closed rather than guessing at global uniqueness.
+_MAX_REVIEWS_SCAN = 4096
+
+
+def _read_payload_facts_scoped(base, review):
+    """Read another review's facts without retaining its payload FD.
+
+    Used by the bind-time global identity-uniqueness scan, which may walk
+    many reviews in one operation and must not exhaust the process FD table.
+    An absent or non-directory payload yields no facts (the review record is
+    authoritative for existence); a present-but-unreadable facts record fails
+    closed through read_flat_record.
+    """
+    payload_name = review["payload_name"]
+    require_match(ENTRY_NAME_RE, payload_name,
+                  "payload_name_invalid", "payload name")
+    entry = try_lstat_at(base.fd, payload_name)
+    if entry is None or not statmod.S_ISDIR(entry.st_mode) \
+            or statmod.S_ISLNK(entry.st_mode):
+        return None
+    payload_fd = open_dir_at(base.fd, payload_name,
+                             code="payload_invalid", what="payload directory")
+    try:
+        return _read_facts(payload_fd)
+    finally:
+        os.close(payload_fd)
+
+
 def _read_pointer(payload_fd):
     return read_flat_record(payload_fd, "pointer.json", "pointer",
                             "review pointer", allow_missing=False)
@@ -3646,12 +3678,6 @@ def cmd_review_bind(args):
 
     payload_fd = _open_payload(fds, base, review)
 
-    # The review must still be in the created phase.
-    if review["state"] != "created":
-        fail("review_not_bindable",
-             "the review is not in the created state (current: %s)"
-             % (review["state"],))
-
     # Read the current facts (if any) to check idempotency or pre-bind state.
     existing_facts = _read_facts(payload_fd)
 
@@ -3672,7 +3698,20 @@ def cmd_review_bind(args):
     provider = review["provider"]
     model = _bounded_env(_MODEL_ENV)
 
-    # Idempotent re-bind: if facts already carry the same identity, succeed.
+    # A model pinned at create (or by an earlier bind) is never silently
+    # re-pinned: a raw provider/model mismatch fails closed truthfully
+    # instead of overwriting the pinned identity.
+    if existing_facts is not None:
+        pinned_model = existing_facts.get("provider_model")
+        if pinned_model is not None and model != pinned_model:
+            fail("provider_model_mismatch",
+                 "the invoking model does not match the pinned provider_model")
+
+    # Idempotent re-bind: if facts already carry the same identity, succeed
+    # regardless of the review record's state (bound is the expected state
+    # after a first successful bind).  This check must run BEFORE the state
+    # guard so a re-bind of an already-bound review returns instead of
+    # failing with review_not_bindable.
     if existing_facts is not None:
         if existing_facts.get("session_id") == session and \
                 existing_facts.get("request_id") == request:
@@ -3694,6 +3733,12 @@ def cmd_review_bind(args):
             fail("review_already_bound",
                  "the review is already bound to a different session/request")
 
+    # The review must still be in the created phase for a first bind.
+    if review["state"] != "created":
+        fail("review_not_bindable",
+             "the review is not in the created state (current: %s)"
+             % (review["state"],))
+
     now = int(time.time())
 
     mutex = TransitionMutex(state)
@@ -3704,6 +3749,32 @@ def cmd_review_bind(args):
         if locked_review["state"] != "created":
             fail("review_not_bindable",
                  "the review transitioned out of created state")
+
+        # Global identity uniqueness: a (session, request) pair authorizes
+        # exactly one review.  A per-review check lets two reviews correlate
+        # the same provider rows forever; scan every other review's facts
+        # under the lock and fail closed on collision.  The scan is bounded;
+        # beyond the bound the bind refuses rather than guessing.
+        names = list_dir_at(state.reviews, "reviews")
+        if len(names) > _MAX_REVIEWS_SCAN:
+            fail("review_scan_too_large",
+                 "too many reviews to prove global session/request uniqueness")
+        for name in names:
+            if name == review["review_id"]:
+                continue
+            other_entry = read_record(state.reviews, name, "review",
+                                      "review record", allow_missing=True)
+            if other_entry is None:
+                continue
+            other_facts = _read_payload_facts_scoped(base,
+                                                     other_entry["record"])
+            if other_facts is None:
+                continue
+            if other_facts.get("session_id") == session \
+                    and other_facts.get("request_id") == request:
+                fail("session_request_in_use",
+                     "the session/request pair is already bound to "
+                     "review %s" % (name,))
 
         facts = new_record("facts", 1, {
             "review_id": review["review_id"],
@@ -3830,6 +3901,9 @@ def cmd_review_refresh(args):
     if facts is None:
         fail("review_not_bound",
              "the review must be bound before refresh")
+    # A closed review is immutable: no post-closure observation may rewrite
+    # the facts, latest diagnostic, or bounded history that audit reads.
+    _require_review_open(review, facts)
     pointer = _read_pointer(payload_fd)
     manifest = _read_manifest(payload_fd)
 
@@ -3958,8 +4032,10 @@ def cmd_review_refresh(args):
         evidence_digest = sha256_hex(canonical_json_bytes(evidence))
 
         raw_model = None
+        raw_provider = None
         if isinstance(matched, dict):
             raw_model = matched.get("model")
+            raw_provider = matched.get("provider")
 
         observation = new_record("observation", new_generation, {
             "review_id": review["review_id"],
@@ -4004,6 +4080,22 @@ def cmd_review_refresh(args):
         # Output correlation evidence (consumed by verify/close).
         if output_correlation is not None:
             updated_facts["conflict"] = "output_correlation"
+        # Raw provider/model mismatch: the correlated row's model must agree
+        # with the pinned provider_model.  A substitution is recorded as a
+        # sticky conflict and surfaced as a status/closure blocker, never
+        # silently sealed as evidence; an existing conflict is never erased.
+        if updated_facts["conflict"] is None \
+                and isinstance(raw_model, str) \
+                and isinstance(updated_facts.get("provider_model"), str) \
+                and raw_model != updated_facts["provider_model"]:
+            updated_facts["conflict"] = "model_mismatch"
+        # Raw provider mismatch: same rule, reported truthfully under its
+        # own code; an existing conflict is never erased.
+        if updated_facts["conflict"] is None \
+                and isinstance(raw_provider, str) \
+                and isinstance(updated_facts.get("provider"), str) \
+                and raw_provider != updated_facts["provider"]:
+            updated_facts["conflict"] = "provider_mismatch"
         facts_record = new_record("facts", new_generation, {
             "review_id": updated_facts["review_id"],
             "session_id": updated_facts["session_id"],
@@ -4096,14 +4188,23 @@ def cmd_review_status(args):
         return {"review": r, "pointer": p, "manifest": m,
                 "facts": f, "latest": l}
 
+    # Sufficient double-sampling.  The previous check compared only the
+    # review record generation, but refresh/cancel rewrite facts.json and
+    # latest.json WITHOUT touching the review record, so a concurrent
+    # mutation could produce a torn status reported as stable -- a
+    # transient false state.  Sampling is sufficient only when BOTH hold:
+    # (a) the transition mutex is absent before, between, and after the
+    # two snapshot reads, and (b) the two FULL snapshots (review, pointer,
+    # manifest, facts, latest) are byte-identical under canonical JSON.
+    # Any divergence is reported as a concurrent-mutation diagnostic
+    # (read-only status never fails on it, but never hides it either).
+    mutex_before = sample_mutex(state) is not None
     sample1 = _sample()
+    mutex_mid = sample_mutex(state) is not None
     sample2 = _sample()
-
-    # Double-sample consistency: if the review generation changed between
-    # samples, report it as a concurrent-mutation diagnostic (not an error).
-    gen1 = sample1["review"]["generation"]
-    gen2 = sample2["review"]["generation"]
-    concurrent = gen1 != gen2
+    mutex_after = sample_mutex(state) is not None
+    concurrent = mutex_before or mutex_mid or mutex_after or \
+        canonical_json_bytes(sample1) != canonical_json_bytes(sample2)
 
     r = sample2["review"]
     p = sample2["pointer"]
@@ -4241,6 +4342,9 @@ def cmd_review_register_process(args):
     if facts.get("session_id") is None or facts.get("request_id") is None:
         fail("review_not_bound",
              "the review facts carry no bound session/request")
+    # A closed review is immutable: registering post-closure process
+    # evidence would rewrite the audit state verify/close already read.
+    _require_review_open(review, facts)
 
     # Validate the role against the strict regex.
     role = _require_role(args.role)
@@ -4361,6 +4465,9 @@ def cmd_review_cancel_requested(args):
         fail("review_not_bound",
              "the review carries no bound session/request; "
              "cancel cannot be requested before bind")
+    # A closed review is immutable: a post-closure cancel would advance the
+    # facts generation and rewrite the record audit sealed at closure.
+    _require_review_open(review, facts)
 
     generation = facts["generation"]
     now = int(time.time())
@@ -4477,6 +4584,9 @@ def cmd_review_submit_report(args):
     if facts.get("session_id") is None or facts.get("request_id") is None:
         fail("review_not_bound",
              "the review facts carry no bound session/request")
+    # A closed review is immutable: the seal decision was made at closure;
+    # no post-closure submit may advance facts or touch the sealed report.
+    _require_review_open(review, facts)
 
     # Refuse if crash residue from an incomplete prior seal is present.
     # The helper never auto-repairs stale temps or stray hard links.
