@@ -3572,7 +3572,30 @@ _MAX_OBSERVATIONS_REPORTED = 64
 
 # Bound on stale-session seconds: if last_activity_at is older than this and the
 # review is not terminal, status projects a fail-closed blocker for verify/close.
-_STALE_SESSION_SECONDS = 86400  # 24 hours
+# Default: 24 hours. Configurable via STITCHPAD_COORD_STALE_SECONDS.
+_STALE_SECONDS_ENV = "STITCHPAD_COORD_STALE_SECONDS"
+_DEFAULT_STALE_SECONDS = 86400  # 24 hours
+
+
+def _stale_threshold_seconds():
+    """Return the stale-session threshold in seconds.
+
+    Reads STITCHPAD_COORD_STALE_SECONDS, validates it is a reasonable
+    integer (>= 60, <= 2592000), and falls back to the 24-hour default.
+    """
+    raw = os.environ.get(_STALE_SECONDS_ENV)
+    if raw is None:
+        return _DEFAULT_STALE_SECONDS
+    try:
+        val = int(raw)
+    except (ValueError, TypeError):
+        fail("stale_threshold_invalid",
+             "%s must be an integer" % (_STALE_SECONDS_ENV,))
+    if val < 60 or val > 2592000:
+        fail("stale_threshold_invalid",
+             "%s must be between 60 and 2592000 seconds (1 min – 30 days)"
+             % (_STALE_SECONDS_ENV,))
+    return val
 
 
 def _load_review(state, review_id):
@@ -3776,6 +3799,9 @@ def _next_observation_slot(payload_fd, fds):
     Observations are stored as ``observations/<n>.json`` where ``<n>`` is a
     zero-based sequential integer.  The slot name is derived from the current
     count of observation files, never from caller input.
+
+    MAX_OBSERVATIONS enforces a hard ceiling: a review that has already
+    accumulated the maximum number of observations cannot accept another.
     """
     obs_entry = try_lstat_at(payload_fd, "observations")
     if obs_entry is None:
@@ -3804,7 +3830,13 @@ def _next_observation_slot(payload_fd, fds):
                 n = int(stem)
                 if n > max_n:
                     max_n = n
-    return obs_fd, max_n + 1
+    next_slot = max_n + 1
+    if next_slot >= MAX_OBSERVATIONS:
+        fail("observation_limit",
+             "this review has accumulated %d observations; no further "
+             "observations can be appended (limit %d)"
+             % (max_n + 1, MAX_OBSERVATIONS))
+    return obs_fd, next_slot
 
 
 def cmd_review_refresh(args):
@@ -3922,9 +3954,14 @@ def cmd_review_refresh(args):
     if terminal and not terminal_observed:
         terminal_observed = True
         terminal_at = now
-        if matched is not None:
-            terminal_completion = matched.get("completion") or \
-                matched.get("state")
+        # `terminal` is only ever True on the exact-correlation branch above:
+        # the no-match and ambiguous branches pin it False, so `matched` is
+        # provably the correlating row here. The former `if matched is not
+        # None` guard was an audited dead conditional — its else path could
+        # never execute, and it implied a terminal fact could be recorded
+        # without a completion. Assign from the row directly.
+        terminal_completion = matched.get("completion") or \
+            matched.get("state")
 
     mutex = TransitionMutex(state)
     with mutex:
@@ -4058,7 +4095,7 @@ def _format_ts(ts):
         return None
     import datetime as _dt
     try:
-        return _dt.datetime.utcfromtimestamp(ts).strftime(
+        return _dt.datetime.fromtimestamp(ts, _dt.timezone.utc).strftime(
             "%Y-%m-%dT%H:%M:%SZ")
     except (ValueError, OSError):
         return None
@@ -4135,7 +4172,7 @@ def cmd_review_status(args):
         # and the review is not terminal/closed.
         last_act = f.get("last_activity_at")
         if isinstance(last_act, int) and not isinstance(last_act, bool):
-            if now - last_act > _STALE_SESSION_SECONDS and \
+            if now - last_act > _stale_threshold_seconds() and \
                     not f.get("terminal_observed") and \
                     r["state"] not in ("closed", "abandoned"):
                 blockers.append("stale_session")

@@ -79,13 +79,13 @@ validate_flags() {
         ;;
       --worktree|--repo|--actor|--base|--old|--new|--head|--commit|\
 --author-actor|--reviewer-actor|--provider|--session|--request|--role|--pid|\
---token-fd|--token-out-fd|--process-token-fd|--process-token-out-fd)
+--token-fd|--token-out-fd|--process-token-fd|--process-token-out-fd|--provider-rows-fd)
         [ $# -ge 2 ] || die_usage "flag $1 requires a value"
         case "$2" in
           --*) die_usage "flag $1 is missing its value" ;;
         esac
         case "$1" in
-          --token-fd|--token-out-fd|--process-token-fd|--process-token-out-fd|--pid)
+          --token-fd|--token-out-fd|--process-token-fd|--process-token-out-fd|--provider-rows-fd|--pid)
             case "$2" in
               ''|*[!0-9]*) die_usage "$1 must be a non-negative integer" ;;
             esac
@@ -176,7 +176,7 @@ fi
 
 validate_flags "$@"
 
-for _fdflag in --token-fd --token-out-fd --process-token-fd --process-token-out-fd; do
+for _fdflag in --token-fd --token-out-fd --process-token-fd --process-token-out-fd --provider-rows-fd; do
   if _fdv="$(extract_fd_value "$_fdflag" "$@")"; then
     check_fd_open "$_fdv"
   fi
