@@ -150,29 +150,47 @@ printf '\n=== P3: surface-less ghost-post refusal (two local pads) ===\n'
 mkdir -p "$tmp/padA" "$tmp/padB" "$tmp/nowhere"
 ( cd "$tmp/padA" && "$SP" init --name padA >/dev/null 2>&1 && "$SP" daemon stop >/dev/null 2>&1 )
 ( cd "$tmp/padB" && "$SP" init --name padB >/dev/null 2>&1 && "$SP" daemon stop >/dev/null 2>&1 )
-( cd "$tmp/padA" && STITCHPAD_SESSION=s1 "$SP" join alice codex pull - >/dev/null 2>&1 )
-check 'P3a join claims session-fallback surface' '1' \
-  "$(ls "$TERMDIR"/sess-s1 >/dev/null 2>&1 && echo 1 || echo 0)"
-out="$( cd "$tmp/padB" && STITCHPAD_SESSION=s1 STITCHPAD_NAME=alice "$SP" say 'ghost via session surface' 2>&1 )"
+SID_A="11111111-1111-1111-1111-111111111111"   # uuid-shaped session id
+( cd "$tmp/padA" && STITCHPAD_SESSION=$SID_A "$SP" join alice codex pull - >/dev/null 2>&1 )
+check 'P3a join claims session-fallback surface (raw id)' '1' \
+  "$(ls "$TERMDIR/$SID_A" >/dev/null 2>&1 && echo 1 || echo 0)"
+check 'P3a2 identity-shaped claims write the reverse index' '1' \
+  "$(ls "$TERMDIR/.byname.alice" >/dev/null 2>&1 && echo 1 || echo 0)"
+out="$( cd "$tmp/padB" && STITCHPAD_SESSION=$SID_A STITCHPAD_NAME=alice "$SP" say 'ghost via session surface' 2>&1 )"
 case "$out" in *REFUSED*) ok 'P3b session-surface say into padB refused' ;; *) bad 'P3b session-surface say into padB refused' "$out" ;; esac
+# MP-2 fail-closed: the SAME post with identity env CLEARED (the trivial
+# bypass flash confirmed) now refuses on byname evidence instead of falling
+# through
+out="$( cd "$tmp/padB" && env -i PATH="$PATH" HOME="$HOME" TMPDIR="${TMPDIR:-/tmp}" STITCHPAD_NAME=alice "$SP" say 'ghost with identity env cleared' 2>&1 )"
+case "$out" in *REFUSED*) ok 'P3c MP-2: env-cleared ghost post REFUSED (fail closed)' ;; *) bad 'P3c MP-2: env-cleared ghost post REFUSED (fail closed)' "$out" ;; esac
 # pane-id fallback: herdr binary absent but HERDR_PANE_ID exported — the claim
 # and the guard key on pane-<id> consistently (rc7's F3 fix direction)
 ( cd "$tmp/padA" && env PATH="/usr/bin:/bin" HOME="$HOME" HERDR_PANE_ID="w9:pZ" STITCHPAD_NAME=carol \
     "$SP" join carol codex pull - >/dev/null 2>&1 )
-check 'P3c pane-fallback join claims pane-<id> surface' '1' \
+check 'P3d pane-fallback join claims pane-<id> surface' '1' \
   "$(ls "$TERMDIR"/pane-w9:pZ >/dev/null 2>&1 && echo 1 || echo 0)"
 out="$( cd "$tmp/padB" && env PATH="/usr/bin:/bin" HOME="$HOME" HERDR_PANE_ID="w9:pZ" STITCHPAD_NAME=carol \
     "$SP" say 'ghost via pane fallback' 2>&1 )"
-case "$out" in *REFUSED*) ok 'P3c2 pane-fallback say into padB refused' ;; *) bad 'P3c2 pane-fallback say into padB refused' "$out" ;; esac
-# fully identity-less shell (no herdr, no pane, no session): permissive BY
-# DESIGN — claims are per-terminal and cannot bind a shell with no identity
-out="$( cd "$tmp/padB" && env -i PATH="$PATH" HOME="$HOME" TMPDIR="${TMPDIR:-/tmp}" STITCHPAD_NAME=alice "$SP" say 'identity-less shell post' 2>&1 )"
-case "$out" in *REFUSED*) bad 'P3d identity-less shell stays permissive (documented limit)' "$out" ;; *) ok 'P3d identity-less shell stays permissive (documented limit)' ;; esac
-out="$( cd "$tmp/padA" && STITCHPAD_SESSION=s1 STITCHPAD_NAME=alice "$SP" say 'legit post in my own pad' 2>&1 )"
-case "$out" in *REFUSED*) bad 'P3e owning-surface say into OWNING pad allowed' "$out" ;; *) ok 'P3e owning-surface say into OWNING pad allowed' ;; esac
-( cd "$tmp/padA" && STITCHPAD_SESSION=s1 STITCHPAD_NAME=alice "$SP" leave >/dev/null 2>&1 )
-out="$( cd "$tmp/padB" && STITCHPAD_SESSION=s1 STITCHPAD_NAME=alice "$SP" say 'alice after leaving padA' 2>&1 )"
-case "$out" in *REFUSED*) bad 'P3f leave clears the claim (post allowed)' "$out" ;; *) ok 'P3f leave clears the claim (post allowed)' ;; esac
+case "$out" in *REFUSED*) ok 'P3d2 pane-fallback say into padB refused' ;; *) bad 'P3d2 pane-fallback say into padB refused' "$out" ;; esac
+# permissive floor (never locks out operator/fixtures): identity-less post as
+# a name with NO identity-backed claim anywhere stays allowed
+out="$( cd "$tmp/padB" && env -i PATH="$PATH" HOME="$HOME" TMPDIR="${TMPDIR:-/tmp}" STITCHPAD_NAME=bob "$SP" say 'bob has no claims anywhere' 2>&1 )"
+case "$out" in *REFUSED*) bad 'P3e unclaimed-name identity-less post allowed' "$out" ;; *) ok 'P3e unclaimed-name identity-less post allowed' ;; esac
+# documented gap: names claimed on NON-identity routing labels are not indexed
+( cd "$tmp/padA" && STITCHPAD_NAME=dave "$SP" join dave codex pull target-123 >/dev/null 2>&1 )
+out="$( cd "$tmp/padB" && env -i PATH="$PATH" HOME="$HOME" TMPDIR="${TMPDIR:-/tmp}" STITCHPAD_NAME=dave "$SP" say 'dave on a routing label' 2>&1 )"
+case "$out" in *REFUSED*) bad 'P3f routing-label claim not byname-indexed (documented)' "$out" ;; *) ok 'P3f routing-label claim not byname-indexed (documented)' ;; esac
+# owning-pad posts still land
+out="$( cd "$tmp/padA" && STITCHPAD_SESSION=$SID_A STITCHPAD_NAME=alice "$SP" say 'legit post in my own pad' 2>&1 )"
+case "$out" in *REFUSED*) bad 'P3g owning-surface say into OWNING pad allowed' "$out" ;; *) ok 'P3g owning-surface say into OWNING pad allowed' ;; esac
+out="$( cd "$tmp/padA" && env -i PATH="$PATH" HOME="$HOME" TMPDIR="${TMPDIR:-/tmp}" STITCHPAD_NAME=alice "$SP" say 'identity-less post in my OWN pad' 2>&1 )"
+case "$out" in *REFUSED*) bad 'P3g2 identity-less say into OWNING pad allowed' "$out" ;; *) ok 'P3g2 identity-less say into OWNING pad allowed' ;; esac
+# leave clears claim + index → name is free again
+( cd "$tmp/padA" && STITCHPAD_SESSION=$SID_A STITCHPAD_NAME=alice "$SP" leave >/dev/null 2>&1 )
+check 'P3h leave clears the reverse index' '0' \
+  "$(ls "$TERMDIR/.byname.alice" >/dev/null 2>&1 && echo 1 || echo 0)"
+out="$( cd "$tmp/padB" && env -i PATH="$PATH" HOME="$HOME" TMPDIR="${TMPDIR:-/tmp}" STITCHPAD_NAME=alice "$SP" say 'alice after leaving padA' 2>&1 )"
+case "$out" in *REFUSED*) bad 'P3h2 post allowed after leave' "$out" ;; *) ok 'P3h2 post allowed after leave' ;; esac
 
 # ── P4: steal checks owner liveness ──────────────────────────────────
 printf '\n=== P4: claim steal honors live owners (stale ts ≠ dead owner) ===\n'
@@ -230,6 +248,35 @@ out="$( cd "$tmp/padA" && STITCHPAD_NAME=alice "$SP" join alice codex pull term_
 case "$out" in *REFUSED*) bad 'P6a stale mutex broken, claim proceeds' "$out" ;; *) ok 'P6a stale mutex broken, claim proceeds' ;; esac
 check 'P6b claim written after stale break' '1' \
   "$(ls "$TERMDIR/term_wedged" >/dev/null 2>&1 && echo 1 || echo 0)"
+
+# ── P7: MP-1 locale-invariance of liveness (flash re-attack) ────────
+printf '\n=== P7: liveness checks are locale-independent (MP-1) ===\n'
+sleep 300 & LPID=$!; SLEEP_PIDS="$SLEEP_PIDS $LPID"
+start_c="$(LC_ALL=C ps -o lstart= -p $LPID 2>/dev/null | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')"
+start_de="$(LC_ALL=de_DE.UTF-8 PAD_DIR="$tmp/padA/.stitchpad" HOME="$HOME" bash -c \
+  '. "'"$ROOT"'/tool/bin/lib.sh" >/dev/null 2>&1; sp_process_start '"$LPID" 2>/dev/null)"
+check 'P7a sp_process_start identical under C and de_DE' "$start_c" "$start_de"
+# aged claim with LIVE owner written under C; steal attempted under de_DE
+now="$(date +%s)"
+printf '%s|%s|%s|%s|%s' "$tmp/padA/.stitchpad" "alice" "$((now - 400))" "$LPID" "$start_c" > "$TERMDIR/term_locale"
+out="$( cd "$tmp/padB" && LC_ALL=de_DE.UTF-8 STITCHPAD_NAME=bob "$SP" join bob codex pull term_locale 2>&1 )"
+case "$out" in *REFUSED*) ok 'P7b live owner protected under de_DE steal attempt' ;; *) bad 'P7b live owner protected under de_DE steal attempt' "$out" ;; esac
+# say-guard path under a third locale: identity-less ghost vs aged live claim
+printf '%s|%s|%s' "$tmp/padA/.stitchpad" "term_locale" "$now" > "$TERMDIR/.byname.greta"
+printf '%s|%s|%s|%s|%s' "$tmp/padA/.stitchpad" "greta" "$((now - 400))" "$LPID" "$start_c" > "$TERMDIR/term_locale"
+out="$( cd "$tmp/padB" && env -i PATH="$PATH" HOME="$HOME" LC_ALL=ja_JP.UTF-8 STITCHPAD_NAME=greta "$SP" say 'locale ghost' 2>&1 )"
+case "$out" in *REFUSED*) ok 'P7c byname guard holds under ja_JP with aged live claim' ;; *) bad 'P7c byname guard holds under ja_JP with aged live claim' "$out" ;; esac
+kill "$LPID" 2>/dev/null; wait "$LPID" 2>/dev/null
+out="$( cd "$tmp/padB" && LC_ALL=de_DE.UTF-8 STITCHPAD_NAME=bob "$SP" join bob codex pull term_locale 2>&1 )"
+case "$out" in *REFUSED*) bad 'P7d dead owner evictable under de_DE' "$out" ;; *) ok 'P7d dead owner evictable under de_DE' ;; esac
+
+# ── P8: surface sanitize (flash recommendation) ──────────────────────
+printf '\n=== P8: claim surfaces cannot escape the registry ===\n'
+out="$( cd "$tmp/padA" && STITCHPAD_NAME=alice "$SP" join alice codex pull '../../escape-probe' 2>&1 )"
+check 'P8a traversal surface refused (claim no-op, join continues)' '0' \
+  "$(ls "$tmp/escape-probe" >/dev/null 2>&1 && echo 1 || echo 0)"
+check 'P8b no registry file written for traversal surface' '0' \
+  "$(ls "$TERMDIR"/../*escape* >/dev/null 2>&1 && echo 1 || echo 0)"
 
 printf '\n========== RESULTS ==========\n'
 printf 'Passed:  %d\nFailed:  %d\n' "$PASSED" "$FAILED"
