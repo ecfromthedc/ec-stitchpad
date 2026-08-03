@@ -72,6 +72,10 @@ export STITCHPAD_PAD_DIR="$S1_PAD_DIR"
 export STITCHPAD_HEARTBEAT_AUTOSTART=0
 export HOME="$WORK/home"
 mkdir -p "$HOME"
+# Authority model (C2/C2b): operator flows require the credential.
+"$STITCHPAD" operator keygen >/dev/null 2>&1 || true
+OP_TOK="$(cat "$HOME/.stitchpad/operator.key" 2>/dev/null)"
+export STITCHPAD_OPERATOR_TOKEN="$OP_TOK"
 unset STITCHPAD_SESSION CLAUDE_CODE_SESSION_ID CODEX_SESSION_ID 2>/dev/null || true
 
 setup_sources
@@ -203,8 +207,8 @@ sp_authority_check_deploy "deepseek" "push" 2>/dev/null
 [ $? -ne 0 ] && ok "S6c: deploy authority denied without grant" \
   || bad "S6c: deploy authority allowed without grant (should deny)"
 
-# Create operator grant
-printf 'operator 2026-08-02T23:00:00\n' > "$S1_PAD_STATE/operator-grant.deepseek.push"
+# Create operator grant (sealed, operator credential required)
+sp_operator_grant_create "deepseek" "push" 86400 >/dev/null
 
 # Deploy with grant = allowed
 sp_authority_check_deploy "deepseek" "push" 2>/dev/null
@@ -339,8 +343,8 @@ sp_authority_guard_grant_write "deepseek" "operator-grant.deepseek.push"
 [ $? -ne 0 ] && ok "S10c: deepseek cannot create own grant for push" \
   || bad "S10c: deepseek created own grant (authority bypass!)"
 
-# Operator creates grant → push allowed → grant consumed
-printf 'eric 2026-08-02T23:30:00\n' > "$S1_PAD_STATE/operator-grant.deepseek.push"
+# Operator creates grant (sealed — a raw hand-written file verifies nowhere)
+sp_operator_grant_create "deepseek" "push" 86400 >/dev/null
 sp_authority_check_deploy "deepseek" "push" 2>/dev/null
 [ $? -eq 0 ] && ok "S10d: push allowed with operator grant" \
   || bad "S10d: push denied even with operator grant"

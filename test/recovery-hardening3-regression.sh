@@ -30,6 +30,14 @@ STITCHPAD="$ROOT/tool/bin/stitchpad"
 # operator's own ~/.stitchpad-terminals/<surface> and collide with live
 # seats. See fx2-harness-hygiene-1b8eed4.md.
 unset HERDR_PANE_ID HERDR_TAB_ID HERDR_ENV HERDR_SOCKET_PATH HERDR_WORKSPACE_ID 2>/dev/null || true
+# Authority model (C2/C2b): operator flows require a credential rooted at
+# $HOME/.stitchpad/operator.key — isolate HOME so the fixture NEVER touches
+# the operator's real key, then mint a fixture credential.
+H3_HOME="$(mktemp -d "${TMPDIR:-/tmp}/sp-h3-home.XXXXXX")"
+export HOME="$H3_HOME"
+trap 'rm -rf "$H3_HOME"' EXIT
+"$STITCHPAD" operator keygen >/dev/null 2>&1 || true
+OP_TOK="$(cat "$HOME/.stitchpad/operator.key" 2>/dev/null)"
 
 RED='\033[0;31m'; GREEN='\033[0;32m'; NC='\033[0m'
 pass=0; fail=0
@@ -578,9 +586,9 @@ N3_PAD_DIR="$N3_WORK/pad/.stitchpad"
 mkdir -p "$N3_PAD_DIR/.state/recovery-attempts"
 printf '5|%d' "$(date +%s)" > "$N3_PAD_DIR/.state/recovery-attempts/journal:test-orphan"
 
-# N3a: operator can clear all counters (H4: requires STITCHPAD_I_AM_OPERATOR=1)
+# N3a: operator can clear all counters (C2: requires the operator credential)
 STITCHPAD_PAD_DIR="$N3_PAD_DIR" STITCHPAD_NAME="operator-human" \
-  STITCHPAD_I_AM_OPERATOR=1 \
+  STITCHPAD_OPERATOR_TOKEN="$OP_TOK" \
   "$STITCHPAD" reset --recovery-counters > "$N3_WORK/n3a.out" 2>&1
 _n3a_rc=$?
 _n3a_remaining="$(find "$N3_PAD_DIR/.state/recovery-attempts" -type f 2>/dev/null | wc -l | tr -d ' ')"

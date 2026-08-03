@@ -186,6 +186,7 @@ body="$(tr '\n' ' ' < "$4")"
 printf '%s|%s|%s|%s\n' "$name" "$count" "${SP_TARGET:-}" "$body" >> "$state/mock.calls"
 case "$mode" in
   slow) sleep 1 ;;
+  gated) _g=0; while [ ! -f "$state/mock.$name.gate" ] && [ "$_g" -lt 3000 ]; do _g=$((_g + 1)); sleep 0.01; done ;;
   busy-once) [ "$count" -eq 1 ] && exit 3 ;;
   fail-slow) sleep 0.5; exit 9 ;;
   fail) exit 9 ;;
@@ -791,14 +792,22 @@ wait_state dndseat completed || fail 'DND-off did not resume pending delivery'
 ok 'DND defers durably without submit or cursor consumption'
 
 new_case controls 'controlseat | mock | push | old-target'
-printf slow > "$PAD_STATE/mock.controlseat.mode"
+# Deterministic (fx3 root-cause family): the old fixture raced the mock's
+# fixed 1s 'slow' sleep against the stop CLI's watcher-first phase (0.3-8s
+# under load) — whenever the watcher phase outlasted the sleep, the adapter
+# exited 0 mid-stop and the worker completed. Gate the mock's completion on
+# a file the test releases only AFTER stop has returned with the worker
+# killed: a completed state is then impossible by construction, and every
+# wait is a bounded poll on a real transition.
+printf gated > "$PAD_STATE/mock.controlseat.mode"
 append_message operator '@controlseat operator-controlled work'
 delivery_enqueue controlseat mock push old-target
 wait_state controlseat started || fail 'control worker never started'
 STITCHPAD_PAD_DIR="$PAD_DIR" "$ROOT/tool/bin/stitchpad" stop >/dev/null
 [ ! -d "$(delivery_worker_lock controlseat)" ] || fail 'operator stop left worker lock'
-sleep 1.1
+: > "$PAD_STATE/mock.controlseat.gate"
 [ "$(state_value controlseat state)" != completed ] || fail 'work completed after operator stop'
+rm -f "$PAD_STATE/mock.controlseat.gate"
 printf success > "$PAD_STATE/mock.controlseat.mode"
 printf '{"pid":%s}\n' "$$" > "$PAD_STATE/alive.test-operator"
 STITCHPAD_PAD_DIR="$PAD_DIR" "$ROOT/tool/bin/stitchpad" restart >/dev/null
@@ -885,16 +894,32 @@ ok 'task and malformed keeper reservations quarantine watcher admission'
 
 new_case publish_stop 'publishseat | mock | push | publish-target'
 append_message operator '@publishseat stop during owner publication'
-export SP_DELIVERY_TEST_PRE_SPAWN_DELAY=0.5
+# Deterministic (fx3 root cause, fx3-delivery-rootcause-732d61a.md): the old
+# fixture raced its own timing — a fixed 0.5s pre-spawn delay vs the stop
+# CLI's watcher-first phase (0.3–8s under load), so the worker spawned
+# mid-stop and delivered during stop's execution. fx3 proved no delivery
+# ever landed after stop RETURNED. Rewrite: synchronize every step on REAL
+# state transitions — lock born → stop invoked → stop-requested written
+# (the documented "mark intent first" contract) → gate released → worker
+# must observe the mark and abort. No sleep races a phase of unknown
+# duration; the only waits are bounded polls on file transitions.
+export SP_DELIVERY_TEST_PRE_SPAWN_GATE="$PAD_STATE/publishseat.spawn.gate"
 delivery_enqueue publishseat mock push publish-target & publish_enqueue=$!
-for _ in $(seq 1 100); do [ -d "$(delivery_worker_lock publishseat)" ] && break; sleep 0.01; done
-[ -d "$(delivery_worker_lock publishseat)" ] || fail 'publication race fixture never created worker claim'
-STITCHPAD_PAD_DIR="$PAD_DIR" "$ROOT/tool/bin/stitchpad" stop >/dev/null
+for _ in $(seq 1 1000); do [ -d "$(delivery_worker_lock publishseat)" ] && break; sleep 0.01; done
+[ -d "$(delivery_worker_lock publishseat)" ] || fail 'publication fixture never created worker claim'
+STITCHPAD_PAD_DIR="$PAD_DIR" "$ROOT/tool/bin/stitchpad" stop >/dev/null & stop_pid=$!
+for _ in $(seq 1 1000); do [ -f "$(delivery_worker_lock publishseat)/stop-requested" ] && break; sleep 0.01; done
+[ -f "$(delivery_worker_lock publishseat)/stop-requested" ] \
+  || fail 'stop never marked the publishing worker (mark-intent-first contract broken)'
+# Release the spawn gate only AFTER stop marked the worker: the launcher
+# must observe the mark (stop holds it for a >=2s owner-wait window before
+# any reap; the launcher polls at 0.01s — a 200x margin, not a race).
+: > "$PAD_STATE/publishseat.spawn.gate"
+wait "$stop_pid"
 wait "$publish_enqueue"
-unset SP_DELIVERY_TEST_PRE_SPAWN_DELAY
-sleep 0.6
+unset SP_DELIVERY_TEST_PRE_SPAWN_GATE
+[ ! -f "$PAD_STATE/mock.publishseat.count" ] || fail 'worker delivered after stop marked it during publication'
 [ ! -d "$(delivery_worker_lock publishseat)" ] || fail 'stop during publication retained worker claim'
-[ ! -f "$PAD_STATE/mock.publishseat.count" ] || fail 'worker delivered after stop during publication'
 ok 'stop closes the pre-owner publication window'
 
 # Pull-seat ownership remains with lifecycle hooks; watcher react must not create

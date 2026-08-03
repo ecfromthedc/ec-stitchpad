@@ -27,6 +27,11 @@ cleanup() {
 trap cleanup EXIT
 mkdir -p "$tmp/home"
 export HOME="$tmp/home"
+mkdir -p "$HOME"
+# Authority model (C2/C2b): operator flows require the credential — a key
+# OUTSIDE the pad (isolated fixture HOME) presented via env token.
+"$SP" operator keygen >/dev/null
+TOK="$(cat "$HOME/.stitchpad/operator.key")"
 export STITCHPAD_HEARTBEAT_AUTOSTART=0
 # Harness hygiene: never inherit the runner's terminal surface — fixtures
 # would collide on ~/.stitchpad-terminals/<surface> with concurrent suites.
@@ -73,14 +78,14 @@ check 'F3 read-seat redeliver injection refused (rc 1)' '1' "$?"
 
 # 3) operator (non-roster caller) MAY reset another seat — audited.
 rm -f "$AUDIT"
-out="$("$SP" reset victim 2>/dev/null)"
+out="$(STITCHPAD_OPERATOR_TOKEN="$TOK" "$SP" reset victim 2>/dev/null)"
 check 'F3 operator cross-seat reset allowed' '0' "$?"
 audit_op="$(python3 -c 'import json,sys; d=json.loads(sys.argv[1]); print(d.get("op",""), d.get("target",""), d.get("actor",""))' "$(tail -1 "$AUDIT")")"
 check 'F3 operator reset audited (op target actor)' 'reset victim operator' "$audit_op"
 
 # 4) deploy seat WITH one-shot operator grant may reset; grant is consumed.
 printf 'deploy' > "$STATE/authority.deployer"
-printf 'operator 2026-08-03T00:00:00Z\n' > "$STATE/operator-grant.deployer.reset-others"
+STITCHPAD_OPERATOR_TOKEN="$TOK" "$SP" operator grant deployer reset-others >/dev/null
 out="$(STITCHPAD_NAME=deployer "$SP" reset victim 2>/dev/null)"
 check 'F3 deploy+grant cross-seat reset allowed' '0' "$?"
 [ ! -f "$STATE/operator-grant.deployer.reset-others" ] \
@@ -98,7 +103,7 @@ check 'F3 self-reset allowed without grant' '0' "$?"
 
 # 6) operator redeliver injection is audited with the ordinal BEFORE landing.
 rm -f "$AUDIT"
-out="$("$SP" reset victim --redeliver 2 2>/dev/null)"
+out="$(STITCHPAD_OPERATOR_TOKEN="$TOK" "$SP" reset victim --redeliver 2 2>/dev/null)"
 check 'F3 operator redeliver allowed' '0' "$?"
 check 'F3 redeliver audited (op target ordinal)' 'redeliver victim 2' \
   "$(python3 -c 'import json,sys
@@ -111,7 +116,7 @@ for line in open(sys.argv[1]):
 # 7) audit trail fail-closed: a symlinked audit file refuses the injection.
 rm -f "$STATE/pending.victim" "$STATE/pending.victim.reset" "$AUDIT"
 ln -s /dev/null "$AUDIT"
-err="$("$SP" reset victim --redeliver 2 2>&1 >/dev/null)"
+err="$(STITCHPAD_OPERATOR_TOKEN="$TOK" "$SP" reset victim --redeliver 2 2>&1 >/dev/null)"
 check 'F3 audit-fail refuses injection (fail-closed)' '1' "$?"
 [ ! -f "$STATE/pending.victim" ] && ok 'F3 fail-closed queued nothing' || bad 'F3 fail-closed queued nothing' 'pending exists' ''
 rm -f "$AUDIT"
@@ -122,7 +127,7 @@ mkdir -p "$STATE/recovery-attempts"
 printf '3' > "$STATE/recovery-attempts/victim.stop_hook"
 printf '9' > "$STATE/seen.victim.probe" 2>/dev/null || true
 seen_before="$(cat "$STATE/seen.victim" 2>/dev/null || echo none)"
-out="$(STITCHPAD_NAME=operator "$SP" reset --recovery-counters 2>/dev/null)"
+out="$(STITCHPAD_NAME=operator STITCHPAD_OPERATOR_TOKEN="$TOK" "$SP" reset --recovery-counters 2>/dev/null)"
 case "$out" in *'recovery counters cleared'*) ok 'F7 counters cleared' ;; *) bad 'F7 counters cleared' "$out" ;; esac
 case "$out" in *'reset pad'*|*'reset @'*) bad 'F7 no fallthrough into seat/pad sweep' "$out" ;; *) ok 'F7 no fallthrough into seat/pad sweep' ;; esac
 [ ! -f "$STATE/recovery-attempts/victim.stop_hook" ] && ok 'F7 counter file removed' \
