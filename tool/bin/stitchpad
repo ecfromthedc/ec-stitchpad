@@ -589,6 +589,12 @@ EOF
           echo "stitchpad: refusing to scrub ghost @$g — Ocean outcome is unresolved" >&2
           reset_failures=$((reset_failures + 1))
         elif _reset_kill_ticker "$g"; then
+          # REAL lifecycle projection: evicting a ghost cancels whatever request
+          # its session still had in flight. Record BEFORE the scrub removes the
+          # sessions/<sid> binding (a ghost with no binding stays explicitly
+          # empty). Busy pad → skipped refresh; the scrub still proceeds.
+          STITCHPAD_SESSION="$(sp_session_registry_sid_for_name "$g")" STITCHPAD_NAME="$g" \
+            sp_session_registry_lifecycle_commit cancel || true
           _reset_scrub_ghost "$g"
         else
           reset_failures=$((reset_failures + 1))
@@ -865,6 +871,12 @@ con.execute("INSERT INTO handoffs(agent, at, body) VALUES(?,?,?)",
 con.commit()
 PY
         rm -f "$_handoff"
+        # REAL lifecycle projection: the seat is rotating to a fresh session
+        # identity. Record the rotate against its current durable binding
+        # (forces a NEW request id for whatever comes next) and refresh the
+        # pad header. Busy pad → skipped refresh, handoff still queued.
+        STITCHPAD_SESSION="$(sp_session_registry_sid_for_name "$who")" STITCHPAD_NAME="$who" \
+          sp_session_registry_lifecycle_commit rotate || true
         echo "✓ shift-change queued for @$who — finish your turn now; the bridge clears the session once idle and delivers this into the fresh chat"
         ;;
       --claim)
@@ -945,6 +957,12 @@ PY
       { print }
     ' "$PAD_MD" > "$tmp" && sp_write_inplace "$tmp" "$PAD_MD"
     sp_system "@$who left the stitchpad"
+    # REAL lifecycle projection: leaving ends the seat's session. We already
+    # hold the pad mutation lock — record the terminal event against the seat's
+    # durable session binding (missing binding stays explicitly empty) and
+    # refresh the pad header so the roster commit below carries both.
+    STITCHPAD_SESSION="$(sp_session_registry_sid_for_name "$who")" STITCHPAD_NAME="$who" \
+      sp_session_registry_lifecycle_locked terminal || true
     sp_commit "roster: - $who"
     # also release any file claims and wake state this agent held
     rm -f "$PAD_STATE/seen.$who" "$PAD_STATE/forcewake.$who" 2>/dev/null
@@ -991,6 +1009,21 @@ PY
       fi
       printf '%s' "$nm" > "$PAD_STATE/sessions/$sid"
       echo "✓ bound session $sid → @$nm"
+      # REAL lifecycle projection: a first-time binding is a dispatch; binding
+      # a session that already ENDED is a resume (the marker helper clears the
+      # stale end marker). Rebinding an already-active session records NOTHING
+      # — the persisted request identity must stay stable across idempotent
+      # re-joins, never re-minted. Busy pad → skipped refresh, never a failure.
+      _bind_event=""
+      if [ -e "$PAD_STATE/session-end.$sid" ]; then
+        _bind_event="resume"
+      elif [ ! -e "$PAD_STATE/session-start.$sid" ]; then
+        _bind_event="dispatch"
+      fi
+      if [ -n "$_bind_event" ]; then
+        STITCHPAD_SESSION="$sid" STITCHPAD_NAME="$nm" \
+          sp_session_registry_lifecycle_commit "$_bind_event" || true
+      fi
     fi
     # Auto-detect the model from the agent's own env (runs in-process, so each
     # harness's vars are visible). Only writes if we find one — never guesses.
@@ -1137,8 +1170,10 @@ PY
     # commit so durable state cannot lag behind a successful sp_commit. All
     # timestamps derive from the same captured epoch — no second date +%s.
     # A failed registry write rolls back (no partial visible state) and is
-    # non-fatal to the post itself.
-    sp_session_registry_append "$_captured_epoch" || true
+    # non-fatal to the post itself. We already hold the pad mutation lock, so
+    # the lifecycle helper also refreshes the sentinel-bounded Active Sessions
+    # + Session History header in place; the say commit below carries both.
+    sp_session_registry_lifecycle_locked activity "$_captured_epoch" || true
     _say_subject="$from: $(printf '%s' "$text" | tr '\n' ' ' | cut -c1-60)"
     if [ -n "$_captured_epoch" ]; then
       GIT_COMMITTER_DATE="@$_captured_epoch" GIT_AUTHOR_DATE="@$_captured_epoch" \
@@ -2055,6 +2090,16 @@ except: print("")' 2>/dev/null)"
       fi
     fi
     [ -z "$msgs" ] && exit 0   # nothing for me → stop normally
+    # Blocking the stop IS the delegated request creation: this reply dispatches
+    # the drained messages into the seat's next turn. Record the REAL dispatch
+    # (session id came from the hook's stdin JSON; an unresolvable one stays
+    # explicitly empty) and refresh the pad-header projection under the pad
+    # mutation lock. Relay mode has no local pad/state — `who` is only resolved
+    # on the local branch, so gate on it. A busy pad skips the refresh; the
+    # wake delivery itself is never blocked on projection bookkeeping.
+    if [ -n "${who:-}" ]; then
+      STITCHPAD_NAME="$who" sp_session_registry_lifecycle_commit dispatch || true
+    fi
     esc="$(printf '%s' "$msgs" | python3 -c 'import json,sys; print(json.dumps(sys.stdin.read()))' 2>/dev/null)"
     [ -z "$esc" ] && esc="$(printf '%s' "$msgs" | sed 's/\\/\\\\/g; s/"/\\"/g' | awk 'BEGIN{ORS="\\n"}{print}')" && esc="\"$esc\""
     printf '{"decision":"block","reason":%s}\n' "$esc"
