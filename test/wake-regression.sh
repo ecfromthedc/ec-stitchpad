@@ -128,6 +128,14 @@ trap cleanup EXIT
 
 export STITCHPAD_HOME="$ROOT/tool"
 
+# TASK-6 evidence label: stamp environment facts + immutable candidate (SHA/
+# tree) into the suite log so a green/red result is bound to the exact
+# environment and commit that produced it. Value-free for ambient session vars.
+if [ -x "$STITCHPAD_HOME/bin/evidence-stamp" ]; then
+  STITCHPAD_EVIDENCE_COMMAND="wake-regression.sh" \
+    "$STITCHPAD_HOME/bin/evidence-stamp" 2>/dev/null || true
+fi
+
 # Startup/stop race: pause a foreground watcher after exact owner publication
 # but before fswatch. Stop must remove that generation, make the signal handler
 # exit (not continue), and leave neither a lock nor an orphan process.

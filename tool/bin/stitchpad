@@ -2282,6 +2282,15 @@ except: print("")' 2>/dev/null)"
       exit 1
     fi
     echo "=== stitchpad test ==="
+    # TASK-6: label the whole run with environment facts + the immutable
+    # candidate (SHA/tree) so a green/red result can never be mistaken for
+    # one of a different environment or commit. Value-free for session vars.
+    if [ -x "$STITCHPAD_HOME/bin/evidence-stamp" ]; then
+      echo "--- evidence ---"
+      STITCHPAD_EVIDENCE_COMMAND="stitchpad test" \
+        "$STITCHPAD_HOME/bin/evidence-stamp" 2>/dev/null || true
+      echo "--- evidence ---"
+    fi
     echo ""
     for t in "${tests[@]}"; do
       total=$((total + 1))
