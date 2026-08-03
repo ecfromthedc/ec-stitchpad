@@ -1138,6 +1138,10 @@ PY
           exit 1
         fi
         printf '%s' "$level" > "$PAD_STATE/authority.$who"
+        # A-2 (fx1): seal the level write so a hand-written authority.<seat>
+        # is detected as forgery on read (sp_authority_level verifies the
+        # sidecar whenever an operator key exists).
+        _sp_authority_level_seal "$who" "$level" > "$PAD_STATE/authority.$who.seal"
         echo "✓ authority for @$who: $level"
         ;;
       show)
@@ -1148,6 +1152,7 @@ PY
           found=0
           for a in "$PAD_STATE"/authority.*; do
             [ -f "$a" ] || continue
+            case "$a" in *.seal) continue ;; esac   # skip A-2 seal sidecars
             found=1
             seat="${a##*.authority.}"
             echo "@$seat: $(cat "$a")"
@@ -1180,7 +1185,7 @@ PY
         who="${2:?usage: authority check <seat> <operation>}"
         op="${3:?usage: authority check <seat> <operation>}"
         if sp_authority_check_deploy "$who" "$op"; then
-          echo "✓ @$seat is authorized for: $op"
+          echo "✓ @$who is authorized for: $op"   # fx1 A-1: $seat is unbound here
         else
           exit 1
         fi

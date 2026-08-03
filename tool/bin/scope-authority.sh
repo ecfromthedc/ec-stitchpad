@@ -79,13 +79,42 @@ _sp_scope_seat() {
 #     stitchpad commands all fail closed. Raising Tier-2 beyond this needs
 #     an OS-level secret store (keychain with ACL prompt) — future work.
 
-_sp_operator_key_path() { printf '%s' "$HOME/.stitchpad/operator.key"; }
+_sp_operator_key_path() {
+  # A-4/A-5 (fx1): $HOME is AMBIENT input the subject controls — a seat can
+  # keygen into a fake HOME and mint/verify under its own key (A-4 full
+  # bypass), while a legitimate operator grant minted under one HOME never
+  # verifies from a seat running under another (A-5 intended-flow breakage).
+  # Root the credential in the PASSWD-database home (a same-uid child cannot
+  # set it), with an explicit override for hermetic test harnesses.
+  # Residual (documented): STITCHPAD_OPERATOR_KEY_PATH is env and therefore
+  # subject-controlled too — but every op this credential gates is a same-uid
+  # operation the subject can already perform directly (kill, file writes);
+  # the credential exists to stop ACCIDENTAL/automated overreach and to make
+  # deliberate bypass a multi-step, auditable act.
+  if [ -n "${STITCHPAD_OPERATOR_KEY_PATH:-}" ]; then
+    printf '%s' "$STITCHPAD_OPERATOR_KEY_PATH"; return 0
+  fi
+  local realhome
+  realhome="$(python3 -c 'import os,pwd; print(pwd.getpwuid(os.getuid()).pw_dir)' 2>/dev/null)"
+  [ -n "$realhome" ] || realhome="$HOME"
+  printf '%s' "$realhome/.stitchpad/operator.key"
+}
 
-# Key file sanity: exists, regular file, not a symlink, non-empty.
+# Key file sanity: exists, regular file, not a symlink, non-empty — and not
+# readable beyond the owner (A-3, fx1: chmod 600 was best-effort; a 0644 key
+# granted to any same-machine user who could read it). When the mode cannot
+# be determined the key is still accepted (portability floor).
 sp_operator_key_present() {
-  local key
+  local key mode
   key="$(_sp_operator_key_path)"
   [ -f "$key" ] && [ ! -L "$key" ] && [ -s "$key" ] || return 1
+  mode="$(stat -f '%Lp' "$key" 2>/dev/null || stat -c '%a' "$key" 2>/dev/null)"
+  if [ -n "$mode" ]; then
+    [ "$mode" -le 600 ] 2>/dev/null || {
+      echo "stitchpad: operator key at $key is readable beyond owner (mode $mode) — chmod 600 required" >&2
+      return 1
+    }
+  fi
 }
 
 # Create the operator key. Refuses to overwrite without $1=--force.
@@ -95,6 +124,15 @@ sp_operator_keygen() {
   if [ "$1" != "--force" ] && [ -e "$key" ]; then
     echo "stitchpad: operator key already exists at $key (use --force to rotate; existing grants/elevations seal against the OLD key and will stop verifying)" >&2
     return 1
+  fi
+  if [ "$1" = "--force" ] && [ -e "$key" ]; then
+    # Rotation is an operator act: prove possession of the CURRENT key —
+    # otherwise any process that can write the key path can rotate into its
+    # own universe (A-4's keygen-must-be-gated point).
+    [ "${STITCHPAD_OPERATOR_TOKEN:-}" = "$(cat "$key" 2>/dev/null)" ] || {
+      echo "stitchpad: key rotation requires STITCHPAD_OPERATOR_TOKEN matching the CURRENT key" >&2
+      return 1
+    }
   fi
   mkdir -p "$dir" 2>/dev/null || return 1
   [ ! -L "$dir" ] || return 1
@@ -256,12 +294,35 @@ sp_scope_check_write() {
 
 # ── Deployment authority ───────────────────────────────────────────
 
+# Seal sidecar for a level write: binds seat+level+pad to the operator key.
+_sp_authority_level_seal() { # $1=seat $2=level
+  local pad_canon
+  pad_canon="$(cd -P "${PAD_STATE%/.state}" 2>/dev/null && pwd)"
+  _sp_authority_hmac "sp-auth-v1|$pad_canon|$1|level|$2"
+}
+
 # Get the authority level for a seat. Defaults to 'write' for backward compat.
+# A-2 (fx1): the level file is seat-writable pad state — a forgeable input.
+# When an operator universe exists (key present) the level must carry a valid
+# operator seal sidecar; a hand-written level is LOUDLY ignored. On keyless
+# dev pads the level stays advisory (no operator acts are possible there
+# anyway), preserving legacy behavior.
 sp_authority_level() {
   local seat="$1"
-  local auth_file="$PAD_STATE/authority.$seat"
+  local auth_file="$PAD_STATE/authority.$seat" level
   [ -f "$auth_file" ] || { echo "write"; return 0; }
-  cat "$auth_file" 2>/dev/null | tr -d '[:space:]' || echo "write"
+  level="$(cat "$auth_file" 2>/dev/null | tr -d '[:space:]')"
+  [ -n "$level" ] || { echo "write"; return 0; }
+  if sp_operator_key_present 2>/dev/null; then
+    local expect got
+    expect="$(_sp_authority_level_seal "$seat" "$level" 2>/dev/null)"
+    got="$(cat "$PAD_STATE/authority.$seat.seal" 2>/dev/null)"
+    if [ -z "$got" ] || [ "$got" != "$expect" ]; then
+      echo "stitchpad: authority level for @$seat is UNSEALED (hand-written?) — ignoring; operator must re-run 'authority set'" >&2
+      echo "write"; return 0
+    fi
+  fi
+  printf '%s' "$level"
 }
 
 # Check if a seat is authorized for a deployment operation.
