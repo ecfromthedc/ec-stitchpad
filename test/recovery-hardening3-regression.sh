@@ -30,6 +30,17 @@ STITCHPAD="$ROOT/tool/bin/stitchpad"
 # operator's own ~/.stitchpad-terminals/<surface> and collide with live
 # seats. See fx2-harness-hygiene-1b8eed4.md.
 unset HERDR_PANE_ID HERDR_TAB_ID HERDR_ENV HERDR_SOCKET_PATH HERDR_WORKSPACE_ID 2>/dev/null || true
+# Authority model (C2/C2b): operator flows require a credential rooted at
+# $HOME/.stitchpad/operator.key — isolate HOME so the fixture NEVER touches
+# the operator's real key, then mint a fixture credential.
+H3_HOME="$(mktemp -d "${TMPDIR:-/tmp}/sp-h3-home.XXXXXX")"
+export HOME="$H3_HOME"
+# A-4/A-5 fix: explicit override keeps this fixture off the real operator key
+export STITCHPAD_OPERATOR_KEY_PATH="$H3_HOME/.stitchpad/operator.key"
+export STITCHPAD_OPERATOR_KEY_OVERRIDE_ACK=1
+trap 'rm -rf "$H3_HOME"' EXIT
+"$STITCHPAD" operator keygen >/dev/null 2>&1 || true
+OP_TOK="$(cat "$HOME/.stitchpad/operator.key" 2>/dev/null)"
 
 RED='\033[0;31m'; GREEN='\033[0;32m'; NC='\033[0m'
 pass=0; fail=0
@@ -578,9 +589,9 @@ N3_PAD_DIR="$N3_WORK/pad/.stitchpad"
 mkdir -p "$N3_PAD_DIR/.state/recovery-attempts"
 printf '5|%d' "$(date +%s)" > "$N3_PAD_DIR/.state/recovery-attempts/journal:test-orphan"
 
-# N3a: operator can clear all counters (H4: requires STITCHPAD_I_AM_OPERATOR=1)
+# N3a: operator can clear all counters (C2: requires the operator credential)
 STITCHPAD_PAD_DIR="$N3_PAD_DIR" STITCHPAD_NAME="operator-human" \
-  STITCHPAD_I_AM_OPERATOR=1 \
+  STITCHPAD_OPERATOR_TOKEN="$OP_TOK" \
   "$STITCHPAD" reset --recovery-counters > "$N3_WORK/n3a.out" 2>&1
 _n3a_rc=$?
 _n3a_remaining="$(find "$N3_PAD_DIR/.state/recovery-attempts" -type f 2>/dev/null | wc -l | tr -d ' ')"
@@ -765,6 +776,86 @@ grep -qi 'did not complete' "$JH_WORK/join2.out" && \
   bad "JH4: 'roster commit did not complete' error on join" \
   || ok "JH4: no 'commit did not complete' error"
 
+# ── JH5: sp_commit benign-race fallthrough (km2 JH4 root-cause, deterministic) ──
+# The JH4 flake mechanism (30-iteration instrumented repro, 50% failure under
+# load): a concurrent UNLOCKED committer (watch.sh auto-commit) sweeps our
+# staged bytes into its own commit between our index check and our commit —
+# git exits 1 "nothing to commit" with EMPTY stderr, HEAD never moves in our
+# window, and H5b's head-moved branches miss it. The fix tests working-tree
+# vs HEAD for our paths in the fallthrough. These gates reproduce the exact
+# interleaving deterministically with a git PATH shim that sweeps the index
+# at the head_before capture.
+echo "  JH5: sp_commit concurrent-committer fallthrough (deterministic shim)..."
+JH5_WORK="$(mktemp -d "${TMPDIR:-/tmp}/sp-h3-jh5.XXXXXX")"
+make_pad "$JH5_WORK/pad" "jh5-pad"
+JH5_PAD_DIR="$JH5_WORK/pad/.stitchpad"
+JH5_REAL_GIT="$(command -v git)"
+mkdir -p "$JH5_WORK/bin"
+cat > "$JH5_WORK/bin/git" <<'EOSHIM'
+#!/usr/bin/env bash
+# JH5 shim: delegate everything to real git, except at the head_before
+# capture (rev-parse --verify -q HEAD) where a simulated concurrent
+# committer sweeps the staged index first — then the subsequent commit
+# finds nothing to commit (rc=1, silent) with HEAD unmoved in the window.
+case "$*" in
+  *"rev-parse --verify -q HEAD"*)
+    if [ ! -f "$JH5_SHIM_DIR/swept" ]; then
+      "$JH5_REAL_GIT" --git-dir="$JH5_GD" --work-tree="$JH5_WT" \
+        commit -q -m "watcher-simulated sweep" >/dev/null 2>&1
+      [ -n "${JH5_WT_APPEND:-}" ] && printf '%s\n' "$JH5_WT_APPEND" >> "$JH5_WT/stitchpad.md"
+      touch "$JH5_SHIM_DIR/swept"
+    fi
+    ;;
+esac
+exec "$JH5_REAL_GIT" "$@"
+EOSHIM
+chmod +x "$JH5_WORK/bin/git"
+
+# JH5a: concurrent committer swept our bytes → sp_commit must return 0 (benign)
+printf 'jh5a roster probe line\n' >> "$JH5_PAD_DIR/stitchpad.md"
+(
+  export STITCHPAD_PAD_DIR="$JH5_PAD_DIR" PATH="$JH5_WORK/bin:$PATH"
+  export JH5_SHIM_DIR="$JH5_WORK" JH5_REAL_GIT="$JH5_REAL_GIT"
+  export JH5_GD="$JH5_PAD_DIR/stitchpad-git" JH5_WT="$JH5_PAD_DIR"
+  # Suite-context hygiene: sp_find_pad short-circuits on a pre-set ambient
+  # PAD_DIR (lib.sh:104) — earlier top-level fixture assignments would
+  # silently hijack the pin. Scrub the ambient pad vars.
+  unset PAD_DIR PAD_MD PAD_GIT PAD_STATE PAD_TASKS PAD_ARCHIVE_DIR
+  source "$ROOT/tool/bin/lib.sh" 2>/dev/null
+  sp_init_paths >/dev/null 2>&1
+  sgit add -A -f -- stitchpad.md 2>/dev/null
+  rm -f "$JH5_WORK/swept"
+  sp_commit "jh5a: simulated race" 2>/dev/null
+  echo "JH5A_RC=$?"
+) > "$JH5_WORK/jh5a.out" 2>&1
+grep -q '^JH5A_RC=0$' "$JH5_WORK/jh5a.out" && \
+  ok "JH5a: sp_commit benign when a concurrent committer swept our staged bytes" \
+  || bad "JH5a: sp_commit refused a durably-committed write (got: $(grep JH5A_RC "$JH5_WORK/jh5a.out"))"
+
+# JH5b: same race but our bytes are NOT in HEAD (write genuinely uncommitted)
+# → sp_commit must still refuse honestly.
+printf 'jh5b staged line\n' >> "$JH5_PAD_DIR/stitchpad.md"
+(
+  export STITCHPAD_PAD_DIR="$JH5_PAD_DIR" PATH="$JH5_WORK/bin:$PATH"
+  export JH5_SHIM_DIR="$JH5_WORK" JH5_REAL_GIT="$JH5_REAL_GIT"
+  export JH5_GD="$JH5_PAD_DIR/stitchpad-git" JH5_WT="$JH5_PAD_DIR"
+  export JH5_WT_APPEND="jh5b UNSTAGED working-tree change"
+  unset PAD_DIR PAD_MD PAD_GIT PAD_STATE PAD_TASKS PAD_ARCHIVE_DIR
+  source "$ROOT/tool/bin/lib.sh" 2>/dev/null
+  sp_init_paths >/dev/null 2>&1
+  sgit add -A -f -- stitchpad.md 2>/dev/null
+  rm -f "$JH5_WORK/swept"
+  sp_commit "jh5b: simulated race with post-sweep wt change" 2>/dev/null
+  echo "JH5B_RC=$?"
+) > "$JH5_WORK/jh5b.out" 2>&1
+if grep -q '^JH5B_RC=1$' "$JH5_WORK/jh5b.out"; then
+  ok "JH5b: sp_commit still refuses when the working tree differs from HEAD"
+  rm -rf "$JH5_WORK"
+else
+  bad "JH5b: sp_commit accepted an uncommitted write (got: $(grep JH5B_RC "$JH5_WORK/jh5b.out"))"
+  echo "  JH5 debug preserved: $JH5_WORK" >&2
+fi
+
 # ============================================================================
 # ROUND 6: H1/H2+H9b/H4/H5b/H6/H10/H11b (flash re-attack 4 escalations)
 # ============================================================================
@@ -856,13 +947,22 @@ _rc=$?
 [ "$_rc" -ne 0 ] && ok "H4a: non-roster name without operator flag denied" \
   || bad "H4a: non-roster name cleared counters without operator flag (spoof)"
 
-# H4b: with operator flag → allowed
+# H4b: with operator flag but NO credential → denied (C2 redesign superseded
+# the H4 flag: operator-ness is proven by the credential, never asserted by
+# an env flag — see the 1a9fc14 integration resolution).
 STITCHPAD_PAD_DIR="$H4_PAD_DIR" STITCHPAD_NAME="operator-human" \
   STITCHPAD_I_AM_OPERATOR=1 STITCHPAD_HEARTBEAT_AUTOSTART=0 STITCHPAD_STEAL=1 \
   "$STITCHPAD" reset --recovery-counters > /dev/null 2>&1
 _rc=$?
-[ "$_rc" -eq 0 ] && ok "H4b: operator with flag can clear counters" \
-  || bad "H4b: operator with flag denied (regression)"
+[ "$_rc" -ne 0 ] && ok "H4b: operator flag WITHOUT credential denied (flag superseded by C2 credential gate)" \
+  || bad "H4b: flag-only operator cleared counters (env-asserted operator-ness accepted)"
+# H4b2: with the credential → allowed
+STITCHPAD_PAD_DIR="$H4_PAD_DIR" STITCHPAD_NAME="operator-human" \
+  STITCHPAD_OPERATOR_TOKEN="$OP_TOK" STITCHPAD_HEARTBEAT_AUTOSTART=0 STITCHPAD_STEAL=1 \
+  "$STITCHPAD" reset --recovery-counters > /dev/null 2>&1
+_rc=$?
+[ "$_rc" -eq 0 ] && ok "H4b2: operator with credential can clear counters" \
+  || bad "H4b2: credentialed operator denied (regression)"
 
 # H4c: roster seat WITH operator flag → still denied
 STITCHPAD_PAD_DIR="$H4_PAD_DIR" STITCHPAD_NAME="alice" \

@@ -1299,7 +1299,23 @@ sp_commit() {
     fi
     sgit diff --cached --quiet -- "${paths[@]}" 2>/dev/null && return 0
   fi
-  # H5b: HEAD didn't move — real failure, write NOT committed.
+  # H5b: HEAD didn't move. One more BENIGN race before declaring failure
+  # (JH4, root-caused with km2's instrumented 30-iteration repro): a
+  # concurrent UNLOCKED committer (watch.sh's periodic auto-commit, which
+  # runs outside sp_lock by design) can sweep our staged bytes into its own
+  # commit BEFORE our _head_before snapshot. Our commit then finds an empty
+  # index, git exits 1 with "nothing to commit", HEAD never moves in our
+  # window, and every H5b/C5 branch above misses it — a spurious refusal of
+  # a write that IS durably committed (JH4 fleet flake).
+  # The honest test is working-tree vs HEAD for OUR paths:
+  #   match  → the desired bytes ARE in HEAD (ours or the race winner's) → 0
+  #   differ → the write is genuinely not committed (hook ate it, C3/RP-2
+  #            tamper class, real git failure) → refuse honestly.
+  if [ -n "$_head_after" ] \
+     && sgit diff --quiet HEAD -- "${paths[@]}" 2>/dev/null; then
+    return 0
+  fi
+  # H5b: HEAD didn't move and our bytes are not in HEAD — real failure.
   return 1
 }
 

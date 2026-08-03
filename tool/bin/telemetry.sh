@@ -13,6 +13,9 @@
 #
 # Events (e=):
 #   wake            outcome=delivered|deferred|zero_run|noop|peek|failed dur_ms exit
+#   poll            outcome=peek|idle|noop dur_ms exit  (F5: non-delivery
+#                   inspections — bridge doctor / watch.sh --peek-ordinal —
+#                   classified apart so polling never inflates wake stats)
 #   say             outcome=posted|failed dur_ms
 #   delivery        outcome=delivered|failed|cancelled|errored dur_ms
 #   verdict         verdict=confirmed|rejected|held candidate detail
@@ -84,7 +87,8 @@ _sp_tel_utc_date() {
 
 # Telemetry root: per-pad by default ($PAD_STATE/telemetry); relay mode and
 # other multi-pad callers redirect with STITCHPAD_TELEMETRY_ROOT. Sanitized:
-# only an absolute path is honored; anything else falls back to per-pad.
+# must be an absolute path (anything else falls back to per-pad); symlink
+# components are rejected at use.
 _sp_tel_root() {
   local root="${STITCHPAD_TELEMETRY_ROOT:-}"
   case "$root" in
@@ -112,7 +116,7 @@ sp_telemetry_record() {
   local ev="${1:-}"; shift || true
   [ -n "$ev" ] || return 0
   case "$ev" in
-    wake|say|delivery|verdict|seal|false_terminal|turn|outage|retry) ;;
+    wake|say|delivery|verdict|seal|false_terminal|turn|outage|retry|poll) ;;
     *) return 0 ;;
   esac
   [ -n "${PAD_STATE:-}" ] && [ -d "$PAD_STATE" ] && [ ! -L "$PAD_STATE" ] || return 0
