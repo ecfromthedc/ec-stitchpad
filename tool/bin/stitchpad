@@ -125,11 +125,17 @@ case "$cmd" in
           echo "stitchpad: init: unknown option '$1'" >&2
           exit 2 ;;
         *)
-          # A positional argument is the pad location. Accept either the project
-          # dir or the .stitchpad dir itself, so both call styles work.
+          # A positional argument is ambiguous: callers use BOTH
+          #   `init /abs/path/.stitchpad`  (a LOCATION)   and
+          #   `init myname`                (a NAME)
+          # Disambiguate on shape, which is the least surprising reading:
+          # anything containing a slash, ending in .stitchpad, or naming an
+          # existing directory is a LOCATION; a bare word is a NAME.
           case "$1" in
-            */.stitchpad) _init_root="$(dirname "$1")" ;;
-            *)            _init_root="$1" ;;
+            */.stitchpad)  _init_root="$(dirname "$1")" ;;
+            */*)           _init_root="$1" ;;
+            *)
+              if [ -d "$1" ]; then _init_root="$1"; else name="$1"; fi ;;
           esac
           shift ;;
       esac
