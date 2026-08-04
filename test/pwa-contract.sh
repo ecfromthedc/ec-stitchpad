@@ -82,6 +82,11 @@ mkdir -p "$FIXTURE_DIR/.stitchpad/.state"
 cd "$FIXTURE_DIR"
 "$SP" init --name fixture >/dev/null 2>&1 || true
 
+# This release hardened `say` to REFUSE when the roster is empty (fail-closed).
+# These fixtures predate that and never joined, so they posted into a rosterless pad.
+# The refusal is correct; the fixture owed a join.
+STITCHPAD_SESSION="fx-alice-$$" "$SP" join alice cli pull - >/dev/null 2>&1 || true
+
 # Simulate an outbox response as the bridge would receive it
 OUTBOX_JSON='{"messages":[{"from":"pwa-user","text":"hello from PWA","at":1700000000000}]}'
 FROM="$(echo "$OUTBOX_JSON" | jq -r '.messages[0].from')"

@@ -82,6 +82,8 @@ printf 'alice' > "$B1_PAD_STATE/sessions/$B1_SID"
 
 # Create a real orphan journal
 B1_ORPHAN="$(STITCHPAD_SESSION="$B1_SID" sp_session_registry_journal_begin "$B1_SID")"
+# R7 liveness: simulate a CRASHED owner (see phaseb fix)
+rm -f "${B1_ORPHAN}/.alive" 2>/dev/null || true
 [ -n "$B1_ORPHAN" ] && [ -d "$B1_ORPHAN" ] || { bad "B1_setup: could not create orphan"; exit 1; }
 
 # Record max attempts so recovery is exhausted

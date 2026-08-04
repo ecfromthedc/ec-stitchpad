@@ -41,6 +41,11 @@ chmod +x "$FAKE_BIN/curl"
 cd "$FIXTURE_DIR"
 "$SP" init --name fixture >/dev/null
 
+# This release hardened `say` to REFUSE when the roster is empty (fail-closed).
+# These fixtures predate that and never joined, so they posted into a rosterless pad.
+# The refusal is correct; the fixture owed a join.
+STITCHPAD_SESSION="fx-alice-$$" "$SP" join alice cli pull - >/dev/null 2>&1 || true
+
 # A valid 1x1 PNG.
 IMG="$FIXTURE_DIR/tiny.png"
 printf '%s' 'iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+/p94AAAAASUVORK5CYII=' | base64 -d > "$IMG" 2>/dev/null \
