@@ -2331,10 +2331,15 @@ PY
       _head="$(sgit rev-parse HEAD 2>/dev/null || true)"
       if [ -n "$_me" ] && [ -n "$_head" ]; then
         case "$_me" in *[!a-zA-Z0-9_-]*) echo "stitchpad: invalid identity for read cursor" >&2; exit 1 ;; esac
+        # E-17: roster handles can exceed 255 bytes (filesystem name limit).
+        # Hash the identity so the cursor key is always a fixed safe length,
+        # regardless of handle length.  Once broken by a long handle the
+        # cursor could never be written again; the hash prevents that.
+        _me_key="$(printf '%s' "$_me" | shasum -a 256 | cut -d' ' -f1 | cut -c1-16)"
         [ ! -L "$PAD_STATE" ] || { echo "stitchpad: refusing symlinked read cursor directory" >&2; exit 1; }
-        [ ! -L "$PAD_STATE/readref.$_me" ] \
+        [ ! -L "$PAD_STATE/readref.$_me_key" ] \
           || { echo "stitchpad: refusing symlinked read cursor" >&2; exit 1; }
-        _ref="$(cat "$PAD_STATE/readref.$_me" 2>/dev/null || true)"
+        _ref="$(cat "$PAD_STATE/readref.$_me_key" 2>/dev/null || true)"
         sgit cat-file -e "${_ref}^{commit}" 2>/dev/null || _ref=""
         if [ "$_ref" = "$_head" ]; then echo "(nothing new since your last read)"; exit 0; fi
         if [ -n "$_ref" ]; then
@@ -2351,9 +2356,9 @@ PY
         fi
         printf '%s\n' "$_out"
         mkdir -p "$PAD_STATE" || { echo "stitchpad: cannot create read cursor directory" >&2; exit 1; }
-        _rr_tmp="$(mktemp "$PAD_STATE/.readref.$_me.XXXXXX")" \
+        _rr_tmp="$(mktemp "$PAD_STATE/.readref.$_me_key.XXXXXX")" \
           || { echo "stitchpad: cannot stage read cursor" >&2; exit 1; }
-        if printf '%s' "$_head" > "$_rr_tmp" && mv -f "$_rr_tmp" "$PAD_STATE/readref.$_me"; then
+        if printf '%s' "$_head" > "$_rr_tmp" && mv -f "$_rr_tmp" "$PAD_STATE/readref.$_me_key"; then
           :
         else
           rm -f "$_rr_tmp" 2>/dev/null
@@ -3773,7 +3778,15 @@ PY
         # to run `stitchpad task migrate`.
         sp_task_detect_duplicate "$tid" || true
         _show_f="$(sp_task_file "$tid")" || { echo "stitchpad: no such task: $tid" >&2; exit 1; }
-        awk -v want="\`\`\`task $tid" '$0==want{p=1} p{print; if (p>1 && $0=="\`\`\`") exit; p=2}' "$_show_f"
+        # E-18: track nested ``` fences so internal code blocks in the task
+        # body don't prematurely close the task block.  The task ends only
+        # when depth returns to zero after the opening ```task fence.
+        awk -v want="\`\`\`task $tid" '
+          $0==want { p=1; depth=1; next }
+          p && /^```[^t]/ { depth++; print; next }
+          p && /^```$/   { depth--; if (depth==0) exit; print; next }
+          p { print }
+        ' "$_show_f"
         ;;
 
       move)

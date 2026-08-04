@@ -1563,15 +1563,33 @@ sp_tasks() {
     BEGIN { id=""; title=""; status=""; priority=""; assignee=""; labels=""; created=""; desc="" }
     # multiple inputs (pad + tasks.md): never let an unterminated block in one
     # file bleed into the next
-    FNR==1                           { inblk=0; meta=0; id="" }
+    FNR==1                           { inblk=0; meta=0; id=""; code_fence=0 }
     /^```task /                      { inblk=1; meta=1; id=$2; gsub(/^ *| *$/,"",id); title=""; status="todo"; priority="none"; assignee=""; labels=""; created=""; desc="" }
+    # E-18: only a TOP-LEVEL ``` (code_fence==0) closes the task block.
+    # Nested ``` pairs inside the body (e.g. a code block in the description)
+    # toggle code_fence and do NOT terminate the task.
+    /^```$/ && inblk && code_fence>0 { code_fence--; next }
     /^```$/ && inblk                 { inblk=0; if (id!="") {
       # duplicate blocks: tasks.md is read second via sp_task_files ordering,
       # so its version naturally wins for cross-file duplicates (LAST wins).
       if (!(id in seen)) { order[++nord]=id; seen[id]=1 }
-      data[id] = id "|" title "|" status "|" priority "|" assignee "|" labels "|" created "|" substr(desc, 1, 240)
+      data[id] = id "|" title "|" status "|" priority "|" assignee "|" labels "|" created "|" desc
       fa[id]=assignee; fst[id]=status; id="" } }
     inblk && /^---/                   { meta=0; next }
+    inblk && !meta && /^```[^t]/ {
+      # a nested code fence inside the task body (e.g. ```python, ```json)
+      code_fence++
+      if (desc != "") desc = desc " / "
+      desc = desc $0
+      next
+    }
+    inblk && !meta && /^```$/ {
+      # closing a nested code fence
+      if (code_fence>0) { code_fence-- }
+      if (desc != "") desc = desc " / "
+      desc = desc $0
+      next
+    }
     inblk && !meta && !/^```/ {
       line=$0; gsub(/^[ \t]+|[ \t]+$/, "", line)
       if (line != "") desc = (desc == "" ? line : desc " / " line)
