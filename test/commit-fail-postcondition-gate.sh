@@ -50,7 +50,7 @@ probe() {
   if [ "$rc" -eq 0 ]; then
     bad "$label: FALSE SUCCESS — exited 0 with the commit forced to fail"
   elif [ "$before" != "$after" ]; then
-    bad "$label: commit count moved ($before→$after) despite forced failure"
+    bad "$label: commit count moved (${before}→$after) despite forced failure"
   else
     ok "$label: exits $rc, commits unchanged ($before)"
   fi

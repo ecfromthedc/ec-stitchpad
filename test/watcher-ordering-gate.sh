@@ -88,7 +88,7 @@ rm -rf "$LOCK_DIR" 2>/dev/null || true
 if [ "$G2_AFTER" -eq "$G2_BEFORE" ]; then
   ok "G2: watcher deferred when lock held (no interleaving, still $G2_BEFORE commits)"
 else
-  bad "G2: watcher committed despite held lock (INTERLEAVING — $G2_BEFORE→$G2_AFTER)"
+  bad "G2: watcher committed despite held lock (INTERLEAVING — ${G2_BEFORE}→$G2_AFTER)"
 fi
 
 # ── G3 (MUTANT): bare sp_commit DOES interleave ──────────────────────────

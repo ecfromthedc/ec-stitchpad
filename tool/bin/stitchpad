@@ -3009,7 +3009,7 @@ except Exception:
       _open="$(sp_tasks --mine "$who" 2>/dev/null | awk -F'|' '$3=="todo"||$3=="in_progress"||$3=="in_review" {printf "%s[%s] %s · ", $1, $3, $2}')"
       if [ -n "$_open" ]; then
         _wake_text="$_wake_text
-your open tasks: $_open— move each with the task tool (in_progress when you start, done when finished), unprompted."
+your open tasks: ${_open}— move each with the task tool (in_progress when you start, done when finished), unprompted."
       fi
       # TICKET DISCIPLINE: numbering work items in prose without creating the
       # ticket makes every board lie. Nag while the phantom refs are fresh.
@@ -3048,13 +3048,29 @@ except: print("")' 2>/dev/null)"
     [ -z "$fp" ] && exit 0   # no file target (not a file write) → allow
     # Claims only apply INSIDE a pad. No .stitchpad here → not a shared worktree,
     # fail-open (else we'd block every write in every non-pad project). Walk up like the CLI does.
+    # BOUNDED walk. The unbounded version walked all the way to "/", so it found
+    # $HOME/.stitchpad and declared EVERY directory under the operator's home to be
+    # "inside a pad" — the exact opposite of the fail-open intent stated above. It
+    # made the captain's own worktree (which correctly has NO pad) claim-governed by
+    # the home pad, and every Edit came back as a lease denial. Stop at $HOME: a pad
+    # at $HOME governs $HOME itself, never an unrelated project nested beneath it.
     _d="$PWD"; _pad=""
-    while [ "$_d" != "/" ]; do [ -d "$_d/.stitchpad" ] && { _pad="$_d/.stitchpad"; break; }; _d="$(dirname "$_d")"; done
+    while [ "$_d" != "/" ]; do
+      [ -d "$_d/.stitchpad" ] && { _pad="$_d/.stitchpad"; break; }
+      [ -n "${HOME:-}" ] && [ "$_d" = "$HOME" ] && break   # never escape above $HOME
+      _d="$(dirname "$_d")"
+    done
     [ -z "$_pad" ] && exit 0   # not in a pad → allow
     # Try to lease it. `claim` exits 0 if I get/hold it, non-zero if someone else holds a fresh one.
-    if "$0" claim "$fp" >/dev/null 2>&1; then
-      exit 0   # claim held by me → allow the write
-    fi
+    # `claim` has THREE documented outcomes (see the claim arm): 0 = I hold it,
+    # 1 = someone else holds a FRESH lease, 2 = no identity. Treating "non-zero" as
+    # "someone else holds it" turned rc=2 into the accusation
+    #   "another agent holds a fresh write-lease on this file"
+    # while `stitchpad claims` printed "(no active claims)" — a lying denial that
+    # blocked every write and named a holder who did not exist. Deny ONLY on rc=1.
+    "$0" claim "$fp" >/dev/null 2>&1; _claim_rc=$?
+    [ "$_claim_rc" -eq 0 ] && exit 0   # claim held by me → allow the write
+    [ "$_claim_rc" -ne 1 ] && exit 0   # no identity / internal error → FAIL OPEN, never accuse
     holder="$("$0" claims 2>/dev/null | grep -F "$fp" | head -1)"
     reason="stitchpad: @$(sp_me 2>/dev/null) blocked — another agent holds a fresh write-lease on this file (${holder:-$fp}). Coordinate on the pad or wait for their release (stale leases free after 600s)."
     # PreToolUse deny contract (current Claude): hookSpecificOutput.permissionDecision=deny.

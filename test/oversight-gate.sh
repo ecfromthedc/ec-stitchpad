@@ -107,9 +107,9 @@ PROJ1=$(echo "$ETA" | grep -oE 'Wall-clock est: +[0-9]+m' | grep -oE '[0-9]+' ||
 ETA2="$("$STITCHPAD_HOME/bin/stitchpad" task eta 2>/dev/null || true)"
 PROJ2=$(echo "$ETA2" | grep -oE 'Wall-clock est: +[0-9]+m' | grep -oE '[0-9]+' || echo "0")
 if [ "$PROJ2" -gt "$PROJ1" ] 2>/dev/null; then
-  ok "G2c: adding card to busiest owner increases projection ($PROJ1→$PROJ2)"
+  ok "G2c: adding card to busiest owner increases projection (${PROJ1}→$PROJ2)"
 else
-  bad "G2c: projection did not increase ($PROJ1→$PROJ2)"
+  bad "G2c: projection did not increase (${PROJ1}→$PROJ2)"
 fi
 
 # G2d: adding a card to idle owner (bob) does NOT increase projection
@@ -128,7 +128,7 @@ else
   if [ "$PROJ3" -eq "$PROJ2" ] 2>/dev/null; then
     ok "G2d: adding card to idle owner does NOT increase projection"
   else
-    bad "G2d: projection changed unexpectedly ($PROJ1→$PROJ2→$PROJ3)"
+    bad "G2d: projection changed unexpectedly (${PROJ1}→${PROJ2}→$PROJ3)"
   fi
 fi
 

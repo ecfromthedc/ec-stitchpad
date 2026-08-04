@@ -171,7 +171,7 @@ AFTER_ENTRIES="$(find "$PAD_C/.stitchpad/.state" -type f 2>/dev/null | wc -l | t
 echo "  shared pad has ${AFTER_ENTRIES:-0} state files after contamination"
 
 if [ "${AFTER_ENTRIES:-0}" -gt "${BEFORE_ENTRIES:-0}" ]; then
-  ok "G2a: contamination detected — state grew ($BEFORE_ENTRIES→$AFTER_ENTRIES entries)"
+  ok "G2a: contamination detected — state grew (${BEFORE_ENTRIES}→$AFTER_ENTRIES entries)"
 else
   bad "G2a: contamination NOT detected — gate is BLIND"
 fi
@@ -232,9 +232,9 @@ fi
 
 # The state should be consistent (both runs succeeded, state grows deterministically)
 if [ "${_run2_state:-0}" -ge "${_run1_state:-0}" ]; then
-  ok "G3b: state file count non-decreasing after second run ($_run1_state→$_run2_state)"
+  ok "G3b: state file count non-decreasing after second run (${_run1_state}→$_run2_state)"
 else
-  bad "G3b: state regressed after second run" "$_run1_state→$_run2_state"
+  bad "G3b: state regressed after second run" "${_run1_state}→$_run2_state"
 fi
 
 # Both messages should be in the pad

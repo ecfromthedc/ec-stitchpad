@@ -99,6 +99,22 @@ run_suite() {
     return 0
   fi
 
+  # ── CRASH SIGNATURE — exit status alone cannot be trusted ────────────────
+  # bash 3.2 (macOS default): when `set -e`/`set -u` ABORTS a script, the EXIT
+  # trap still runs, and if the trap's last command SUCCEEDS the shell exits 0.
+  # The crash is masked. Proven on this machine:
+  #   cleanup(){ true; }; trap cleanup EXIT; set -u; echo "$UNSET"   -> rc=0
+  #   (same without the trap -> rc=1; an explicit `exit 1` is never masked)
+  # 70 of our suites install an EXIT trap, and five are baselined 0/0 — judged on
+  # rc ALONE — so for those a mid-run crash would be recorded as a clean pass.
+  # This is exactly how oversight-gate.sh reported rc=0 while dying at assertion
+  # 6 of 14 with "PROJ1<0xe2>: unbound variable", and how it got a false 14/0
+  # baseline. A fatal shell diagnostic in the output IS a crash, whatever rc says.
+  if echo "$output" | grep -qE 'unbound variable|command not found|syntax error near|: cannot execute|Segmentation fault'; then
+    echo "$suite|CRASH|0|$rc"
+    return 0
+  fi
+
   # ── Anchored parse ──
   # PARSER FIX: suites print counts in several honest shapes and the strict matcher
   # rejected most of them, producing FORMAT-DRIFT for 29 working suites — which would
@@ -149,6 +165,21 @@ run_suite() {
   p="$(echo "$output" | grep -oiE 'all [0-9]+' | grep -oE '[0-9]+' || true)"
   if [ -n "$p" ]; then
     echo "$suite|$p|0|$rc"
+    return 0
+  fi
+
+  # Final honest shape: suites that print one PASS/FAIL line per assertion and no
+  # summary count at all. Counting the lines IS the count:
+  #   "  PASS fresh heartbeat with interval reads alive"   (bridge-heartbeat-interval)
+  #   "PASS: pad runtime survives outer stash ..."         (pad-runtime-safety)
+  #   "PASS: health is structured, actionable ..."         (test-health-readonly)
+  #   "ALL PROVIDER AVAILABILITY TESTS PASSED" + 8 PASS:   (test-provider-availability)
+  # ANSI was stripped above, so these match bare. A suite is NEVER quarantined for
+  # lacking a summary line — that deletes real coverage instead of measuring it.
+  p="$(echo "$output" | grep -cE '^[[:space:]]*PASS([:[:space:]]|$)' 2>/dev/null || true)"
+  if [ "${p:-0}" -gt 0 ] 2>/dev/null; then
+    f="$(echo "$output" | grep -cE '^[[:space:]]*FAIL([:[:space:]]|$)' 2>/dev/null || true)"
+    echo "$suite|$p|${f:-0}|$rc"
     return 0
   fi
 
@@ -239,6 +270,14 @@ while IFS='|' read -r suite obs_p obs_f obs_rc; do
   if [ "$obs_p" = "VOID" ]; then
     VOIDS=$((VOIDS + 1))
     printf "%-41s %10s %10s %10s %-16s\n" "$suite" "${bl_p:-?} pass" "VOID (mkdtemp)" "?" "VOID"
+    continue
+  fi
+
+  # CRASHED mid-run — a fatal shell diagnostic was printed. This is a hard FAIL
+  # even when rc=0, because an EXIT trap can mask the abort (see run_suite).
+  if [ "$obs_p" = "CRASH" ]; then
+    FAILS=$((FAILS + 1))
+    printf "%-41s %10s %10s %10s %-16s\n" "$suite" "${bl_p:-?} pass" "fatal (rc=$obs_rc)" "?" "CRASHED"
     continue
   fi
 
