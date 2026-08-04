@@ -344,7 +344,14 @@ EOF
     # F3: Case-ambiguous duplicate: sp_user_exists uses tolower, so 'Dave'
     # matches 'dave' — re-joining the same seat is idempotent (exit 0).
     if sp_user_exists "$who"; then
+      # Re-joining the same seat is idempotent — but idempotent means the same
+      # OBSERVABLE result, not just the same exit code. This path used to exit 0
+      # while skipping the ponytail context that the equivalent under-lock branch
+      # below emits, so an agent that restarted could never rebuild its context:
+      # it got a bare stderr notice and nothing to work from. Emit the context here
+      # too, so `join` is genuinely idempotent from the caller's point of view.
       echo "stitchpad: @$who already in roster (or a case variant exists — names are case-insensitive)" >&2
+      printf '%s\n' "$who already in roster" | sp_prompt_with_ponytail
       exit 0
     fi
     wake="${3:-pull}"; target="${4:--}"
