@@ -55,6 +55,7 @@ heartbeat.sh 0 0
 heartbeat-races.sh 0 0
 multipad-isolation.sh 42 0
 pad-io-and-archive.sh 0 0
+pad-visibility-gate.sh 16 0
 pwa-contract.sh 0 0
 rc1-c11-c13-regression.sh 13 0
 reset-recovery.sh 0 0

@@ -3857,10 +3857,104 @@ PY
       (( warn++ ))
     fi
 
+    # Git health check (P5): a missing or broken pad git makes roster/sessions
+    # meaningless. Report it here so the operator sees it before relying on output.
+    printf '\nPad Git:\n'
+    if [ ! -d "$PAD_GIT" ]; then
+      printf '  \033[0;31m✗\033[0m pad git is MISSING — this pad is broken\n'
+      printf '    Restore from backup or re-init:\n'
+      printf '    %s %s %s %s\n' 'cd' "$(dirname "$PAD_DIR")" '&& stitchpad init --name' '<name>'
+      (( err++ ))
+    elif ! sgit rev-parse --git-dir >/dev/null 2>&1; then
+      printf '  \033[0;31m✗\033[0m pad git is CORRUPT — rev-parse failed\n'
+      printf '    The git repository at %s is unreadable.\n' "$PAD_GIT"
+      printf '    Restore from backup or re-init.\n'
+      (( err++ ))
+    else
+      _doc_commit_count="$(sgit rev-list --count HEAD 2>/dev/null || echo 0)"
+      _doc_head="$(sgit rev-parse --short HEAD 2>/dev/null || echo "???")"
+      printf '  ✓ pad git healthy (%s commits, HEAD %s)\n' "$_doc_commit_count" "$_doc_head"
+    fi
+
     # Summary
     total=$(( warn + err ))
     printf '\n%d issues found (%d warnings, %d errors)\n' "$total" "$warn" "$err"
     if [ "$err" -gt 0 ]; then exit 1; fi
+    ;;
+
+  evidence)
+    # P7: canonical evidence location management.
+    #   stitchpad evidence list            — list all evidence artifacts
+    #   stitchpad evidence verify          — check .sha256 sidecars, report OK/STALE/MISSING
+    #   stitchpad evidence seal <file>     — create .sha256 sidecar for a file
+    sp_init_paths_readonly || exit 1
+    _ev_dir="$PAD_DIR/evidence"
+    sub="${1:-list}"; shift 2>/dev/null || true
+    _ev_ok()  { printf '  \033[0;32mOK\033[0m    %s\n' "$1"; }
+    _ev_stale() { printf '  \033[0;31mSTALE\033[0m %s\n' "$1"; }
+    _ev_miss()  { printf '  \033[0;33mMISS\033[0m %s\n' "$1"; }
+
+    case "$sub" in
+      list)
+        if [ ! -d "$_ev_dir" ]; then
+          echo "No evidence directory: $_ev_dir"
+          echo "Evidence artifacts are sealed to this location with 'stitchpad evidence seal <file>'."
+          exit 0
+        fi
+        find "$_ev_dir" -type f ! -name '*.sha256' | sort | while read -r f; do
+          _rel="$(echo "$f" | sed "s|^$_ev_dir/||")"
+          _sha="$f.sha256"
+          if [ -f "$_sha" ]; then
+            _stored="$(head -1 "$_sha" 2>/dev/null | awk '{print $1}')"
+            _computed="$(shasum -a 256 "$f" 2>/dev/null | awk '{print $1}' || true)"
+            if [ "$_stored" = "$_computed" ] && [ -n "$_stored" ]; then
+              printf '  OK    %s  (sha256: %s)\n' "$_rel" "$_stored"
+            else
+              printf '  STALE %s  (stored: %s, computed: %s)\n' "$_rel" "${_stored:-MISSING}" "${_computed:-ERROR}"
+            fi
+          else
+            printf '  UNSLD %s  (no .sha256 sidecar)\n' "$_rel"
+          fi
+        done
+        ;;
+
+      verify)
+        [ ! -d "$_ev_dir" ] && { echo "No evidence directory: $_ev_dir"; exit 0; }
+        _v_ok=0; _v_stale=0; _v_miss=0
+        find "$_ev_dir" -type f ! -name '*.sha256' | sort | while read -r f; do
+          _rel="$(echo "$f" | sed "s|^$_ev_dir/||")"
+          _sha="$f.sha256"
+          if [ ! -f "$_sha" ]; then
+            _ev_miss "$_rel (no .sha256 sidecar)"
+            continue
+          fi
+          _stored="$(head -1 "$_sha" 2>/dev/null | awk '{print $1}')"
+          _computed="$(shasum -a 256 "$f" 2>/dev/null | awk '{print $1}' || true)"
+          if [ "$_stored" = "$_computed" ] && [ -n "$_stored" ]; then
+            _ev_ok "$_rel"
+          else
+            _ev_stale "$_rel"
+          fi
+        done
+        ;;
+
+      seal)
+        _seal_file="${1:-}"
+        [ -n "$_seal_file" ] || { echo "usage: stitchpad evidence seal <file>" >&2; exit 1; }
+        [ -f "$_seal_file" ] || { echo "stitchpad: file not found: $_seal_file" >&2; exit 1; }
+        mkdir -p "$_ev_dir" 2>/dev/null || true
+        _seal_name="$(basename "$_seal_file")"
+        _seal_dest="$_ev_dir/$_seal_name"
+        cp "$_seal_file" "$_seal_dest" 2>/dev/null || { echo "stitchpad: could not copy evidence" >&2; exit 1; }
+        shasum -a 256 "$_seal_dest" | awk '{print $1}' > "$_seal_dest.sha256"
+        printf '✓ sealed: %s\n' "$_seal_dest"
+        ;;
+
+      *)
+        echo "usage: stitchpad evidence {list|verify|seal <file>}" >&2
+        exit 1
+        ;;
+    esac
     ;;
 
   # ── Stitch-Tasks (Linear-style issue tracking) ────────────────────────
