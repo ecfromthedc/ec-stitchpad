@@ -31,20 +31,39 @@ STITCHPAD="$ROOT/tool/bin/stitchpad"
 # seats. See fx2-harness-hygiene-1b8eed4.md.
 unset HERDR_PANE_ID HERDR_TAB_ID HERDR_ENV HERDR_SOCKET_PATH HERDR_WORKSPACE_ID 2>/dev/null || true
 
-# ── pro3 structural tmpdir: one parent, export TMPDIR, single EXIT trap ──
+# ── pro4 structural tmpdir: PID-annotated parent, concurrency-safe sweep ──
+# Design: sp-run.<pid>.XXXXXX encodes the owning PID.  The startup sweep
+# deletes ONLY parents whose PID is dead (kill -0 fails) AND whose
+# directory is older than 60 seconds (PID-reuse grace window).  A live
+# concurrent instance's parent is NEVER deleted.  Other suites' mktemp
+# dirs (sp-mgate.*, sp-h3-*, etc.) lack the sp-run.* prefix and are
+# never touched.
 _SYS_TMP="${TMPDIR:-/tmp}"
-
-# Startup sweep: remove stale sp-run.* from prior SIGKILL-interrupted runs
 _STALE_SWEPT=0
-for _d in $(find "$_SYS_TMP" -maxdepth 1 -name 'sp-run.*' -type d 2>/dev/null); do
-  rm -rf "$_d" 2>/dev/null || true
-  _STALE_SWEPT=$((_STALE_SWEPT + 1))
-done
-[ "$_STALE_SWEPT" -gt 0 ] && echo "  (swept $_STALE_SWEPT stale prior-run sp-run.* dirs)" >&2 || true
 
-# Create per-run parent; every fixture mktemp lands inside via TMPDIR
-_RUN_TMP="$(mktemp -d "$_SYS_TMP/sp-run.XXXXXXXX")"
+# Create per-run parent BEFORE sweeping — we must exist before we could
+# be swept, and our own PID ensures we survive our own sweep iteration.
+_RUN_TMP="$(mktemp -d "$_SYS_TMP/sp-run.$$.XXXXXXXX")"
 export TMPDIR="$_RUN_TMP"
+
+# Startup sweep: only delete parents whose PID is demonstrably dead.
+for _d in $(find "$_SYS_TMP" -maxdepth 1 -name 'sp-run.*' -type d 2>/dev/null); do
+  [ "$_d" = "$_RUN_TMP" ] && continue   # never sweep ourselves
+  _dname="$(basename "$_d")"
+  # Extract PID: strip "sp-run.", then take everything up to the next dot.
+  _pid="${_dname#sp-run.}"
+  _pid="${_pid%%.*}"
+  case "$_pid" in ''|*[!0-9]*) continue ;; esac  # not a PID-annotated name; skip
+  # PID reuse grace: only sweep if dir hasn't been touched in >1 min.
+  # find -mmin +1 returns the dir only when mod time >1 min ago (portable).
+  if kill -0 "$_pid" 2>/dev/null; then
+    :  # PID is alive — never touch
+  elif [ -n "$(find "$_d" -maxdepth 0 -mmin +1 2>/dev/null)" ]; then
+    rm -rf "$_d" 2>/dev/null || true
+    _STALE_SWEPT=$((_STALE_SWEPT + 1))
+  fi
+done
+[ "$_STALE_SWEPT" -gt 0 ] && echo "  (swept $_STALE_SWEPT dead-PID stale sp-run.* dirs)" >&2 || true
 # Teardown: rm -rf the entire tree.  Prove RED: set STITCHPAD_TEST_LEAK=1
 # to skip the rm so the gate catches the leak.
 _teardown() {
@@ -102,6 +121,12 @@ setup_sources() {
 echo "=== recovery-hardening3-regression tests ==="
 echo ""
 
+# Fast-only probe: skip all substantive tests; only infrastructure gates
+# (tmpdir, concurrency) run.  Controlled by STITCHPAD_H3_FAST_ONLY=1.
+if [ "${STITCHPAD_H3_FAST_ONLY:-0}" = "1" ]; then
+  # Jump straight to the tmpdir/concurrency gates at the end.
+  true  # no-op; fall through to the gates below
+else
 # ============================================================================
 # E1: leave-path sid confusion — passed sid (target) != env sid (operator)
 # ============================================================================
@@ -1058,13 +1083,11 @@ STITCHPAD_PAD_DIR="$N2B_PAD_DIR" STITCHPAD_NAME=alice \
   || bad "N2b: fresh index.lock was removed (unsafe — could clobber a live writer)"
 
 
-# ── pro3 tmpdir gate ──────────────────────────────────────────────────
-# Run teardown NOW (rm -rf _RUN_TMP unless STITCHPAD_TEST_LEAK=1), then
-# assert zero residue.  RED proof: STITCHPAD_TEST_LEAK=1 skips the rm,
-# gate FAILS because _RUN_TMP still exists.
+fi  # end of STITCHPAD_H3_FAST_ONLY guard — tmpdir/concurrency gates run in both modes
+
+# ── pro4 tmpdir gates ──────────────────────────────────────────────────
 _teardown
 
-# Gate: _RUN_TMP must be gone
 if [ ! -d "$_RUN_TMP" ]; then
   ok "GATE-TMPDIR: _RUN_TMP removed (all fixture tmpdirs cleaned, swept $_STALE_SWEPT stale)"
 else
@@ -1072,12 +1095,78 @@ else
   bad "GATE-TMPDIR: _RUN_TMP still exists with $_LEAKED subdirs (leak!)"
 fi
 
-# Gate: no sp-run.* residue in system tmp
-_AFTER=$(find "$_SYS_TMP" -maxdepth 1 -name 'sp-run.*' -type d 2>/dev/null | wc -l | tr -d ' ')
-if [ "$_AFTER" -eq 0 ]; then
-  ok "GATE-TMPDIR: zero stale sp-run.* dirs in _SYS_TMP"
+_sp_gate_orphan_count() {
+  local _count=0 _dname _pid
+  for _d in $(find "$_SYS_TMP" -maxdepth 1 -name 'sp-run.*' -type d 2>/dev/null); do
+    _dname="$(basename "$_d")"
+    _pid="${_dname#sp-run.}"
+    _pid="${_pid%%.*}"
+    case "$_pid" in ''|*[!0-9]*) continue ;; esac
+    if ! kill -0 "$_pid" 2>/dev/null; then
+      if [ -n "$(find "$_d" -maxdepth 0 -mmin +1 2>/dev/null)" ]; then
+        _count=$((_count + 1))
+      fi
+    fi
+  done
+  printf '%d' "$_count"
+}
+_ORPHANS=$(_sp_gate_orphan_count)
+if [ "$_ORPHANS" -eq 0 ]; then
+  ok "GATE-TMPDIR: zero orphan sp-run.* dirs in _SYS_TMP"
 else
-  bad "GATE-TMPDIR: $_AFTER sp-run.* dirs leaked in _SYS_TMP"
+  bad "GATE-TMPDIR: $_ORPHANS orphan sp-run.* dirs leaked in _SYS_TMP"
+fi
+
+# ── pro4 concurrency gate: two concurrent instances both survive ─────
+if [ "${STITCHPAD_H3_CONCURRENT_CHILD:-0}" = "0" ]; then
+  _SELF="$(cd "$HERE" && pwd)/$(basename "${BASH_SOURCE[0]}")"
+  _CONC_TMP_A="$(mktemp "$_SYS_TMP/sp-h3-conc-a.XXXXXX")"
+  _CONC_TMP_B="$(mktemp "$_SYS_TMP/sp-h3-conc-b.XXXXXX")"
+
+  (
+    TMPDIR="$_SYS_TMP" \
+    STITCHPAD_H3_CONCURRENT_CHILD=1 STITCHPAD_H3_FAST_ONLY=1 \
+      bash "$_SELF" >"$_CONC_TMP_A" 2>&1
+    echo "$?" > "${_CONC_TMP_A}.rc"
+  ) &
+  _CONC_PID_A=$!
+
+  (
+    TMPDIR="$_SYS_TMP" \
+    STITCHPAD_H3_CONCURRENT_CHILD=1 STITCHPAD_H3_FAST_ONLY=1 \
+      bash "$_SELF" >"$_CONC_TMP_B" 2>&1
+    echo "$?" > "${_CONC_TMP_B}.rc"
+  ) &
+  _CONC_PID_B=$!
+
+  wait $_CONC_PID_A $_CONC_PID_B 2>/dev/null || true
+
+  _RC_A="$(cat "${_CONC_TMP_A}.rc" 2>/dev/null || echo 127)"
+  _RC_B="$(cat "${_CONC_TMP_B}.rc" 2>/dev/null || echo 127)"
+  _MKDTEMP_A="$(grep -c 'mkdtemp failed\|mkdtemp.*failed\|mkstemp failed' "$_CONC_TMP_A" 2>/dev/null; true)"
+  _MKDTEMP_A="${_MKDTEMP_A:-0}"
+  _MKDTEMP_B="$(grep -c 'mkdtemp failed\|mkdtemp.*failed\|mkstemp failed' "$_CONC_TMP_B" 2>/dev/null; true)"
+  _MKDTEMP_B="${_MKDTEMP_B:-0}"
+
+  if [ "$_RC_A" = "0" ] && [ "$_RC_B" = "0" ] && \
+     [ "$_MKDTEMP_A" = "0" ] && [ "$_MKDTEMP_B" = "0" ]; then
+    ok "GATE-TMPDIR-CONCURRENT: two instances survived — zero mkdtemp failures"
+  else
+    bad "GATE-TMPDIR-CONCURRENT: A(rc=$_RC_A mkdtemp=$_MKDTEMP_A) B(rc=$_RC_B mkdtemp=$_MKDTEMP_B)"
+    echo "  --- child A output ---" >&2
+    cat "$_CONC_TMP_A" >&2
+    echo "  --- child B output ---" >&2
+    cat "$_CONC_TMP_B" >&2
+  fi
+  rm -f "$_CONC_TMP_A" "$_CONC_TMP_A.rc" "$_CONC_TMP_B" "$_CONC_TMP_B.rc"
+fi
+
+if [ "${STITCHPAD_H3_FAST_ONLY:-0}" = "1" ]; then
+  echo ""
+  echo "=== RESULTS (fast-only concurrency probe) ==="
+  printf "Passed:  %d\n" "$pass"
+  printf "Failed:  %d\n" "$fail"
+  [ "$fail" -eq 0 ] && exit 0 || exit 1
 fi
 
 # ============================================================================
