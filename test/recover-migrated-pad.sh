@@ -259,13 +259,18 @@ if [ -z "$JOURNAL_EMPTY" ] || [ ! -d "$JOURNAL_EMPTY" ]; then
 else
   if [ -f "$JOURNAL_EMPTY/.base-sha" ]; then
     STAMPED_EMPTY=$(cat "$JOURNAL_EMPTY/.base-sha")
-    if [ -n "$STAMPED_EMPTY" ]; then
-      bad "P4 — .base-sha stamped despite unresolvable HEAD (fix 3 regression)"
+    # D2 fix: "unborn" sentinel is stamped when HEAD is unresolvable
+    # so recovery can refuse a first-commit rollback.  This is correct
+    # behavior — not a regression.
+    if [ "$STAMPED_EMPTY" = "unborn" ]; then
+      ok "P4 — .base-sha='unborn' sentinel stamped (D2: recovery will refuse first-commit)"
+    elif [ -n "$STAMPED_EMPTY" ]; then
+      bad "P4 — .base-sha stamped with '$STAMPED_EMPTY' (expected 'unborn')"
     else
-      ok "P4 — .base-sha empty (stamped but empty — fix 3 handles this)"
+      ok "P4 — .base-sha empty (stamped but empty)"
     fi
   else
-    ok "P4 — .base-sha NOT stamped (HEAD unresolvable → skipped, fix 3)"
+    bad "P4 — .base-sha NOT stamped at all (unborn sentinel missing)"
   fi
 
   # Write some pad content (simulating committed work)
@@ -556,8 +561,15 @@ if [ -z "$JOURNAL_C" ] || [ ! -d "$JOURNAL_C" ]; then
 else
   if [ -f "$JOURNAL_C/.base-sha" ]; then
     C_SHA=$(cat "$JOURNAL_C/.base-sha")
-    if [ -n "$C_SHA" ]; then
-      bad "P9 — .base-sha stamped from symlinked wrong repo ($(echo $C_SHA | head -c 8)...)"
+    if [ "$C_SHA" = "unborn" ]; then
+      ok "P9 — .base-sha='unborn' sentinel (PAD_GIT symlink → cross-validation rejected)"
+    elif [ -n "$C_SHA" ]; then
+      WRONG_HEAD_C=$(git --git-dir="$C_WRONG" rev-parse HEAD 2>/dev/null || echo "")
+      if [ "$C_SHA" = "$WRONG_HEAD_C" ]; then
+        bad "P9 — .base-sha stamped from symlinked wrong repo ($(echo $C_SHA | head -c 8)...)"
+      else
+        ok "P9 — .base-sha stamped with non-wrong-repo SHA (cross-validation worked)"
+      fi
     else
       ok "P9 — .base-sha empty (symlink → skip)"
     fi
@@ -588,16 +600,137 @@ fi
 set -u
 
 # =========================================================================
+# PROOF 10 (flash D1): caller-supplied PAD_GIT from DIFFERENT repo → refuse
+# =========================================================================
+echo ""
+echo "--- Proof 10 (flash D1): stale PAD_GIT → cross-validated refuse ---"
+
+reset_pad_vars
+D1_PARENT="$TEST_ROOT/pad-d1"
+D1_DIR="$D1_PARENT/.pasture"
+mkdir -p "$D1_DIR/pasture-git" "$D1_DIR/.state/sessions"
+echo "## pad D1 initial" > "$D1_DIR/pasture.md"
+( cd "$D1_PARENT" && \
+  git init --quiet --separate-git-dir="$D1_DIR/pasture-git" . >/dev/null 2>&1 && \
+  git add .pasture/pasture.md 2>/dev/null && \
+  git -c user.name=test -c user.email=test@test commit -qm "V1 real" >/dev/null 2>&1 )
+REAL_HEAD_D1=$(git --git-dir="$D1_DIR/pasture-git" rev-parse HEAD)
+
+D1_DECOY="$D1_DIR/decoy-git"
+git --git-dir="$D1_DECOY" init -q
+git --git-dir="$D1_DECOY" commit --allow-empty -qm "decoy" >/dev/null 2>&1
+DECOY_HEAD=$(git --git-dir="$D1_DECOY" rev-parse HEAD)
+
+export PAD_DIR="$D1_DIR" PAD_MD="$D1_DIR/pasture.md" PAD_STATE="$D1_DIR/.state"
+export PAD_TASKS="$D1_DIR/tasks.md" PAD_ARCHIVE_DIR="$D1_DIR/archive"
+export PAD_GIT="$D1_DECOY"
+set +u
+
+JOURNAL_D1=$(sp_session_registry_journal_begin "test-sid-d1" 2>/dev/null)
+if [ -z "$JOURNAL_D1" ] || [ ! -d "$JOURNAL_D1" ]; then
+  bad "P10 — journal_begin failed"
+else
+  if [ -f "$JOURNAL_D1/.base-sha" ]; then
+    D1_SHA=$(cat "$JOURNAL_D1/.base-sha")
+    if [ "$D1_SHA" = "$DECOY_HEAD" ]; then
+      bad "P10 — .base-sha stamped from DECOY repo (cross-validation FAILED — D1 bypass)"
+    elif [ "$D1_SHA" = "$REAL_HEAD_D1" ]; then
+      ok "P10 — .base-sha stamped from REAL pad repo (pad-own authoritative, decoy ignored)"
+    elif [ "$D1_SHA" = "unborn" ]; then
+      bad "P10 — .base-sha='unborn' but real repo has commits (pad-own should have resolved)"
+    else
+      ok "P10 — .base-sha stamped with non-decoy SHA (cross-validation worked)"
+    fi
+  else
+    bad "P10 — .base-sha NOT stamped (pad-own git should have resolved)"
+  fi
+
+  echo "V2-COMMITTED-WORK-D1" >> "$PAD_MD"
+  ( cd "$D1_PARENT" && \
+    git add .pasture/pasture.md 2>/dev/null && \
+    git -c user.name=t -c user.email=t@t commit -qm "V2 committed" >/dev/null 2>&1 )
+
+  sp_session_registry_journal_recover 2>/tmp/pro2-test-d1-err.log
+
+  if [ -d "$JOURNAL_D1" ]; then
+    ok "P10 — orphan PRESERVED (D1 cross-validation → fail-closed refuse)"
+  else
+    bad "P10 — orphan DELETED — D1 stale-PAD_GIT bypass succeeded (FAIL-OPEN)"
+  fi
+
+  PAD_CONTENT_D1=$(cat "$PAD_MD" 2>/dev/null)
+  if echo "$PAD_CONTENT_D1" | grep -q "V2-COMMITTED-WORK-D1"; then
+    ok "P10 — committed V2 preserved (no revert from stale PAD_GIT)"
+  else
+    bad "P10 — committed V2 REVERTED!"
+  fi
+fi
+set -u
+
+# =========================================================================
+# PROOF 11 (flash D2): unborn-to-born — first-commit after begin → refuse
+# =========================================================================
+echo ""
+echo "--- Proof 11 (flash D2): unborn repo → first-commit → refuse ---"
+
+reset_pad_vars
+D2_PARENT="$TEST_ROOT/pad-d2"
+D2_DIR="$D2_PARENT/.pasture"
+mkdir -p "$D2_DIR/pasture-git" "$D2_DIR/.state/sessions"
+echo "## pad D2 initial" > "$D2_DIR/pasture.md"
+( cd "$D2_PARENT" && \
+  git init --quiet --separate-git-dir="$D2_DIR/pasture-git" . >/dev/null 2>&1 )
+
+export STITCHPAD_PAD_DIR="$D2_DIR"
+sp_init_paths
+
+JOURNAL_D2=$(sp_session_registry_journal_begin "test-sid-d2" 2>/dev/null)
+if [ -z "$JOURNAL_D2" ] || [ ! -d "$JOURNAL_D2" ]; then
+  bad "P11 — journal_begin failed"
+else
+  if [ -f "$JOURNAL_D2/.base-sha" ]; then
+    D2_SENTINEL=$(cat "$JOURNAL_D2/.base-sha")
+    if [ "$D2_SENTINEL" = "unborn" ]; then
+      ok "P11 — .base-sha='unborn' sentinel stamped (D2 protection armed)"
+    else
+      bad "P11 — .base-sha='$D2_SENTINEL' (expected 'unborn')"
+    fi
+  else
+    bad "P11 — .base-sha NOT stamped (unborn sentinel missing — D2 fail-open)"
+  fi
+
+  echo "V2-COMMITTED-WORK-D2" >> "$PAD_MD"
+  ( cd "$D2_PARENT" && \
+    git add .pasture/pasture.md 2>/dev/null && \
+    git -c user.name=t -c user.email=t@t commit -qm "FIRST commit (V2)" >/dev/null 2>&1 )
+
+  sp_session_registry_journal_recover 2>/tmp/pro2-test-d2-err.log
+
+  if [ -d "$JOURNAL_D2" ]; then
+    ok "P11 — orphan PRESERVED (unborn→born transition → D2 gate refuse)"
+  else
+    bad "P11 — orphan DELETED — first-commit rollback (FAIL-OPEN, D2 bypass)"
+  fi
+
+  PAD_CONTENT_D2=$(cat "$PAD_MD" 2>/dev/null)
+  if echo "$PAD_CONTENT_D2" | grep -q "V2-COMMITTED-WORK-D2"; then
+    ok "P11 — committed first-write preserved (no revert)"
+  else
+    bad "P11 — committed first-write REVERTED!"
+  fi
+fi
+set -u
+
+# =========================================================================
 echo ""
 echo "RESULTS: $pass passed, $fail failed"
 echo ""
 if [ "$fail" -eq 0 ]; then
-  echo "CONCLUSION: All 9 proofs pass. OLD stitchpad-git hardcoded guard"
-  echo "skipped R3 on migrated pads (P1). The \$PAD_GIT fix engaged R3 but was"
-  echo "FAIL-OPEN on the direct-caller surface (P4/P6). Flash's A (PAD_GIT unset),"
-  echo "B (TOCTOU vanish), and C (symlink-to-wrong-repo) bypasses are now"
-  echo "PERMANENTLY GATED by identity-based fail-closed guards in BOTH"
-  echo "journal_begin and journal_recover. Recovery now refuses unless the"
-  echo "repository identity is verified — orphan preserved, content intact."
+  echo "CONCLUSION: All 11 proofs pass. Recovery now requires POSITIVE PROOF"
+  echo "of safety before rollback — the default is REFUSE, never roll back."
+  echo "D1 (stale PAD_GIT from different repo): cross-validation detects"
+  echo "caller-supplied PAD_GIT ≠ pad-own git → refuse."
+  echo "D2 (unborn→born first-commit): \"unborn\" sentinel stamped at begin,"
+  echo "recovery refuses when HEAD is now resolvable."
 fi
 [ "$fail" -eq 0 ] || exit 1

@@ -790,10 +790,20 @@ PY
 # before any rollback write; a mismatch is a LOUD refusal (rc != 0).
 
 _sp_session_registry_journal_orphans() {
-  local orphan
+  local orphan _alive_pid _alive_ts _alive_now
   for orphan in "$PAD_STATE"/.registry-journal.*; do
     [ -d "$orphan" ] || continue
     [ -L "$orphan" ] && continue
+    # R7 liveness: skip journals whose owning process is still alive.
+    # Without this, a concurrent journal_begin on the same pad treats
+    # a running operation's journal as stale and recovers (destroys) it.
+    if [ -f "$orphan/.alive" ]; then
+      read -r _alive_pid _alive_ts < "$orphan/.alive" 2>/dev/null || true
+      if [ -n "${_alive_pid:-}" ] && kill -0 "$_alive_pid" 2>/dev/null; then
+        # Process still alive — this journal is NOT an orphan.
+        continue
+      fi
+    fi
     printf '%s\n' "$orphan"
   done
 }
@@ -837,53 +847,42 @@ sp_session_registry_journal_recover() {
     fi
 
     # ── Fail-closed by identity ──────────────────────────────────────
-    # Recovery must validate the pad git directory on EVERY orphan, not
-    # trust a caller-supplied global.  PAD_GIT may be:
-    #   • unset (direct-caller/embedder never ran sp_init_paths — A)
-    #   • a symlink (embedder resolved it directly, bypassing init guard — C)
-    #   • vanished since journal_begin (TOCTOU in crash-to-recover gap — B)
-    #   • pointing at a DIFFERENT repo than the one that stamped .base-sha
-    #     (symlink-to-wrong-repo attack — C)
-    #
-    # Resolve the git dir internally from PAD_DIR when PAD_GIT is unset
-    # or invalid (same resolution order as journal_begin and lib.sh:144:
-    # caller-supplied PAD_GIT first, then pasture-git/, then stitchpad-git/,
-    # refusing symlinks at every step).
-    #
-    # Decision order (every path is fail-closed — never roll back when
-    # the identity of the pad repository cannot be verified):
-    #   (a) Git dir unresolvable → refuse (A)
-    #   (b) Resolved git dir is a symlink → refuse (C)
-    #   (c) Git dir not a directory → refuse; .base-sha proves repo existed (B)
-    #   (d) Resolve canonical path; if .git-realpath stamped and differs
-    #       from current → refuse (repo swapped — C)
-    #   (e) Cross-check: HEAD unresolvable → refuse (empty/unborn repo)
-    #   (f) R3: base-SHA ≠ HEAD → refuse or supersede (canonical guard)
-    local _git="" _git_real="" _git_ok=0
-    # Resolve git dir: prefer caller-set PAD_GIT if valid, then PAD_DIR
-    if [ -n "${PAD_GIT:-}" ] && [ ! -L "$PAD_GIT" ] && [ -d "$PAD_GIT" ]; then
-      _git="$PAD_GIT"
-    elif [ -n "${PAD_DIR:-}" ]; then
+    # Recovery must positively prove rollback is safe.  Every unproven
+    # state REFUSES — the default is NEVER rollback.  Decision order
+    # (fail-closed at every step):
+    #   (a) Pad-own git dir unresolvable → refuse (A/R5)
+    #   (b) Cross-validate: caller PAD_GIT ≠ pad-own git → refuse (D1)
+    #   (c) Git dir not a directory → refuse (B)
+    #   (d) Canonical path unresolvable → refuse
+    #   (e) .git-realpath present but empty/unreadable → refuse (S8)
+    #   (f) .git-realpath mismatch → refuse (repo swapped — C)
+    #   (g) HEAD unresolvable → refuse (empty/unborn repo)
+    #   (h) .base-sha absent → refuse (positive-proof: R4/D2)
+    #   (i) .base-sha is "unborn" with now-resolvable HEAD → refuse (D2/R5)
+    #   (j) .base-sha is 0-byte → refuse (R3 truncated)
+    #   (k) R3: base-SHA ≠ HEAD → refuse or supersede (canonical guard)
+    #   (l) TOCTOU re-verify: HEAD still matches base before rollback (R6)
+    local _pad_git="" _git="" _git_real=""
+    # Resolve pad's own git dir from PAD_DIR (D1 cross-validation source)
+    if [ -n "${PAD_DIR:-}" ]; then
       if [ -d "$PAD_DIR/pasture-git" ] && [ ! -L "$PAD_DIR/pasture-git" ]; then
-        _git="$PAD_DIR/pasture-git"
+        _pad_git="$PAD_DIR/pasture-git"
       elif [ -d "$PAD_DIR/stitchpad-git" ] && [ ! -L "$PAD_DIR/stitchpad-git" ]; then
-        _git="$PAD_DIR/stitchpad-git"
+        _pad_git="$PAD_DIR/stitchpad-git"
       fi
     fi
+    # Pad-own git is authoritative — same resolution as journal_begin.
+    if [ -n "$_pad_git" ]; then
+      _git="$_pad_git"
+    elif [ -n "${PAD_GIT:-}" ] && [ ! -L "$PAD_GIT" ] && [ -d "$PAD_GIT" ]; then
+      _git="$PAD_GIT"
+    fi
     if [ -z "$_git" ]; then
-      if [ -f "$orphan/.base-sha" ]; then
-        echo "stitchpad: stale journal $(basename "$orphan") — cannot resolve pad git directory (PAD_GIT unset, PAD_DIR has no pasture-git/ or stitchpad-git/) but .base-sha proves a repo existed at journal_begin; refusing recovery — orphan PRESERVED at $orphan" >&2
-      else
-        echo "stitchpad: stale journal $(basename "$orphan") — cannot resolve pad git directory and no .base-sha; cannot verify safety — orphan PRESERVED at $orphan" >&2
-      fi
+      echo "stitchpad: stale journal $(basename "$orphan") — cannot resolve pad git directory; refusing recovery — orphan PRESERVED at $orphan" >&2
       continue
     fi
     if [ ! -d "$_git" ]; then
-      if [ -f "$orphan/.base-sha" ]; then
-        echo "stitchpad: stale journal $(basename "$orphan") — resolved git dir ($_git) does not exist but .base-sha proves a repo existed at journal_begin; refusing recovery — orphan PRESERVED at $orphan" >&2
-      else
-        echo "stitchpad: stale journal $(basename "$orphan") — resolved git dir ($_git) does not exist and no .base-sha; cannot verify safety — orphan PRESERVED at $orphan" >&2
-      fi
+      echo "stitchpad: stale journal $(basename "$orphan") — resolved git dir ($_git) does not exist; refusing recovery — orphan PRESERVED at $orphan" >&2
       continue
     fi
     _git_real="$(cd -P "$_git" 2>/dev/null && pwd)" || _git_real=""
@@ -891,13 +890,16 @@ sp_session_registry_journal_recover() {
       echo "stitchpad: stale journal $(basename "$orphan") — could not resolve canonical path for git dir ($_git); refusing recovery — orphan PRESERVED at $orphan" >&2
       continue
     fi
-    # Cross-check repo identity: the orphan's .git-realpath (stamped at
-    # journal_begin) must match the current resolved path.  A mismatch
-    # means the repo was swapped between begin and recover (repro C).
+    # S8: cross-check .git-realpath.  If the stamp exists but is empty
+    # or unreadable, the identity cannot be verified — refuse.
     if [ -f "$orphan/.git-realpath" ]; then
       local _stamped_real
       _stamped_real="$(cat "$orphan/.git-realpath" 2>/dev/null)" || _stamped_real=""
-      if [ -n "$_stamped_real" ] && [ "$_stamped_real" != "$_git_real" ]; then
+      if [ -z "$_stamped_real" ]; then
+        echo "stitchpad: stale journal $(basename "$orphan") — .git-realpath is present but empty/unreadable; cannot verify repo identity — refusing, orphan PRESERVED at $orphan" >&2
+        continue
+      fi
+      if [ "$_stamped_real" != "$_git_real" ]; then
         echo "stitchpad: stale journal $(basename "$orphan") — repo identity mismatch (stamped $_stamped_real, current $_git_real); repo may have been swapped — refusing recovery, orphan PRESERVED at $orphan" >&2
         continue
       fi
@@ -908,6 +910,32 @@ sp_session_registry_journal_recover() {
       continue
     fi
 
+    # ── Positive-proof gate: rollback requires .base-sha ─────────────
+    # Without a stamped .base-sha, there is NO positive proof that
+    # rollback is safe — the default must be refuse, never roll back.
+    if [ ! -f "$orphan/.base-sha" ]; then
+      echo "stitchpad: stale journal $(basename "$orphan") — no .base-sha stamp; cannot positively prove rollback is safe — refusing, orphan PRESERVED at $orphan" >&2
+      continue
+    fi
+
+    # ── Read .base-sha and validate ──────────────────────────────────
+    local _recovery_base_sha _recovery_head_sha _recovery_parent_sha
+    _recovery_base_sha="$(cat "$orphan/.base-sha" 2>/dev/null)" || _recovery_base_sha=""
+
+    # R3 truncated: 0-byte .base-sha is not a valid stamp — refuse.
+    if [ -z "$_recovery_base_sha" ]; then
+      echo "stitchpad: stale journal $(basename "$orphan") — .base-sha is empty (truncated/corrupt); cannot verify safety — refusing, orphan PRESERVED at $orphan" >&2
+      continue
+    fi
+
+    # D2/R5: "unborn" sentinel + HEAD now resolvable → refuse.
+    if [ "$_recovery_base_sha" = "unborn" ]; then
+      echo "stitchpad: stale journal $(basename "$orphan") — repo was unborn (empty/nonexistent) at journal_begin but HEAD is now resolvable; the crashed operation may have created the first commit — refusing recovery, orphan PRESERVED at $orphan" >&2
+      continue
+    fi
+
+    _recovery_head_sha="$(git --git-dir="$_git_real" rev-parse HEAD 2>/dev/null)" || _recovery_head_sha=""
+
     # R3: refuse recovery when HEAD has advanced past the stamped base SHA.
     # The orphan's pad snapshot predates committed work; restoring it would
     # silently clobber later commits.  Refuse loudly and PRESERVE the orphan
@@ -916,78 +944,64 @@ sp_session_registry_journal_recover() {
     # E2b: if the stamped base SHA is the PARENT of current HEAD, the crash
     # MAY have happened after the commit landed but before journal_commit
     # removed the journal — the pad would then be consistent and the orphan
-    # is stale-but-superseded, not a real conflict. But "HEAD advanced by
-    # exactly one commit" is also exactly what an UNRELATED third-party commit
-    # looks like while this orphan sat idle (a live in-progress edit that never
-    # got committed). SHA-adjacency alone cannot distinguish the two.
-    #
-    # Decisive signal: in a genuine crash-after-commit, the operation's own
-    # write is what landed in that commit — so the CURRENT LIVE bytes of the
-    # journaled pad file exactly match what git has at HEAD (nothing left
-    # uncommitted). In the unrelated-commit case, the orphan's own live file
-    # still carries whatever was in flight when it crashed — bytes that were
-    # never committed — so live content diverges from HEAD. Only archive when
-    # live content exactly matches HEAD; otherwise fall through to the loud
-    # refusal (matches R3's crashed-say-content-diverges-from-HEAD shape).
-    if [ -f "$orphan/.base-sha" ] && [ -n "${PAD_DIR:-}" ]; then
-      local _recovery_base_sha _recovery_head_sha _recovery_parent_sha
-      _recovery_base_sha="$(cat "$orphan/.base-sha" 2>/dev/null)" || _recovery_base_sha=""
-      _recovery_head_sha="$(git --git-dir="$_git_real" rev-parse HEAD 2>/dev/null)" || _recovery_head_sha=""
-      if [ -n "$_recovery_base_sha" ] && [ -n "$_recovery_head_sha" ] && \
-         [ "$_recovery_base_sha" != "$_recovery_head_sha" ]; then
-        _recovery_parent_sha="$(git --git-dir="$_git_real" rev-parse HEAD~1 2>/dev/null)" || _recovery_parent_sha=""
-        local _recovery_superseded=0
-        if [ "$_recovery_parent_sha" = "$_recovery_base_sha" ] && [ -n "${PAD_MD:-}" ] && [ -f "$PAD_MD" ]; then
-          local _recovery_relpath _recovery_head_bytes _recovery_live_bytes
-          _recovery_relpath="$(basename "$PAD_MD")"
-          _recovery_head_bytes="$(git --git-dir="$_git_real" show "HEAD:$_recovery_relpath" 2>/dev/null)"
-          _recovery_live_bytes="$(cat "$PAD_MD" 2>/dev/null)"
-          [ "$_recovery_head_bytes" = "$_recovery_live_bytes" ] && _recovery_superseded=1
-        fi
-        if [ "$_recovery_superseded" -eq 1 ]; then
-          # Stale-but-superseded: live content exactly matches the commit at
-          # HEAD — the operation's own write is what landed. Archive it and
-          # reset the counter — the operation SUCCEEDED.
-          echo "stitchpad: stale journal $(basename "$orphan") superseded (base was parent of HEAD, live content matches HEAD exactly — crash-after-commit); archiving orphan" >&2
-          # N2: the archive dir must not be a symlink — a pre-planted link
-          # would move the orphan (pre-op pad/registry/marker snapshots) OUT
-          # of PAD_STATE, the same containment discipline the rest of the
-          # journal stack already enforces (_sp_recovery_safe_mkdir, the
-          # journal_begin/rollback symlink refusals). Refuse loudly instead
-          # of silently exfiltrating; the orphan stays untouched and the
-          # attempt bound still applies on the next pass.
-          # N2+H6+H10: archive dir must not be symlink or regular file.
-          # H10: if journal-archive is a regular FILE, mkdir/mv fail and old
-          # code's `|| rm -rf` SILENTLY DESTROYED the orphan. Now preserve.
-          # H6: only reset counter on successful archive.
-          local _archive_ok=0
+    # is stale-but-superseded, not a real conflict.
+    if [ -n "$_recovery_head_sha" ] && [ "$_recovery_base_sha" != "$_recovery_head_sha" ]; then
+      _recovery_parent_sha="$(git --git-dir="$_git_real" rev-parse HEAD~1 2>/dev/null)" || _recovery_parent_sha=""
+      local _recovery_superseded=0
+      if [ "$_recovery_parent_sha" = "$_recovery_base_sha" ] && [ -n "${PAD_MD:-}" ] && [ -f "$PAD_MD" ]; then
+        local _recovery_relpath _recovery_head_bytes _recovery_live_bytes
+        _recovery_relpath="$(basename "$PAD_MD")"
+        _recovery_head_bytes="$(git --git-dir="$_git_real" show "HEAD:$_recovery_relpath" 2>/dev/null)"
+        _recovery_live_bytes="$(cat "$PAD_MD" 2>/dev/null)"
+        [ "$_recovery_head_bytes" = "$_recovery_live_bytes" ] && _recovery_superseded=1
+      fi
+      if [ "$_recovery_superseded" -eq 1 ]; then
+        # Stale-but-superseded: live content exactly matches the commit at
+        # HEAD — the operation's own write is what landed. Archive it.
+        echo "stitchpad: stale journal $(basename "$orphan") superseded (base was parent of HEAD, live content matches HEAD exactly — crash-after-commit); archiving orphan" >&2
+        local _archive_ok=0
+        if [ -L "$PAD_STATE/journal-archive" ]; then
+          echo "stitchpad: refusing to archive into symlinked journal-archive dir: $PAD_STATE/journal-archive; orphan preserved at $orphan" >&2
+        elif [ -f "$PAD_STATE/journal-archive" ]; then
+          echo "stitchpad: journal-archive exists as a regular file (not a directory); orphan preserved at $orphan" >&2
+        else
+          mkdir -p "$PAD_STATE/journal-archive" 2>/dev/null || true
           if [ -L "$PAD_STATE/journal-archive" ]; then
-            echo "stitchpad: refusing to archive into symlinked journal-archive dir: $PAD_STATE/journal-archive; orphan preserved at $orphan" >&2
+            echo "stitchpad: journal-archive became a symlink during mkdir (race) — orphan preserved at $orphan" >&2
           elif [ -f "$PAD_STATE/journal-archive" ]; then
-            echo "stitchpad: journal-archive exists as a regular file (not a directory); orphan preserved at $orphan" >&2
+            echo "stitchpad: journal-archive became a regular file during mkdir — orphan preserved at $orphan" >&2
+          elif mv "$orphan" "$PAD_STATE/journal-archive/$(basename "$orphan")" 2>/dev/null; then
+            _archive_ok=1
           else
-            mkdir -p "$PAD_STATE/journal-archive" 2>/dev/null || true
-            if [ -L "$PAD_STATE/journal-archive" ]; then
-              echo "stitchpad: journal-archive became a symlink during mkdir (race) — orphan preserved at $orphan" >&2
-            elif [ -f "$PAD_STATE/journal-archive" ]; then
-              echo "stitchpad: journal-archive became a regular file during mkdir — orphan preserved at $orphan" >&2
-            elif mv "$orphan" "$PAD_STATE/journal-archive/$(basename "$orphan")" 2>/dev/null; then
-              _archive_ok=1
-            else
-              echo "stitchpad: could not archive orphan (mv failed); orphan preserved at $orphan" >&2
-            fi
+            echo "stitchpad: could not archive orphan (mv failed); orphan preserved at $orphan" >&2
           fi
-          # H6: only reset on success
-          if [ "$_archive_ok" -eq 1 ]; then
-            type sp_recovery_reset >/dev/null 2>&1 && \
-              sp_recovery_reset "$PAD_STATE" "$_recovery_key" || true
-          fi
-          continue
         fi
-        echo "stitchpad: stale journal $(basename "$orphan") base SHA ($_recovery_base_sha) differs from current HEAD ($_recovery_head_sha) — committed work would be reverted; orphan PRESERVED for manual inspection at $orphan" >&2
+        if [ "$_archive_ok" -eq 1 ]; then
+          type sp_recovery_reset >/dev/null 2>&1 && \
+            sp_recovery_reset "$PAD_STATE" "$_recovery_key" || true
+        fi
         continue
       fi
+      echo "stitchpad: stale journal $(basename "$orphan") base SHA ($_recovery_base_sha) differs from current HEAD ($_recovery_head_sha) — committed work would be reverted; orphan PRESERVED for manual inspection at $orphan" >&2
+      continue
     fi
+
+    # ── R6 TOCTOU: re-verify HEAD hasn't moved since the R3 check ────
+    # Between the R3 check above and the rollback write below, a
+    # concurrent commit could land — check-then-act with no atomic
+    # compare.  Re-read HEAD immediately before the write and abort
+    # if it moved.  This is not an atomic lock but narrows the race
+    # window to a single line: if HEAD moved between this re-read and
+    # rollback's first write, the committed content could still be
+    # reverted — but the window shrinks from the whole validation
+    # path to a few instructions.
+    local _toctou_head
+    _toctou_head="$(git --git-dir="$_git_real" rev-parse HEAD 2>/dev/null)" || _toctou_head=""
+    if [ "$_toctou_head" != "$_recovery_base_sha" ]; then
+      echo "stitchpad: stale journal $(basename "$orphan") — HEAD moved between R3 check and rollback (was $_recovery_head_sha, now $_toctou_head); refusing recovery, orphan PRESERVED at $orphan" >&2
+      continue
+    fi
+
     echo "stitchpad: recovering stale journal $(basename "$orphan") — restoring pre-crash state" >&2
     # E3: check rollback rc — only consume the orphan and reset the counter
     # when rollback actually succeeded. Never delete a journal that rollback
@@ -1059,40 +1073,68 @@ sp_session_registry_journal_begin() {
   # R1/R2: stamp the owning sid so recovery interprets the orphan with the
   # CRASHED caller's sid, never the recovering caller's env.
   printf '%s' "$sid" > "$jdir/.sid" || { rm -rf "$jdir"; return 1; }
-  # R3: stamp the pad git HEAD SHA and the repo identity so recovery
-  # can refuse when HEAD has advanced past the base and can cross-check
-  # that it's talking to the same repository as journal_begin.
+  # R3: stamp the pad git HEAD SHA, the repo identity, and a liveness
+  # marker so recovery can refuse when HEAD has advanced past the base,
+  # cross-check repo identity, and skip journals that belong to a
+  # still-running operation (R7).
   #
-  # Resolve the git dir internally from PAD_DIR — do not trust a
-  # caller-supplied global that may be unset (direct-caller embedder),
-  # a symlink (bypassing init guard), or missing.
-  # If PAD_GIT is set and valid it is preferred; otherwise resolve
-  # from PAD_DIR using the same order as lib.sh:144 (pasture-git first,
-  # then stitchpad-git, refusing symlinks).
+  # Resolve the pad's OWN git dir from PAD_DIR, then cross-validate any
+  # caller-supplied PAD_GIT against it (D1).  Stamp an "unborn" sentinel
+  # when HEAD is unresolvable so recovery can distinguish "no stamp at all"
+  # from "repo existed but was empty at begin" (D2/R5).
+  #
+  # Liveness marker (R7): stamp the begin PID + epoch so
+  # _sp_session_registry_journal_orphans can detect and skip live
+  # journals.  Without this, a concurrent begin on the same pad treats
+  # a running operation's journal as stale and recovers it.
+  printf '%s' "$$ $(date +%s)" > "$jdir/.alive" 2>/dev/null || true
+  local _pad_git=""
+  if [ -n "${PAD_DIR:-}" ]; then
+    if [ -d "$PAD_DIR/pasture-git" ] && [ ! -L "$PAD_DIR/pasture-git" ]; then
+      _pad_git="$PAD_DIR/pasture-git"
+    elif [ -d "$PAD_DIR/stitchpad-git" ] && [ ! -L "$PAD_DIR/stitchpad-git" ]; then
+      _pad_git="$PAD_DIR/stitchpad-git"
+    fi
+  fi
   local _git=""
-  if [ -n "${PAD_GIT:-}" ] && [ ! -L "$PAD_GIT" ] && [ -d "$PAD_GIT" ]; then
+  # Pad-own git is authoritative.  Caller-supplied PAD_GIT is a HINT:
+  # trusted only when identical to pad-own git (or when pad-own doesn't
+  # exist — D1 cross-validation).
+  if [ -n "$_pad_git" ]; then
+    _git="$_pad_git"
+    if [ -n "${PAD_GIT:-}" ] && [ ! -L "$PAD_GIT" ] && [ -d "$PAD_GIT" ]; then
+      local _caller_real _pad_real
+      _caller_real="$(cd -P "$PAD_GIT" 2>/dev/null && pwd)" || _caller_real=""
+      _pad_real="$(cd -P "$_pad_git" 2>/dev/null && pwd)" || _pad_real=""
+      if [ -n "$_caller_real" ] && [ -n "$_pad_real" ] && [ "$_caller_real" != "$_pad_real" ]; then
+        # D1: caller PAD_GIT ≠ pad-own git — silently ignore, use pad-own.
+        # This is not an error; the pad-own git is the authority.
+        :
+      fi
+    fi
+  elif [ -n "${PAD_GIT:-}" ] && [ ! -L "$PAD_GIT" ] && [ -d "$PAD_GIT" ]; then
     _git="$PAD_GIT"
-  elif [ -d "$PAD_DIR/pasture-git" ] && [ ! -L "$PAD_DIR/pasture-git" ]; then
-    _git="$PAD_DIR/pasture-git"
-  elif [ -d "$PAD_DIR/stitchpad-git" ] && [ ! -L "$PAD_DIR/stitchpad-git" ]; then
-    _git="$PAD_DIR/stitchpad-git"
   fi
   if [ -n "$_git" ]; then
-    local _begin_real
+    local _begin_real _stamp_sha
     _begin_real="$(cd -P "$_git" 2>/dev/null && pwd)" || _begin_real=""
     if [ -n "$_begin_real" ]; then
       printf '%s' "$_begin_real" > "$jdir/.git-realpath" 2>/dev/null || true
-      local _stamp_sha
       _stamp_sha="$(git --git-dir="$_begin_real" rev-parse HEAD 2>/dev/null)" || _stamp_sha=""
-      # Only stamp when HEAD resolves to a real commit.  An empty/unborn
-      # repo produces an empty string which, when written to .base-sha,
-      # causes the R3 guard's [ -n ] to fail → fail-open → silent
-      # rollback.  Skipping the stamp pairs with the recovery fail-closed
-      # guard that refuses when HEAD is unresolvable.
       if [ -n "$_stamp_sha" ]; then
         printf '%s' "$_stamp_sha" > "$jdir/.base-sha" 2>/dev/null || true
+      else
+        # D2/R5: stamp "unborn" sentinel so recovery can REFUSE when
+        # HEAD is now resolvable (the crashed op may have created the
+        # first commit or created the repo itself during the op).
+        printf 'unborn' > "$jdir/.base-sha" 2>/dev/null || true
       fi
     fi
+  else
+    # R5: no git dir resolvable at all (fresh pad pre-sp_init_paths
+    # auto-create).  Stamp "unborn" sentinel so recovery refuses if a
+    # repo+commit appeared during the operation.
+    printf 'unborn' > "$jdir/.base-sha" 2>/dev/null || true
   fi
   # C2: capture state-root identity for rollback-time validation.
   python3 -c "import os,sys; s=os.lstat(sys.argv[1]); print(s.st_dev,s.st_ino)" \
@@ -1280,13 +1322,20 @@ sp_session_registry_journal_rollback() {
       # rm -f unlinks the path itself — it never follows a symlink target.
       rm -f "$f" 2>/dev/null || true
     else
-      # An unreadable/truncated manifest line is not proof the file was
-      # created by the operation — fail closed and leave it untouched.
+      # S10: an unreadable/truncated manifest line is not proof the file was
+      # created by the operation — leave it untouched AND preserve the orphan
+      # (return non-zero so recover does not consume it).
       echo "stitchpad: rollback manifest line $(( i + 1 )) unreadable — leaving $(basename "$f") untouched" >&2
+      _rollback_partial=1
     fi
     i=$(( i + 1 ))
   done < "$_paths_source"
   rm -f "$jdir/.paths.$$" 2>/dev/null || true
+  if [ "${_rollback_partial:-0}" -ne 0 ]; then
+    # S10: at least one file was not restored — do NOT consume the orphan.
+    echo "stitchpad: rollback PARTIAL — some files could not be restored; journal PRESERVED at $jdir" >&2
+    return 1
+  fi
   rm -rf "$jdir" 2>/dev/null || true
 }
 
