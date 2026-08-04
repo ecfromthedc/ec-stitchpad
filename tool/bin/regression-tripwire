@@ -100,7 +100,13 @@ run_suite() {
   fi
 
   # ── Anchored parse ──
-  result_line="$(echo "$output" | grep -E 'RESULTS:' | tail -1 || true)"
+  # PARSER FIX: suites print counts in several honest shapes and the strict matcher
+  # rejected most of them, producing FORMAT-DRIFT for 29 working suites — which would
+  # have pushed them into quarantine and DELETED real coverage (the exact abuse this
+  # build set out to stop). Strip ANSI colour first and match case-insensitively:
+  #   "RESULTS: 30 passed, 0 failed"  and  "Results: \033[32m30 passed\033[0m, ..."
+  output="$(printf '%s' "$output" | sed -E 's/\x1b\[[0-9;]*[mK]//g')"
+  result_line="$(echo "$output" | grep -iE 'results:' | tail -1 || true)"
   if [ -n "$result_line" ]; then
     p="$(echo "$result_line" | grep -oE '[0-9]+ PASS' | grep -oE '[0-9]+' || true)"
     if [ -n "$p" ]; then
