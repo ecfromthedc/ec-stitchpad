@@ -1269,6 +1269,25 @@ sp_ensure_pad_git_exclude() {
 # interlock durable state with the commit (session registry / pad header) key
 # rollback off this status — the old `|| true` tail let a failed commit look
 # like success. Pads without a git dir keep the historical no-op success.
+sp_narrate() {
+  local _nr_text="$1" _nr_from _nr_ts _nr_depoch _nr_commit_rc
+  [ -n "$_nr_text" ] || return 0
+  [ -n "${PAD_DIR:-}" ] && [ -f "${PAD_MD:-}" ] || return 0
+  _nr_from="$(sp_me 2>/dev/null)" || _nr_from=""
+  [ -n "$_nr_from" ] || return 0
+  [ "$_nr_from" = "stitchpad" ] && return 0  # Bootstrap commits aren't agent events
+  # Derive the timestamp — consistent with date-divider when available
+  if type sp_date_divider_hhmm >/dev/null 2>&1; then
+    _nr_ts="$(sp_date_divider_hhmm 2>/dev/null)" || _nr_ts="$(date '+%I:%M %p')"
+  else
+    _nr_ts="$(date '+%I:%M %p')"
+  fi
+  # Append the narration line to the pad.  Use a compact format that is
+  # distinguishable from human conversation: `### @name event · HH:MM AM`
+  printf '\n### %s %s · %s\n' "@${_nr_from}" "$_nr_text" "$_nr_ts" >> "$PAD_MD"
+  return 0
+}
+
 sp_commit() {
   local msg="$1"; shift 2>/dev/null || true
   local paths=("$@")
@@ -1478,6 +1497,11 @@ sp_commit() {
   fi
   # H5b: HEAD didn't move and our bytes are not in HEAD — real failure.
   return 1
+  # P19 auto-narration: every durable commit emits a pad line so the operator sees
+  # progress without an agent remembering to narrate. Best-effort and never
+  # self-committing (that doubled commit counts and broke heal-roster).
+  sp_narrate "commit: $1" 2>/dev/null || true
+
 }
 
 # ── Roster parsing (the magic: roster is IN the markdown) ────────────
