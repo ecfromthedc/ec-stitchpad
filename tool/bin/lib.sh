@@ -1538,24 +1538,14 @@ sp_narrate() {
   # Append the narration line to the pad.  Use a compact format that is
   # distinguishable from human conversation: `### @name event · HH:MM AM`
   printf '\n### %s %s · %s\n' "@${_nr_from}" "$_nr_text" "$_nr_ts" >> "$PAD_MD"
-  # Commit the narration — best-effort, never roll back the primary operation
-  if type _sp_date_divider_now_epoch >/dev/null 2>&1; then
-    _nr_depoch="$(_sp_date_divider_now_epoch 2>/dev/null)" || _nr_depoch=""
-  fi
-  if [ -n "$_nr_depoch" ] && type sgit >/dev/null 2>&1 && [ -d "${PAD_GIT:-}" ]; then
-    sgit -c "user.name=$_nr_from" -c "user.email=${_nr_from}@ocean.local" \
-      add "$(basename "$PAD_MD")" 2>/dev/null || true
-    GIT_COMMITTER_DATE="@${_nr_depoch}" GIT_AUTHOR_DATE="@${_nr_depoch}" \
-      sgit -c "user.name=$_nr_from" -c "user.email=${_nr_from}@ocean.local" \
-      commit -q -m "$_nr_from: $_nr_text" >/dev/null 2>/dev/null || true
-  elif type sgit >/dev/null 2>&1 && [ -d "${PAD_GIT:-}" ]; then
-    sgit -c "user.name=$_nr_from" -c "user.email=${_nr_from}@ocean.local" \
-      add "$(basename "$PAD_MD")" 2>/dev/null || true
-    sgit -c "user.name=$_nr_from" -c "user.email=${_nr_from}@ocean.local" \
-      commit -q -m "$_nr_from: $_nr_text" >/dev/null 2>/dev/null || true
-  fi
+  # P19 REFINEMENT: narration must NOT mint its own commit. Doing so doubled the
+  # commit count on every durable write and broke heal-roster-regression (expected 3,
+  # got 5) — a narration side-effect must never change the pad's commit semantics.
+  # The line is appended to PAD_MD and rides along in the NEXT commit, or is picked up
+  # by the watcher. Best-effort: never roll back or delay the primary operation.
   return 0
 }
+
 
 # ── Roster parsing (the magic: roster is IN the markdown) ────────────
 # Emits "name|adapter|wake|target" per participant from the ```roster fence.

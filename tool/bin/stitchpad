@@ -3716,23 +3716,6 @@ except: print("")' 2>/dev/null)"
     exec "$0" say --image "$file" ${caption:+"$caption"}
     ;;
 
-  lanes)
-    # P19: compact activity view — last narration event per seat so the
-    # operator can see the fleet working without scrolling the full pad.
-    sp_init_paths_readonly || exit 1
-    awk '
-      /^### @[a-zA-Z0-9_-]+ / {
-        match($0, /@[a-zA-Z0-9_-]+/)
-        name = substr($0, RSTART+1, RLENGTH-1)
-        rest = substr($0, RSTART+RLENGTH)
-        sub(/^ */, "", rest)
-        last[name] = rest
-      }
-      END {
-        for (n in last) printf "%-16s%s\n", n, last[n]
-      }
-    ' "$PAD_MD" | sort
-    ;;
 
   roster|who)
     sp_init_paths_readonly || exit 1
