@@ -43,6 +43,8 @@
 #   stitchpad hook                         internal bridge post-commit signal
 #   stitchpad heal-roster                 repair a corrupt roster via operator credential
 #   stitchpad reconcile                   backfill contributors missing from the roster
+#   stitchpad pads [--scratch]            list pads; --scratch shows ephemeral ones
+#   stitchpad evidence list|verify        list sealed artifacts / verify their sha256 sidecars
 #
 # The roster lives INSIDE stitchpad.md as a ```roster fenced block. To add an agent
 # from any runtime (pi/codex/cline/claude), drop an adapter in ~/.stitchpad/adapters
@@ -95,6 +97,55 @@ sp_maybe_start_heartbeat() {
 }
 
 sp_maybe_start_heartbeat
+
+# P5: a deleted or corrupt pad git makes read commands print EMPTY results and exit 0 —
+# indistinguishable from "nobody joined". That cost a full cycle and a near-misdiagnosis
+# of a DESTROYED pad as a quiet one. Called explicitly from each READ command rather than
+# from sp_init_paths: the shared-init version (4efb159) also refused journal/recovery
+# paths that legitimately run on empty or not-yet-initialised git dirs, breaking a pillar
+# suite plus websec, heal-roster and authority-redesign. Blast radius is part of the design.
+sp_assert_pad_git_usable() {
+  # Resolve paths if the caller has not yet — otherwise PAD_GIT is unset here and the
+  # guard silently no-ops, which is the very "looks fine, does nothing" shape we are
+  # eliminating.
+  if [ -z "${PAD_GIT:-}" ]; then
+    sp_init_paths_readonly >/dev/null 2>&1 || true
+  fi
+  if [ -z "${PAD_GIT:-}" ] && [ -n "${PAD_DIR:-}" ]; then
+    if [ -d "$PAD_DIR/pasture-git" ]; then PAD_GIT="$PAD_DIR/pasture-git"
+    else PAD_GIT="$PAD_DIR/stitchpad-git"; fi
+  fi
+  [ -n "${PAD_GIT:-}" ] || return 0
+  # DESTROYED vs BARE — these are different states and deserve different answers.
+  #   BARE:      a stitchpad.md that was never initialised (no .state, no git). Read-only
+  #              commands must stay harmless here (test-health-readonly asserts they
+  #              neither crash nor create .state/git). Nothing was lost; say nothing.
+  #   DESTROYED: the pad was operated on (.state exists) but its git history is GONE.
+  #              THAT is the incident that cost a full cycle — roster printed zero rows
+  #              and exited 0, and a destroyed pad read as an idle fleet. Refuse loudly.
+  if [ ! -d "$PAD_GIT" ] && [ ! -d "${PAD_STATE:-$PAD_DIR/.state}" ]; then
+    return 0
+  fi
+  if [ ! -d "$PAD_GIT" ]; then
+    echo "stitchpad: pad git is missing — this pad is broken, not empty" >&2
+    echo "  expected history at: $PAD_GIT" >&2
+    echo "  an empty result here means the PAD is gone, not that nobody joined" >&2
+    echo "  recover:  cd $(dirname "${PAD_DIR:-.}") && stitchpad init --name <name>" >&2
+    return 1
+  fi
+  # An empty or unreadable git dir cannot answer a READ command — roster/whoami/doctor
+  # would print nothing and exit 0, which is the bug. Refuse here.
+  # NOTE: this helper is called ONLY from read commands. journal_begin and the recovery
+  # paths still accept an empty git dir via the "unborn" sentinel — that distinction is
+  # exactly why this guard is not in sp_init_paths (see 4efb159, which broke a pillar).
+  if ! git --git-dir="$PAD_GIT" rev-parse --git-dir >/dev/null 2>&1; then
+    echo "stitchpad: pad git is corrupt — cannot read history at $PAD_GIT" >&2
+    echo "  the repository is present but unreadable (corrupt HEAD or config)" >&2
+    echo "  recover:  restore from backup, or re-init with 'stitchpad init --name <name>'" >&2
+    return 1
+  fi
+  return 0
+}
 
 case "$cmd" in
   instructions)
@@ -1899,6 +1950,7 @@ PY
     ;;
 
   whoami)
+    sp_assert_pad_git_usable || exit 1
     # Print the handle bound to this session (the MCP `join` tool calls this to
     # detect a prior binding). Resolution: sessions/<$STITCHPAD_SESSION>, else
     # the pad-level default. No binding → no output, exit 1. Read-only.
@@ -3672,13 +3724,7 @@ except: print("")' 2>/dev/null)"
     # recover-migrated-pad, websec, heal-roster and authority-redesign, because
     # journal/recovery paths legitimately operate on empty or not-yet-initialised git
     # dirs. Blast radius belongs at the call site, not in shared init.
-    if [ -n "${PAD_GIT:-}" ] && [ ! -d "$PAD_GIT" ]; then
-      echo "stitchpad: pad git is MISSING — this pad is broken, not empty" >&2
-      echo "  expected history at: $PAD_GIT" >&2
-      echo "  an empty roster here means the PAD is gone, not that nobody joined" >&2
-      echo "  recover:  cd $(dirname "${PAD_DIR:-.}") && stitchpad init --name <name>" >&2
-      exit 1
-    fi
+    sp_assert_pad_git_usable || exit 1
     sp_roster ;;
 
   sessions)
@@ -3710,6 +3756,9 @@ except: print("")' 2>/dev/null)"
     ;;
 
   doctor)
+    # doctor exists to DIAGNOSE a broken pad — refusing to run would be backwards.
+    # Report the condition (pad-visibility-gate G3 asserts the wording) and continue.
+    sp_assert_pad_git_usable || true
     # Roster health check — read-only diagnostic, no mutations.
     # Reports: untargeted push entries, missing adapter scripts, missing pull
     # session identity, duplicate names, orphaned session files.
