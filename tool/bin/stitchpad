@@ -3742,14 +3742,32 @@ PY
 
       move)
         id="${1:-}"; new_status="${2:-}"
-        [ -z "$id" ] && { echo "usage: stitchpad task move <id> <status>" >&2; exit 1; }
-        [ -z "$new_status" ] && { echo "usage: stitchpad task move <id> <status>" >&2; exit 1; }
+        [ -z "$id" ] && { echo "usage: stitchpad task move <id> <status> [--from <current-status>]" >&2; exit 1; }
+        [ -z "$new_status" ] && { echo "usage: stitchpad task move <id> <status> [--from <current-status>]" >&2; exit 1; }
+        # Parse optional --from for CAS (compare-and-set) guard
+        _move_from=""
+        if [ "${3:-}" = "--from" ]; then _move_from="${4:-}"; fi
         sp_lock || exit 1
         # Edit only the file that actually holds the card. A migrated task lives
         # in tasks.md, so moving it never touches (or re-commits) the pad; a
         # legacy inline task is still edited where it sits. An unknown id fails
         # instead of rewriting the whole pad for nothing.
         tfile="$(sp_task_file "$id")" || { sp_unlock; echo "stitchpad: no such task: $id" >&2; exit 1; }
+        # F5 CAS: if --from was specified, re-read current status under the lock
+        # and refuse if it no longer matches.  Two concurrent moves on one card
+        # produce exactly one success + one explicit refusal, never two successes.
+        if [ -n "$_move_from" ]; then
+          _move_current="$(awk -v tid="$id" '
+            /^```task / && $2==tid  { inblk=1; inmeta=1; next }
+            inblk && inmeta && /^status:/ { sub(/^status:[[:space:]]*/,""); print; exit }
+            /^```$/ && inblk          { exit }
+          ' "$tfile")"
+          if [ -n "$_move_current" ] && [ "$_move_current" != "$_move_from" ]; then
+            sp_unlock
+            echo "stitchpad: REFUSED — $id is '$_move_current', not '$_move_from' (changed by another writer); re-read and retry with --from '$_move_current'"
+            exit 1
+          fi
+        fi
         sp_task_detect_duplicate "$id" || true  # warn if ghost exists in the other file
         tmp="$(sp_stage "$tfile")"
         awk -v tid="$id" -v ns="$new_status" '
