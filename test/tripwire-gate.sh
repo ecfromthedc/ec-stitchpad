@@ -67,12 +67,35 @@ setup_fixture() {
 }
 
 write_bl() {
+  # The tripwire gained a suite-level baseline + quarantine + meta-gate (P14/P16)
+  # and now exits 2 ("FATAL — baseline not found") without them. This fixture
+  # still wrote only pillar-baseline.txt, so EVERY case here failed with rc=2 and
+  # all 21 assertions were reporting one stale interface, not 21 defects.
   cat > "$FIXTURE/test/pillar-baseline.txt" <<'BL'
 pro5-tier1-mutant-gates.sh 3 0
 roster-recovery-guard-regression.sh 3 0
 recover-migrated-pad.sh 3 0
 recovery-hardening3-regression.sh 3 0
 BL
+  cp "$FIXTURE/test/pillar-baseline.txt" "$FIXTURE/test/suite-baseline.txt"
+  printf '# fixture: nothing quarantined\n' > "$FIXTURE/test/suite-quarantine.txt"
+}
+
+
+# Apply an anchored mutation and PROVE it landed. A mutation that does not apply
+# is INCONCLUSIVE and must never be scored as a pass — these three were addressed
+# by absolute line number ('175s/...'), so any edit to the tripwire silently
+# turned them into no-ops that still "passed".
+mutate() { # $1=file $2=needle $3=replacement $4=label
+  python3 - "$1" "$2" "$3" <<'PY_MUT'
+import sys
+p,old,new=sys.argv[1],sys.argv[2],sys.argv[3]
+s=open(p,encoding='utf-8').read()
+if s.count(old)!=1: sys.exit(9)
+open(p,'w',encoding='utf-8').write(s.replace(old,new))
+PY_MUT
+  if [ $? -ne 0 ]; then bad "$4: MUTATION DID NOT APPLY — inconclusive"; return 1; fi
+  return 0
 }
 
 write_suite() {
@@ -212,8 +235,8 @@ write_suite roster-recovery-guard-regression.sh 'echo "=== RESULTS ==="; echo "P
 write_suite recover-migrated-pad.sh             'echo "=== RESULTS ==="; echo "Passed:  3"; echo "Failed:  0"; exit 0'
 write_suite recovery-hardening3-regression.sh   'echo "=== RESULTS ==="; echo "Passed:  3"; echo "Failed:  0"; exit 0'
 
-sed -i '' '175s/_trap_status="EXIT-CODE"/_trap_status="GREEN"/' "$FIXTURE/tool/bin/regression-tripwire"
-sed -i '' '176s/_trap_fail=1/_trap_fail=0/' "$FIXTURE/tool/bin/regression-tripwire"
+mutate "$FIXTURE/tool/bin/regression-tripwire" \
+  '_trap_status="EXIT-CODE"; _trap_fail=1' '_trap_status="GREEN"; _trap_fail=0' "M1"
 
 run_tw; out="$(tw_stdout)"
 _tw_rc="$(tw_rc)"
@@ -235,8 +258,8 @@ write_suite roster-recovery-guard-regression.sh 'echo "=== RESULTS ==="; echo "P
 write_suite recover-migrated-pad.sh             'echo "=== RESULTS ==="; echo "Passed:  3"; echo "Failed:  0"; exit 0'
 write_suite recovery-hardening3-regression.sh   'echo "=== RESULTS ==="; echo "Passed:  3"; echo "Failed:  0"; exit 0'
 
-sed -i '' '167s/_trap_status="INFLATED"/_trap_status="GREEN"/' "$FIXTURE/tool/bin/regression-tripwire"
-sed -i '' '168s/_trap_fail=1/_trap_fail=0/' "$FIXTURE/tool/bin/regression-tripwire"
+mutate "$FIXTURE/tool/bin/regression-tripwire" \
+  '_trap_status="INFLATED"; _trap_fail=1' '_trap_status="GREEN"; _trap_fail=0' "M2"
 
 run_tw; out="$(tw_stdout)"
 _tw_rc="$(tw_rc)"
@@ -258,8 +281,11 @@ write_suite roster-recovery-guard-regression.sh 'echo "=== RESULTS ==="; echo "P
 write_suite recover-migrated-pad.sh             'echo "=== RESULTS ==="; echo "Passed:  3"; echo "Failed:  0"; exit 0'
 write_suite recovery-hardening3-regression.sh   'echo "no RESULTS line"; echo "just junk"; exit 0'
 
-sed -i '' '147s/FAILS=\$((FAILS + 1))/#FAILS blinded — FORMAT-DRIFT no longer fails/' "$FIXTURE/tool/bin/regression-tripwire"
-sed -i '' '151s/FORMAT-DRIFT/SKIP/' "$FIXTURE/tool/bin/regression-tripwire"
+mutate "$FIXTURE/tool/bin/regression-tripwire" \
+  '    FAILS=$((FAILS + 1))
+    if [ "$obs_rc" != "0" ]; then' '    : # FAILS blinded — FORMAT-DRIFT no longer fails
+    if [ "$obs_rc" != "0" ]; then' "M3-a"
+mutate "$FIXTURE/tool/bin/regression-tripwire" '"FORMAT-DRIFT"' '"SKIP"' "M3-b"
 
 run_tw; out="$(tw_stdout)"
 _tw_rc="$(tw_rc)"
