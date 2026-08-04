@@ -28,6 +28,7 @@ delivery-supervision-regression.sh 15 0
 e13-dualwrite-gate.sh 15 0
 empty-lock-reclaim-gate.sh 12 0
 evidence-labeling.sh 0 0
+evidence-verify-gate.sh 8 0
 false-success-gate.sh 2 0
 fixture-bleed-gate.sh 5 0
 fixture-reap-gate.sh 9 0

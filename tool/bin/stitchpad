@@ -4048,7 +4048,7 @@ PY
           exit 0
         fi
         find "$_ev_dir" -type f ! -name '*.sha256' | sort | while read -r f; do
-          _rel="$(echo "$f" | sed "s|^$_ev_dir/||")"
+          _rel="${f#"$_ev_dir"/}"
           _sha="$f.sha256"
           if [ -f "$_sha" ]; then
             _stored="$(head -1 "$_sha" 2>/dev/null | awk '{print $1}')"
@@ -4065,23 +4065,47 @@ PY
         ;;
 
       verify)
-        [ ! -d "$_ev_dir" ] && { echo "No evidence directory: $_ev_dir"; exit 0; }
+        # P7: verify is the CI/script surface for "is it sealed?" — it MUST
+        # count in the current shell (a `find | while` pipeline counts in a
+        # subshell and loses every increment) and MUST exit non-zero when any
+        # artifact is STALE or unsealed, or when a sidecar is orphaned.
+        # Otherwise "verify" is a printer, not a verdict.
+        if [ ! -d "$_ev_dir" ]; then
+          echo "No evidence directory: $_ev_dir"
+          echo "Evidence artifacts are sealed to this location with 'stitchpad evidence seal <file>'."
+          exit 0
+        fi
         _v_ok=0; _v_stale=0; _v_miss=0
-        find "$_ev_dir" -type f ! -name '*.sha256' | sort | while read -r f; do
-          _rel="$(echo "$f" | sed "s|^$_ev_dir/||")"
+        while IFS= read -r f; do
+          _rel="${f#"$_ev_dir"/}"
           _sha="$f.sha256"
           if [ ! -f "$_sha" ]; then
             _ev_miss "$_rel (no .sha256 sidecar)"
+            _v_miss=$(( _v_miss + 1 ))
             continue
           fi
           _stored="$(head -1 "$_sha" 2>/dev/null | awk '{print $1}')"
           _computed="$(shasum -a 256 "$f" 2>/dev/null | awk '{print $1}' || true)"
           if [ "$_stored" = "$_computed" ] && [ -n "$_stored" ]; then
             _ev_ok "$_rel"
+            _v_ok=$(( _v_ok + 1 ))
           else
             _ev_stale "$_rel"
+            _v_stale=$(( _v_stale + 1 ))
           fi
-        done
+        done < <(find "$_ev_dir" -type f ! -name '*.sha256' | sort)
+        # Orphan sidecar: a .sha256 whose artifact is gone is evidence
+        # pointing at nothing — that is a MISSING verdict, not silence.
+        while IFS= read -r s; do
+          [ -f "${s%.sha256}" ] && continue
+          _ev_miss "${s#"$_ev_dir"/} (sidecar with no artifact)"
+          _v_miss=$(( _v_miss + 1 ))
+        done < <(find "$_ev_dir" -type f -name '*.sha256' | sort)
+        echo "verify: $_v_ok OK, $_v_stale STALE, $_v_miss MISSING"
+        if [ "$_v_stale" -gt 0 ] || [ "$_v_miss" -gt 0 ]; then
+          echo "stitchpad: evidence verification FAILED — reseal changed artifacts with 'stitchpad evidence seal <file>'" >&2
+          exit 1
+        fi
         ;;
 
       seal)
