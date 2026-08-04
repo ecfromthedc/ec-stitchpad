@@ -276,4 +276,5 @@ esac
 if [ "$RUN" = "all" ]; then
   echo "=== RESULTS: $pass PASS, $fail FAIL, $((pass+fail)) total ==="
   [ "$fail" -gt 0 ] && exit 1
+  exit 0
 fi
