@@ -18,29 +18,24 @@ export STITCHPAD_HOME="$ROOT/tool"
 export STITCHPAD_HEARTBEAT_AUTOSTART=0
 export PATH="$ROOT/tool/bin:$PATH"
 
+TMP="$(mktemp -d /tmp/p18-gate.XXXXXX)"
+cleanup() { rm -rf "$TMP" 2>/dev/null || true; }
+trap cleanup EXIT
+
 pass=0; fail=0
 ok()  { printf '  \033[32mPASS\033[0m %s\n' "$1"; pass=$((pass+1)); }
 bad() { printf '  \033[31mFAIL\033[0m %s\n' "$1"; fail=$((fail+1)); }
 
-# Pad listing: channels only, no scratch
-sp_pads()        { "$SP" pads 2>/dev/null; }
-sp_pads_scratch(){ "$SP" pads --scratch 2>/dev/null; }
+# Pad listing: explicit roots so test pads in $TMP are discoverable
+# For G4-G7,G9: scan only $TMP (test fixtures)
+sp_pads_tmp()       { STITCHPAD_SCAN_ROOTS="$TMP" "$SP" pads 2>/dev/null; }
+sp_pads_scratch_tmp(){ STITCHPAD_SCAN_ROOTS="$TMP" "$SP" pads --scratch 2>/dev/null; }
+sp_pads_prune_tmp()  { STITCHPAD_SCAN_ROOTS="$TMP" "$SP" pads --prune 2>/dev/null; }
 
-count_channels() {
-  sp_pads | grep -c '^\[ch\]' 2>/dev/null || echo 0
+# For G8: scan $HOME to verify no new real channels
+count_home_channels() {
+  STITCHPAD_SCAN_ROOTS="$HOME" "$SP" pads 2>/dev/null | grep -c '^\[ch\]' 2>/dev/null || echo 0
 }
-
-count_scratch() {
-  sp_pads_scratch | grep -c '^\[scr\]' 2>/dev/null || echo 0
-}
-
-TMP="$(mktemp -d /tmp/p18-gate.XXXXXX)"
-cleanup() {
-  rm -rf "$TMP" 2>/dev/null || true
-}
-trap cleanup EXIT
-# Pads scanning: include our fixture root so test pads are discoverable
-export STITCHPAD_SCAN_ROOTS="$HOME $TMP"
 
 echo "=== P18: scratch-pad gate ==="
 echo ""
@@ -82,29 +77,28 @@ G3_OUT="$(cd "$WORKTREE2" && "$SP" init --force --name g3-channel 2>&1)" || { ba
   || bad "G3: no scratch sentinel for --force pad"
 
 # ── G4: scratch pad NOT in channel listing ───────────────────────────────
-_channels_before="$(count_channels)"
-if sp_pads | grep -q "g2-scratch"; then
-  bad "G4: scratch pad g2-scratch appears in channel listing"
+if sp_pads_tmp | grep -q "wt-scratch"; then
+  bad "G4: scratch pad wt-scratch appears in channel listing"
 else
   ok "G4: scratch pad NOT in channel listing"
 fi
 
 # ── G5: scratch pad IS in --scratch listing ──────────────────────────────
-if sp_pads_scratch | grep -q "g2-scratch"; then
+if sp_pads_scratch_tmp | grep -q "wt-scratch"; then
   ok "G5: scratch pad appears in --scratch listing"
 else
   bad "G5: scratch pad appears in --scratch listing"
 fi
 
 # ── G6: channel pad appears in normal listing ────────────────────────────
-if sp_pads | grep -q "g3-channel"; then
+if sp_pads_tmp | grep -q "wt-channel"; then
   ok "G6: channel pad (--force) appears in normal listing"
 else
   bad "G6: channel pad (--force) appears in normal listing"
 fi
 
 # ── G7: pads --prune removes scratch pads ────────────────────────────────
-G7_OUT="$("$SP" pads --prune 2>&1)" || true
+G7_OUT="$(sp_pads_prune_tmp 2>&1)" || true
 if echo "$G7_OUT" | grep -q "pruned"; then
   if [ ! -d "$WORKTREE/.stitchpad" ]; then
     ok "G7: pads --prune removed scratch pad"
@@ -115,15 +109,15 @@ else
   bad "G7: pads --prune (no prune output: $G7_OUT)"
 fi
 
-# Clean up channel pad from listing
+# Clean up channel pad
 rm -rf "$WORKTREE2/.stitchpad" 2>/dev/null || true
 
 # ── G8: suite sweep — ZERO new channels after running tests ──────────────
 echo ""
 echo "--- G8: suite sweep channel invasion ---"
-_channels_pre_sweep="$(count_channels)"
+_channels_pre_sweep="$(count_home_channels)"
 
-# Create a worktree-like scenario: a test init inside a temp dir
+# Create a worktree-like scenario: test init inside a temp dir
 SUITE_TMP="$TMP/suite-fixture"
 mkdir -p "$SUITE_TMP"
 ( cd "$SUITE_TMP" && "$SP" init --scratch --name fixture-pad >/dev/null 2>&1 ) || true
@@ -134,7 +128,7 @@ STITCHPAD_NAME=test STITCHPAD_PAD_DIR="$SUITE_TMP/.stitchpad" STITCHPAD_STEAL=1 
 STITCHPAD_NAME=test STITCHPAD_PAD_DIR="$SUITE_TMP/.stitchpad" \
   "$SP" say "sweep test message" >/dev/null 2>&1 || true
 
-_channels_post_sweep="$(count_channels)"
+_channels_post_sweep="$(count_home_channels)"
 if [ "$_channels_pre_sweep" = "$_channels_post_sweep" ]; then
   ok "G8: suite sweep created ZERO new channels ($_channels_pre_sweep before = $_channels_post_sweep after)"
 else
@@ -147,16 +141,13 @@ echo "--- G9: mutant (remove .scratch → channel breach) ---"
 MUT_TMP="$TMP/mutant-wt"
 git -C "$GIT_REPO" worktree add --detach "$MUT_TMP" HEAD >/dev/null 2>&1
 ( cd "$MUT_TMP" && "$SP" init --scratch --name g9-mutant >/dev/null 2>&1 ) || { bad "G9 setup: init --scratch failed"; }
-# Verify it's scratch
-if sp_pads | grep -q "g9-mutant"; then
+if sp_pads_tmp | grep -q "mutant-wt"; then
   bad "G9 pre: scratch pad leaked into channel listing (pre-mutation)"
 else
   ok "G9 pre: scratch pad hidden (correct)"
 fi
-# MUTATE: remove .scratch sentinel
 rm -f "$MUT_TMP/.stitchpad/.scratch" 2>/dev/null || true
-# Now it should appear as a channel
-if sp_pads | grep -q "g9-mutant"; then
+if sp_pads_tmp | grep -q "mutant-wt"; then
   ok "G9 mutant: removing .scratch exposes pad as channel — GATE RED (the sentinel is the ONLY barrier)"
 else
   bad "G9 mutant: removing .scratch exposes pad as channel (sentinel removal had no effect)"
@@ -166,9 +157,8 @@ fi
 git -C "$GIT_REPO" worktree remove "$WORKTREE" --force 2>/dev/null || true
 git -C "$GIT_REPO" worktree remove "$WORKTREE2" --force 2>/dev/null || true
 git -C "$GIT_REPO" worktree remove "$MUT_TMP" --force 2>/dev/null || true
-rm -rf "$SUITE_TMP/.stitchpad" 2>/dev/null || true
+rm -rf "$SUITE_TMP" 2>/dev/null || true
 
-# ── Verdict ──────────────────────────────────────────────────────────────
 echo ""
 if [ "$fail" -gt 0 ]; then
   echo "$fail FAILED, $pass passed"

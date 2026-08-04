@@ -325,6 +325,8 @@ EOF
         *) echo "stitchpad: pads: unknown option '$1'" >&2; exit 2 ;;
       esac
     done
+    # --prune implies --scratch: only scratch pads are prunable
+    [ "$_pads_prune" -eq 1 ] && _pads_scratch=1
     _pads_roots="${STITCHPAD_SCAN_ROOTS:-$HOME}"
     _pads_found=0
     for _r in $_pads_roots; do
