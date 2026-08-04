@@ -76,4 +76,4 @@ watcher-ordering-gate.sh 3 0
 watcher-races.sh 0 0
 websec-regression.sh 8 0
 artifact-contract-gate.sh 13 0
-oversight-gate.sh 14 0
+watcher-singleton-gate.sh
