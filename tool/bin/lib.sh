@@ -142,6 +142,14 @@ sp_init_paths_readonly() {
   # migrated pads carry pasture.md/pasture-git; legacy names accepted until stage 4
   if [ -f "$PAD_DIR/pasture.md" ]; then PAD_MD="$PAD_DIR/pasture.md"; else PAD_MD="$PAD_DIR/stitchpad.md"; fi
   if [ -d "$PAD_DIR/pasture-git" ]; then PAD_GIT="$PAD_DIR/pasture-git"; else PAD_GIT="$PAD_DIR/stitchpad-git"; fi
+  # Refuse symlinked pad git directories: a dangling symlink reads as absent
+  # to [ -d ] but routes through fallback/auto-create, enabling an empty-repo
+  # attack. Even a valid symlink-to-directory is refused — the pad git must
+  # be a genuine directory, not an alias that can be swapped mid-operation.
+  if [ -L "$PAD_GIT" ]; then
+    echo "stitchpad: pad git directory is a symlink — refusing" >&2
+    return 1
+  fi
   PAD_STATE="$PAD_DIR/.state"
   # Task cards live in a SIBLING file so a `task move` never rewrites (or
   # commits) the whole conversation. Legacy inline ```task blocks in the pad are

@@ -836,6 +836,16 @@ sp_session_registry_journal_recover() {
       fi
     fi
 
+    # Fail-closed: if PAD_GIT exists but git HEAD is unresolvable (empty
+    # repo, zero commits, unborn branch), refuse ALL recovery — we cannot
+    # determine whether rollback would destroy committed content.  Must
+    # precede the R3 block so the guard fires regardless of .base-sha state
+    # (absent, empty, or stamped).
+    if [ -d "$PAD_GIT" ] && ! git --git-dir="$PAD_GIT" rev-parse --verify -q HEAD >/dev/null 2>&1; then
+      echo "stitchpad: stale journal $(basename "$orphan") — pad git HEAD is unresolvable (empty/unborn repo); cannot verify safety — orphan PRESERVED at $orphan" >&2
+      continue
+    fi
+
     # R3: refuse recovery when HEAD has advanced past the stamped base SHA.
     # The orphan's pad snapshot predates committed work; restoring it would
     # silently clobber later commits.  Refuse loudly and PRESERVE the orphan
@@ -991,8 +1001,16 @@ sp_session_registry_journal_begin() {
   # advanced past the base — never silently restore old bytes over committed
   # content.
   if [ -n "${PAD_DIR:-}" ] && [ -d "$PAD_GIT" ]; then
-    printf '%s' "$(git --git-dir="$PAD_GIT" rev-parse HEAD 2>/dev/null)" \
-      > "$jdir/.base-sha" 2>/dev/null || true
+    local _stamp_sha
+    _stamp_sha="$(git --git-dir="$PAD_GIT" rev-parse HEAD 2>/dev/null)" || _stamp_sha=""
+    # Only stamp when HEAD resolves to a real commit.  An empty/unborn repo
+    # produces an empty string which, when written to .base-sha, causes the
+    # R3 guard's [ -n "$_recovery_base_sha" ] to fail → fail-open → silent
+    # rollback.  Skipping the stamp entirely pairs with the recovery-side
+    # fail-closed guard that refuses when HEAD is unresolvable.
+    if [ -n "$_stamp_sha" ]; then
+      printf '%s' "$_stamp_sha" > "$jdir/.base-sha" 2>/dev/null || true
+    fi
   fi
   # C2: capture state-root identity for rollback-time validation.
   python3 -c "import os,sys; s=os.lstat(sys.argv[1]); print(s.st_dev,s.st_ino)" \
