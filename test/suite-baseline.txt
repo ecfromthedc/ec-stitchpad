@@ -1,1 +1,67 @@
+# suite-baseline.txt — recorded pass/fail counts for every test suite.
+# Format: <suite-name> <expected_pass_count> <expected_fail_count>
+# The regression tripwire compares each suite run against its baseline.
+# If ANY suite's pass count DROPS or exit code disagrees, the tripwire FAILS.
+# Update this file after verified intentional suite changes.
+# 
+# Pillar suites (headline numbers for the PR):
+recover-migrated-pad.sh 40 0
+pro5-tier1-mutant-gates.sh 15 0
+roster-recovery-guard-regression.sh 21 0
+recovery-hardening3-regression.sh 67 0
+# All other suites (measured on b24cbe8, quiet window):
+authority-hardfix-regression.sh ? ?
+authority-redesign-regression.sh ? ?
+bridge-heartbeat-interval.sh ? ?
+clear-regression.sh 9 0
+color-bash32.sh ? ?
+concurrency-round5-regression.sh ? ?
+coordination-lifecycle-slice-a.sh ? ?
+coordination-lifecycle-sliceB.sh ? ?
+coordination-safety.sh ? ?
+coordination-task3-contracts.sh ? ?
+crosslane-f3-f6.sh ? ?
+date-session-atomicity.sh ? ?
+date-session-projection.sh ? ?
+delivery-supervision-regression.sh ? ?
+e13-dualwrite-gate.sh 15 0
+empty-lock-reclaim-gate.sh ? ?
+evidence-labeling.sh ? ?
+fixture-reap-gate.sh ? ?
+heal-roster-regression.sh 19 0
+heartbeat.sh ? ?
+heartbeat-races.sh ? ?
+help-discoverability-gate.sh ? ?
+identity-survival-under-join.sh ? ?
+model-pinning.sh ? ?
+multipad-isolation.sh ? ?
+pad-io-and-archive.sh ? ?
+pad-runtime-safety.sh ? ?
+phaseb-hardening-regression.sh ? ?
+phaseb-hardening2-regression.sh ? ?
+portability-regression.sh 21 0
+pro3-f4-gate.sh ? ?
+pro5-tier1-mutant-kill-demo.sh ? ?
+pro7-task12-identity-gate.sh ? ?
+pwa-contract.sh ? ?
+rc1-c11-c13-regression.sh ? ?
+recovery-round7-regression.sh ? ?
+reset-recovery.sh ? ?
+roster-validation-gate.sh ? ?
+say-image.sh ? ?
+seat-keeper.sh ? ?
+task-dual-source-regression.sh 14 0
+task26-mutant.sh ? ?
+task4-bounded-recovery-regression.sh ? ?
+task5-scope-authority-regression.sh ? ?
+telemetry-regression.sh ? ?
+telemetry-tonight-demo.sh ? ?
+test-health-readonly.sh ? ?
+test-ponytail-instructions.sh ? ?
+test-provider-availability.sh ? ?
+test-runner.sh ? ?
+wake-regression.sh ? ?
+watcher-ordering-gate.sh ? ?
+watcher-races.sh ? ?
+websec-regression.sh ? ?
 commit-fail-postcondition-gate.sh 6 0

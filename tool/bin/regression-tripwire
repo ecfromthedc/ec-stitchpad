@@ -1,16 +1,17 @@
 #!/usr/bin/env bash
-# regression-tripwire — pillar suite regression gate.
+# regression-tripwire — ALL-SUITE regression gate.
 #
-# Runs the four pillar suites and compares pass counts against a committed
-# baseline (test/pillar-baseline.txt).  If any suite's pass count DROPS
-# versus the baseline, the tripwire FAILS LOUDLY with a before/after table.
+# Enforces every test suite in test/ against a committed baseline.
+# Four pillar suites produce the headline numbers; all others also run
+# unless explicitly QUARANTINED (env-dependent, nondeterministic, or
+# requires external daemons).  A quarantined suite never runs but is
+# printed as SKIPPED so reviewers know it exists.
+#
+# META-GATE: any *.sh file in test/ that is NOT in the baseline AND NOT
+# in quarantine causes the tripwire to FAIL.  Ungated gates are impossible.
 #
 # Usage:
 #   regression-tripwire [--sha <ref>]   default: HEAD
-#
-# When --sha is given, a temporary detached worktree is created at that
-# commit and the suites run from there.  The baseline is always read from
-# the worktree's test/pillar-baseline.txt.
 #
 # Hardened (pro3, r1 T-1): exit-code required, anchored regex, delta>0 fails.
 # Compatible with bash 3.2 (macOS default).
@@ -18,7 +19,6 @@ set -euo pipefail
 
 _script_path="${BASH_SOURCE[0]:-$0}"
 HERE="$(cd "$(dirname "$_script_path")" 2>/dev/null && pwd)" || HERE="$(pwd)"
-# HERE is tool/bin/ — repo root is two levels up
 TOP="$(cd "$HERE/../.." && pwd)"
 
 # ── args ───────────────────────────────────────────────────────────────────
@@ -35,7 +35,8 @@ if [ -n "$SHA" ]; then
   WT="$(mktemp -d "${TMPDIR:-/tmp}/tripwire-wt.XXXXXX")"
   git -C "$TOP" worktree add --detach "$WT" "$SHA" >&2
   STITCHPAD_HOME="$WT/tool"
-  BASELINE="$WT/test/pillar-baseline.txt"
+  BASELINE="$WT/test/suite-baseline.txt"
+  QUARANTINE="$WT/test/suite-quarantine.txt"
   _cleanup() {
     git -C "$TOP" worktree remove --force "$WT" 2>/dev/null || true
     rm -rf "$WT" 2>/dev/null || true
@@ -43,23 +44,41 @@ if [ -n "$SHA" ]; then
 else
   WT="$TOP"
   STITCHPAD_HOME="$TOP/tool"
-  BASELINE="$TOP/test/pillar-baseline.txt"
+  BASELINE="$TOP/test/suite-baseline.txt"
+  QUARANTINE="$TOP/test/suite-quarantine.txt"
   _cleanup() { true; }
 fi
 trap 'kill -9 $(jobs -p) 2>/dev/null; _cleanup' EXIT
 
 [ -f "$BASELINE" ] || { echo "tripwire: FATAL — baseline not found: $BASELINE" >&2; exit 2; }
+[ -f "$QUARANTINE" ] || { echo "tripwire: FATAL — quarantine not found: $QUARANTINE" >&2; exit 2; }
 
-# ── pillar suite list ──────────────────────────────────────────────────────
-# Order: fastest first, most critical last.
+# ── discover suites ─────────────────────────────────────────────────────────
+# All *.sh files in test/ are candidates.
+ALL_SUITES=()
+for f in "$WT/test/"*.sh; do
+  [ -f "$f" ] && ALL_SUITES+=("$(basename "$f")")
+done
+
+# Four pillar suites always run first (fastest then most critical).
 PILLARS="pro5-tier1-mutant-gates.sh roster-recovery-guard-regression.sh recover-migrated-pad.sh recovery-hardening3-regression.sh"
 
-# ── helpers ────────────────────────────────────────────────────────────────
+# ── quarantine resolver ─────────────────────────────────────────────────────
+is_quarantined() {
+  grep -q "^${1}[[:space:]]" "$QUARANTINE" 2>/dev/null
+}
+quarantine_reason() {
+  grep "^${1}[[:space:]]" "$QUARANTINE" 2>/dev/null | sed "s/^${1}[[:space:]]*//" || echo "no reason recorded"
+}
+
+# ── baseline resolver ──────────────────────────────────────────────────────
+has_baseline() {
+  grep -q "^${1}[[:space:]]" "$BASELINE" 2>/dev/null
+}
 baseline_pass() { awk -v suite="$1" '$1 == suite { print $2 }' "$BASELINE"; }
 baseline_fail() { awk -v suite="$1" '$1 == suite { print $3 }' "$BASELINE"; }
 
-# Run one suite, return a pipe-delimited result line: suite|pass|fail|rc
-# Pass and fail are anchored to the RESULTS line; "?" means unparseable.
+# ── run helper ─────────────────────────────────────────────────────────────
 run_suite() {
   local suite="$1" outfile rc output p f result_line
   outfile="$(mktemp "${TMPDIR:-/tmp}/tripwire-out.XXXXXX")"
@@ -74,20 +93,21 @@ run_suite() {
   output="$(cat "$outfile")"
   rm -f "$outfile"
 
-  # ── Anchored parse: extract the RESULTS line, then parse from it ──────
-  # Only the line containing "RESULTS:" is authoritative.  This eliminates
-  # unanchored sub-matches in diagnostic prose (T-1: unanchored FAIL regex).
-  result_line="$(echo "$output" | grep -E 'RESULTS:' | tail -1 || true)"
+  # Check for VOID: mkdtemp failed
+  if echo "$output" | grep -q 'mkdtemp failed'; then
+    echo "$suite|VOID|0|$rc"
+    return 0
+  fi
 
+  # ── Anchored parse ──
+  result_line="$(echo "$output" | grep -E 'RESULTS:' | tail -1 || true)"
   if [ -n "$result_line" ]; then
-    # FMT_B: "=== RESULTS: N PASS, M FAIL, T total ==="
     p="$(echo "$result_line" | grep -oE '[0-9]+ PASS' | grep -oE '[0-9]+' || true)"
     if [ -n "$p" ]; then
       f="$(echo "$result_line" | grep -oE '[0-9]+ FAIL' | grep -oE '[0-9]+' || echo 0)"
       echo "$suite|$p|$f|$rc"
       return 0
     fi
-    # FMT_A: "RESULTS: N passed, M failed"
     p="$(echo "$result_line" | grep -oE '[0-9]+ passed' | grep -oE '[0-9]+' || true)"
     if [ -n "$p" ]; then
       f="$(echo "$result_line" | grep -oE '[0-9]+ failed' | grep -oE '[0-9]+' || echo 0)"
@@ -96,7 +116,6 @@ run_suite() {
     fi
   fi
 
-  # FMT_C: separate "Passed:" / "Failed:" lines (anchored at line start)
   p="$(echo "$output" | grep -E '^Passed:' | tail -1 | grep -oE '[0-9]+' || true)"
   if [ -n "$p" ]; then
     f="$(echo "$output" | grep -E '^Failed:' | tail -1 | grep -oE '[0-9]+' || echo 0)"
@@ -104,89 +123,142 @@ run_suite() {
     return 0
   fi
 
-  # Unparseable — format drift or suite crash before printing results
+  # Special case: "All N ... gates PASSED" (single-line all-pass output)
+  p="$(echo "$output" | grep -oE 'All [0-9]+' | grep -oE '[0-9]+' || true)"
+  if [ -n "$p" ]; then
+    echo "$suite|$p|0|$rc"
+    return 0
+  fi
+
   echo "$suite|?|?|$rc"
 }
 
-# ── run all suites, store results in temp file ─────────────────────────────
+# ═══════════════════════════════════════════════════════════════════════════
+# META-GATE: detect unregistered suites (test file exists but NO baseline
+# and NOT quarantined).  This MUST fail the tripwire — every gate must be
+# gated, or the gate itself is unenforceable.
+# ═══════════════════════════════════════════════════════════════════════════
+UNREGISTERED=()
+for suite in "${ALL_SUITES[@]}"; do
+  if has_baseline "$suite"; then continue; fi
+  if is_quarantined "$suite"; then continue; fi
+  UNREGISTERED+=("$suite")
+done
+
+if [ ${#UNREGISTERED[@]} -gt 0 ]; then
+  echo "==========================================="
+  echo "  TRIPWIRE: UNREGISTERED SUITES DETECTED"
+  echo "==========================================="
+  echo ""
+  echo "The following test files have NEITHER a baseline entry in test/suite-baseline.txt"
+  echo "NOR a quarantine entry in test/suite-quarantine.txt:"
+  echo ""
+  for u in "${UNREGISTERED[@]}"; do
+    echo "  • $u"
+  done
+  echo ""
+  echo "ACTION REQUIRED:"
+  echo "  1. Measure the suite's true pass/fail counts on a quiet machine."
+  echo "  2. Add to test/suite-baseline.txt:  <suite> <pass> <fail>"
+  echo "  3. OR add to test/suite-quarantine.txt with a one-line reason."
+  echo ""
+  echo "Every gate must have a baseline. Ungated gates are impossible."
+  exit 1
+fi
+
+# ── build run list: pillars first, then all other baselined & non-quarantined ─
+RUN_LIST=()
+for suite in $PILLARS; do
+  has_baseline "$suite" && RUN_LIST+=("$suite")
+done
+for suite in "${ALL_SUITES[@]}"; do
+  # skip pillars (already added)
+  [[ " $PILLARS " == *" $suite "* ]] && continue
+  has_baseline "$suite" || continue
+  is_quarantined "$suite" && continue
+  RUN_LIST+=("$suite")
+done
+
+# ── run all suites ──────────────────────────────────────────────────────────
 echo "" >&2
 RFILE="$(mktemp "${TMPDIR:-/tmp}/tripwire-results.XXXXXX")"
 : > "$RFILE"
 
-for suite in $PILLARS; do
-  blp="$(baseline_pass "$suite")"
-  [ -n "$blp" ] || { echo "tripwire: skipping $suite — no baseline" >&2; continue; }
+for suite in "${RUN_LIST[@]}"; do
   echo "tripwire: running $suite ..." >&2
   run_suite "$suite" >> "$RFILE"
+done
+
+# ── also list quarantined suites so reviewers see them ──────────────────────
+QUARANTINED_LIST=()
+for suite in "${ALL_SUITES[@]}"; do
+  is_quarantined "$suite" && QUARANTINED_LIST+=("$suite")
 done
 
 # ── build report table ─────────────────────────────────────────────────────
 echo ""
 echo "==========================================="
-echo "  REGRESSION TRIPWIRE — PILLAR SUITE REPORT"
+echo "  REGRESSION TRIPWIRE — ALL-SUITE REPORT"
 echo "==========================================="
 echo ""
 
 printf "%-41s %10s %10s %10s %-16s\n" "SUITE" "BASELINE" "OBSERVED" "CHANGE" "STATUS"
 printf "%-41s %10s %10s %10s %-16s\n" "-----------------------------------------" "----------" "----------" "----------" "----------------"
 
-REGRESSIONS=0
-PARSED=0
-FAILS=0
+REGRESSIONS=0; PARSED=0; FAILS=0; VOIDS=0
 
 while IFS='|' read -r suite obs_p obs_f obs_rc; do
   [ -n "$suite" ] || continue
   obs_p="${obs_p:-?}"; obs_f="${obs_f:-0}"; obs_rc="${obs_rc:-?}"
   bl_p="$(baseline_pass "$suite")"
   bl_f="$(baseline_fail "$suite")"
-  [ -n "$bl_p" ] || continue
 
-  # T-1 fix 3: format drift is a HARD FAIL, not SKIP.
-  # Non-zero exit + unparseable = CRASHED; zero exit + unparseable = FORMAT-DRIFT.
+  # VOID runs
+  if [ "$obs_p" = "VOID" ]; then
+    VOIDS=$((VOIDS + 1))
+    printf "%-41s %10s %10s %10s %-16s\n" "$suite" "${bl_p:-?} pass" "VOID (mkdtemp)" "?" "VOID"
+    continue
+  fi
+
+  # Unparseable
   if [ "$obs_p" = "?" ]; then
     FAILS=$((FAILS + 1))
     if [ "$obs_rc" != "0" ]; then
-      printf "%-41s %10s %10s %10s %-16s\n" "$suite" "$bl_p pass" "PARSE_ERR" "?" "CRASHED"
+      printf "%-41s %10s %10s %10s %-16s\n" "$suite" "${bl_p:-?} pass" "PARSE_ERR" "?" "CRASHED"
     else
-      printf "%-41s %10s %10s %10s %-16s\n" "$suite" "$bl_p pass" "PARSE_ERR" "?" "FORMAT-DRIFT"
+      printf "%-41s %10s %10s %10s %-16s\n" "$suite" "${bl_p:-?} pass" "PARSE_ERR" "?" "FORMAT-DRIFT"
     fi
     continue
   fi
-  PARSED=$((PARSED + 1))
 
+  # Baseline check
+  if [ "$bl_p" = "?" ]; then
+    # Suite is baselined as "? ?" — measured but not yet locked. Show as MEASURED.
+    printf "%-41s %10s %10s %10s %-16s\n" "$suite" "?" "${obs_p} pass (${obs_f} fail)" "0" "MEASURED"
+    PARSED=$((PARSED + 1))
+    continue
+  fi
+
+  PARSED=$((PARSED + 1))
   delta=$((obs_p - bl_p))
   _trap_status="" _trap_fail=0
 
-  # Primary verdict: count-based. Delta > 0 is INFLATED (T-1 fix 2), not improved.
-  # Exit code is a SECONDARY gate: only fails when the delta verdict is GREEN.
-  # A suite that passed all tests but crashed in cleanup is still suspect.
   if [ "$delta" -lt 0 ]; then
-    _trap_status="REGRESSION"
-    _trap_fail=1
+    _trap_status="REGRESSION"; _trap_fail=1
   elif [ "$delta" -gt 0 ]; then
-    _trap_status="INFLATED"
-    _trap_fail=1
+    _trap_status="INFLATED"; _trap_fail=1
   elif [ "$obs_f" -gt "${bl_f:-0}" ]; then
-    _trap_status="MORE-FAILURES"
-    _trap_fail=1
+    _trap_status="MORE-FAILURES"; _trap_fail=1
   elif [ "$obs_rc" != "0" ]; then
-    # T-1 fix 1: exit code matters — GREEN counts paired with non-zero exit is a fail.
-    # Example: suite prints correct counts then pkill in cleanup fails (exit 1).
-    _trap_status="EXIT-CODE"
-    _trap_fail=1
+    _trap_status="EXIT-CODE"; _trap_fail=1
   else
     _trap_status="GREEN"
   fi
 
-  if [ "$_trap_fail" -eq 1 ]; then
-    FAILS=$((FAILS + 1))
-  fi
+  [ "$_trap_fail" -eq 1 ] && FAILS=$((FAILS + 1))
 
-  # Build OBSERVED string — show exit code when non-zero
   _obs_str="${obs_p} pass (${obs_f} fail)"
-  if [ "$obs_rc" != "0" ] && [ "$_trap_status" != "EXIT-CODE" ]; then
-    _obs_str="${obs_p} pass (${obs_f} fail, rc=$obs_rc)"
-  fi
+  [ "$obs_rc" != "0" ] && [ "$_trap_status" != "EXIT-CODE" ] && _obs_str="${obs_p} pass (${obs_f} fail, rc=$obs_rc)"
 
   case "$_trap_status" in
     REGRESSION) _obs_change="$delta" ;;
@@ -199,10 +271,27 @@ while IFS='|' read -r suite obs_p obs_f obs_rc; do
 done < "$RFILE"
 
 rm -f "$RFILE"
+
+# ── quarantined suites ──────────────────────────────────────────────────────
+if [ ${#QUARANTINED_LIST[@]} -gt 0 ]; then
+  echo ""
+  echo "────────────────────────────────────────────"
+  echo "  QUARANTINED SUITES (skipped)"
+  echo "────────────────────────────────────────────"
+  for q in "${QUARANTINED_LIST[@]}"; do
+    printf "  %-39s  %s\n" "$q" "$(quarantine_reason "$q")"
+  done
+fi
+
 echo ""
 
 # ── verdict ────────────────────────────────────────────────────────────────
-if [ "$PARSED" -eq 0 ] && [ "$FAILS" -eq 0 ]; then
+if [ "$VOIDS" -gt 0 ]; then
+  echo "WARNING: $VOIDS suite(s) returned VOID (mkdtemp failed) — re-run in a quiet window"
+  echo ""
+fi
+
+if [ "$PARSED" -eq 0 ] && [ "$FAILS" -eq 0 ] && [ "$VOIDS" -eq 0 ]; then
   echo "TRIPWIRE: INCONCLUSIVE — no suites produced parseable output"
   exit 2
 fi
@@ -212,16 +301,22 @@ if [ "$FAILS" -gt 0 ]; then
   echo ""
   echo "  STATUS key:"
   echo "    GREEN         pass count matches baseline, failures ≤ baseline, exit 0"
+  echo "    MEASURED      measured but baseline is '?' — not yet locked"
   echo "    REGRESSION    pass count dropped vs baseline"
   echo "    INFLATED      pass count exceeds baseline (unexplained increase)"
   echo "    MORE-FAILURES pass count matches but failure count increased"
   echo "    EXIT-CODE     pass/fail counts match baseline but suite exited non-zero"
   echo "    CRASHED       no parseable RESULTS line + non-zero exit"
   echo "    FORMAT-DRIFT  no parseable RESULTS line + exit 0 — format changed"
+  echo "    VOID          mkdtemp failed — environment contention, re-run"
   echo ""
-  echo "  When baseline is intentionally changed, update test/pillar-baseline.txt."
+  echo "  When baseline is intentionally changed, update test/suite-baseline.txt."
   exit 1
 fi
 
-echo "TRIPWIRE: PASSED — all $PARSED pillar suites green"
+_voiderr=""
+[ "$VOIDS" -gt 0 ] && _voiderr=" ($VOIDS VOID — re-run in a quiet window)"
+
+echo "TRIPWIRE: PASSED — all $PARSED enforced suites green${_voiderr}"
+[ "$VOIDS" -gt 0 ] && exit 2
 exit 0

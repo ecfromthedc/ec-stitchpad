@@ -181,14 +181,34 @@ EOF
     # fx4 F2: git absent from PATH makes init report false success.
     # Fail loudly before touching any files.
     command -v git >/dev/null 2>&1 || { echo "stitchpad: git not found on PATH — stichpad requires git for durable pad history" >&2; exit 1; }
-    git --git-dir="$dir/stitchpad-git" --work-tree="$dir" init -q
-    git --git-dir="$dir/stitchpad-git" --work-tree="$dir" config user.name "stitchpad"
-    git --git-dir="$dir/stitchpad-git" --work-tree="$dir" config user.email "stitchpad@agents.local"
+    # FALSE SUCCESS (found by @pro2's false-success-gate under a read-only stitchpad-git):
+    # these git calls were unchecked, so init wrote the markdown, silently failed to
+    # create any history, and still printed "✓ stitchpad created". A pad with no
+    # isolated git is NOT a pad — sp_find_pad will not recognise it and every later
+    # command answers "no pasture found". Fail here, loudly, instead of handing back
+    # a pad-shaped directory that cannot work.
+    _init_git_fail() {
+      echo "stitchpad: cannot create pad history in $dir/stitchpad-git — $1" >&2
+      echo "stitchpad: pad NOT created (removing partial files)" >&2
+      rm -f "$md" 2>/dev/null || true
+      exit 1
+    }
+    git --git-dir="$dir/stitchpad-git" --work-tree="$dir" init -q \
+      || _init_git_fail "git init failed (permissions?)"
+    git --git-dir="$dir/stitchpad-git" --work-tree="$dir" config user.name "stitchpad" \
+      || _init_git_fail "git config failed"
+    git --git-dir="$dir/stitchpad-git" --work-tree="$dir" config user.email "stitchpad@agents.local" \
+      || _init_git_fail "git config failed"
     # pad content that is versioned alongside the conversation: the task board
     # (tasks.md) and archived transcripts (archive/). Everything else is runtime.
     printf '*\n!stitchpad.md\n!tasks.md\n!archive/\n!archive/**\n' > "$dir/stitchpad-git/info/exclude"
-    git --git-dir="$dir/stitchpad-git" --work-tree="$dir" add stitchpad.md
-    git --git-dir="$dir/stitchpad-git" --work-tree="$dir" commit -q -m "stitchpad created"
+    git --git-dir="$dir/stitchpad-git" --work-tree="$dir" add stitchpad.md \
+      || _init_git_fail "git add failed"
+    git --git-dir="$dir/stitchpad-git" --work-tree="$dir" commit -q -m "stitchpad created" \
+      || _init_git_fail "initial commit failed"
+    # Post-condition: the pad must now be discoverable and have real history.
+    git --git-dir="$dir/stitchpad-git" rev-parse HEAD >/dev/null 2>&1 \
+      || _init_git_fail "no HEAD after initial commit"
     # The entire pad is runtime state with its own isolated Git history. Ignore
     # it from the outer repo so `git stash -u` / `git clean` cannot temporarily
     # remove stitchpad.md while agents and the bridge are still writing.
@@ -200,8 +220,17 @@ EOF
     # Self-sufficient from creation: start this pad's wake watcher now so it's live
     # the moment it exists (pinned to this pad regardless of cwd). join also ensures
     # it; this just means a fresh pad is ready before the first agent even joins.
-    STITCHPAD_PAD_DIR="$dir" ensure_watcher 2>/dev/null \
-      && echo "✓ wake watcher started for #$name"
+    # FALSE SUCCESS (found by @pro2's false-success-gate under a read-only pad git):
+    # ensure_watcher returns 0 for "nothing to do" as well as "started" — it is not a
+    # post-condition. Claiming "✓ wake watcher started" off that return printed a
+    # success for a watcher that was never running. Verify liveness before claiming,
+    # and say plainly when there is no watcher rather than inventing one.
+    STITCHPAD_PAD_DIR="$dir" ensure_watcher 2>/dev/null || true
+    if STITCHPAD_PAD_DIR="$dir" sp_watcher_alive 2>/dev/null; then
+      echo "✓ wake watcher started for #$name"
+    else
+      echo "stitchpad: no wake watcher running for #$name (start one with 'stitchpad watch')" >&2
+    fi
     ;;
 
   restore-roster)
