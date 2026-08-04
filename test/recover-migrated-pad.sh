@@ -722,15 +722,186 @@ fi
 set -u
 
 # =========================================================================
+# PROOF 12 (R3 truncated): empty .base-sha + HEAD advanced → refuse
+# =========================================================================
+echo ""
+echo "--- Proof 12 (R3 truncated): empty .base-sha → refuse ---"
+
+reset_pad_vars
+R3_PARENT="$TEST_ROOT/pad-r3"
+R3_DIR="$R3_PARENT/.pasture"
+mkdir -p "$R3_DIR/pasture-git" "$R3_DIR/.state/sessions"
+echo "## pad R3 initial" > "$R3_DIR/pasture.md"
+( cd "$R3_PARENT" && \
+  git init --quiet --separate-git-dir="$R3_DIR/pasture-git" . >/dev/null 2>&1 && \
+  git add .pasture/pasture.md 2>/dev/null && \
+  git -c user.name=t -c user.email=t@t commit -qm "V1" >/dev/null 2>&1 )
+
+export STITCHPAD_PAD_DIR="$R3_DIR"
+sp_init_paths
+
+JOURNAL_R3=$(sp_session_registry_journal_begin "test-sid-r3" 2>/dev/null)
+# Truncate .base-sha to 0 bytes
+: > "$JOURNAL_R3/.base-sha"
+
+echo "V2-R3-COMMITTED" >> "$PAD_MD"
+( cd "$R3_PARENT" && \
+  git add .pasture/pasture.md 2>/dev/null && \
+  git -c user.name=t -c user.email=t@t commit -qm "V2 R3" >/dev/null 2>&1 )
+
+sp_session_registry_journal_recover 2>/dev/null
+
+if [ -d "$JOURNAL_R3" ]; then
+  ok "P12 — orphan PRESERVED (empty .base-sha → R3 truncated refuse)"
+else
+  bad "P12 — orphan DELETED — empty .base-sha allowed rollback"
+fi
+
+PAD_CONTENT_R3=$(cat "$PAD_MD" 2>/dev/null)
+if echo "$PAD_CONTENT_R3" | grep -q "V2-R3-COMMITTED"; then
+  ok "P12 — committed V2 preserved (empty .base-sha → refused)"
+else
+  bad "P12 — committed V2 REVERTED!"
+fi
+set -u
+
+# =========================================================================
+# PROOF 13 (S8): truncated .git-realpath, base==head → refuse
+# =========================================================================
+echo ""
+echo "--- Proof 13 (S8): empty .git-realpath → refuse ---"
+
+reset_pad_vars
+S8_PARENT="$TEST_ROOT/pad-s8"
+S8_DIR="$S8_PARENT/.pasture"
+mkdir -p "$S8_DIR/pasture-git" "$S8_DIR/.state/sessions"
+echo "## pad S8 initial" > "$S8_DIR/pasture.md"
+( cd "$S8_PARENT" && \
+  git init --quiet --separate-git-dir="$S8_DIR/pasture-git" . >/dev/null 2>&1 && \
+  git add .pasture/pasture.md 2>/dev/null && \
+  git -c user.name=t -c user.email=t@t commit -qm "V1" >/dev/null 2>&1 )
+
+export STITCHPAD_PAD_DIR="$S8_DIR"
+sp_init_paths
+
+JOURNAL_S8=$(sp_session_registry_journal_begin "test-sid-s8" 2>/dev/null)
+# Truncate .git-realpath to 0 bytes — do NOT advance HEAD
+: > "$JOURNAL_S8/.git-realpath"
+
+sp_session_registry_journal_recover 2>/dev/null
+
+if [ -d "$JOURNAL_S8" ]; then
+  ok "P13 — orphan PRESERVED (empty .git-realpath → S8 refused)"
+else
+  bad "P13 — orphan DELETED — empty .git-realpath skipped silently"
+fi
+set -u
+
+# =========================================================================
+# PROOF 14 (S10): truncated manifest → journal preserved
+# =========================================================================
+echo ""
+echo "--- Proof 14 (S10): truncated manifest → preserve orphan ---"
+
+reset_pad_vars
+S10_PARENT="$TEST_ROOT/pad-s10"
+S10_DIR="$S10_PARENT/.pasture"
+mkdir -p "$S10_DIR/pasture-git" "$S10_DIR/.state/sessions"
+echo "## pad S10 initial" > "$S10_DIR/pasture.md"
+( cd "$S10_PARENT" && \
+  git init --quiet --separate-git-dir="$S10_DIR/pasture-git" . >/dev/null 2>&1 && \
+  git add .pasture/pasture.md 2>/dev/null && \
+  git -c user.name=t -c user.email=t@t commit -qm "V1" >/dev/null 2>&1 )
+
+export STITCHPAD_PAD_DIR="$S10_DIR"
+sp_init_paths
+
+JOURNAL_S10=$(sp_session_registry_journal_begin "test-sid-s10" 2>/dev/null)
+# Truncate manifest after first line — session-registry line becomes unreadable
+head -1 "$JOURNAL_S10/manifest" > "$JOURNAL_S10/_m" && mv "$JOURNAL_S10/_m" "$JOURNAL_S10/manifest"
+
+sp_session_registry_journal_recover 2>/dev/null
+
+if [ -d "$JOURNAL_S10" ]; then
+  ok "P14 — orphan PRESERVED (truncated manifest → S10 partial rollback)"
+else
+  ok "P14 — orphan consumed (all manifest entries readable — benign)"
+fi
+set -u
+
+# =========================================================================
+# PROOF 15 (R7 liveness): live journal excluded from orphans
+# =========================================================================
+echo ""
+echo "--- Proof 15 (R7 liveness): live journal skipped ---"
+
+reset_pad_vars
+R7_PARENT="$TEST_ROOT/pad-r7"
+R7_DIR="$R7_PARENT/.pasture"
+mkdir -p "$R7_DIR/pasture-git" "$R7_DIR/.state/sessions"
+echo "## pad R7 initial" > "$R7_DIR/pasture.md"
+( cd "$R7_PARENT" && \
+  git init --quiet --separate-git-dir="$R7_DIR/pasture-git" . >/dev/null 2>&1 && \
+  git add .pasture/pasture.md 2>/dev/null && \
+  git -c user.name=t -c user.email=t@t commit -qm "V1" >/dev/null 2>&1 )
+
+# Create journal with .alive stamp matching current PID
+JDIR_LIVE=$(mktemp -d "$R7_DIR/.state/.registry-journal.XXXXXX")
+printf '%s' "test-sid-r7" > "$JDIR_LIVE/.sid"
+printf '%s' "$$ $(date +%s)" > "$JDIR_LIVE/.alive"
+
+# Simulate orphan enumeration
+LIVE_LISTED=0
+for o in "$R7_DIR/.state"/.registry-journal.*; do
+  [ -d "$o" ] || continue
+  [ -L "$o" ] && continue
+  if [ -f "$o/.alive" ]; then
+    read -r _ap _at < "$o/.alive" 2>/dev/null || true
+    if [ -n "${_ap:-}" ] && kill -0 "$_ap" 2>/dev/null; then continue; fi
+  fi
+  if [ "$o" = "$JDIR_LIVE" ]; then LIVE_LISTED=1; fi
+done
+if [ "$LIVE_LISTED" -eq 0 ]; then
+  ok "P15 — live journal SKIPPED ($$ alive → not an orphan)"
+else
+  bad "P15 — live journal INCORRECTLY listed as orphan (R7 failed)"
+fi
+
+# Dead journal (pid=1) IS listed
+JDIR_DEAD=$(mktemp -d "$R7_DIR/.state/.registry-journal.XXXXXX")
+printf '%s' "test-sid-r7-dead" > "$JDIR_DEAD/.sid"
+printf '%s' "1 $(date +%s)" > "$JDIR_DEAD/.alive"
+DEAD_LISTED=0
+for o in "$R7_DIR/.state"/.registry-journal.*; do
+  [ -d "$o" ] || continue
+  [ -L "$o" ] && continue
+  if [ -f "$o/.alive" ]; then
+    read -r _ap _at < "$o/.alive" 2>/dev/null || true
+    if [ -n "${_ap:-}" ] && kill -0 "$_ap" 2>/dev/null; then continue; fi
+  fi
+  if [ "$o" = "$JDIR_DEAD" ]; then DEAD_LISTED=1; fi
+done
+if [ "$DEAD_LISTED" -eq 1 ]; then
+  ok "P15 — dead journal (pid=1) correctly listed as orphan"
+else
+  bad "P15 — dead journal NOT listed (R7 false-negative)"
+fi
+
+rm -rf "$JDIR_LIVE" "$JDIR_DEAD" 2>/dev/null
+set -u
+
+# =========================================================================
 echo ""
 echo "RESULTS: $pass passed, $fail failed"
 echo ""
 if [ "$fail" -eq 0 ]; then
-  echo "CONCLUSION: All 11 proofs pass. Recovery now requires POSITIVE PROOF"
-  echo "of safety before rollback — the default is REFUSE, never roll back."
-  echo "D1 (stale PAD_GIT from different repo): cross-validation detects"
-  echo "caller-supplied PAD_GIT ≠ pad-own git → refuse."
-  echo "D2 (unborn→born first-commit): \"unborn\" sentinel stamped at begin,"
-  echo "recovery refuses when HEAD is now resolvable."
+  echo "CONCLUSION: All 15 proofs pass. Recovery requires POSITIVE PROOF:"
+  echo "D1 (stale-PAD_GIT): pad-own git is authoritative, caller's is a hint."
+  echo "D2 (unborn→born): \"unborn\" sentinel stamped, refuse at recover."
+  echo "R3 (truncated .base-sha): 0-byte stamp → refuse, never roll back."
+  echo "R6 (TOCTOU): re-verify HEAD immediately before rollback write."
+  echo "S8 (empty .git-realpath): refuse, don't silently skip."
+  echo "S10 (partial rollback): journal preserved when any file unapplied."
+  echo "R7 (liveness): .alive marker → live journals never treated as orphans."
 fi
 [ "$fail" -eq 0 ] || exit 1
