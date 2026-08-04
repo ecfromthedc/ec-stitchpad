@@ -473,7 +473,10 @@ EOF
       }
       { print }
     ' "$PAD_MD" > "$tmp" && sp_write_inplace "$tmp" "$PAD_MD"
-    sp_commit "roster: ~ $who wake=$wake target=$target"
+    sp_commit_or_fail "roster: ~ $who wake=$wake target=$target" || {
+      sp_unlock
+      echo "stitchpad: set-wake NOT recorded — wake mode did not land in pad history" >&2
+      exit 1; }
     sp_unlock
     rm -f "$PAD_STATE/delivery.$who.pending" "$PAD_STATE/delivery.$who.successor" \
       "$PAD_STATE"/delivery."$who".turn.* "$PAD_STATE"/delivery."$who".ack.* \
@@ -564,7 +567,13 @@ EOF
       [ "$_lp" = "$PAD_DIR" ] && [ "$_ln" = "$old" ] && printf '%s|%s|%s' "$PAD_DIR" "$new" "$_lt" > "$_f"
     done
     sp_system "@$old is now @$new"
-    sp_commit "roster: ~ $old renamed to $new"
+    # S3: rename rewrites roster bytes, per-agent state, delivery artifacts,
+    # session bindings and terminal locks on disk. An unrecorded rename leaves
+    # the pad's history disagreeing with its own filesystem.
+    sp_commit_or_fail "roster: ~ $old renamed to $new" || {
+      sp_unlock
+      echo "stitchpad: rename NOT recorded — @$old → @$new did not land in pad history" >&2
+      exit 1; }
     sp_unlock
     if [ "$_hb_live" -eq 1 ]; then
       STITCHPAD_NAME="$new" STITCHPAD_HEARTBEAT_PARENT_PID=0 \
@@ -1070,7 +1079,14 @@ PY
       sed -n "${cut_line},\$p" "$PAD_MD"
     } > "$tmp" && sp_write_inplace "$tmp" "$PAD_MD"
     rm -f "$PAD_STATE"/seen.* 2>/dev/null
-    sp_commit "compact: gen $gen — $arch_count msgs → archive (keep $keep)"
+    # S1: the commit return was ignored, and the readref stamping below then
+    # anchored EVERY agent's cursor to `rev-parse HEAD` — which, on a failed
+    # commit, is the PRE-compact commit. False success compounded into cursor
+    # corruption. Verify the commit landed BEFORE touching any cursor.
+    sp_commit_or_fail "compact: gen $gen — $arch_count msgs → archive (keep $keep)" || {
+      sp_unlock
+      echo "stitchpad: compact NOT recorded — pad unchanged, cursors untouched" >&2
+      exit 1; }
     _h="$(sgit rev-parse HEAD 2>/dev/null || true)"
     if [ -n "$_h" ]; then for _f in "$PAD_STATE"/readref.*; do [ -f "$_f" ] && printf '%s' "$_h" > "$_f"; done; fi
     sp_unlock
@@ -1161,7 +1177,12 @@ PY
     # compact. A still-unanswered mention in the kept tail may re-fire once,
     # which is correct: it IS unanswered.
     rm -f "$PAD_STATE"/seen.* 2>/dev/null
-    sp_commit "archive: $arch_count msgs → $arch_rel (keep $keep)" "$(basename "$PAD_MD")" archive
+    # S2: same compound defect as compact — unchecked commit, then cursors
+    # stamped onto a possibly-stale HEAD. Verify before stamping.
+    sp_commit_or_fail "archive: $arch_count msgs → $arch_rel (keep $keep)" "$(basename "$PAD_MD")" archive || {
+      sp_unlock
+      echo "stitchpad: archive NOT recorded — cursors untouched" >&2
+      exit 1; }
     _h="$(sgit rev-parse HEAD 2>/dev/null || true)"
     if [ -n "$_h" ]; then for _f in "$PAD_STATE"/readref.*; do [ -f "$_f" ] && printf '%s' "$_h" > "$_f"; done; fi
     sp_unlock
@@ -4029,8 +4050,13 @@ TASKSEOF
         printf '\n' >> "$PAD_TASKS"; cat "$moved" >> "$PAD_TASKS"; rm -f "$moved"
         sp_write_inplace "$kept" "$PAD_MD"
         sp_ensure_tasks_pointer
-        sp_commit "tasks: migrated $n_inline inline block(s) → $(basename "$PAD_TASKS")" \
-          "$(basename "$PAD_TASKS")" "$(basename "$PAD_MD")"
+        # S5: migrate MOVES bytes between two files. Unrecorded, tasks.md holds
+        # the cards while the pad no longer does, with nothing in history.
+        sp_commit_or_fail "tasks: migrated $n_inline inline block(s) → $(basename "$PAD_TASKS")" \
+          "$(basename "$PAD_TASKS")" "$(basename "$PAD_MD")" || {
+          sp_unlock
+          echo "stitchpad: task migrate NOT recorded — refusing to report success" >&2
+          exit 1; }
         sp_unlock
         echo "✓ migrated $n_inline task block(s) → $PAD_TASKS"
         ;;
