@@ -865,7 +865,10 @@ delivery_worker() {
       # in silence wondering whether the question was queued or dropped.
       # Only ack once per ordinal — retries of the same busy generation
       # do not re-post. Ack is staged as a marker file; react() posts it.
-      _busy_ack_stage "$name" "$ordinal" "$message_id" "$sender"
+      # An acknowledgement is a COURTESY — it must never be able to break delivery.
+      # If staging fails for any reason the retry loop must still run to completion
+      # (delivery-supervision: "busy seat did not retry to completion").
+      _busy_ack_stage "$name" "$ordinal" "$message_id" "${sender:-}" || true
       sleep "$retry_seconds"
       continue
     fi

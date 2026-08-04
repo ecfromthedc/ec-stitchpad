@@ -43,6 +43,7 @@
 #   stitchpad hook                         internal bridge post-commit signal
 #   stitchpad heal-roster                 repair a corrupt roster via operator credential
 #   stitchpad reconcile                   backfill contributors missing from the roster
+#   stitchpad lanes [--json]             per-seat status, artifact expected vs present, verdict
 #   stitchpad pads [--scratch]            list pads; --scratch shows ephemeral ones
 #   stitchpad evidence list|verify        list sealed artifacts / verify their sha256 sidecars
 #
