@@ -3003,11 +3003,117 @@ except: print("")' 2>/dev/null)"
       done < "$_rp_registry"
       return 1
     }
+    # TASK-10: defense-in-depth fixture reap — three independent detectors.
+    # (a) GROUP:    recorded PGID scan (_runner_reap_registered above)
+    # (b) MARKER:   ps eww env scan — catches setsid/reparented escapes
+    # (c) FS:       lsof +D sweep — catches env-scrubbed evaders whose cwd
+    #               or open fd is still under the fixture root
+    _runner_reap_count=0
+    _runner_fixture_id=""
+    _runner_fixture_root=""
+    _runner_generate_fixture_id() {
+      _runner_fixture_id="$(python3 -c 'import uuid; print(uuid.uuid4())' 2>/dev/null || uuidgen 2>/dev/null || echo "pro6-$$-$RANDOM")"
+    }
+    _runner_generate_fixture_root() {
+      _runner_fixture_root="$(mktemp -d "${TMPDIR:-/tmp}/stitchpad-fixture.XXXXXX")"
+    }
+    _runner_marker_pids() {
+      ps eww -axo pid=,command= 2>/dev/null | grep "STITCHPAD_FIXTURE_ID=$_runner_fixture_id" | awk '{print $1}' | sort -un
+    }
+    _runner_reap_by_marker() {
+      local _pid _killed=0 _survivor=0
+      [ -n "${_runner_fixture_id:-}" ] || return 0
+      for _pid in $(_runner_marker_pids); do
+        [ "$_pid" = "$$" ] && continue
+        [ "$_pid" = "$PPID" ] && continue
+        kill -0 "$_pid" 2>/dev/null || continue
+        kill -TERM "$_pid" 2>/dev/null && _killed=$((_killed + 1)) || true
+      done
+      sleep 0.1
+      for _pid in $(_runner_marker_pids); do
+        [ "$_pid" = "$$" ] && continue
+        [ "$_pid" = "$PPID" ] && continue
+        kill -0 "$_pid" 2>/dev/null || continue
+        kill -KILL "$_pid" 2>/dev/null && _killed=$((_killed + 1)) || true
+        echo "stitchpad: TASK-10 marker reap: killed evader pid=$_pid fixture_id=$_runner_fixture_id" >&2
+      done
+      _runner_reap_count=$((_runner_reap_count + _killed))
+      sleep 0.1
+      for _pid in $(_runner_marker_pids); do
+        [ "$_pid" = "$$" ] && continue
+        [ "$_pid" = "$PPID" ] && continue
+        kill -0 "$_pid" 2>/dev/null || continue
+        _survivor=1
+        echo "stitchpad: TASK-10 boundary guard: pid=$_pid survived marker reap (fixture_id=$_runner_fixture_id)" >&2
+      done
+      [ "$_survivor" -eq 0 ] && return 0
+      return 1
+    }
+    _runner_assert_zero_tmpdir_handles() {
+      local _rp_registry="$1" _rp_group="$2" _rp_root="$3"
+      local _pid _found=0
+      [ -n "${_runner_fixture_id:-}" ] || return 0
+      # Independent ps eww scan — does NOT delegate to _runner_marker_pids.
+      # If _runner_marker_pids is mutated/neutered, this assertion still fires.
+      for _pid in $(ps eww -axo pid=,command= 2>/dev/null | grep "STITCHPAD_FIXTURE_ID=$_runner_fixture_id" | awk '{print $1}' | sort -un); do
+        [ "$_pid" = "$$" ] && continue
+        [ "$_pid" = "$PPID" ] && continue
+        kill -0 "$_pid" 2>/dev/null || continue
+        _found=1
+        echo "stitchpad: TASK-10 boundary guard: pid=$_pid bears fixture marker $_runner_fixture_id after all reaps" >&2
+      done
+      [ "$_found" -eq 0 ] && return 0
+      return 1
+    }
+    _runner_reap_by_filesystem() {
+      local _pid _killed=0 _survivor=0 _root="${_runner_fixture_root:-}"
+      [ -n "$_root" ] && [ -d "$_root" ] || return 0
+      for _pid in $(lsof -Fp +D "$_root" 2>/dev/null | grep '^p' | sed 's/^p//' | sort -un); do
+        [ "$_pid" = "$$" ] && continue
+        [ "$_pid" = "$PPID" ] && continue
+        kill -0 "$_pid" 2>/dev/null || continue
+        kill -TERM "$_pid" 2>/dev/null && _killed=$((_killed + 1)) || true
+      done
+      sleep 0.1
+      for _pid in $(lsof -Fp +D "$_root" 2>/dev/null | grep '^p' | sed 's/^p//' | sort -un); do
+        [ "$_pid" = "$$" ] && continue
+        [ "$_pid" = "$PPID" ] && continue
+        kill -0 "$_pid" 2>/dev/null || continue
+        kill -KILL "$_pid" 2>/dev/null && _killed=$((_killed + 1)) || true
+        echo "stitchpad: TASK-10 fs reap: killed filesystem evader pid=$_pid root=$_root" >&2
+      done
+      _runner_reap_count=$((_runner_reap_count + _killed))
+      sleep 0.1
+      for _pid in $(lsof -Fp +D "$_root" 2>/dev/null | grep '^p' | sed 's/^p//' | sort -un); do
+        [ "$_pid" = "$$" ] && continue
+        [ "$_pid" = "$PPID" ] && continue
+        kill -0 "$_pid" 2>/dev/null || continue
+        _survivor=1
+        echo "stitchpad: TASK-10 boundary guard: pid=$_pid survived filesystem reap (root=$_root)" >&2
+      done
+      [ "$_survivor" -eq 0 ] && return 0
+      return 1
+    }
+    _runner_assert_zero_filesystem_survivors() {
+      local _pid _found=0 _root="${_runner_fixture_root:-}"
+      [ -n "$_root" ] && [ -d "$_root" ] || return 0
+      # Independent lsof scan — not delegated to _runner_reap_by_filesystem.
+      for _pid in $(lsof -Fp +D "$_root" 2>/dev/null | grep '^p' | sed 's/^p//' | sort -un); do
+        [ "$_pid" = "$$" ] && continue
+        [ "$_pid" = "$PPID" ] && continue
+        kill -0 "$_pid" 2>/dev/null || continue
+        _found=1
+        echo "stitchpad: TASK-10 boundary guard: pid=$_pid holds handle under fixture root $_root after all reaps" >&2
+      done
+      [ "$_found" -eq 0 ] && return 0
+      return 1
+    }
     _runner_registry=""
     _runner_output=""
     _runner_cleanup_files() {
       [ -z "${_runner_registry:-}" ] || rm -f "$_runner_registry" "${_runner_registry}.scan" 2>/dev/null || true
       [ -z "${_runner_output:-}" ] || rm -f "$_runner_output" 2>/dev/null || true
+      [ -z "${_runner_fixture_root:-}" ] || rm -rf "$_runner_fixture_root" 2>/dev/null || true
     }
     trap '_runner_cleanup_files' EXIT
     # STITCHPAD_HOME is tool/; repo root is one level up
@@ -3045,11 +3151,15 @@ except: print("")' 2>/dev/null)"
       rc=0
       _runner_registry="$(mktemp "${TMPDIR:-/tmp}/stitchpad-test-processes.XXXXXX")"
       _runner_output="$(mktemp "${TMPDIR:-/tmp}/stitchpad-test-output.XXXXXX")"
-      # A new session/process group closes the polling gap: a child remains a
-      # member even after it reparents to PID 1, so the final group scan can
-      # register it before exact PID/start/command reaping. Python is already a
-      # stitchpad runtime dependency (health and watcher ownership parsing).
-      STITCHPAD_HOME="$STITCHPAD_HOME" env \
+      _runner_generate_fixture_id
+      _runner_generate_fixture_root
+      # Defense in depth: three independent detectors for fixture processes.
+      # (a) GROUP:  recorded PGID catches ordinary children
+      # (b) MARKER: ps eww env scan catches setsid/reparented escapes
+      # (c) FS:     lsof sweep catches env-scrubbed evaders still under the fixture root
+      STITCHPAD_HOME="$STITCHPAD_HOME" \
+        STITCHPAD_FIXTURE_ID="$_runner_fixture_id" \
+        STITCHPAD_FIXTURE_ROOT="$_runner_fixture_root" env \
         -u HERDR_PANE_ID -u HERDR_TAB_ID -u HERDR_ENV \
         -u HERDR_SOCKET_PATH -u HERDR_WORKSPACE_ID \
         python3 -c 'import os,sys; os.setsid(); os.execvp(sys.argv[1], sys.argv[1:])' \
@@ -3064,17 +3174,27 @@ except: print("")' 2>/dev/null)"
       done
       wait "$_runner_test_pid" || rc=$?
       cat "$_runner_output"
+      # Phase 1: group reap (catches ordinary children)
       if ! _runner_reap_registered "$_runner_registry" "$_runner_test_group" "$_runner_test_pid"; then
         [ "$rc" -ne 0 ] || rc=97
       fi
+      # Phase 2: global marker reap (catches double-fork+setsid evaders)
+      _runner_reap_by_marker || { [ "$rc" -ne 0 ] || rc=97; }
+      # Phase 3: global filesystem reap (catches env-scrubbed evaders)
+      _runner_reap_by_filesystem || { [ "$rc" -ne 0 ] || rc=97; }
+      # Phase 4: zero-survivor assertions across all three layers
+      _runner_assert_zero_tmpdir_handles "$_runner_registry" "$_runner_test_group" "$_runner_test_pid" || { [ "$rc" -ne 0 ] || rc=97; }
+      _runner_assert_zero_filesystem_survivors || { [ "$rc" -ne 0 ] || rc=97; }
       rm -f "$_runner_registry" "$_runner_output"
+      rm -rf "$_runner_fixture_root" 2>/dev/null || true
       _runner_registry=""
       _runner_output=""
+      _runner_fixture_root=""
       if [ "$rc" -eq 0 ]; then
-        echo "  PASS: $name"
+        echo "  PASS: $name  (reaped $_runner_reap_count fixture processes)"
         passed=$((passed + 1))
       else
-        echo "  FAIL: $name (exit code $rc)"
+        echo "  FAIL: $name (exit code $rc, reaped $_runner_reap_count fixture processes)"
         failed=$((failed + 1))
       fi
       echo ""
