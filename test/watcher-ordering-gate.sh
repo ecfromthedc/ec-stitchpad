@@ -66,13 +66,24 @@ echo "bob: G2 concurrent write data" >> "$PAD_MD"
 G2_BEFORE=$(count_commits)
 
 LOCK_DIR="$PAD_STATE/.lock"
-mkdir "$LOCK_DIR" 2>/dev/null || { bad "G2: could not simulate held lock"; }
+# An EMPTY .lock dir is NOT a held lock. This release added empty-lock reclaim, which
+# correctly treats an ownerless lock dir as crash residue and takes it — so the old
+# `mkdir "$LOCK_DIR"` simulation tested nothing, and the "INTERLEAVING" this gate
+# reported was the reclaim path working as designed. Hold the lock honestly instead:
+# a background shell acquires it with the REAL sp_lock and keeps it for the assertion.
+( sp_lock 2>/dev/null && { : > "$PAD_STATE/.g2-held"; sleep 30; } ) &
+_G2_HOLDER=$!
+for _ in $(seq 1 200); do [ -e "$PAD_STATE/.g2-held" ] && break; sleep 0.05; done
+[ -e "$PAD_STATE/.g2-held" ] || bad "G2: could not acquire a real held lock"
 
 G2_RC=0
 export SP_LOCK_TIMEOUT=1
 ( sp_lock 2>/dev/null && sp_commit "update test G2" ) || G2_RC=$?
 G2_AFTER=$(count_commits)
-rmdir "$LOCK_DIR" 2>/dev/null || true
+kill -9 "$_G2_HOLDER" 2>/dev/null || true
+wait "$_G2_HOLDER" 2>/dev/null || true
+rm -f "$PAD_STATE/.g2-held" 2>/dev/null || true
+rm -rf "$LOCK_DIR" 2>/dev/null || true
 
 if [ "$G2_AFTER" -eq "$G2_BEFORE" ]; then
   ok "G2: watcher deferred when lock held (no interleaving, still $G2_BEFORE commits)"
