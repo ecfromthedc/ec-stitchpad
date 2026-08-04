@@ -27,9 +27,12 @@ find_pads() {
 
 echo "[bridge] relay=$RELAY  interval=${INTERVAL}s  scanning: ${ROOTS[*]}"
 while :; do
+  _bridge_current=""
   while IFS= read -r padd; do
     [ -f "$padd/stitchpad.md" ] || continue
     name="$(basename "$(dirname "$padd")")"            # pad name = project dir
+    _bridge_current="${_bridge_current}${name}
+"
     md="$(cat "$padd/stitchpad.md")"
     roster="$(cd "$(dirname "$padd")" && "$SP" roster 2>/dev/null | awk -F'|' '{printf "%s{\"name\":\"%s\",\"adapter\":\"%s\"}", (NR>1?",":""), $1, $2}')"
     # file list for the `>` attach dropdown: project files, relative paths, skip junk/dotdirs
@@ -167,5 +170,23 @@ print(json.dumps(skills))
     # Write heartbeat after successful push+drain for this pad
     printf '{"ts":"%s","pad":"%s","interval":%s}' "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$name" "$INTERVAL" > "$padd/.state/bridge-heartbeat" 2>/dev/null || true
   done < <(find_pads)
+
+  # P26: reconcile — DELETE any pad on the relay that was pushed last cycle
+  # but no longer exists on disk (pad directory deleted). Uses a simple
+  # persisted name list in the relay state dir.
+  _bridge_state_dir="${HOME}/.stitchpad/relay/state"
+  mkdir -p "$_bridge_state_dir" 2>/dev/null || true
+  _bridge_prev="$_bridge_state_dir/bridge-pads.prev"
+  if [ -f "$_bridge_prev" ]; then
+    while IFS= read -r _old_name; do
+      [ -z "$_old_name" ] && continue
+      if ! echo "$_bridge_current" | grep -Fxq "$_old_name"; then
+        api -X DELETE "$RELAY/pads?pad=$_old_name" >/dev/null 2>&1 || true
+        echo "[bridge] unregistered: #$_old_name (pad no longer on disk)"
+      fi
+    done < "$_bridge_prev"
+  fi
+  printf '%s\n' "$_bridge_current" > "$_bridge_prev"
+
   sleep "$INTERVAL"
 done

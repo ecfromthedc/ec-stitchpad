@@ -162,6 +162,11 @@ export class PadHub {
     if (url.pathname === "/doctor" && req.method === "GET") {
       return json((await this.ctx.storage.get("doctor")) || null);
     }
+    // P26: clear DO storage when a pad is unregistered
+    if (url.pathname === "/forget" && req.method === "POST") {
+      await this.ctx.storage.deleteAll();
+      return json({ ok: true });
+    }
 
     return json({ error: "not found" }, 404);
   }
@@ -288,6 +293,19 @@ export default {
       }
       return json(Object.entries(idx).map(([name, at]) => ({ name, at })).sort((a, b) => b.at - a.at));
     }
+    // P26: unregister a pad — remove its KV index entry so it disappears from the
+    // sidebar. The bridge calls this when a pad directory is deleted; the CLI calls
+    // this via `stitchpad pads --forget`. Also clears the DO storage.
+    if (url.pathname === "/pads" && req.method === "DELETE") {
+      if (!pad) return json({ error: "missing ?pad=NAME" }, 400);
+      await env.STITCHPAD.delete("pad:" + pad);
+      // also try to clear the DO storage (non-fatal if DO doesn't exist)
+      try {
+        const h = hub(env, pad);
+        await h.fetch("https://hub/forget?pad=" + encodeURIComponent(pad), { method: "POST" });
+      } catch {}
+      return json({ ok: true, forgotten: pad });
+    }
     // Serve attached files from R2 (token-gated; no ?pad needed — key is global)
     if (url.pathname.startsWith("/f/") && req.method === "GET") {
       const obj = await env.IMAGES.get("files/" + url.pathname.slice(3));
@@ -299,7 +317,7 @@ export default {
     if (!pad) return json({ error: "missing ?pad=NAME" }, 400);
 
     // realtime hot path → the pad's Durable Object
-    if (url.pathname === "/ws" || url.pathname === "/push" || url.pathname === "/pad" || url.pathname === "/pad.colors" || url.pathname === "/dmlog" || url.pathname === "/summary" || (url.pathname === "/doctor" && req.method === "GET") || (url.pathname === "/term" && req.method === "GET")) {
+    if (url.pathname === "/ws" || url.pathname === "/push" || url.pathname === "/pad" || url.pathname === "/pad.colors" || url.pathname === "/dmlog" || url.pathname === "/summary" || url.pathname === "/forget" || (url.pathname === "/doctor" && req.method === "GET") || (url.pathname === "/term" && req.method === "GET")) {
       return hub(env, pad).fetch(req);
     }
     // bridge reporting a DM's delivery outcome → pair-log update + live receipt

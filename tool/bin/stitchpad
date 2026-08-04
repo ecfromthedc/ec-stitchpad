@@ -313,19 +313,40 @@ EOF
     # P18: list discoverable pads. By default shows only full channels
     # (non-scratch pads).  --scratch lists ephemeral pads only.
     # --prune deletes scratch pads after listing them.
+    # P26: --forget <name> unregisters an orphaned channel from the relay.
     #   stitchpad pads            list channel pads
     #   stitchpad pads --scratch  list ephemeral/scratch pads
     #   stitchpad pads --prune    remove scratch pads
     #   stitchpad pads --all      list every pad
-    _pads_scratch=0; _pads_prune=0; _pads_all=0
+    #   stitchpad pads --forget <name>  remove orphan channel from relay
+    _pads_scratch=0; _pads_prune=0; _pads_all=0; _pads_forget=""
     while [ "$#" -gt 0 ]; do
       case "$1" in
         --scratch) _pads_scratch=1; shift ;;
         --prune)   _pads_prune=1; shift ;;
         --all)     _pads_all=1; shift ;;
+        --forget)  _pads_forget="$2"; shift 2 ;;
         *) echo "stitchpad: pads: unknown option '$1'" >&2; exit 2 ;;
       esac
     done
+    # P26: --forget calls the relay DELETE endpoint
+    if [ -n "$_pads_forget" ]; then
+      _forget_name="$_pads_forget"
+      _forget_relay="${STITCHPAD_RELAY:-}"
+      _forget_token="${STITCHPAD_TOKEN:-}"
+      if [ -z "$_forget_relay" ] || [ -z "$_forget_token" ]; then
+        echo "stitchpad: pads --forget needs STITCHPAD_RELAY + STITCHPAD_TOKEN in the environment" >&2
+        exit 1
+      fi
+      if curl -fsS -X DELETE -H "authorization: Bearer $_forget_token" \
+        "$_forget_relay/pads?pad=$_forget_name" >/dev/null 2>&1; then
+        echo "✓ forgot #$_forget_name — channel removed from relay"
+      else
+        echo "stitchpad: could not unregister #$_forget_name from relay (check STITCHPAD_RELAY + token)" >&2
+        exit 1
+      fi
+      exit 0
+    fi
     # --prune implies --scratch: only scratch pads are prunable
     [ "$_pads_prune" -eq 1 ] && _pads_scratch=1
     _pads_roots="${STITCHPAD_SCAN_ROOTS:-$HOME}"
