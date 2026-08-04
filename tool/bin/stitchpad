@@ -3731,8 +3731,13 @@ PY
 
       show)
         tid="${1:?usage: stitchpad task show <TASK-N>}"
-        _tf=(); while IFS= read -r _f; do _tf+=("$_f"); done < <(sp_task_files)
-        awk -v want="\`\`\`task $tid" '$0==want{p=1} p{print; if (p>1 && $0=="\`\`\`") exit; p=2}' "${_tf[@]}"
+        # tasks.md wins: show the authoritative copy, not whichever file awk
+        # hits first.  A duplicate (ghost inline block in the pad + real card
+        # in tasks.md) is common pre-migration — warn so the operator knows
+        # to run `stitchpad task migrate`.
+        sp_task_detect_duplicate "$tid" || true
+        _show_f="$(sp_task_file "$tid")" || { echo "stitchpad: no such task: $tid" >&2; exit 1; }
+        awk -v want="\`\`\`task $tid" '$0==want{p=1} p{print; if (p>1 && $0=="\`\`\`") exit; p=2}' "$_show_f"
         ;;
 
       move)
@@ -3745,6 +3750,7 @@ PY
         # legacy inline task is still edited where it sits. An unknown id fails
         # instead of rewriting the whole pad for nothing.
         tfile="$(sp_task_file "$id")" || { sp_unlock; echo "stitchpad: no such task: $id" >&2; exit 1; }
+        sp_task_detect_duplicate "$id" || true  # warn if ghost exists in the other file
         tmp="$(sp_stage "$tfile")"
         awk -v tid="$id" -v ns="$new_status" '
           /^```task / && $2==tid { inblk=1; inmeta=1 }
@@ -3775,6 +3781,7 @@ PY
           esac
         done
         tfile="$(sp_task_file "$id")" || { sp_unlock; echo "stitchpad: no such task: $id" >&2; exit 1; }
+        sp_task_detect_duplicate "$id" || true  # warn if ghost exists in the other file
         tmp="$(sp_stage "$tfile")"
         awk -v tid="$id" -v np="$new_priority" -v na="$new_assignee" -v nl="$new_labels" '
           /^```task / && $2==tid { inblk=1; inmeta=1 }

@@ -1511,6 +1511,22 @@ sp_task_file() {
   return 1
 }
 
+# Detect duplicate task id across both files. Emits a LOUD stderr warning when
+# the same id exists in BOTH stitchpad.md AND tasks.md so the operator knows
+# the two views may differ until they run `stitchpad task migrate`.
+# Returns 0 (duplicate found) / 1 (unique or absent).
+sp_task_detect_duplicate() {
+  local id="$1" found_md=0 found_tasks=0
+  [ -n "$id" ] || return 1
+  [ -f "$PAD_MD" ] && awk -v tid="$id" '$1=="```task" && $2==tid { found=1; exit } END { exit !found }' "$PAD_MD" 2>/dev/null && found_md=1
+  [ -n "${PAD_TASKS:-}" ] && [ -f "$PAD_TASKS" ] && awk -v tid="$id" '$1=="```task" && $2==tid { found=1; exit } END { exit !found }' "$PAD_TASKS" 2>/dev/null && found_tasks=1
+  if [ "$found_md" -eq 1 ] && [ "$found_tasks" -eq 1 ]; then
+    echo "stitchpad: WARNING — task $id exists in BOTH $(basename "$PAD_MD") AND $(basename "$PAD_TASKS"); $(basename "$PAD_TASKS") takes precedence; run 'stitchpad task migrate' to consolidate" >&2
+    return 0
+  fi
+  return 1
+}
+
 sp_tasks() {
   local filter_name="" filter_status=""
   while [ $# -gt 0 ]; do
@@ -1521,14 +1537,16 @@ sp_tasks() {
     esac
   done
   local _tf=(); while IFS= read -r _f; do _tf+=("$_f"); done < <(sp_task_files)
-  awk -v fn="$filter_name" -v fs="$filter_status" '
+  local _sp_tasks_output
+  _sp_tasks_output="$(awk -v fn="$filter_name" -v fs="$filter_status" '
     BEGIN { id=""; title=""; status=""; priority=""; assignee=""; labels=""; created=""; desc="" }
     # multiple inputs (pad + tasks.md): never let an unterminated block in one
     # file bleed into the next
     FNR==1                           { inblk=0; meta=0; id="" }
     /^```task /                      { inblk=1; meta=1; id=$2; gsub(/^ *| *$/,"",id); title=""; status="todo"; priority="none"; assignee=""; labels=""; created=""; desc="" }
     /^```$/ && inblk                 { inblk=0; if (id!="") {
-      # duplicate blocks (compact-carried copies, re-posts): LAST occurrence wins
+      # duplicate blocks: tasks.md is read second via sp_task_files ordering,
+      # so its version naturally wins for cross-file duplicates (LAST wins).
       if (!(id in seen)) { order[++nord]=id; seen[id]=1 }
       data[id] = id "|" title "|" status "|" priority "|" assignee "|" labels "|" created "|" substr(desc, 1, 240)
       fa[id]=assignee; fst[id]=status; id="" } }
@@ -1548,7 +1566,16 @@ sp_tasks() {
     }
     END { for (i=1; i<=nord; i++) { k=order[i]
       if ((fn=="" || fa[k]==fn) && (fs=="" || fst[k]==fs)) print data[k] } }
-  ' "${_tf[@]}"
+  ' "${_tf[@]}")"
+  # Detect cross-file duplicates: when the same task id lives in both
+  # stitchpad.md and tasks.md, WARN so the operator knows the views diverged.
+  if [ -n "${PAD_TASKS:-}" ] && [ -f "$PAD_TASKS" ]; then
+    local _tid
+    while IFS='|' read -r _tid _; do
+      [ -n "$_tid" ] && sp_task_detect_duplicate "$_tid" || true
+    done <<< "$_sp_tasks_output"
+  fi
+  printf '%s\n' "$_sp_tasks_output"
 }
 
 # Create tasks.md (with its header) if it does not exist yet. Callers hold the lock.
