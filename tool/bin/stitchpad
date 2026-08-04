@@ -1439,6 +1439,23 @@ PY
     #   stitchpad clear
     sp_init_paths || exit 1
     sp_lock || exit 1
+    # FLASH2 F1: a legacy pad stores task cards inline in stitchpad.md after the
+    # roster block. The cut below drops everything past the roster closing fence,
+    # which would silently delete the entire task board. Refuse until migrated.
+    # Migrated pads (tasks.md has real cards) are safe: the cut only trims the
+    # conversation transcript + stale inline copies that tasks.md already owns.
+    _clear_has_inline_tasks=0
+    if awk '/^```task[[:space:]]/ { found=1; exit } END { exit !found }' "$PAD_MD"; then
+      if [ ! -f "$PAD_TASKS" ] || ! awk '/^```task[[:space:]]/ { found=1; exit } END { exit !found }' "$PAD_TASKS"; then
+        _clear_has_inline_tasks=1
+      fi
+    fi
+    if [ "$_clear_has_inline_tasks" -eq 1 ]; then
+      sp_unlock
+      echo "stitchpad: REFUSED — task cards live inline in stitchpad.md and clear would delete them."
+      echo "  Run 'stitchpad task migrate' first to move cards to tasks.md, then clear."
+      exit 1
+    fi
     # Keep everything through the roster block's closing fence, drop the rest,
     # add a fresh separator. Reset wake cursors so old mentions don't re-fire.
     tmp="$(sp_stage "$PAD_MD")"
