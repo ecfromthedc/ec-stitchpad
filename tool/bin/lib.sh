@@ -658,6 +658,7 @@ sp_ticker_stop_owned() {
 # stale lock so a crashed writer can't wedge the pad forever.
 SP_LOCK_TIMEOUT="${SP_LOCK_TIMEOUT:-5}"   # seconds to wait for the lock
 SP_LOCK_STALE="${SP_LOCK_STALE:-30}"      # seconds before a held lock is "stale"
+SP_LOCK_EMPTY_RECLAIM="${SP_LOCK_EMPTY_RECLAIM:-1}"  # seconds before an empty (ownerless) lock is reclaimed
 _SP_LOCK_DIR=""
 _SP_LOCK_GENERATION=""
 _SP_LOCK_PID=""
@@ -788,6 +789,14 @@ sp_lock() {
           rmdir "$lock" 2>/dev/null || true
           [ -d "$lock" ] || continue
         fi
+      elif [ ! -f "$lock/owner" ] && [ "$age" -ge "$SP_LOCK_EMPTY_RECLAIM" ]; then
+        # E1: empty (ownerless) lock reclaim. The owner file is written within
+        # ~ms of mkdir, so a lock that is still empty after a short bounded
+        # wait means the creator was SIGKILLed in the mkdir→owner-write window.
+        # Without this, the next writer hits "pad busy (lock timeout)" at 5 s
+        # and every retry fails until the 30 s SP_LOCK_STALE age-based path.
+        rmdir "$lock" 2>/dev/null || true
+        [ -d "$lock" ] || continue
       elif [ "$age" -ge "$SP_LOCK_STALE" ]; then
         # Fallback: age-based stale-break for pre-generation or empty locks.
         # Non-empty unknown locks fail closed because their contents are not
