@@ -343,23 +343,26 @@ EOF
     case "$who" in *[!a-zA-Z0-9_-]*) echo "stitchpad: bad name '$who' (allowed: a-z 0-9 _ -)" >&2; exit 1;; esac
     # F3: Case-ambiguous duplicate: sp_user_exists uses tolower, so 'Dave'
     # matches 'dave' — re-joining the same seat is idempotent (exit 0).
-    if sp_user_exists "$who"; then
-      # Re-joining the same seat is idempotent — but idempotent means the same
-      # OBSERVABLE result, not just the same exit code. This path used to exit 0
-      # while skipping the ponytail context that the equivalent under-lock branch
-      # below emits, so an agent that restarted could never rebuild its context:
-      # it got a bare stderr notice and nothing to work from. Emit the context here
-      # too, so `join` is genuinely idempotent from the caller's point of view.
-      echo "stitchpad: @$who already in roster (or a case variant exists — names are case-insensitive)" >&2
-      printf '%s\n' "$who already in roster" | sp_prompt_with_ponytail
-      exit 0
-    fi
+    # ORDER MATTERS. The duplicate-name check used to run FIRST and exit 0, which
+    # meant a join as an ALREADY-PRESENT name never reached the terminal claim —
+    # so "one terminal = one pad" could be bypassed simply by using an existing
+    # name, and (once rejoin started emitting context) pad context would be handed
+    # to a terminal that never held the claim. Claim the terminal FIRST, then treat
+    # a duplicate as an idempotent rejoin.
     wake="${3:-pull}"; target="${4:--}"
     # ONE TERMINAL = ONE PAD: claim the target terminal before touching the
     # roster; a terminal live in another pad refuses the join outright.
     _owner_pid="${STITCHPAD_HEARTBEAT_PARENT_PID:-$PPID}"
     if [ "$target" != "-" ]; then sp_term_lock_claim "$target" "$who" "$_owner_pid" || exit 1
     else _jsurf="$(sp_this_surface)"; [ -n "$_jsurf" ] && { sp_term_lock_claim "$_jsurf" "$who" "$_owner_pid" || exit 1; }; fi
+    if sp_user_exists "$who"; then
+      # Idempotent rejoin — but only for a terminal that just proved its claim
+      # above. Idempotent means the same OBSERVABLE result, not just the same exit
+      # code: emit the ponytail context so a restarted agent can actually rebuild.
+      echo "stitchpad: @$who already in roster (or a case variant exists — names are case-insensitive)" >&2
+      printf '%s\n' "$who already in roster" | sp_prompt_with_ponytail
+      exit 0
+    fi
     sp_lock || exit 1
     if sp_user_exists "$who"; then
       sp_unlock
