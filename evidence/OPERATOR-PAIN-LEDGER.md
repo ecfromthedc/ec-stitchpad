@@ -410,3 +410,30 @@ P36. TWO SUITES ENCODE OPPOSITE POLICY FOR CONFUSABLE NAMES.  **NEEDS EC.**
      9/3, so absorbing that lane would NOT close this. This is an operator
      decision, not an implementation detail, and it is why roster-validation is
      recorded KNOWN-RED rather than "fixed".
+
+P37. THE REAL HERDR PANE RESOLVES A SURFACE BUT CARRIES NO IDENTITY.
+     Exercised by hand from inside a live herdr pane (HERDR_PANE_ID=w4:p3), self-
+     hosted on the fixed tree — the first time this build ran the core flow on the
+     integration path instead of the CLI path:
+       sp_this_surface  -> term_6583ffdbadffef   (the REAL `herdr pane get`
+                           branch, not the pane-id fallback — so that branch works)
+       whoami           -> EMPTY
+       say              -> "no identity — call the MCP join tool first"
+       doctor           -> "⚠ @captain (cli/pull) — no session identity file"
+     So the pane is recognised as a stable terminal, and the operator standing in
+     it is still nobody. `doctor` diagnoses the gap correctly; nothing closes it.
+     Every core command worked once STITCHPAD_NAME was set (roster, task list,
+     doctor, say all fine), so this is the ONE gap on the herdr path — not a
+     broken integration, a missing identity binding.
+     NOTE ON GATE SCOPE: p28-herdr-parity-gate covers the pane-id FALLBACK branch
+     (where P12 and P27 lived). It deliberately does not bind a live pane, because
+     a fixture that claims the operator's real pane IS P27. The `herdr pane get`
+     branch above is therefore verified BY HAND, and this entry is that record.
+
+P38. `task list` IS UNREADABLE IN A TERMINAL.
+     Every card prints as one pipe-delimited line with the entire body inline —
+     TASK-1's single line runs to ~700 characters of OBSERVED/REQUIRED/ACCEPTANCE
+     prose. Six cards fill a screen and nothing can be scanned. The data is right;
+     the presentation makes the board useless exactly when an operator is trying
+     to see where the fleet is. Sits directly alongside P20/P21 (the board shows
+     no ETA / no live progress) — same surface, same operator.
