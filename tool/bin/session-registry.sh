@@ -858,18 +858,18 @@ sp_session_registry_journal_recover() {
     # live content exactly matches HEAD; otherwise fall through to the loud
     # refusal (matches R3's crashed-say-content-diverges-from-HEAD shape).
     if [ -f "$orphan/.base-sha" ] && [ -n "${PAD_DIR:-}" ] && \
-       [ -d "${PAD_DIR}/stitchpad-git" ]; then
+       [ -d "$PAD_GIT" ]; then
       local _recovery_base_sha _recovery_head_sha _recovery_parent_sha
       _recovery_base_sha="$(cat "$orphan/.base-sha" 2>/dev/null)" || _recovery_base_sha=""
-      _recovery_head_sha="$(git --git-dir="${PAD_DIR}/stitchpad-git" rev-parse HEAD 2>/dev/null)" || _recovery_head_sha=""
+      _recovery_head_sha="$(git --git-dir="$PAD_GIT" rev-parse HEAD 2>/dev/null)" || _recovery_head_sha=""
       if [ -n "$_recovery_base_sha" ] && [ -n "$_recovery_head_sha" ] && \
          [ "$_recovery_base_sha" != "$_recovery_head_sha" ]; then
-        _recovery_parent_sha="$(git --git-dir="${PAD_DIR}/stitchpad-git" rev-parse HEAD~1 2>/dev/null)" || _recovery_parent_sha=""
+        _recovery_parent_sha="$(git --git-dir="$PAD_GIT" rev-parse HEAD~1 2>/dev/null)" || _recovery_parent_sha=""
         local _recovery_superseded=0
         if [ "$_recovery_parent_sha" = "$_recovery_base_sha" ] && [ -n "${PAD_MD:-}" ] && [ -f "$PAD_MD" ]; then
           local _recovery_relpath _recovery_head_bytes _recovery_live_bytes
           _recovery_relpath="$(basename "$PAD_MD")"
-          _recovery_head_bytes="$(git --git-dir="${PAD_DIR}/stitchpad-git" show "HEAD:$_recovery_relpath" 2>/dev/null)"
+          _recovery_head_bytes="$(git --git-dir="$PAD_GIT" show "HEAD:$_recovery_relpath" 2>/dev/null)"
           _recovery_live_bytes="$(cat "$PAD_MD" 2>/dev/null)"
           [ "$_recovery_head_bytes" = "$_recovery_live_bytes" ] && _recovery_superseded=1
         fi
@@ -990,8 +990,8 @@ sp_session_registry_journal_begin() {
   # R3: stamp the pad git HEAD SHA so recovery can refuse when HEAD has
   # advanced past the base — never silently restore old bytes over committed
   # content.
-  if [ -n "${PAD_DIR:-}" ] && [ -d "${PAD_DIR}/stitchpad-git" ]; then
-    printf '%s' "$(git --git-dir="${PAD_DIR}/stitchpad-git" rev-parse HEAD 2>/dev/null)" \
+  if [ -n "${PAD_DIR:-}" ] && [ -d "$PAD_GIT" ]; then
+    printf '%s' "$(git --git-dir="$PAD_GIT" rev-parse HEAD 2>/dev/null)" \
       > "$jdir/.base-sha" 2>/dev/null || true
   fi
   # C2: capture state-root identity for rollback-time validation.
