@@ -7,3 +7,6 @@ recover-migrated-pad.sh 40 0
 pro5-tier1-mutant-gates.sh 15 0
 roster-recovery-guard-regression.sh 21 0
 recovery-hardening3-regression.sh 67 0
+fixture-reap-gate.sh 9 0
+watcher-containment-gate.sh 10 0
+fixture-bleed-gate.sh 5 0

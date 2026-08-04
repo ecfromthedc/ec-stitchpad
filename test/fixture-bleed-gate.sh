@@ -1,149 +1,233 @@
 #!/usr/bin/env bash
-# fixture-bleed-gate.sh — prove that running a test suite creates ZERO
-# new state entries in any pad outside the suite's own fixture root.
+# fixture-bleed-gate.sh — P11: a suite must create ZERO entities outside
+# its own fixture root. Captured `heartbeat --touch flash-portability`
+# was written into REAL pad state while a test ran — a fixture-named
+# heartbeat bleeding into the operator's pad.
 #
-# R1: evidence/live-checkout-escapes.log shows fixture-named heartbeats
-# (flash-portability, etc.) registered against real pads during suite runs.
+# Gate: create decoy pad, snapshot state, run suite, assert zero new state.
+# Bleed = any new file in a .state/, .stitchpad/, .pasture/, or
+# .stitchpad-terminals/ directory NOT under the suite's declared fixture root.
 #
-# Gate: create decoy pad (via init + kill watcher), snapshot, run suite,
-# assert no new state.  Mutant: suite explicitly bleeds into decoy → RED.
-set -euo pipefail
+# Mutant proof (G2): suite explicitly joins into decoy pad → RED.
+set -uo pipefail
 
-HERE="$(cd -P "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-ROOT="$HERE/.."
+ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 SP="$ROOT/tool/bin/stitchpad"
-pass=0; fail=0
+PASSED=0; FAILED=0
+ok()  { PASSED=$((PASSED+1)); printf '  \033[0;32mPASS\033[0m %s\n' "$1"; }
+bad() { FAILED=$((FAILED+1)); printf '  \033[0;31mFAIL\033[0m %s: %s\n' "$1" "${2:-}" >&2; }
 
-ok()  { printf '  \033[0;32mPASS\033[0m %s\n' "$1"; pass=$((pass+1)); }
-bad() { printf '  \033[0;31mFAIL\033[0m %s\n' "$1"; fail=$((fail+1)); }
-
-state_files() { find "$1/.state" -type f 2>/dev/null | sort; }
-state_diff()  { comm -13 "$1" "$2" 2>/dev/null || true; }
-
-# run_bounded <timeout_secs> <cmd...>: run command, kill if exceeds timeout
-run_bounded() {
-  local timeout="$1"; shift
-  local rc=0
-  "$@" &
-  local pid=$!
-  ( sleep "$timeout"; kill -9 $pid 2>/dev/null ) &
-  local bound=$!
-  wait $pid 2>/dev/null || rc=$?
-  kill $bound 2>/dev/null || true
-  return $rc
+_MY_PIDS=""
+_record_pid() { _MY_PIDS="$_MY_PIDS $1"; }
+_cleanup_pids() {
+  for _pid in $_MY_PIDS; do
+    kill "$_pid" 2>/dev/null || true
+    wait "$_pid" 2>/dev/null || true
+  done
+}
+_kill_path() {
+  # Kill processes whose args reference a path — via PID-list, never bare pkill
+  local _path="$1"
+  for _pid in $(ps aux 2>/dev/null | grep "$_path" | grep -v grep | awk '{print $2}'); do
+    kill "$_pid" 2>/dev/null || true
+  done
+  sleep 0.5
 }
 
-echo "=== fixture-bleed-gate ==="
+state_snapshot() {
+  # Snapshot all state-holding directories under a pad root
+  local _pad="$1" _out="$2"
+  {
+    find "$_pad" -path '*/.state/*' -type f 2>/dev/null || true
+    find "$_pad" -path '*/.stitchpad-terminals/*' -type f 2>/dev/null || true
+    find "$_pad" -path '*/.pasture-terminals/*' -type f 2>/dev/null || true
+  } | sort > "$_out"
+}
+
+state_diff() { comm -13 "$1" "$2" 2>/dev/null || true; }
+
+TMP="$(mktemp -d "${TMPDIR:-/tmp}/sp-bleed-gate.XXXXXX")"
+trap 'rm -rf "$TMP"' EXIT
+
+export STITCHPAD_HEARTBEAT_AUTOSTART=0
+unset HERDR_PANE_ID HERDR_TAB_ID HERDR_ENV HERDR_SOCKET_PATH HERDR_WORKSPACE_ID 2>/dev/null || true
+
+echo ""
+echo "=== P11: fixture-bleed-gate ==="
 echo ""
 
-# ── Setup ────────────────────────────────────────────────────────────────
-FIXTURE="$(mktemp -d /tmp/sp-fixture-bleed.XXXXXX)"
-DECOY="$(mktemp -d /tmp/sp-decoy-pad.XXXXXX)"
-mkdir -p "$FIXTURE/test"
+# ===========================================================================
+# G1: CLEAN SUITE — zero bleed into decoy pad
+# ===========================================================================
+echo "--- G1: clean suite (isolated HOME), zero bleed ---"
 
-# Cleanup: kill all watchers touching our dirs, then rm
-_cleanup() {
-  pkill -9 -f "$DECOY" 2>/dev/null || true
-  pkill -9 -f "$FIXTURE" 2>/dev/null || true
-  rm -rf "$FIXTURE" "$DECOY" 2>/dev/null || true
-}
-trap _cleanup EXIT
+DECOY="$TMP/decoy-pad"
+CLEAN_HOME="$TMP/clean-home"
+FIXTURE="$TMP/fixture-suite"
+mkdir -p "$DECOY" "$CLEAN_HOME" "$FIXTURE"
 
-# Create decoy pad
-( cd "$DECOY" && STITCHPAD_HEARTBEAT_AUTOSTART=0 STITCHPAD_WATCH_START_GRACE=0 \
-  "$SP" init --name decoy 2>/dev/null )
+# Create decoy pad with isolated HOME
+(
+  export HOME="$CLEAN_HOME"
+  cd "$DECOY"
+  "$SP" init --name decoy-pad >/dev/null 2>&1
+)
 # Kill any watcher spawned by init
-sleep 1
-pkill -9 -f "$DECOY" 2>/dev/null || true
+_kill_path "$DECOY"
 sleep 0.5
-echo "  decoy pad ready: $DECOY"
+_cleanup_pids
 
-# ── T1: Clean suite, zero bleed ─────────────────────────────────────────
-echo "--- T1: clean suite, zero bleed ---"
+# Snapshot BEFORE
+BEFORE="/tmp/sp-bleed-before.$$"
+rm -f "$BEFORE"
+state_snapshot "$DECOY" "$BEFORE"
+_before_count="$(wc -l < "$BEFORE" 2>/dev/null | tr -d ' ')"
+echo "  decoy baseline: ${_before_count:-0} state entries"
 
-BEFORE="/tmp/sp-bleed-t1-before.$$"
-state_files "$DECOY" > "$BEFORE"
-echo "  decoy baseline: $(wc -l < "$BEFORE" | tr -d ' ') state files"
-
-# Clean suite: does NOT touch decoy, writes only in its own tmpdir
-cat > "$FIXTURE/test/clean-suite.sh" <<'SUITE'
+# Run a clean suite — operates only in its own fixture dir, isolated HOME
+cat > "$FIXTURE/clean-suite.sh" << 'SUITE'
 #!/usr/bin/env bash
 set -euo pipefail
-# Suite operates in isolation — never touches any external pad
-T="$(mktemp -d /tmp/sp-clean-suite.XXXXXX)"
-echo "suite running in $T" > "$T/log.txt"
+T="$(mktemp -d /tmp/sp-clean-fixture.XXXXXX)"
+echo "clean suite in $T" > "$T/log.txt"
+sleep 0.5
 rm -rf "$T"
-echo "=== RESULTS ==="
-echo "Passed:  1"
-echo "Failed:  0"
-exit 0
 SUITE
-chmod +x "$FIXTURE/test/clean-suite.sh"
+chmod +x "$FIXTURE/clean-suite.sh"
 
-run_bounded 15 STITCHPAD_HOME="$ROOT/tool" STITCHPAD_HEARTBEAT_AUTOSTART=0 \
-  STITCHPAD_WATCH_START_GRACE=0 bash "$FIXTURE/test/clean-suite.sh" >/dev/null 2>&1 || true
+(
+  export HOME="$CLEAN_HOME"
+  bash "$FIXTURE/clean-suite.sh" >/dev/null 2>&1
+)
+_cleanup_pids
+_kill_path "$DECOY"
+sleep 0.5
 
-AFTER="/tmp/sp-bleed-t1-after.$$"
-state_files "$DECOY" > "$AFTER"
+# Snapshot AFTER
+AFTER="/tmp/sp-bleed-after.$$"
+rm -f "$AFTER"
+state_snapshot "$DECOY" "$AFTER"
+_after_count="$(wc -l < "$AFTER" 2>/dev/null | tr -d ' ')"
+
+# Compute diff
 NEW="$(state_diff "$BEFORE" "$AFTER")"
+_new_count="$(echo "$NEW" | sed '/^[[:space:]]*$/d' | wc -l | tr -d ' ')"
 
-if [ -z "$NEW" ]; then
-  ok "T1: zero state bleed — decoy .state/ unchanged"
+if [ "${_new_count:-0}" -eq 0 ]; then
+  ok "G1a: zero bleed — decoy state unchanged ($_before_count entries)"
 else
-  bad "T1: BLEED — $(echo "$NEW" | wc -l | tr -d ' ') new file(s)"
-  echo "$NEW" | while read f; do echo "       $f"; done
+  bad "G1a: BLEED — $_new_count new entries in decoy pad"
+  echo "$NEW" | head -5 | while read f; do echo "       NEW: $f"; done
 fi
+
 rm -f "$BEFORE" "$AFTER"
+
+# ===========================================================================
+# G2: MUTANT PROOF — explicit bleed into decoy → RED
+# ===========================================================================
 echo ""
+echo "--- G2: mutant — explicit join into decoy → RED ---"
 
-# ── T2: Mutant — explicit bleed → RED ───────────────────────────────────
-echo "--- T2: mutant bleed → RED ---"
+MUTANT_HOME="$TMP/mutant-home"
+mkdir -p "$MUTANT_HOME"
 
-BEFORE_M="/tmp/sp-bleed-t2-before.$$"
-state_files "$DECOY" > "$BEFORE_M"
+BEFORE_M="/tmp/sp-bleed-m-before.$$"
+rm -f "$BEFORE_M"
+state_snapshot "$DECOY" "$BEFORE_M"
+_before_m="$(wc -l < "$BEFORE_M" 2>/dev/null | tr -d ' ')"
+echo "  pre-mutant decoy state: ${_before_m:-0} entries"
 
-# Mutant suite: cd's into decoy and calls stitchpad operations there
-cat > "$FIXTURE/test/mutant-suite.sh" <<MUTANT
-#!/usr/bin/env bash
-set -euo pipefail
-D="\$(cd -P "\$(dirname "\${BASH_SOURCE[0]}")" && pwd)"
-SP="\$D/../../tool/bin/stitchpad"
-cd "$DECOY"
-# BLEED: join a member in the decoy pad (creates state entries)
-STITCHPAD_HEARTBEAT_AUTOSTART=0 STITCHPAD_WATCH_START_GRACE=0 \
-  STITCHPAD_NAME=bleeder "\$SP" join bleeder off 2>/dev/null || true
-echo "=== RESULTS ==="
-echo "Passed:  1"
-echo "Failed:  0"
-exit 0
-MUTANT
-chmod +x "$FIXTURE/test/mutant-suite.sh"
+# Mutant: suite joins into the decoy pad directly
+(
+  export HOME="$MUTANT_HOME"
+  cd "$DECOY"
+  STITCHPAD_NAME=bleeder "$SP" join bleeder off >/dev/null 2>&1 || true
+  STITCHPAD_NAME=bleeder "$SP" say "I leaked into the decoy pad" >/dev/null 2>&1 || true
+)
+_kill_path "$DECOY"
+sleep 0.5
+_cleanup_pids
 
-# Kill any lingering watchers from T1
-pkill -9 -f "$DECOY" 2>/dev/null || true; sleep 0.5
+AFTER_M="/tmp/sp-bleed-m-after.$$"
+rm -f "$AFTER_M"
+state_snapshot "$DECOY" "$AFTER_M"
+_after_m="$(wc -l < "$AFTER_M" 2>/dev/null | tr -d ' ')"
 
-run_bounded 15 STITCHPAD_HOME="$ROOT/tool" STITCHPAD_HEARTBEAT_AUTOSTART=0 \
-  STITCHPAD_WATCH_START_GRACE=0 bash "$FIXTURE/test/mutant-suite.sh" >/dev/null 2>&1 || true
-
-# Kill watchers spawned by mutant
-pkill -9 -f "$DECOY" 2>/dev/null || true; sleep 0.5
-
-AFTER_M="/tmp/sp-bleed-t2-after.$$"
-state_files "$DECOY" > "$AFTER_M"
 NEW_M="$(state_diff "$BEFORE_M" "$AFTER_M")"
+_new_m="$(echo "$NEW_M" | sed '/^[[:space:]]*$/d' | wc -l | tr -d ' ')"
 
-if [ -n "$NEW_M" ]; then
-  ok "T2: bleed detected — gate goes RED ($(echo "$NEW_M" | wc -l | tr -d ' ') new file(s))"
-  echo "  new: $(echo "$NEW_M" | head -3)"
+echo "  post-mutant decoy state: ${_after_m:-0} entries"
+echo "  new entries: ${_new_m:-0}"
+
+if [ "${_new_m:-0}" -gt 0 ]; then
+  ok "G2a: bleed detected — $_new_m new entries in decoy after mutant join"
 else
-  bad "T2: bleed NOT detected — gate is BLIND (mutant proof FAILED)"
+  bad "G2a: bleed NOT detected — gate is BLIND to explicit join"
 fi
-rm -f "$BEFORE_M" "$AFTER_M"
-echo ""
 
-# ── Results ──────────────────────────────────────────────────────────────
-echo "=== RESULTS ==="
-echo "Passed:  $pass"
-echo "Failed:  $fail"
+if grep -q 'bleeder\|leaked' "$DECOY/.stitchpad/stitchpad.md" 2>/dev/null; then
+  ok "G2b: bleeder message found in decoy pad (contamination confirmed)"
+else
+  bad "G2b: bleeder message NOT found — join didn't take"
+fi
+
+rm -f "$BEFORE_M" "$AFTER_M"
+
+# ===========================================================================
+# G3: TERMINAL CLAIM BLEED — suite must not create terminal claims
+#      outside its isolated HOME
+# ===========================================================================
 echo ""
-[ "$fail" -eq 0 ] && exit 0 || exit 1
+echo "--- G3: terminal claim bleed ---"
+
+ISO_HOME="$TMP/iso-home"
+mkdir -p "$ISO_HOME"
+
+# Count terminal claims before
+_before_terms="$(find "$ISO_HOME/.stitchpad-terminals" -type f -not -name '.mutex.*' -not -name '.byname.*' 2>/dev/null | wc -l | tr -d ' ')"
+echo "  terminal claims before: ${_before_terms:-0}"
+
+# Run a stitchpad operation with this HOME — it creates claims inside HOME
+PAD_G3="$TMP/pad-g3"
+mkdir -p "$PAD_G3"
+
+(
+  export HOME="$ISO_HOME"
+  export STITCHPAD_TERMINAL_NAMESPACE="bleed-gate-$$"
+  cd "$PAD_G3"
+  "$SP" init --name g3-pad >/dev/null 2>&1
+  STITCHPAD_NAME=charlie "$SP" join charlie codex pull - >/dev/null 2>&1
+)
+_kill_path "$PAD_G3"
+_cleanup_pids
+sleep 0.5
+
+_after_terms="$(find "$ISO_HOME/.stitchpad-terminals" -type f -not -name '.mutex.*' -not -name '.byname.*' 2>/dev/null | wc -l | tr -d ' ')"
+
+if [ "${_after_terms:-0}" -gt 0 ]; then
+  ok "G3a: terminal claims created inside isolated HOME (expected — ${_after_terms} claims)"
+else
+  bad "G3a: no terminal claims created (join may have failed silently)"
+fi
+
+# But the claim must NOT be in the REAL operator home
+_real_home_count="$(find "$HOME/.stitchpad-terminals" -type f -name "*bleed-gate*" 2>/dev/null | wc -l | tr -d ' ')"
+if [ "${_real_home_count:-0}" -eq 0 ]; then
+  ok "G3b: zero terminal claims in real HOME (no fixture bleed into operator state)"
+else
+  bad "G3b: BLEED — $_real_home_count fixture claims in real HOME/.stitchpad-terminals"
+  find "$HOME/.stitchpad-terminals" -type f -name "*bleed-gate*" 2>/dev/null | head -3 | while read f; do
+    echo "       BLEED: $f"
+  done
+fi
+
+# ===========================================================================
+echo ""
+cd "$ROOT"
+_cleanup_pids
+rm -f "/tmp/sp-bleed-before.$$" "/tmp/sp-bleed-after.$$" "/tmp/sp-bleed-m-before.$$" "/tmp/sp-bleed-m-after.$$" 2>/dev/null || true
+
+printf '\n========== RESULTS ==========\n'
+printf 'Passed:  %d\nFailed:  %d\n' "$PASSED" "$FAILED"
+[ "$FAILED" -eq 0 ] && { printf '\nAll fixture-bleed gates PASSED.\n'; exit 0; }
+printf '\nSome fixture-bleed gates FAILED.\n'; exit 1
