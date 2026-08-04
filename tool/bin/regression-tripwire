@@ -1,0 +1,191 @@
+#!/usr/bin/env bash
+# regression-tripwire — pillar suite regression gate.
+#
+# Runs the four pillar suites and compares pass counts against a committed
+# baseline (test/pillar-baseline.txt).  If any suite's pass count DROPS
+# versus the baseline, the tripwire FAILS LOUDLY with a before/after table.
+#
+# Usage:
+#   regression-tripwire [--sha <ref>]   default: HEAD
+#
+# When --sha is given, a temporary detached worktree is created at that
+# commit and the suites run from there.  The baseline is always read from
+# the worktree's test/pillar-baseline.txt.
+#
+# Compatible with bash 3.2 (macOS default).
+set -euo pipefail
+
+_script_path="${BASH_SOURCE[0]:-$0}"
+HERE="$(cd "$(dirname "$_script_path")" 2>/dev/null && pwd)" || HERE="$(pwd)"
+# HERE is tool/bin/ — repo root is two levels up
+TOP="$(cd "$HERE/../.." && pwd)"
+
+# ── args ───────────────────────────────────────────────────────────────────
+SHA=""
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --sha) SHA="$2"; shift 2 ;;
+    *) echo "regression-tripwire: unknown arg: $1" >&2; exit 2 ;;
+  esac
+done
+
+# ── worktree setup ─────────────────────────────────────────────────────────
+if [ -n "$SHA" ]; then
+  WT="$(mktemp -d "${TMPDIR:-/tmp}/tripwire-wt.XXXXXX")"
+  git -C "$TOP" worktree add --detach "$WT" "$SHA" >&2
+  STITCHPAD_HOME="$WT/tool"
+  BASELINE="$WT/test/pillar-baseline.txt"
+  _cleanup() {
+    git -C "$TOP" worktree remove --force "$WT" 2>/dev/null || true
+    rm -rf "$WT" 2>/dev/null || true
+  }
+else
+  WT="$TOP"
+  STITCHPAD_HOME="$TOP/tool"
+  BASELINE="$TOP/test/pillar-baseline.txt"
+  _cleanup() { true; }
+fi
+trap 'kill -9 $(jobs -p) 2>/dev/null; _cleanup' EXIT
+
+[ -f "$BASELINE" ] || { echo "tripwire: FATAL — baseline not found: $BASELINE" >&2; exit 2; }
+
+# ── pillar suite list ──────────────────────────────────────────────────────
+# Order: fastest first, most critical last.
+PILLARS="pro5-tier1-mutant-gates.sh roster-recovery-guard-regression.sh recover-migrated-pad.sh recovery-hardening3-regression.sh"
+
+# ── helpers ────────────────────────────────────────────────────────────────
+baseline_pass() { awk -v suite="$1" '$1 == suite { print $2 }' "$BASELINE"; }
+baseline_fail() { awk -v suite="$1" '$1 == suite { print $3 }' "$BASELINE"; }
+
+# Run one suite, return a pipe-delimited result line.
+run_suite() {
+  local suite="$1" outfile rc output p f
+  outfile="$(mktemp "${TMPDIR:-/tmp}/tripwire-out.XXXXXX")"
+
+  set +e
+  STITCHPAD_HOME="$STITCHPAD_HOME" \
+    HERDR_PANE_ID= HERDR_TAB_ID= HERDR_ENV= HERDR_SOCKET_PATH= HERDR_WORKSPACE_ID= \
+    bash "$WT/test/$suite" >"$outfile" 2>&1
+  rc=$?
+  set -e
+
+  output="$(cat "$outfile")"
+  rm -f "$outfile"
+
+  p=""; f="0"
+
+  # FMT_B: "=== RESULTS: N PASS, M FAIL, T total ==="
+  p="$(echo "$output" | grep -oE 'RESULTS: ([0-9]+) PASS' | tail -1 | grep -oE '[0-9]+' || true)"
+  if [ -n "$p" ]; then
+    f="$(echo "$output" | grep -oE '([0-9]+) FAIL' | tail -1 | grep -oE '[0-9]+' || echo 0)"
+    echo "$suite|$p|$f|$rc"
+    return 0
+  fi
+
+  # FMT_A: "RESULTS: N passed, M failed"
+  p="$(echo "$output" | grep -oE 'RESULTS: ([0-9]+) passed' | tail -1 | grep -oE '[0-9]+' || true)"
+  if [ -n "$p" ]; then
+    f="$(echo "$output" | grep -oE '([0-9]+) failed' | tail -1 | grep -oE '[0-9]+' || echo 0)"
+    echo "$suite|$p|$f|$rc"
+    return 0
+  fi
+
+  # FMT_C: "Passed:  N" then "Failed:  M"
+  p="$(echo "$output" | grep -E '^Passed:' | tail -1 | grep -oE '[0-9]+' || true)"
+  if [ -n "$p" ]; then
+    f="$(echo "$output" | grep -E '^Failed:' | tail -1 | grep -oE '[0-9]+' || echo 0)"
+    echo "$suite|$p|$f|$rc"
+    return 0
+  fi
+
+  echo "$suite|?|?|$rc"
+}
+
+# ── run all suites, store results in temp file ─────────────────────────────
+echo "" >&2
+RFILE="$(mktemp "${TMPDIR:-/tmp}/tripwire-results.XXXXXX")"
+: > "$RFILE"
+
+for suite in $PILLARS; do
+  blp="$(baseline_pass "$suite")"
+  [ -n "$blp" ] || { echo "tripwire: skipping $suite — no baseline" >&2; continue; }
+  echo "tripwire: running $suite ..." >&2
+  run_suite "$suite" >> "$RFILE"
+done
+
+# ── build report table ─────────────────────────────────────────────────────
+echo ""
+echo "==========================================="
+echo "  REGRESSION TRIPWIRE — PILLAR SUITE REPORT"
+echo "==========================================="
+echo ""
+
+printf "%-41s %10s %10s %10s %-14s\n" "SUITE" "BASELINE" "OBSERVED" "CHANGE" "STATUS"
+printf "%-41s %10s %10s %10s %-14s\n" "-----------------------------------------" "----------" "----------" "----------" "--------------"
+
+REGRESSIONS=0
+PARSED=0
+
+while IFS='|' read -r suite obs_p obs_f obs_rc; do
+  [ -n "$suite" ] || continue
+  obs_p="${obs_p:-?}"; obs_f="${obs_f:-0}"; obs_rc="${obs_rc:-?}"
+  bl_p="$(baseline_pass "$suite")"
+  bl_f="$(baseline_fail "$suite")"
+  [ -n "$bl_p" ] || continue
+
+  if [ "$obs_p" = "?" ]; then
+    printf "%-41s %10s %10s %10s %-14s\n" "$suite" "$bl_p pass" "PARSE_ERR" "?" "SKIP"
+    continue
+  fi
+  PARSED=$((PARSED + 1))
+
+  delta=$((obs_p - bl_p))
+  status=""
+  if [ "$delta" -lt 0 ]; then
+    status="REGRESSION"
+    REGRESSIONS=$((REGRESSIONS + 1))
+  elif [ "$delta" -eq 0 ]; then
+    if [ "$obs_f" -gt "${bl_f:-0}" ]; then
+      status="MORE-FAILURES"
+      REGRESSIONS=$((REGRESSIONS + 1))
+    else
+      status="SAME"
+    fi
+  else
+    status="IMPROVED"
+  fi
+
+  change_str="$delta"
+  [ "$delta" -gt 0 ] && change_str="+$delta"
+
+  printf "%-41s %10s %10s %10s %-14s\n" \
+    "$suite" \
+    "${bl_p} pass" \
+    "${obs_p} pass" \
+    "$change_str" \
+    "$status"
+done < "$RFILE"
+
+rm -f "$RFILE"
+echo ""
+
+# ── verdict ────────────────────────────────────────────────────────────────
+if [ "$PARSED" -eq 0 ]; then
+  echo "TRIPWIRE: INCONCLUSIVE — no suites produced parseable output"
+  exit 2
+fi
+
+if [ "$REGRESSIONS" -gt 0 ]; then
+  echo "TRIPWIRE: FAILED — $REGRESSIONS suite(s) regressed"
+  echo ""
+  echo "  Column 'BASELINE' is the committed expected pass count"
+  echo "  Column 'OBSERVED' is what just ran"
+  echo "  STATUS = REGRESSION means pass count dropped vs. baseline"
+  echo ""
+  echo "  Investigate the offending commit; if the new results are"
+  echo "  correct, update test/pillar-baseline.txt and recommit."
+  exit 1
+fi
+
+echo "TRIPWIRE: PASSED — all $PARSED pillar suites match or exceed baseline"
+exit 0

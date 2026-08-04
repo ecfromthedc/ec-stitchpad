@@ -1,0 +1,9 @@
+# pillar-baseline.txt — recorded pass/fail counts for the four pillar suites.
+# Format: <suite-name> <expected_pass_count> <expected_fail_count>
+# The regression tripwire compares each run against these numbers.
+# If any suite's pass count DROPS, the tripwire fails loudly.
+# Update this file after verified intentional suite changes.
+recover-migrated-pad.sh 40 0
+pro5-tier1-mutant-gates.sh 15 0
+roster-recovery-guard-regression.sh 21 0
+recovery-hardening3-regression.sh 66 0
