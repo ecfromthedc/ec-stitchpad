@@ -1199,6 +1199,24 @@ sp_recover_inplace() {
   sp_apply_ready_generation "$ready" "$target" "$generation"
 }
 
+# Post-condition verification: confirm a durable commit actually landed.
+# Callers snapshot the rev-list count BEFORE the mutation, then call this
+# AFTER sp_commit.  Returns 0 when the commit landed (or PAD_GIT is absent,
+# which the sp_commit gate handles), returns 1 when the expected commit is
+# absent from the tip.  FAILS LOUDLY: success messages must not be printed
+# for mutations that never committed.
+sp_commit_count() {
+  sgit rev-list --count HEAD 2>/dev/null || echo 0
+}
+
+sp_verify_commit_landed() {
+  local pre_count="${1:-0}" post_count
+  [ -d "$PAD_GIT" ] || return 0
+  post_count="$(sp_commit_count)"
+  [ "$post_count" -gt "$pre_count" ] && return 0
+  return 1
+}
+
 # Append a small italic system/presence line to the pad (join/leave, etc.).
 # Not a message — no @sender — so it never trips mention detection or the gate.
 sp_system() {

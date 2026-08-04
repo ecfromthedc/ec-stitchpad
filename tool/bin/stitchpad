@@ -176,7 +176,7 @@ EOF
     body="$(mktemp)"; tmp="$(sp_stage "$PAD_MD")"
     [ -f "$PAD_MD" ] && cat "$PAD_MD" > "$body"
     {
-      printf '# 🧵 #%s — agent stitchpad\n\n' "$(basename "$(dirname "$PAD_DIR")")"
+      printf -- '# 🧵 #%s — agent stitchpad\n\n' "$(basename "$(dirname "$PAD_DIR")")"
       cat "$backup"
       printf '\n\n---\n\n'
       cat "$body"
@@ -186,6 +186,94 @@ EOF
     sp_commit "repair: restore missing roster header"
     sp_unlock
     echo "✓ roster restored from $backup"
+    ;;
+
+  heal-roster)
+    # Recover the roster from pad git history when the fence is missing or
+    # empty. Walk HEAD history in reverse chronological order, find the first
+    # commit whose stitchpad.md blob contains a valid ```roster``` fence WITH
+    # at least one member, extract it, and prepend it to the pad under the
+    # mutation lock. Refuse LOUDLY if no historic roster exists (never guess).
+    # Post-condition: after this command exits 0, the pad has a valid roster
+    # fence with members and the commit is durable.
+    sp_init_paths || exit 1
+    if [ -f "$PAD_MD" ] && grep -q '^```roster[[:space:]]*$' "$PAD_MD" 2>/dev/null; then
+      _count="$(sp_roster_members_count "$PAD_MD")"
+      if [ "$_count" -gt 0 ]; then
+        echo "stitchpad: roster already present with $_count members — nothing to heal" >&2
+        exit 0
+      fi
+    fi
+    [ -d "$PAD_GIT" ] || { echo "stitchpad: no pad git history — cannot heal roster" >&2; exit 1; }
+    # Walk pad git history in reverse chronological order. For each commit,
+    # extract stitchpad.md and check for a populated roster fence. The FIRST
+    # hit (newest) is the best candidate — the most recent known-good roster.
+    _heal_candidate=""
+    _heal_roster_text=""
+    _heal_members=0
+    while IFS= read -r _hc; do
+      [ -n "$_hc" ] || continue
+      _blob_text="$(git --git-dir="$PAD_GIT" show "$_hc:stitchpad.md" 2>/dev/null || true)"
+      [ -n "$_blob_text" ] || continue
+      if ! printf '%s' "$_blob_text" | grep -q '^```roster[[:space:]]*$'; then
+        continue
+      fi
+      _member_count="$(printf '%s' "$_blob_text" | awk '
+        /^```roster/ { inblk=1; next }
+        /^```/ && inblk { inblk=0 }
+        inblk && $0 !~ /^[[:space:]]*#/ && $0 !~ /^[[:space:]]*$/ {
+          n=split($0,f,/[[:space:]]*\|[[:space:]]*/); if(n>=2) c++
+        }
+        END { print c+0 }
+      ')"
+      if [ "$_member_count" -gt 0 ]; then
+        _heal_candidate="$_hc"
+        _heal_members="$_member_count"
+        _heal_roster_text="$(printf '%s' "$_blob_text" | awk '
+          /^```roster/ { inblk=1; print; next }
+          /^```/ && inblk { print; inblk=0; exit }
+          inblk { print }
+        ')"
+        break
+      fi
+    done < <(git --git-dir="$PAD_GIT" log --format='%H' -- stitchpad.md 2>/dev/null || true)
+    [ -n "$_heal_roster_text" ] || {
+      echo "stitchpad: no historic roster with members found in pad git — cannot heal; re-init or restore-roster from a backup" >&2
+      exit 1
+    }
+    sp_lock || exit 1
+    # Revalidate under lock (concurrent heal could have won)
+    if [ -f "$PAD_MD" ] && grep -q '^```roster[[:space:]]*$' "$PAD_MD" 2>/dev/null; then
+      _count2="$(sp_roster_members_count "$PAD_MD")"
+      if [ "$_count2" -gt 0 ]; then
+        sp_unlock
+        echo "stitchpad: roster already present with $_count2 members (concurrent heal won)"
+        exit 0
+      fi
+    fi
+    _body="$(mktemp)"; _tmp="$(sp_stage "$PAD_MD")"
+    [ -f "$PAD_MD" ] && cat "$PAD_MD" > "$_body"
+    {
+      printf -- '# 🧵 #%s — agent stitchpad\n\n' "$(basename "$(dirname "$PAD_DIR")")"
+      printf -- '%s\n\n' "$_heal_roster_text"
+      printf '---\n\n'
+      cat "$_body"
+    } > "$_tmp"
+    sp_write_inplace "$_tmp" "$PAD_MD"
+    rm -f "$_body"
+    _pre_commit="$(sp_commit_count)"
+    sp_commit "repair: heal-roster recovered $_heal_members member(s) from $_heal_candidate" || {
+      sp_unlock
+      echo "stitchpad: heal-roster commit failed — pad may be dirty" >&2
+      exit 1
+    }
+    sp_verify_commit_landed "$_pre_commit" || {
+      sp_unlock
+      echo "stitchpad: heal-roster commit did not land — refusing to report success" >&2
+      exit 1
+    }
+    sp_unlock
+    echo "✓ roster healed from commit ${_heal_candidate:0:7} ($_heal_members member(s))"
     ;;
 
   join)
