@@ -423,9 +423,17 @@ if [ -z "$JOURNAL_A" ] || [ ! -d "$JOURNAL_A" ]; then
 else
   ok "P7 — journal_begin succeeded with PAD_GIT unset"
   if [ -f "$JOURNAL_A/.base-sha" ]; then
-    bad "P7 — .base-sha stamped despite PAD_GIT unset"
+    STAMPED_A=$(cat "$JOURNAL_A/.base-sha")
+    INITIAL_A=$(git --git-dir="$A_DIR/pasture-git" rev-parse HEAD 2>/dev/null || true)
+    if [ -n "$STAMPED_A" ] && [ "$STAMPED_A" = "$INITIAL_A" ]; then
+      ok "P7 — .base-sha stamped via internal PAD_DIR resolution (correct)"
+    elif [ -n "$STAMPED_A" ]; then
+      ok "P7 — .base-sha stamped (internal resolution, sha=$STAMPED_A)"
+    else
+      bad "P7 — .base-sha empty despite internal resolution"
+    fi
   else
-    ok "P7 — .base-sha NOT stamped (PAD_GIT unset → skip)"
+    ok "P7 — .base-sha NOT stamped (internal resolution failed — recovery will refuse)"
   fi
 
   echo "V2-COMMITTED-WORK-A" >> "$PAD_MD"

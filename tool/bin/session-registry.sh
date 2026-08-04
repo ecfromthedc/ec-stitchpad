@@ -845,40 +845,50 @@ sp_session_registry_journal_recover() {
     #   • pointing at a DIFFERENT repo than the one that stamped .base-sha
     #     (symlink-to-wrong-repo attack — C)
     #
+    # Resolve the git dir internally from PAD_DIR when PAD_GIT is unset
+    # or invalid (same resolution order as journal_begin and lib.sh:144:
+    # caller-supplied PAD_GIT first, then pasture-git/, then stitchpad-git/,
+    # refusing symlinks at every step).
+    #
     # Decision order (every path is fail-closed — never roll back when
     # the identity of the pad repository cannot be verified):
-    #   (a) PAD_GIT unset/empty → refuse (cannot verify safety)
-    #   (b) PAD_GIT is a symlink → refuse (embedder bypass of init guard)
-    #   (c) PAD_GIT not a directory → refuse; the existence of .base-sha
-    #       in the orphan proves a repo existed at journal_begin (B)
+    #   (a) Git dir unresolvable → refuse (A)
+    #   (b) Resolved git dir is a symlink → refuse (C)
+    #   (c) Git dir not a directory → refuse; .base-sha proves repo existed (B)
     #   (d) Resolve canonical path; if .git-realpath stamped and differs
     #       from current → refuse (repo swapped — C)
     #   (e) Cross-check: HEAD unresolvable → refuse (empty/unborn repo)
     #   (f) R3: base-SHA ≠ HEAD → refuse or supersede (canonical guard)
-    local _git_real="" _git_ok=0
-    if [ -z "${PAD_GIT:-}" ]; then
+    local _git="" _git_real="" _git_ok=0
+    # Resolve git dir: prefer caller-set PAD_GIT if valid, then PAD_DIR
+    if [ -n "${PAD_GIT:-}" ] && [ ! -L "$PAD_GIT" ] && [ -d "$PAD_GIT" ]; then
+      _git="$PAD_GIT"
+    elif [ -n "${PAD_DIR:-}" ]; then
+      if [ -d "$PAD_DIR/pasture-git" ] && [ ! -L "$PAD_DIR/pasture-git" ]; then
+        _git="$PAD_DIR/pasture-git"
+      elif [ -d "$PAD_DIR/stitchpad-git" ] && [ ! -L "$PAD_DIR/stitchpad-git" ]; then
+        _git="$PAD_DIR/stitchpad-git"
+      fi
+    fi
+    if [ -z "$_git" ]; then
       if [ -f "$orphan/.base-sha" ]; then
-        echo "stitchpad: stale journal $(basename "$orphan") — PAD_GIT is not set (caller did not run sp_init_paths) but .base-sha proves a repo existed at journal_begin; refusing recovery — orphan PRESERVED at $orphan" >&2
+        echo "stitchpad: stale journal $(basename "$orphan") — cannot resolve pad git directory (PAD_GIT unset, PAD_DIR has no pasture-git/ or stitchpad-git/) but .base-sha proves a repo existed at journal_begin; refusing recovery — orphan PRESERVED at $orphan" >&2
       else
-        echo "stitchpad: stale journal $(basename "$orphan") — PAD_GIT is not set and no .base-sha; cannot verify safety — orphan PRESERVED at $orphan" >&2
+        echo "stitchpad: stale journal $(basename "$orphan") — cannot resolve pad git directory and no .base-sha; cannot verify safety — orphan PRESERVED at $orphan" >&2
       fi
       continue
     fi
-    if [ -L "$PAD_GIT" ]; then
-      echo "stitchpad: stale journal $(basename "$orphan") — PAD_GIT is a symlink; refusing recovery — orphan PRESERVED at $orphan" >&2
-      continue
-    fi
-    if [ ! -d "$PAD_GIT" ]; then
+    if [ ! -d "$_git" ]; then
       if [ -f "$orphan/.base-sha" ]; then
-        echo "stitchpad: stale journal $(basename "$orphan") — PAD_GIT ($PAD_GIT) does not exist but .base-sha proves a repo existed at journal_begin; refusing recovery — orphan PRESERVED at $orphan" >&2
+        echo "stitchpad: stale journal $(basename "$orphan") — resolved git dir ($_git) does not exist but .base-sha proves a repo existed at journal_begin; refusing recovery — orphan PRESERVED at $orphan" >&2
       else
-        echo "stitchpad: stale journal $(basename "$orphan") — PAD_GIT ($PAD_GIT) does not exist and no .base-sha; cannot verify safety — orphan PRESERVED at $orphan" >&2
+        echo "stitchpad: stale journal $(basename "$orphan") — resolved git dir ($_git) does not exist and no .base-sha; cannot verify safety — orphan PRESERVED at $orphan" >&2
       fi
       continue
     fi
-    _git_real="$(cd -P "$PAD_GIT" 2>/dev/null && pwd)" || _git_real=""
+    _git_real="$(cd -P "$_git" 2>/dev/null && pwd)" || _git_real=""
     if [ -z "$_git_real" ]; then
-      echo "stitchpad: stale journal $(basename "$orphan") — could not resolve canonical path for PAD_GIT ($PAD_GIT); refusing recovery — orphan PRESERVED at $orphan" >&2
+      echo "stitchpad: stale journal $(basename "$orphan") — could not resolve canonical path for git dir ($_git); refusing recovery — orphan PRESERVED at $orphan" >&2
       continue
     fi
     # Cross-check repo identity: the orphan's .git-realpath (stamped at
@@ -1041,6 +1051,7 @@ _sp_session_registry_journal_files() {
 sp_session_registry_journal_begin() {
   local sid="${1:-}"
   [ -n "${PAD_STATE:-}" ] && [ -d "$PAD_STATE" ] && [ ! -L "$PAD_STATE" ] || return 1
+  [ -n "${PAD_DIR:-}" ] && [ -d "$PAD_DIR" ] && [ ! -L "$PAD_DIR" ] || return 1
   # C1: recover stale journals from a prior crash BEFORE any new journal.
   sp_session_registry_journal_recover
   local jdir
@@ -1052,33 +1063,34 @@ sp_session_registry_journal_begin() {
   # can refuse when HEAD has advanced past the base and can cross-check
   # that it's talking to the same repository as journal_begin.
   #
-  # Validate PAD_GIT identity here — do not trust a caller-supplied
-  # global that may be unset (direct-caller embedder), a symlink
-  # (bypassing init guard), or dangling (TOCTOU before the stamp).
-  # Failing to stamp is safe: the orphan has no .base-sha and no
-  # .git-realpath; recovery's fail-closed guard refuses.
-  if [ -n "${PAD_DIR:-}" ]; then
-    if [ -z "${PAD_GIT:-}" ] || [ -L "$PAD_GIT" ] || [ ! -d "$PAD_GIT" ]; then
-      # Cannot stamp — PAD_GIT is unset, a symlink, or missing.
-      # Recovery will refuse this orphan (fail-closed by identity).
-      # Do NOT fail journal_begin — the journal still snapshots the
-      # pad state for crash recovery even without a repo stamp.
-      :
-    else
-      local _begin_real
-      _begin_real="$(cd -P "$PAD_GIT" 2>/dev/null && pwd)" || _begin_real=""
-      if [ -n "$_begin_real" ]; then
-        printf '%s' "$_begin_real" > "$jdir/.git-realpath" 2>/dev/null || true
-        local _stamp_sha
-        _stamp_sha="$(git --git-dir="$_begin_real" rev-parse HEAD 2>/dev/null)" || _stamp_sha=""
-        # Only stamp when HEAD resolves to a real commit.  An empty/unborn
-        # repo produces an empty string which, when written to .base-sha,
-        # causes the R3 guard's [ -n ] to fail → fail-open → silent
-        # rollback.  Skipping the stamp pairs with the recovery fail-closed
-        # guard that refuses when HEAD is unresolvable.
-        if [ -n "$_stamp_sha" ]; then
-          printf '%s' "$_stamp_sha" > "$jdir/.base-sha" 2>/dev/null || true
-        fi
+  # Resolve the git dir internally from PAD_DIR — do not trust a
+  # caller-supplied global that may be unset (direct-caller embedder),
+  # a symlink (bypassing init guard), or missing.
+  # If PAD_GIT is set and valid it is preferred; otherwise resolve
+  # from PAD_DIR using the same order as lib.sh:144 (pasture-git first,
+  # then stitchpad-git, refusing symlinks).
+  local _git=""
+  if [ -n "${PAD_GIT:-}" ] && [ ! -L "$PAD_GIT" ] && [ -d "$PAD_GIT" ]; then
+    _git="$PAD_GIT"
+  elif [ -d "$PAD_DIR/pasture-git" ] && [ ! -L "$PAD_DIR/pasture-git" ]; then
+    _git="$PAD_DIR/pasture-git"
+  elif [ -d "$PAD_DIR/stitchpad-git" ] && [ ! -L "$PAD_DIR/stitchpad-git" ]; then
+    _git="$PAD_DIR/stitchpad-git"
+  fi
+  if [ -n "$_git" ]; then
+    local _begin_real
+    _begin_real="$(cd -P "$_git" 2>/dev/null && pwd)" || _begin_real=""
+    if [ -n "$_begin_real" ]; then
+      printf '%s' "$_begin_real" > "$jdir/.git-realpath" 2>/dev/null || true
+      local _stamp_sha
+      _stamp_sha="$(git --git-dir="$_begin_real" rev-parse HEAD 2>/dev/null)" || _stamp_sha=""
+      # Only stamp when HEAD resolves to a real commit.  An empty/unborn
+      # repo produces an empty string which, when written to .base-sha,
+      # causes the R3 guard's [ -n ] to fail → fail-open → silent
+      # rollback.  Skipping the stamp pairs with the recovery fail-closed
+      # guard that refuses when HEAD is unresolvable.
+      if [ -n "$_stamp_sha" ]; then
+        printf '%s' "$_stamp_sha" > "$jdir/.base-sha" 2>/dev/null || true
       fi
     fi
   fi
