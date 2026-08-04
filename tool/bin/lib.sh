@@ -3048,6 +3048,163 @@ ensure_watcher() {
 # Self-derive BIN_DIR when a consumer sources lib.sh directly (tests do this
 # without exporting BIN_DIR) — telemetry must never break that contract.
 _TEL_BIN="${BIN_DIR:-$(cd -P "$(dirname "${BASH_SOURCE[0]}")" && pwd)}"
+
+# ── P3 Artifact Contract ─────────────────────────────────────────────────
+# A dispatched lane declares its expected artifact. A turn that ends without
+# producing that artifact is a FAILED turn, visible on the board — never silent.
+# This closes the most expensive defect of the build: a seat that produces
+# nothing is indistinguishable from one that is working.
+
+# sp_artifact_declare <name> <path> [path...]
+# Write expected artifact paths for a seat.  Each path is a file or directory
+# that must exist when the turn terminates.  Call on dispatch; the lanes board
+# checks these against reality.
+sp_artifact_declare() {
+  local name="${1:?usage: sp_artifact_declare <name> <path>...}" artifact
+  shift
+  [ $# -gt 0 ] || { echo "stitchpad: artifact_declare requires at least one path" >&2; return 1; }
+  local claim_file="$PAD_STATE/artifact-expect.$name"
+  printf '' > "$claim_file.tmp.$$" || return 1
+  for artifact in "$@"; do
+    printf '%s\n' "$artifact" >> "$claim_file.tmp.$$"
+  done
+  mv "$claim_file.tmp.$$" "$claim_file" || return 1
+  return 0
+}
+
+# sp_artifact_verify <name>
+# Check every artifact declared for <name> exists on disk.  Returns 0 if all
+# present (or none declared), 1 if any missing (prints missing paths to stderr).
+sp_artifact_verify() {
+  local name="${1:?usage: sp_artifact_verify <name>}" claim_file path missing=0
+  claim_file="$PAD_STATE/artifact-expect.$name"
+  [ -f "$claim_file" ] || return 0  # no claim = nothing to verify
+  while IFS= read -r path; do
+    [ -n "$path" ] || continue
+    if [ ! -e "$path" ]; then
+      echo "  missing: $path" >&2
+      missing=1
+    fi
+  done < "$claim_file"
+  return "$missing"
+}
+
+# sp_artifact_expected <name>
+# Print the expected artifact paths for <name>, one per line.  Empty if none.
+sp_artifact_expected() {
+  local name="${1:-}" claim_file
+  [ -n "$name" ] || return 0
+  claim_file="$PAD_STATE/artifact-expect.$name"
+  [ -f "$claim_file" ] && cat "$claim_file" || true
+}
+
+# sp_artifact_clear <name>
+# Remove the artifact claim for <name> (turn complete, artifacts verified).
+sp_artifact_clear() {
+  local name="${1:?usage: sp_artifact_clear <name>}"
+  rm -f "$PAD_STATE/artifact-expect.$name"
+}
+
+# sp_lanes_display — produce a pipe-delimited lanes table.
+# Columns: name|session_status|last_age_s|artifact_expected|artifact_present|verdict
+# Verdicts: WORKING (artifact present), FAILED (artifact missing after terminal),
+#           PENDING (active/idle, no artifact yet), UNKNOWN (no session data).
+# This is the board the operator uses to see every seat's real output.
+sp_lanes_display() {
+  local proj name status age_s claim claim_file present verdict art_display
+  proj="$(sp_session_registry_project 2>/dev/null || echo '[]')"
+  # Build a list of names from roster + session registry + artifact claims
+  local names=""
+  # From session registry
+  names="$(echo "$proj" | python3 -c "
+import json, sys
+data = json.load(sys.stdin)
+for s in data:
+    n = s.get('name','')
+    if n: print(n)
+" 2>/dev/null)"
+  # From artifact claims
+  for claim in "$PAD_STATE"/artifact-expect.*; do
+    [ -f "$claim" ] || continue
+    local cn="${claim##*/artifact-expect.}"
+    echo "$names" | grep -qxF "$cn" 2>/dev/null || names="$names"$'\n'"$cn"
+  done
+  # From roster
+  if [ -f "$PAD_DIR/roster.csv" ]; then
+    while IFS='|' read -r rn rest; do
+      [ -n "$rn" ] && echo "$names" | grep -qxF "$rn" 2>/dev/null || names="$names"$'\n'"$rn"
+    done < "$PAD_DIR/roster.csv"
+  fi
+  names="$(echo "$names" | sort -u | sed '/^$/d')"
+  [ -z "$names" ] && { echo "no lanes — empty roster"; return 0; }
+  printf '%-12s %-12s %6s %-20s %-12s %-16s\n' "LANE" "STATUS" "AGE" "ARTIFACT" "PRESENT" "VERDICT"
+  printf '%-12s %-12s %6s %-20s %-12s %-16s\n' "------------" "------------" "------" "--------------------" "------------" "----------------"
+  local _now; _now="$(date +%s)"
+  while IFS= read -r name; do
+    [ -n "$name" ] || continue
+    # Get session status from registry projection
+    status="$(echo "$proj" | python3 -c "
+import json, sys
+data = json.load(sys.stdin)
+for s in data:
+    if s.get('name','') == '$name':
+        print(s.get('status',''))
+        sys.exit(0)
+print('unknown')
+" 2>/dev/null)"
+    [ -z "$status" ] && status="unknown"
+    # Age since last activity
+    age_s="$(echo "$proj" | python3 -c "
+import json, sys
+data = json.load(sys.stdin)
+for s in data:
+    if s.get('name','') == '$name':
+        la = s.get('last_activity', 0)
+        if la:
+            import time
+            print(int(time.time()) - la)
+        else:
+            print('?')
+        sys.exit(0)
+print('?')
+" 2>/dev/null)"
+    [ -z "$age_s" ] && age_s="?"
+    # Artifact check
+    art_display=""
+    if [ -f "$PAD_STATE/artifact-expect.$name" ]; then
+      art_display="$(head -1 "$PAD_STATE/artifact-expect.$name")"
+      if sp_artifact_verify "$name" 2>/dev/null; then
+        present="YES"
+      else
+        present="NO"
+      fi
+    else
+      art_display="-"
+      present="-"
+    fi
+    # Truncate artifact display
+    if [ "${#art_display}" -gt 20 ]; then
+      art_display="${art_display:0:17}..."
+    fi
+    # Verdict
+    verdict=""
+    case "$status" in
+      terminal)
+        if [ "$present" = "NO" ]; then verdict="FAILED"
+        elif [ "$present" = "YES" ]; then verdict="COMPLETE"
+        else verdict="TERMINAL"; fi ;;
+      stale)  verdict="STALE" ;;
+      idle)   verdict="IDLE" ;;
+      active) verdict="WORKING" ;;
+      unknown)
+        if [ "$present" = "NO" ]; then verdict="FAILED"
+        elif [ "$present" = "YES" ]; then verdict="DONE"
+        else verdict="UNKNOWN"; fi ;;
+    esac
+    printf '%-12s %-12s %6s %-20s %-12s %-16s\n' \
+      "$name" "$status" "${age_s}s" "$art_display" "$present" "$verdict"
+  done <<< "$names"
+}
 if [ -f "$_TEL_BIN/telemetry.sh" ]; then
   # shellcheck disable=SC1091
   source "$_TEL_BIN/telemetry.sh"

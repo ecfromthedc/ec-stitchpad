@@ -4373,6 +4373,52 @@ sys.exit(1)
     fi
     ;;
 
+  lanes)
+    # P3: artifact-contract board — every seat's real output, never silent.
+    #   stitchpad lanes [--json]
+    # A seat that produces nothing shows FAILED, not idle.  Missing artifacts
+    # after a terminal session are the loudest signal in the fleet.
+    sp_init_paths_readonly || exit 1
+    if [ "${1:-}" = "--json" ]; then
+      local _names _proj _now _name _status _age _art _present _verdict
+      _now="$(date +%s)"
+      _proj="$(sp_session_registry_project 2>/dev/null || echo '[]')"
+      echo '['
+      local _first=1
+      for _claim in "$PAD_STATE"/artifact-expect.*; do
+        [ -f "$_claim" ] || continue
+        _name="${_claim##*/artifact-expect.}"
+        _status="$(echo "$_proj" | python3 -c "
+import json, sys
+data = json.load(sys.stdin)
+for s in data:
+    if s.get('name','') == '$_name':
+        print(s.get('status',''))
+        sys.exit(0)
+print('unknown')
+" 2>/dev/null)"
+        [ -z "$_status" ] && _status="unknown"
+        _age="$(( _now - $(stat -f %m "$_claim" 2>/dev/null || echo "$_now") ))"
+        _art="$(head -1 "$_claim")"
+        if sp_artifact_verify "$_name" 2>/dev/null; then _present="yes"; else _present="no"; fi
+        case "$_status" in
+          terminal) [ "$_present" = "no" ] && _verdict="FAILED" || _verdict="COMPLETE" ;;
+          stale) _verdict="STALE" ;;
+          idle) _verdict="IDLE" ;;
+          active) _verdict="WORKING" ;;
+          *) [ "$_present" = "no" ] && _verdict="FAILED" || _verdict="DONE" ;;
+        esac
+        [ "$_first" -eq 1 ] || printf ',\n'
+        _first=0
+        printf '  {"name":"%s","status":"%s","age_s":%s,"artifact_expected":"%s","artifact_present":"%s","verdict":"%s"}' \
+          "$_name" "$_status" "$_age" "$_art" "$_present" "$_verdict"
+      done
+      echo ''; echo ']'
+    else
+      sp_lanes_display
+    fi
+    ;;
+
   telemetry)
     # TASK-7: bounded per-model reliability + cost-value reader.
     #   stitchpad telemetry [--json] [--model M] [--days N] [--limit N]
