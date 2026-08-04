@@ -398,14 +398,198 @@ else
 fi
 
 # =========================================================================
+# PROOF 7 (flash A): PAD_GIT unset — direct-caller embedder, nounset off
+# =========================================================================
+echo ""
+echo "--- Proof 7 (flash A): PAD_GIT unset → fail-closed refuse ---"
+
+reset_pad_vars
+A_PARENT="$TEST_ROOT/pad-a"
+A_DIR="$A_PARENT/.pasture"
+mkdir -p "$A_DIR/pasture-git" "$A_DIR/.state/sessions"
+echo "## pad A initial" > "$A_DIR/pasture.md"
+( cd "$A_PARENT" && \
+  git init --quiet --separate-git-dir="$A_DIR/pasture-git" . >/dev/null 2>&1 && \
+  git add .pasture/pasture.md 2>/dev/null && \
+  git -c user.name=test -c user.email=test@test commit -qm "V1" >/dev/null 2>&1 )
+
+export PAD_DIR="$A_DIR" PAD_MD="$A_DIR/pasture.md" PAD_STATE="$A_DIR/.state"
+export PAD_TASKS="$A_DIR/tasks.md" PAD_ARCHIVE_DIR="$A_DIR/archive"
+set +u; unset PAD_GIT; set -u
+
+JOURNAL_A=$(sp_session_registry_journal_begin "test-sid-a" 2>/dev/null)
+if [ -z "$JOURNAL_A" ] || [ ! -d "$JOURNAL_A" ]; then
+  bad "P7 — journal_begin failed (unexpected)"
+else
+  ok "P7 — journal_begin succeeded with PAD_GIT unset"
+  if [ -f "$JOURNAL_A/.base-sha" ]; then
+    bad "P7 — .base-sha stamped despite PAD_GIT unset"
+  else
+    ok "P7 — .base-sha NOT stamped (PAD_GIT unset → skip)"
+  fi
+
+  echo "V2-COMMITTED-WORK-A" >> "$PAD_MD"
+  ( cd "$A_PARENT" && \
+    git add .pasture/pasture.md 2>/dev/null && \
+    git -c user.name=t -c user.email=t@t commit -qm "V2 committed" >/dev/null 2>&1 )
+
+  sp_session_registry_journal_recover 2>/tmp/pro2-test-a-err.log
+
+  if [ -d "$JOURNAL_A" ]; then
+    ok "P7 — orphan PRESERVED (PAD_GIT unset → fail-closed refuse)"
+  else
+    bad "P7 — orphan DELETED — fail-open rollback!"
+  fi
+
+  PAD_CONTENT_A=$(cat "$PAD_MD" 2>/dev/null)
+  if echo "$PAD_CONTENT_A" | grep -q "V2-COMMITTED-WORK-A"; then
+    ok "P7 — committed V2 preserved (no revert)"
+  else
+    bad "P7 — committed V2 REVERTED!"
+  fi
+fi
+set -u
+
+# =========================================================================
+# PROOF 8 (flash B): valid at begin, dangling at recover (TOCTOU)
+# =========================================================================
+echo ""
+echo "--- Proof 8 (flash B): PAD_GIT valid at begin, dangling at recover → refuse ---"
+
+reset_pad_vars
+B_PARENT="$TEST_ROOT/pad-b"
+B_DIR="$B_PARENT/.pasture"
+mkdir -p "$B_DIR/pasture-git" "$B_DIR/.state/sessions"
+echo "## pad B initial" > "$B_DIR/pasture.md"
+( cd "$B_PARENT" && \
+  git init --quiet --separate-git-dir="$B_DIR/pasture-git" . >/dev/null 2>&1 && \
+  git add .pasture/pasture.md 2>/dev/null && \
+  git -c user.name=test -c user.email=test@test commit -qm "V1" >/dev/null 2>&1 )
+INITIAL_B=$(git --git-dir="$B_DIR/pasture-git" rev-parse HEAD)
+
+export STITCHPAD_PAD_DIR="$B_DIR"
+sp_init_paths
+
+JOURNAL_B=$(sp_session_registry_journal_begin "test-sid-b" 2>/dev/null)
+if [ -z "$JOURNAL_B" ] || [ ! -d "$JOURNAL_B" ]; then
+  bad "P8 — journal_begin failed"
+else
+  if [ -f "$JOURNAL_B/.base-sha" ] && [ -f "$JOURNAL_B/.git-realpath" ]; then
+    STAMPED_B_SHA=$(cat "$JOURNAL_B/.base-sha")
+    if [ "$STAMPED_B_SHA" = "$INITIAL_B" ]; then
+      ok "P8 — .base-sha + .git-realpath stamped from real repo"
+    else
+      bad "P8 — .base-sha wrong: $STAMPED_B_SHA != $INITIAL_B"
+    fi
+  else
+    bad "P8 — stamps missing"
+  fi
+
+  echo "V2-COMMITTED-WORK-B" >> "$PAD_MD"
+  ( cd "$B_PARENT" && \
+    git add .pasture/pasture.md 2>/dev/null && \
+    git -c user.name=t -c user.email=t@t commit -qm "V2 committed" >/dev/null 2>&1 )
+
+  # TOCTOU: swap for a dangling symlink
+  mv "$B_DIR/pasture-git" "$B_DIR/pasture-git.real"
+  ln -s /nonexistent-gone "$B_DIR/pasture-git"
+
+  sp_session_registry_journal_recover 2>/tmp/pro2-test-b-err.log
+
+  if [ -d "$JOURNAL_B" ]; then
+    ok "P8 — orphan PRESERVED (dangling PAD_GIT at recover → fail-closed)"
+  else
+    bad "P8 — orphan DELETED — TOCTOU bypass (FAIL-OPEN)"
+  fi
+
+  PAD_CONTENT_B=$(cat "$PAD_MD" 2>/dev/null)
+  if echo "$PAD_CONTENT_B" | grep -q "V2-COMMITTED-WORK-B"; then
+    ok "P8 — committed V2 preserved (no revert)"
+  else
+    bad "P8 — committed V2 REVERTED!"
+  fi
+
+  rm -f "$B_DIR/pasture-git"
+  mv "$B_DIR/pasture-git.real" "$B_DIR/pasture-git"
+fi
+
+# =========================================================================
+# PROOF 9 (flash C): symlink to valid-but-wrong repo (caller bypasses init)
+# =========================================================================
+echo ""
+echo "--- Proof 9 (flash C): PAD_GIT symlink to valid-but-WRONG repo → refuse ---"
+
+reset_pad_vars
+C_PARENT="$TEST_ROOT/pad-c"
+C_DIR="$C_PARENT/.pasture"
+mkdir -p "$C_DIR/.state/sessions"
+echo "## pad C initial" > "$C_DIR/pasture.md"
+
+C_REAL="$C_DIR/git-real"
+git --git-dir="$C_REAL" init -q
+( cd "$C_DIR" && \
+  git --git-dir="$C_REAL" --work-tree=. add pasture.md 2>/dev/null && \
+  git --git-dir="$C_REAL" --work-tree=. -c user.name=test -c user.email=test@test commit -qm "V1 real" >/dev/null 2>&1 )
+
+C_WRONG="$C_DIR/other-repo"
+git --git-dir="$C_WRONG" init -q
+git --git-dir="$C_WRONG" commit --allow-empty -qm "wrong" >/dev/null 2>&1
+
+ln -s "$C_WRONG" "$C_DIR/pasture-git"
+
+export PAD_DIR="$C_DIR" PAD_MD="$C_DIR/pasture.md" PAD_STATE="$C_DIR/.state"
+export PAD_TASKS="$C_DIR/tasks.md" PAD_ARCHIVE_DIR="$C_DIR/archive"
+export PAD_GIT="$C_DIR/pasture-git"
+set +u
+
+JOURNAL_C=$(sp_session_registry_journal_begin "test-sid-c" 2>/dev/null)
+if [ -z "$JOURNAL_C" ] || [ ! -d "$JOURNAL_C" ]; then
+  bad "P9 — journal_begin failed"
+else
+  if [ -f "$JOURNAL_C/.base-sha" ]; then
+    C_SHA=$(cat "$JOURNAL_C/.base-sha")
+    if [ -n "$C_SHA" ]; then
+      bad "P9 — .base-sha stamped from symlinked wrong repo ($(echo $C_SHA | head -c 8)...)"
+    else
+      ok "P9 — .base-sha empty (symlink → skip)"
+    fi
+  else
+    ok "P9 — .base-sha NOT stamped (PAD_GIT symlink → skip)"
+  fi
+
+  echo "V2-COMMITTED-WORK-C" >> "$PAD_MD"
+  ( cd "$C_DIR" && \
+    git --git-dir="$C_REAL" --work-tree=. add pasture.md 2>/dev/null && \
+    git --git-dir="$C_REAL" --work-tree=. -c user.name=t -c user.email=t@t commit -qm "V2 committed" >/dev/null 2>&1 )
+
+  sp_session_registry_journal_recover 2>/tmp/pro2-test-c-err.log
+
+  if [ -d "$JOURNAL_C" ]; then
+    ok "P9 — orphan PRESERVED (PAD_GIT symlink → identity guard refuse)"
+  else
+    bad "P9 — orphan DELETED — symlink-to-wrong-repo bypass (FAIL-OPEN)"
+  fi
+
+  PAD_CONTENT_C=$(cat "$PAD_MD" 2>/dev/null)
+  if echo "$PAD_CONTENT_C" | grep -q "V2-COMMITTED-WORK-C"; then
+    ok "P9 — committed V2 preserved (no revert)"
+  else
+    bad "P9 — committed V2 REVERTED!"
+  fi
+fi
+set -u
+
+# =========================================================================
 echo ""
 echo "RESULTS: $pass passed, $fail failed"
 echo ""
 if [ "$fail" -eq 0 ]; then
-  echo "CONCLUSION: OLD code (stitchpad-git hardcoded) would silently skip R3 on"
-  echo "migrated pads. OLD + \$PAD_GIT fix was still FAIL-OPEN on empty-repo edge"
-  echo "cases. NEW fail-closed guards (symlink refusal + unresolvable-HEAD guard)"
-  echo "now REFUSE recovery when safety cannot be verified — orphan preserved,"
-  echo "committed content intact, no silent rollback."
+  echo "CONCLUSION: All 9 proofs pass. OLD stitchpad-git hardcoded guard"
+  echo "skipped R3 on migrated pads (P1). The \$PAD_GIT fix engaged R3 but was"
+  echo "FAIL-OPEN on the direct-caller surface (P4/P6). Flash's A (PAD_GIT unset),"
+  echo "B (TOCTOU vanish), and C (symlink-to-wrong-repo) bypasses are now"
+  echo "PERMANENTLY GATED by identity-based fail-closed guards in BOTH"
+  echo "journal_begin and journal_recover. Recovery now refuses unless the"
+  echo "repository identity is verified — orphan preserved, content intact."
 fi
 [ "$fail" -eq 0 ] || exit 1
