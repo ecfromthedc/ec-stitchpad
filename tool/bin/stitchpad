@@ -2,32 +2,46 @@
 # stitchpad — a model-agnostic agent channel that's just a markdown file.
 #
 #   stitchpad init [--name <pad>]         create .stitchpad/ in the current project
-#   stitchpad join <name> <adapter> [wake] [target]   add a participant to the roster
+#   stitchpad join <name> <adapter> [wake] [target] [--role <r>] [--level <l>]   add a participant
+#   stitchpad leave [name]                remove a name from the roster (active seat only)
+#   stitchpad set-wake <name> <push|pull> <target> [adapter]   update wake mode for an existing row
+#   stitchpad rename <old> <new>          rename a member everywhere local state knows them
 #   STITCHPAD_NAME=<you> stitchpad say [--image <path>] <text...>   post a message (auto-commits)
 #   stitchpad read [-n N]                 print the recent conversation (plain)
-#   stitchpad meta set|get <name> <key> [value] runtime/model metadata
+#   stitchpad who / stitchpad roster      print parsed roster
+#   stitchpad whoami                      print your own resolved name for this terminal
+#   stitchpad task new|list|show|move|edit|migrate   kanban board — cards live in tasks.md
+#   stitchpad task                        bare 'task' prints the board
+#   stitchpad meta set|get <name> <key> [value]  runtime/model metadata
 #   stitchpad dnd on|off [--drain]|status silence/resume wake delivery
 #   stitchpad wake [name] [--peek]        print new @name messages since last drain
 #   stitchpad watch                       run the daemon (foreground)
-#   stitchpad invite [--name <handle>] [--ttl 1h|30m|7d|never]   make a remote-join invite
-#   stitchpad invite --revoke <token>     revoke an invite token
 #   stitchpad start|stop|status|restart   manage the daemon (background)
 #   stitchpad health [--json] [--deep]    non-mutating local health snapshot
-#   stitchpad roster                      print parsed roster
 #   stitchpad sessions [--json]           read-only session-registry projection
-#   stitchpad telemetry [--json] [--model M] [--days N] [--limit N]   per-model reliability + cost-value summary (TASK-7)
-#   stitchpad rename <old> <new>          rename a member everywhere local state knows them
-#   stitchpad reset [name] [--redeliver N] repair a wedged seat without rewinding its cursor
-#   stitchpad operator <keygen|env|grant|revoke|status>   operator credential (root of authority, key lives outside every pad)
+#   stitchpad telemetry [--json] [--model M] [--days N] [--limit N]   per-model reliability + cost-value summary
+#   stitchpad invite [--name <handle>] [--ttl 1h|30m|7d|never]   make a remote-join invite
+#   stitchpad invite --revoke <token>     revoke an invite token
+#   stitchpad operator <keygen|env|grant|revoke|status>   operator credential (root of authority)
 #   stitchpad keeper [repo ...]           wake idle Ocean seats for current open tasks
-#   stitchpad archive [--keep N]          move old messages to .stitchpad/archive/<date>-conversation.md (plain md, no deps)
-#   stitchpad compact [--keep N]          archive old transcript to sqlite, replace with rolling summary block
-#   stitchpad task migrate                move legacy inline ```task blocks out of the pad into tasks.md
-#   stitchpad summarize [-n N]            LLM summary of the recent thread (read-only, nothing archived)
+#   stitchpad archive [--keep N]          move old messages to .stitchpad/archive/<date>-conversation.md
+#   stitchpad compact [--keep N]          archive old transcript to sqlite, replace with rolling summary
+#   stitchpad task migrate                move legacy inline ```task blocks into tasks.md
+#   stitchpad summarize [-n N]            LLM summary of the recent thread (read-only)
 #   stitchpad search <query> [-n N]       full-history search: live pad + compaction archive
-#   stitchpad shift-change --save <n> --file <f>   agent hands itself off to a fresh session (bridge clears + rebriefs)
-#   stitchpad who                         alias for roster
+#   stitchpad shift-change --save <n> --file <f>   agent hands itself off to a fresh session
 #   stitchpad log [-n N]                  show recent history (git log)
+#   stitchpad reset [name] [--redeliver N] [--recovery-counters]   repair a wedged seat
+#   stitchpad scope <set|show|check|clear|violations|clear-violation> ...   authority scope
+#   stitchpad migration-check <name>      push-target reachability verifier
+#   stitchpad color <name>|--all          collision-aware color assignment
+#   stitchpad restore-roster <backup>     internal bridge recovery primitive
+#   stitchpad doctor                      self-heal the daemon and heartbeat watchdog
+#   stitchpad instructions [mode]         print the runtime-neutral prompt source
+#   stitchpad prompt-context [mode]       prefix stdin with canonical rules exactly once
+#   stitchpad bind-session                bind a terminal to the current pad
+#   stitchpad hook                         internal bridge post-commit signal
+#   stitchpad heal-roster                 repair a corrupt roster via operator credential
 #
 # The roster lives INSIDE stitchpad.md as a ```roster fenced block. To add an agent
 # from any runtime (pi/codex/cline/claude), drop an adapter in ~/.stitchpad/adapters
@@ -3926,7 +3940,7 @@ sys.exit(1)
     ;;
 
   help|-h|--help)
-    sed -n '2,23p' "$0" | sed 's/^# \{0,1\}//'
+    sed -n '2,44p' "$0" | sed 's/^# \{0,1\}//'
     ;;
 
   *)
