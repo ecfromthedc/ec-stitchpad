@@ -16,11 +16,13 @@ INTERVAL="${STITCHPAD_BRIDGE_INTERVAL:-3}"
 
 api() { curl -fsS -H "authorization: Bearer $TOKEN" -H "content-type: application/json" "$@"; }
 
-# find all .stitchpad pads under the roots (skip the ~/.stitchpad install symlink)
+# find all .stitchpad pads under the roots, excluding scratch pads (P18)
 find_pads() {
   for r in "${ROOTS[@]}"; do
     find "$r" -maxdepth 4 -type d -name .stitchpad 2>/dev/null
-  done | grep -v "/.stitchpad/.stitchpad" | sort -u
+  done | grep -v "/.stitchpad/.stitchpad" \
+        | while IFS= read -r pd; do [ -f "$pd/.scratch" ] || printf '%s\n' "$pd"; done \
+        | sort -u
 }
 
 echo "[bridge] relay=$RELAY  interval=${INTERVAL}s  scanning: ${ROOTS[*]}"

@@ -114,24 +114,18 @@ case "$cmd" in
   init)
     # F-INIT: `init` used to IGNORE a positional path argument entirely and always
     # create the pad in $PWD/.stitchpad — reporting success while the caller's
-    # requested directory got nothing. That is the false-success family in the most
-    # fundamental command, and it is why test/empty-lock-reclaim-gate.sh never once
-    # passed: it calls `init "$PAD_DIR"` and then every later command says
-    # "no pasture found". Honor the argument, and refuse anything we do not understand.
+    # requested directory got nothing.
     _init_root="$PWD"
+    _init_scratch=0; _init_force=0
     while [ "$#" -gt 0 ]; do
       case "$1" in
         --name) name="$2"; shift 2 ;;
+        --scratch) _init_scratch=1; shift ;;
+        --force) _init_force=1; shift ;;
         -*)
           echo "stitchpad: init: unknown option '$1'" >&2
           exit 2 ;;
         *)
-          # A positional argument is ambiguous: callers use BOTH
-          #   `init /abs/path/.stitchpad`  (a LOCATION)   and
-          #   `init myname`                (a NAME)
-          # Disambiguate on shape, which is the least surprising reading:
-          # anything containing a slash, ending in .stitchpad, or naming an
-          # existing directory is a LOCATION; a bare word is a NAME.
           case "$1" in
             */.stitchpad)  _init_root="$(dirname "$1")" ;;
             */*)           _init_root="$1" ;;
@@ -141,6 +135,28 @@ case "$cmd" in
           shift ;;
       esac
     done
+    # P18: pad created inside a git WORKTREE of another repo must not register
+    # as a channel. Detection: a worktree has `.git` as a FILE (not a directory).
+    # A genuine project checkout has `.git/` (a directory). A worktree pad
+    # requires --scratch (explicit) or --force (operator override). Only a real
+    # project checkout or --scratch/--force gets past this gate.
+    _init_is_worktree=0
+    if [ -f "$_init_root/.git" ]; then
+      _init_is_worktree=1
+    elif git -C "$_init_root" rev-parse --git-dir >/dev/null 2>&1; then
+      # .git is a dir but it might still be a linked worktree (some git versions)
+      _gd="$(git -C "$_init_root" rev-parse --git-common-dir 2>/dev/null || echo "")"
+      [ -n "$_gd" ] && [ -d "$_gd/worktrees" ] && _init_is_worktree=1
+    fi
+    if [ "$_init_is_worktree" -eq 1 ] && [ "$_init_scratch" -eq 0 ] && [ "$_init_force" -eq 0 ]; then
+      echo "stitchpad: $_init_root is inside a git worktree — scratch pads do NOT become channels" >&2
+      echo "stitchpad: use --scratch for an ephemeral pad, or --force to override and create a channel" >&2
+      exit 1
+    fi
+    # In a worktree, default to scratch unless --force (operator decides)
+    if [ "$_init_is_worktree" -eq 1 ] && [ "$_init_force" -eq 0 ]; then
+      _init_scratch=1
+    fi
     mkdir -p "$_init_root" 2>/dev/null || {
       echo "stitchpad: init: cannot create '$_init_root'" >&2; exit 1; }
     _init_root="$(cd -P "$_init_root" 2>/dev/null && pwd)" || {
@@ -217,7 +233,14 @@ EOF
       grep -Fqx '.stitchpad/' "$_init_root/.gitignore" 2>/dev/null || printf '\n# stitchpad runtime (isolated history)\n.stitchpad/\n' >> "$_init_root/.gitignore"
     fi
     PAD_DIR="$dir"; sp_ensure_outer_git_ignore; unset PAD_DIR
-    echo "✓ stitchpad #$name created at $md"
+    # P18: scratch pads carry a sentinel so pad discovery (bridge, pasture,
+    # `stitchpad pads`) can exclude them. An agent scratch tree is NOT a channel.
+    if [ "$_init_scratch" -eq 1 ]; then
+      touch "$dir/.scratch"
+      echo "✓ scratch pad #$name created at $md (NOT a channel — excluded from pad listings)"
+    else
+      echo "✓ stitchpad #$name created at $md"
+    fi
     # Self-sufficient from creation: start this pad's wake watcher now so it's live
     # the moment it exists (pinned to this pad regardless of cwd). join also ensures
     # it; this just means a fresh pad is ready before the first agent even joins.
@@ -231,6 +254,59 @@ EOF
       echo "✓ wake watcher started for #$name"
     else
       echo "stitchpad: no wake watcher running for #$name (start one with 'stitchpad watch')" >&2
+    fi
+    ;;
+
+  pads)
+    # P18: list discoverable pads. By default shows only full channels
+    # (non-scratch pads).  --scratch lists ephemeral pads only.
+    # --prune deletes scratch pads after listing them.
+    #   stitchpad pads            list channel pads
+    #   stitchpad pads --scratch  list ephemeral/scratch pads
+    #   stitchpad pads --prune    remove scratch pads
+    #   stitchpad pads --all      list every pad
+    _pads_scratch=0; _pads_prune=0; _pads_all=0
+    while [ "$#" -gt 0 ]; do
+      case "$1" in
+        --scratch) _pads_scratch=1; shift ;;
+        --prune)   _pads_prune=1; shift ;;
+        --all)     _pads_all=1; shift ;;
+        *) echo "stitchpad: pads: unknown option '$1'" >&2; exit 2 ;;
+      esac
+    done
+    _pads_roots="${STITCHPAD_SCAN_ROOTS:-$HOME}"
+    _pads_found=0
+    for _r in $_pads_roots; do
+      [ -d "$_r" ] || continue
+      while IFS= read -r _pd; do
+        [ -d "$_pd" ] || continue
+        [ -f "$_pd/stitchpad.md" ] || { [ -f "$_pd/pasture.md" ] || continue; }
+        _pn="$(basename "$(dirname "$_pd")")"
+        _is_scratch=0; [ -f "$_pd/.scratch" ] && _is_scratch=1
+        # Filter by mode
+        if [ "$_pads_all" -eq 0 ]; then
+          if [ "$_pads_scratch" -eq 1 ] && [ "$_is_scratch" -eq 0 ]; then continue; fi
+          if [ "$_pads_scratch" -eq 0 ] && [ "$_is_scratch" -eq 1 ]; then continue; fi
+        fi
+        if [ "$_pads_prune" -eq 1 ]; then
+          if [ "$_is_scratch" -eq 1 ]; then
+            printf 'PRUNE scratch: %-30s %s\n' "#$_pn" "$(dirname "$_pd")"
+            rm -rf "$_pd" 2>/dev/null && _pads_found=$((_pads_found + 1))
+          fi
+          continue
+        fi
+        _pads_found=$((_pads_found + 1))
+        if [ "$_is_scratch" -eq 1 ]; then
+          printf '%-5s %-30s %s\n' '[scr]' "#$_pn" "$(dirname "$_pd")"
+        else
+          printf '%-5s %-30s %s\n' '[ch]'  "#$_pn" "$(dirname "$_pd")"
+        fi
+      done < <(find "$_r" -maxdepth 4 -type d \( -name .stitchpad -o -name .pasture \) 2>/dev/null | grep -v '/\.stitchpad/\.stitchpad' | sort -u)
+    done
+    if [ "$_pads_prune" -eq 1 ]; then
+      echo "✓ pruned $_pads_found scratch pad(s)"
+    elif [ "$_pads_found" -eq 0 ]; then
+      echo "(no pads found)"
     fi
     ;;
 
