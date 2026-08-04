@@ -12,6 +12,7 @@
 # commit and the suites run from there.  The baseline is always read from
 # the worktree's test/pillar-baseline.txt.
 #
+# Hardened (pro3, r1 T-1): exit-code required, anchored regex, delta>0 fails.
 # Compatible with bash 3.2 (macOS default).
 set -euo pipefail
 
@@ -57,9 +58,10 @@ PILLARS="pro5-tier1-mutant-gates.sh roster-recovery-guard-regression.sh recover-
 baseline_pass() { awk -v suite="$1" '$1 == suite { print $2 }' "$BASELINE"; }
 baseline_fail() { awk -v suite="$1" '$1 == suite { print $3 }' "$BASELINE"; }
 
-# Run one suite, return a pipe-delimited result line.
+# Run one suite, return a pipe-delimited result line: suite|pass|fail|rc
+# Pass and fail are anchored to the RESULTS line; "?" means unparseable.
 run_suite() {
-  local suite="$1" outfile rc output p f
+  local suite="$1" outfile rc output p f result_line
   outfile="$(mktemp "${TMPDIR:-/tmp}/tripwire-out.XXXXXX")"
 
   set +e
@@ -72,25 +74,29 @@ run_suite() {
   output="$(cat "$outfile")"
   rm -f "$outfile"
 
-  p=""; f="0"
+  # ── Anchored parse: extract the RESULTS line, then parse from it ──────
+  # Only the line containing "RESULTS:" is authoritative.  This eliminates
+  # unanchored sub-matches in diagnostic prose (T-1: unanchored FAIL regex).
+  result_line="$(echo "$output" | grep -E 'RESULTS:' | tail -1 || true)"
 
-  # FMT_B: "=== RESULTS: N PASS, M FAIL, T total ==="
-  p="$(echo "$output" | grep -oE 'RESULTS: ([0-9]+) PASS' | tail -1 | grep -oE '[0-9]+' || true)"
-  if [ -n "$p" ]; then
-    f="$(echo "$output" | grep -oE '([0-9]+) FAIL' | tail -1 | grep -oE '[0-9]+' || echo 0)"
-    echo "$suite|$p|$f|$rc"
-    return 0
+  if [ -n "$result_line" ]; then
+    # FMT_B: "=== RESULTS: N PASS, M FAIL, T total ==="
+    p="$(echo "$result_line" | grep -oE '[0-9]+ PASS' | grep -oE '[0-9]+' || true)"
+    if [ -n "$p" ]; then
+      f="$(echo "$result_line" | grep -oE '[0-9]+ FAIL' | grep -oE '[0-9]+' || echo 0)"
+      echo "$suite|$p|$f|$rc"
+      return 0
+    fi
+    # FMT_A: "RESULTS: N passed, M failed"
+    p="$(echo "$result_line" | grep -oE '[0-9]+ passed' | grep -oE '[0-9]+' || true)"
+    if [ -n "$p" ]; then
+      f="$(echo "$result_line" | grep -oE '[0-9]+ failed' | grep -oE '[0-9]+' || echo 0)"
+      echo "$suite|$p|$f|$rc"
+      return 0
+    fi
   fi
 
-  # FMT_A: "RESULTS: N passed, M failed"
-  p="$(echo "$output" | grep -oE 'RESULTS: ([0-9]+) passed' | tail -1 | grep -oE '[0-9]+' || true)"
-  if [ -n "$p" ]; then
-    f="$(echo "$output" | grep -oE '([0-9]+) failed' | tail -1 | grep -oE '[0-9]+' || echo 0)"
-    echo "$suite|$p|$f|$rc"
-    return 0
-  fi
-
-  # FMT_C: "Passed:  N" then "Failed:  M"
+  # FMT_C: separate "Passed:" / "Failed:" lines (anchored at line start)
   p="$(echo "$output" | grep -E '^Passed:' | tail -1 | grep -oE '[0-9]+' || true)"
   if [ -n "$p" ]; then
     f="$(echo "$output" | grep -E '^Failed:' | tail -1 | grep -oE '[0-9]+' || echo 0)"
@@ -98,6 +104,7 @@ run_suite() {
     return 0
   fi
 
+  # Unparseable — format drift or suite crash before printing results
   echo "$suite|?|?|$rc"
 }
 
@@ -120,11 +127,12 @@ echo "  REGRESSION TRIPWIRE — PILLAR SUITE REPORT"
 echo "==========================================="
 echo ""
 
-printf "%-41s %10s %10s %10s %-14s\n" "SUITE" "BASELINE" "OBSERVED" "CHANGE" "STATUS"
-printf "%-41s %10s %10s %10s %-14s\n" "-----------------------------------------" "----------" "----------" "----------" "--------------"
+printf "%-41s %10s %10s %10s %-16s\n" "SUITE" "BASELINE" "OBSERVED" "CHANGE" "STATUS"
+printf "%-41s %10s %10s %10s %-16s\n" "-----------------------------------------" "----------" "----------" "----------" "----------------"
 
 REGRESSIONS=0
 PARSED=0
+FAILS=0
 
 while IFS='|' read -r suite obs_p obs_f obs_rc; do
   [ -n "$suite" ] || continue
@@ -133,59 +141,87 @@ while IFS='|' read -r suite obs_p obs_f obs_rc; do
   bl_f="$(baseline_fail "$suite")"
   [ -n "$bl_p" ] || continue
 
+  # T-1 fix 3: format drift is a HARD FAIL, not SKIP.
+  # Non-zero exit + unparseable = CRASHED; zero exit + unparseable = FORMAT-DRIFT.
   if [ "$obs_p" = "?" ]; then
-    printf "%-41s %10s %10s %10s %-14s\n" "$suite" "$bl_p pass" "PARSE_ERR" "?" "SKIP"
+    FAILS=$((FAILS + 1))
+    if [ "$obs_rc" != "0" ]; then
+      printf "%-41s %10s %10s %10s %-16s\n" "$suite" "$bl_p pass" "PARSE_ERR" "?" "CRASHED"
+    else
+      printf "%-41s %10s %10s %10s %-16s\n" "$suite" "$bl_p pass" "PARSE_ERR" "?" "FORMAT-DRIFT"
+    fi
     continue
   fi
   PARSED=$((PARSED + 1))
 
   delta=$((obs_p - bl_p))
-  status=""
+  _trap_status="" _trap_fail=0
+
+  # Primary verdict: count-based. Delta > 0 is INFLATED (T-1 fix 2), not improved.
+  # Exit code is a SECONDARY gate: only fails when the delta verdict is GREEN.
+  # A suite that passed all tests but crashed in cleanup is still suspect.
   if [ "$delta" -lt 0 ]; then
-    status="REGRESSION"
-    REGRESSIONS=$((REGRESSIONS + 1))
-  elif [ "$delta" -eq 0 ]; then
-    if [ "$obs_f" -gt "${bl_f:-0}" ]; then
-      status="MORE-FAILURES"
-      REGRESSIONS=$((REGRESSIONS + 1))
-    else
-      status="SAME"
-    fi
+    _trap_status="REGRESSION"
+    _trap_fail=1
+  elif [ "$delta" -gt 0 ]; then
+    _trap_status="INFLATED"
+    _trap_fail=1
+  elif [ "$obs_f" -gt "${bl_f:-0}" ]; then
+    _trap_status="MORE-FAILURES"
+    _trap_fail=1
+  elif [ "$obs_rc" != "0" ]; then
+    # T-1 fix 1: exit code matters — GREEN counts paired with non-zero exit is a fail.
+    # Example: suite prints correct counts then pkill in cleanup fails (exit 1).
+    _trap_status="EXIT-CODE"
+    _trap_fail=1
   else
-    status="IMPROVED"
+    _trap_status="GREEN"
   fi
 
-  change_str="$delta"
-  [ "$delta" -gt 0 ] && change_str="+$delta"
+  if [ "$_trap_fail" -eq 1 ]; then
+    FAILS=$((FAILS + 1))
+  fi
 
-  printf "%-41s %10s %10s %10s %-14s\n" \
-    "$suite" \
-    "${bl_p} pass" \
-    "${obs_p} pass" \
-    "$change_str" \
-    "$status"
+  # Build OBSERVED string — show exit code when non-zero
+  _obs_str="${obs_p} pass (${obs_f} fail)"
+  if [ "$obs_rc" != "0" ] && [ "$_trap_status" != "EXIT-CODE" ]; then
+    _obs_str="${obs_p} pass (${obs_f} fail, rc=$obs_rc)"
+  fi
+
+  case "$_trap_status" in
+    REGRESSION) _obs_change="$delta" ;;
+    INFLATED)   _obs_change="+$delta" ;;
+    *)          _obs_change="0" ;;
+  esac
+
+  printf "%-41s %10s %10s %10s %-16s\n" \
+    "$suite" "${bl_p} pass" "$_obs_str" "$_obs_change" "$_trap_status"
 done < "$RFILE"
 
 rm -f "$RFILE"
 echo ""
 
 # ── verdict ────────────────────────────────────────────────────────────────
-if [ "$PARSED" -eq 0 ]; then
+if [ "$PARSED" -eq 0 ] && [ "$FAILS" -eq 0 ]; then
   echo "TRIPWIRE: INCONCLUSIVE — no suites produced parseable output"
   exit 2
 fi
 
-if [ "$REGRESSIONS" -gt 0 ]; then
-  echo "TRIPWIRE: FAILED — $REGRESSIONS suite(s) regressed"
+if [ "$FAILS" -gt 0 ]; then
+  echo "TRIPWIRE: FAILED — $FAILS suite(s) failed"
   echo ""
-  echo "  Column 'BASELINE' is the committed expected pass count"
-  echo "  Column 'OBSERVED' is what just ran"
-  echo "  STATUS = REGRESSION means pass count dropped vs. baseline"
+  echo "  STATUS key:"
+  echo "    GREEN         pass count matches baseline, failures ≤ baseline, exit 0"
+  echo "    REGRESSION    pass count dropped vs baseline"
+  echo "    INFLATED      pass count exceeds baseline (unexplained increase)"
+  echo "    MORE-FAILURES pass count matches but failure count increased"
+  echo "    EXIT-CODE     pass/fail counts match baseline but suite exited non-zero"
+  echo "    CRASHED       no parseable RESULTS line + non-zero exit"
+  echo "    FORMAT-DRIFT  no parseable RESULTS line + exit 0 — format changed"
   echo ""
-  echo "  Investigate the offending commit; if the new results are"
-  echo "  correct, update test/pillar-baseline.txt and recommit."
+  echo "  When baseline is intentionally changed, update test/pillar-baseline.txt."
   exit 1
 fi
 
-echo "TRIPWIRE: PASSED — all $PARSED pillar suites match or exceed baseline"
+echo "TRIPWIRE: PASSED — all $PARSED pillar suites green"
 exit 0
