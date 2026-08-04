@@ -3751,12 +3751,84 @@ PY
         # Tasks are written to the SIBLING tasks.md, not the conversation. A
         # ticket op no longer rewrites or re-commits the whole transcript.
         # (Legacy inline blocks in the pad are still read — see sp_tasks.)
-        sp_ensure_tasks_file || { sp_unlock; exit 1; }
-        printf '\n%s\n' "$block" >> "$PAD_TASKS"
-        sp_ensure_tasks_pointer
-        if [ -n "$assignee" ] && sp_user_exists "$assignee"; then
-          printf '\n## @%s · %s\n\n**task %s assigned:** %s\n' "$assignee" "$(date -u '+%H:%M')" "$id" "$title" >> "$PAD_MD"
+        #
+        # E-13: atomic dual-write.  A crash between appending to tasks.md and
+        # appending to the pad leaves tasks.md dirty (card present) and the
+        # pad clean — recovery resets tasks.md, losing the card permanently.
+        # Now both files are built in temp copies under the pad dir, then
+        # renamed into place together.  The two mv calls are a ~ms window
+        # instead of the ~human-scale window between the original appends.
+        _e13_tasks_tmp="$PAD_DIR/.e13-tasks.$$.$RANDOM"
+        _e13_pad_tmp="$PAD_DIR/.e13-pad.$$.$RANDOM"
+        _e13_cleanup() { rm -f "$_e13_tasks_tmp" "$_e13_pad_tmp" 2>/dev/null || true; }
+        trap '_e13_cleanup' EXIT
+
+        # Build temp tasks.md
+        if [ -f "$PAD_TASKS" ]; then
+          cp "$PAD_TASKS" "$_e13_tasks_tmp" || { _e13_cleanup; sp_unlock; exit 1; }
+        else
+          cat > "$_e13_tasks_tmp" <<'TASKSEOF'
+# 📋 tasks
+
+> Task cards for this pad, split out of the conversation so that creating or
+> moving a ticket no longer rewrites (and re-commits) the whole transcript.
+> Format is unchanged: one ```task TASK-N fenced block per ticket.
+>
+> Legacy inline ```task blocks still in the pad are read too — run
+> `stitchpad task migrate` to move them here.
+
+TASKSEOF
         fi
+        printf '\n%s\n' "$block" >> "$_e13_tasks_tmp"
+
+        # Build temp pad (copy + tasks:file pointer + assignment notice)
+        cp "$PAD_MD" "$_e13_pad_tmp" || { _e13_cleanup; sp_unlock; exit 1; }
+        if ! grep -Fq '<!-- tasks:file -->' "$_e13_pad_tmp" 2>/dev/null; then
+          base="$(basename "$PAD_TASKS")"
+          if grep -q '^## Tasks' "$_e13_pad_tmp" 2>/dev/null; then
+            awk -v base="$base" '
+              { print }
+              !stamped && /^## Tasks/ {
+                print ""
+                print "<!-- tasks:file -->"
+                print "> 📋 Task cards live in `" base "` beside this pad. `stitchpad task list|new|move|edit` reads and writes there, so a ticket update no longer rewrites this conversation. Legacy task blocks left below are still read."
+                stamped=1
+              }
+            ' "$_e13_pad_tmp" > "$_e13_pad_tmp.tmp" && mv "$_e13_pad_tmp.tmp" "$_e13_pad_tmp"
+          else
+            {
+              printf '\n## Tasks\n\n<!-- tasks:file -->\n'
+              printf '> 📋 Task cards live in `%s` beside this pad. `stitchpad task list|new|move|edit` reads and writes there.\n' "$base"
+            } >> "$_e13_pad_tmp"
+          fi
+        fi
+        if [ -n "$assignee" ] && sp_user_exists "$assignee"; then
+          printf '\n## @%s · %s\n\n**task %s assigned:** %s\n' "$assignee" "$(date -u '+%H:%M')" "$id" "$title" >> "$_e13_pad_tmp"
+        fi
+
+        # Move both temp copies into place.  The window between the two mv
+        # calls is a single filesystem op — bounded to ~ms.  A crash before
+        # either mv leaves NEITHER real file dirty (temps are trap-cleaned).
+        if ! mv "$_e13_tasks_tmp" "$PAD_TASKS"; then
+          _e13_cleanup; sp_unlock; echo "stitchpad: failed to write tasks.md" >&2; exit 1
+        fi
+        # E-13 test barrier: park between tasks.md mv and pad mv so the gate
+        # can SIGKILL here and verify both files land atomically on recovery.
+        if [ -n "${STITCHPAD_TASK_DUALWRITE_BARRIER:-}" ]; then
+          printf '%s' ready > "$STITCHPAD_TASK_DUALWRITE_BARRIER.ready"
+          local _e13_barrier_i=0
+          while [ ! -f "$STITCHPAD_TASK_DUALWRITE_BARRIER.release" ] && [ "$_e13_barrier_i" -lt 500 ]; do
+            sleep 0.01; _e13_barrier_i=$((_e13_barrier_i + 1))
+          done
+          [ -f "$STITCHPAD_TASK_DUALWRITE_BARRIER.release" ] || { _e13_cleanup; sp_unlock; exit 1; }
+        fi
+        if ! mv "$_e13_pad_tmp" "$PAD_MD"; then
+          _e13_cleanup; sp_unlock
+          echo "stitchpad: task $id: tasks.md written but pad update failed — board is consistent; retry any command" >&2
+          exit 1
+        fi
+        trap - EXIT  # temps already moved, disarm cleanup
+
         if ! sp_commit_or_fail "task $id: $title" "$(basename "$PAD_TASKS")" "$(basename "$PAD_MD")"; then
           sp_unlock
           echo "stitchpad: task $id commit failed — card may not be durable; $id NOT created" >&2
