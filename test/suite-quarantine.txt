@@ -5,35 +5,4 @@
 # a free pass — it documents a measurement gap that must be justified.
 # Additions to this file require a commit message explaining WHY the suite
 # cannot be reliably measured.
-authority-redesign-regression.sh requires: herdr/Ocean session
-bridge-heartbeat-interval.sh requires: herdr daemon
-concurrency-round5-regression.sh nondeterministic: concurrent-process race timing
-coordination-lifecycle-slice-a.sh requires: herdr coordination
-coordination-lifecycle-sliceB.sh requires: herdr coordination
-coordination-safety.sh requires: herdr coordination
-coordination-task3-contracts.sh requires: herdr coordination
-date-session-projection.sh time-dependent: session-projection timestamp drift
-delivery-supervision-regression.sh requires: herdr delivery supervision
-heartbeat.sh requires: herdr terminal session
-heartbeat-races.sh nondeterministic: heartbeat race timing
 help-discoverability-gate.sh requires: terminal-width (~80 cols) for help output assertions
-multipad-isolation.sh requires: herdr multi-pad isolation
-pad-io-and-archive.sh terminal-dependent: pad I/O output format assertions
-pwa-contract.sh requires: herdr PWA contract
-rc1-c11-c13-regression.sh requires: herdr regressions
-reset-recovery.sh spawns: watcher recovery, nondeterministic timing
-roster-validation-gate.sh spawns: watcher roster validation
-seat-keeper.sh requires: herdr keeper
-task26-mutant.sh requires: cargo + rust toolchain (compiled test)
-task4-bounded-recovery-regression.sh requires: herdr bounded recovery
-task5-scope-authority-regression.sh requires: herdr scope authority
-telemetry-regression.sh requires: herdr telemetry
-telemetry-tonight-demo.sh requires: herdr demo
-test-health-readonly.sh requires: herdr health
-test-ponytail-instructions.sh requires: herdr ponytail
-test-provider-availability.sh requires: herdr provider
-test-runner.sh requires: herdr test runner
-wake-regression.sh requires: herdr wake
-watcher-ordering-gate.sh spawns: watcher + two writers, nondeterministic ordering
-watcher-races.sh nondeterministic: watcher race timing
-websec-regression.sh requires: herdr websec

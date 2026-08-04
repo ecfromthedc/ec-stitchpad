@@ -42,6 +42,7 @@
 #   stitchpad bind-session                bind a terminal to the current pad
 #   stitchpad hook                         internal bridge post-commit signal
 #   stitchpad heal-roster                 repair a corrupt roster via operator credential
+#   stitchpad reconcile                   backfill contributors missing from the roster
 #
 # The roster lives INSIDE stitchpad.md as a ```roster fenced block. To add an agent
 # from any runtime (pi/codex/cline/claude), drop an adapter in ~/.stitchpad/adapters
@@ -265,6 +266,66 @@ EOF
     fi
     sp_unlock
     echo "✓ roster restored from $backup"
+    ;;
+
+  reconcile)
+    # V1-backfill: scan pad-git commit authors and register any not yet in
+    # the roster as cli|pull|-.  Idempotent — running it twice adds nothing
+    # on the second pass.  Heals agents like @km2 and @fx3 that shipped
+    # commits before the V1 auto-register gate was installed.
+    # Git authors may carry display-name suffixes (e.g. "fx3 (deepseek-v4-flash)")
+    # — extract the first word as the roster key when a full-name match fails.
+    #   stitchpad reconcile [--dry-run]
+    sp_init_paths || exit 1
+    _rec_dry=0; [ "${1:-}" = "--dry-run" ] && _rec_dry=1
+    if [ ! -d "$PAD_GIT" ] || ! sgit rev-parse --git-dir >/dev/null 2>&1; then
+      echo "stitchpad: no pad git history — nothing to reconcile" >&2
+      exit 0
+    fi
+    _rec_authors="$(sgit log --format='%an' 2>/dev/null | grep -vx 'stitchpad' | sort -u || true)"
+    [ -n "$_rec_authors" ] || { echo "stitchpad: no non-bootstrap git authors found — nothing to reconcile" >&2; exit 0; }
+    _rec_added=""
+    while IFS= read -r _ra; do
+      [ -z "$_ra" ] && continue
+      # Try full name match first, then first-word extraction for display-name
+      # authors like "fx3 (deepseek-v4-flash)".
+      _rec_key="$_ra"
+      if ! sp_user_exists "$_rec_key" 2>/dev/null; then
+        _rec_key="${_ra%% *}"  # first space-delimited word
+      fi
+      [ -n "$_rec_key" ] && ! sp_user_exists "$_rec_key" 2>/dev/null || continue
+      case "$_rec_key" in *[!a-zA-Z0-9_-]*) continue ;; esac
+      _rec_added="${_rec_added:+$_rec_added }$_rec_key"
+    done <<< "$_rec_authors"
+    if [ -z "$_rec_added" ]; then
+      echo "stitchpad: all git authors already in roster — nothing to reconcile"
+      exit 0
+    fi
+    if [ "$_rec_dry" -eq 1 ]; then
+      echo "stitchpad: would reconcile: $_rec_added"
+      exit 0
+    fi
+    sp_lock || exit 1
+    _rec_registered=""
+    for _rn in $_rec_added; do
+      if sp_user_exists "$_rn" 2>/dev/null; then continue; fi
+      _rec_tmp="$(sp_stage "$PAD_MD")"
+      awk -v line="$_rn | cli | pull | -" '
+        /^```roster/ { inblk=1; print; next }
+        inblk && /^```/ { print line; inblk=0; print; next }
+        { print }
+      ' "$PAD_MD" > "$_rec_tmp" && sp_write_inplace "$_rec_tmp" "$PAD_MD"
+      _rec_registered="${_rec_registered:+$_rec_registered }$_rn"
+    done
+    if [ -n "$_rec_registered" ]; then
+      if sp_commit "reconcile: + $_rec_registered"; then
+        echo "✓ reconciled: $_rec_registered"
+      else
+        echo "stitchpad: reconcile commit failed — roster may be dirty" >&2
+        sp_unlock; exit 1
+      fi
+    fi
+    sp_unlock
     ;;
 
   heal-roster)

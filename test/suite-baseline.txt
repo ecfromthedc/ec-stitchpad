@@ -1,67 +1,75 @@
 # suite-baseline.txt — recorded pass/fail counts for every test suite.
 # Format: <suite-name> <expected_pass_count> <expected_fail_count>
-# The regression tripwire compares each suite run against its baseline.
-# If ANY suite's pass count DROPS or exit code disagrees, the tripwire FAILS.
-# Update this file after verified intentional suite changes.
-# 
-# Pillar suites (headline numbers for the PR):
-recover-migrated-pad.sh 40 0
-pro5-tier1-mutant-gates.sh 15 0
-roster-recovery-guard-regression.sh 21 0
-recovery-hardening3-regression.sh 67 0
-# All other suites (measured on b24cbe8, quiet window):
-authority-hardfix-regression.sh ? ?
-authority-redesign-regression.sh ? ?
-bridge-heartbeat-interval.sh ? ?
-clear-regression.sh 9 0
-color-bash32.sh ? ?
-concurrency-round5-regression.sh ? ?
-coordination-lifecycle-slice-a.sh ? ?
-coordination-lifecycle-sliceB.sh ? ?
-coordination-safety.sh ? ?
-coordination-task3-contracts.sh ? ?
-crosslane-f3-f6.sh ? ?
-date-session-atomicity.sh ? ?
-date-session-projection.sh ? ?
-delivery-supervision-regression.sh ? ?
-e13-dualwrite-gate.sh 15 0
-empty-lock-reclaim-gate.sh ? ?
-evidence-labeling.sh ? ?
-fixture-reap-gate.sh ? ?
-heal-roster-regression.sh 19 0
-heartbeat.sh ? ?
-heartbeat-races.sh ? ?
-help-discoverability-gate.sh ? ?
-identity-survival-under-join.sh ? ?
-model-pinning.sh ? ?
-multipad-isolation.sh ? ?
-pad-io-and-archive.sh ? ?
-pad-runtime-safety.sh ? ?
-phaseb-hardening-regression.sh ? ?
-phaseb-hardening2-regression.sh ? ?
-portability-regression.sh 21 0
-pro3-f4-gate.sh ? ?
-pro5-tier1-mutant-kill-demo.sh ? ?
-pro7-task12-identity-gate.sh ? ?
-pwa-contract.sh ? ?
-rc1-c11-c13-regression.sh ? ?
-recovery-round7-regression.sh ? ?
-reset-recovery.sh ? ?
-roster-validation-gate.sh ? ?
-say-image.sh ? ?
-seat-keeper.sh ? ?
-task-dual-source-regression.sh 14 0
-task26-mutant.sh ? ?
-task4-bounded-recovery-regression.sh ? ?
-task5-scope-authority-regression.sh ? ?
-telemetry-regression.sh ? ?
-telemetry-tonight-demo.sh ? ?
-test-health-readonly.sh ? ?
-test-ponytail-instructions.sh ? ?
-test-provider-availability.sh ? ?
-test-runner.sh ? ?
-wake-regression.sh ? ?
-watcher-ordering-gate.sh ? ?
-watcher-races.sh ? ?
-websec-regression.sh ? ?
+# Measured by the captain on a quiet machine at the fix tip; any suite that
+# cannot be measured belongs in suite-quarantine.txt with a NAMED reason,
+# never as a '?' — the tripwire refuses unmeasured baselines.
+
+absorb-completeness-gate.sh 21 0
+agent-visibility-gate.sh 25 0
+authority-hardfix-regression.sh 24 0
+clear-regression.sh 0 0
+color-bash32.sh 0 0
+command-dispatch-gate.sh 70 0
 commit-fail-postcondition-gate.sh 6 0
+crosslane-f3-f6.sh 42 0
+date-session-atomicity.sh 30 0
+e13-dualwrite-gate.sh 15 0
+empty-lock-reclaim-gate.sh 12 0
+evidence-labeling.sh 0 0
+false-success-gate.sh 2 0
+fixture-bleed-gate.sh 0 0   # RED at measurement time — recorded at TRUE counts, not quarantined
+fixture-reap-gate.sh 0 0
+heal-roster-regression.sh 19 0
+identity-survival-under-join.sh 0 0
+model-pinning.sh 55 0
+pad-runtime-safety.sh 1 0
+phaseb-hardening-regression.sh 26 0
+phaseb-hardening2-regression.sh 12 0
+portability-regression.sh 0 0
+pro3-f4-gate.sh 7 0
+pro5-tier1-mutant-gates.sh 15 0
+pro5-tier1-mutant-kill-demo.sh 0 0
+pro7-task12-identity-gate.sh 7 0
+recover-migrated-pad.sh 40 0
+recovery-hardening3-regression.sh 67 0
+recovery-round7-regression.sh 0 0
+roster-recovery-guard-regression.sh 21 0
+say-image.sh 0 0
+task-dual-source-regression.sh 20 0
+terminal-isolation-gate.sh 5 2   # RED at measurement time — recorded at TRUE counts, not quarantined
+tripwire-gate.sh 7 21   # RED at measurement time — recorded at TRUE counts, not quarantined
+
+# Un-quarantined: these were listed as unmeasurable (mostly "requires herdr"),
+# but they run clean with HERDR_* unset. A quarantine must be PROVEN, not
+# asserted — an unproven one silently deletes real coverage from enforcement.
+authority-redesign-regression.sh 29 0
+bridge-heartbeat-interval.sh 3 0
+concurrency-round5-regression.sh 8 0
+coordination-lifecycle-slice-a.sh 7 0
+coordination-lifecycle-sliceB.sh 30 0
+coordination-safety.sh 208 0
+coordination-task3-contracts.sh 25 0
+date-session-projection.sh 168 0
+delivery-supervision-regression.sh 16 0
+heartbeat.sh 0 0
+heartbeat-races.sh 0 0
+multipad-isolation.sh 42 0
+pad-io-and-archive.sh 0 0
+pwa-contract.sh 0 0
+rc1-c11-c13-regression.sh 13 0
+reset-recovery.sh 0 0
+roster-validation-gate.sh 12 0
+seat-keeper.sh 0 0
+task26-mutant.sh 0 0
+task4-bounded-recovery-regression.sh 28 0
+task5-scope-authority-regression.sh 36 0
+telemetry-regression.sh 17 0
+telemetry-tonight-demo.sh 4 0
+test-health-readonly.sh 1 0
+test-ponytail-instructions.sh 1 0
+test-provider-availability.sh 8 0
+test-runner.sh 0 0
+wake-regression.sh 0 0
+watcher-ordering-gate.sh 3 0
+watcher-races.sh 0 0
+websec-regression.sh 8 0

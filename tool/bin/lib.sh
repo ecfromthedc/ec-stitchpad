@@ -1320,6 +1320,33 @@ sp_commit() {
       rm -f "$_idxlock" 2>/dev/null || true
     fi
   fi
+  # V1: auto-register invisible agents on first durable write. An agent
+  # whose STITCHPAD_NAME / session binding resolves to a real name not
+  # yet in the roster is inserted as cli|pull|- before their first commit
+  # lands.  Without this, @km2 shipped 14 commits of central work while
+  # completely invisible to `stitchpad roster`.
+  local _v1_who=""
+  _v1_who="$(sp_me 2>/dev/null)" || _v1_who=""
+  if [ -n "$_v1_who" ] && [ "$_v1_who" != "stitchpad" ]; then
+    if ! sp_user_exists "$_v1_who" 2>/dev/null; then
+      case "$_v1_who" in *[!a-zA-Z0-9_-]*) ;; *)
+        _v1_tmp="$(sp_stage "$PAD_MD")"
+        awk -v line="$_v1_who | cli | pull | -" '
+          /^```roster/ { inblk=1; print; next }
+          inblk && /^```/ { print line; inblk=0; print; next }
+          { print }
+        ' "$PAD_MD" > "$_v1_tmp" && sp_write_inplace "$_v1_tmp" "$PAD_MD"
+        # Ensure PAD_MD is in the staged paths so the roster edit
+        # is included in this commit.
+        local _v1_has_pad=0
+        for _v1_p in "${paths[@]}"; do
+          [ "$_v1_p" = "$(basename "$PAD_MD")" ] && { _v1_has_pad=1; break; }
+        done
+        [ "$_v1_has_pad" -eq 0 ] && paths+=("$(basename "$PAD_MD")")
+        ;;
+      esac
+    fi
+  fi
   sgit add -A -f -- "${paths[@]}" 2>/dev/null || return 1
   sgit diff --cached --quiet -- "${paths[@]}" 2>/dev/null && return 0
   # H5b: capture HEAD BEFORE the commit attempt.  Use --verify -q to avoid
@@ -2009,6 +2036,15 @@ sp_this_surface() {
                            # claim and say-guard must key identically
     done
   fi
+  # GAP 2 terminal-isolation: when STITCHPAD_TERMINAL_NAMESPACE is set,
+  # namespace the surface id so different fixtures with the same inherited
+  # session env vars (STITCHPAD_SESSION, CLAUDE_CODE_SESSION_ID, etc.) get
+  # distinct terminal claim files. Without this, two consecutive test runs
+  # sharing the runner's live session id collide on "REFUSED — terminal
+  # <id> is live as @alice" even when HOME is already fixture-isolated,
+  # because sp_this_surface() returns the LIVE session id in both fixtures.
+  local _ns="${STITCHPAD_TERMINAL_NAMESPACE:-}"
+  [ -n "$_ns" ] && _s="${_ns}:${_s}"
   printf '%s' "$_s"
   return 0
 }
