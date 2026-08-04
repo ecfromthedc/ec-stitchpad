@@ -307,6 +307,16 @@ EOF
     set -- "${_args[@]:+${_args[@]}}"
     who="${1:?usage: stitchpad join <name> <adapter> [wake] [target] [--role <role>] [--level <level>]}"
     adapter="${2:?adapter required (e.g. pi, claude, codex, mcp)}"
+    # F3: Name validation — same allowlist as rename. Unicode/homoglyph names
+    # are rejected because they bypass the tolower duplicate guard and create
+    # ghost roster rows.
+    case "$who" in *[!a-zA-Z0-9_-]*) echo "stitchpad: bad name '$who' (allowed: a-z 0-9 _ -)" >&2; exit 1;; esac
+    # F3: Case-ambiguous duplicate: sp_user_exists uses tolower, so 'Dave'
+    # matches 'dave' — re-joining the same seat is idempotent (exit 0).
+    if sp_user_exists "$who"; then
+      echo "stitchpad: @$who already in roster (or a case variant exists — names are case-insensitive)" >&2
+      exit 0
+    fi
     wake="${3:-pull}"; target="${4:--}"
     # ONE TERMINAL = ONE PAD: claim the target terminal before touching the
     # roster; a terminal live in another pad refuses the join outright.
@@ -1484,6 +1494,18 @@ PY
     if sp_delivery_ocean_unresolved_after_stop "$who"; then
       echo "stitchpad: refusing to remove @$who — Ocean acceptance/cancellation outcome is unresolved" >&2
       exit 1
+    fi
+    # F4: Surface open tasks assigned to the departing member BEFORE locking.
+    # A task handed to a departed member is invisible to everyone and stranded.
+    _leave_open_tasks="$(sp_tasks --mine "$who" --status todo 2>/dev/null || true)"
+    _leave_open_count="$(echo "$_leave_open_tasks" | grep -c '^TASK-' 2>/dev/null || true)"
+    _leave_open_count="${_leave_open_count:-0}"
+    if [ "$_leave_open_count" -gt 0 ]; then
+      echo "stitchpad: @$who has $_leave_open_count open task(s) — reassign before or after leave:" >&2
+      echo "$_leave_open_tasks" | while IFS= read -r _lt; do
+        [ -n "$_lt" ] && echo "    $_lt" >&2
+      done
+      echo "  Reassign with: stitchpad task edit <TASK-N> --to <new-name>" >&2
     fi
     sp_lock || exit 1
     # Journal the registry/markers/header/pad window BEFORE any mutation — the
@@ -3697,6 +3719,12 @@ PY
             *) shift ;;
           esac
         done
+        # F4: Validate assignee against roster BEFORE locking — refusing a
+        # ghost assignee early avoids lock contention and prevents stranded tasks.
+        if [ -n "$assignee" ] && ! sp_user_exists "$assignee"; then
+          echo "stitchpad: @$assignee not in roster — assignee must be a roster member; use 'stitchpad roster' to see members" >&2
+          exit 1
+        fi
         sp_lock || exit 1
         if [ -L "$PAD_TASKS" ] || [ -L "$PAD_MD" ]; then
           sp_unlock
@@ -3787,8 +3815,8 @@ PY
       edit)
         id="${1:-}"; shift 2>/dev/null || true
         [ -z "$id" ] && { echo "usage: stitchpad task edit <id> [--priority X] [--to name] [--labels X]" >&2; exit 1; }
-        sp_lock || exit 1
-        # Collect field updates
+        # F4: Collect field updates BEFORE locking — validate assignee against
+        # roster so a ghost assignee is refused without holding the lock.
         new_priority=""; new_assignee=""; new_labels=""
         while [ $# -gt 0 ]; do
           case "$1" in
@@ -3798,6 +3826,11 @@ PY
             *) shift ;;
           esac
         done
+        if [ -n "$new_assignee" ] && ! sp_user_exists "$new_assignee"; then
+          echo "stitchpad: @$new_assignee not in roster — assignee must be a roster member" >&2
+          exit 1
+        fi
+        sp_lock || exit 1
         tfile="$(sp_task_file "$id")" || { sp_unlock; echo "stitchpad: no such task: $id" >&2; exit 1; }
         sp_task_detect_duplicate "$id" || true  # warn if ghost exists in the other file
         tmp="$(sp_stage "$tfile")"
