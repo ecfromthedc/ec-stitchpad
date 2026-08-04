@@ -1170,7 +1170,10 @@ react() {
     return 0
   fi
 
-  sp_commit "update ($(date '+%H:%M:%S'))"
+  # Serialize against pad writes so the watcher's auto-commit never
+  # interleaves between two teammates' simultaneous posts. A subshell
+  # isolates the lock's trap handlers from the watcher's own EXIT trap.
+  ( sp_lock 2>/dev/null && sp_commit "update ($(date '+%H:%M:%S'))" ) || true
   local -a members=( "" )
   local rline
   while IFS= read -r rline; do members+=("$rline"); done < <(sp_roster)
