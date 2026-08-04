@@ -860,6 +860,12 @@ delivery_worker() {
       delivery_pending_matches "$name" "$generation" "$ordinal" "$message_id" || continue
       delivery_write_state "$name" busy "$generation" "$ordinal" "$message_id" "$task_id" \
         "$accepted_at" "$started" "" "$(delivery_now)" busy
+      # P22 OPERATOR-CONDUCT: a mention arriving while the agent is mid-turn
+      # gets an IMMEDIATE ack posted to the pad. The operator never waits
+      # in silence wondering whether the question was queued or dropped.
+      # Only ack once per ordinal — retries of the same busy generation
+      # do not re-post. Ack is staged as a marker file; react() posts it.
+      _busy_ack_stage "$name" "$ordinal" "$message_id" "$sender"
       sleep "$retry_seconds"
       continue
     fi
@@ -1131,6 +1137,33 @@ delivery_enqueue_locked() {
   delivery_start_worker "$name"
 }
 
+# P22 OPERATOR-CONDUCT: busy-agent acknowledgement.
+# When a mention arrives for a busy agent, the delivery worker stages an ack
+# marker. react() posts it under the lock+commit so it appears on the pad
+# within seconds. Each ordinal is ack'd at most once.
+_busy_ack_marker() { echo "$PAD_STATE/.busy-ack.$1.$2"; }
+_busy_ack_stage() {
+  local name="$1" ordinal="$2" message_id="$3" sender="${4:-}"
+  local marker
+  marker="$(_busy_ack_marker "$name" "$ordinal")"
+  [ -f "$marker" ] && return 0  # already staged
+  local ts
+  ts="$(date '+%I:%M %p')"
+  local sender_label="operator"
+  [ -n "$sender" ] && sender_label="$sender"
+  printf '%s\n## %s · %s\n\n_@%s is mid-lane; your message is queued and will be answered at end of turn._\n\n' \
+    "" "@$sender_label" "$ts" "$name" > "$marker"
+}
+_busy_ack_post_pending() {
+  local marker name ordinal
+  shopt -s nullglob 2>/dev/null || true
+  for marker in "$PAD_STATE"/.busy-ack.*; do
+    [ -f "$marker" ] || continue
+    cat "$marker" >> "$PAD_MD"
+    rm -f "$marker"
+  done
+}
+
 # react() takes NO stdin — everything inside redirects from /dev/null where it
 # might otherwise read the fswatch pipe.
 react() {
@@ -1173,7 +1206,7 @@ react() {
   # Serialize against pad writes so the watcher's auto-commit never
   # interleaves between two teammates' simultaneous posts. A subshell
   # isolates the lock's trap handlers from the watcher's own EXIT trap.
-  ( sp_lock 2>/dev/null && sp_commit "update ($(date '+%H:%M:%S'))" ) || true
+  ( sp_lock 2>/dev/null && _busy_ack_post_pending && sp_commit "update ($(date '+%H:%M:%S'))" ) || true
   local -a members=( "" )
   local rline
   while IFS= read -r rline; do members+=("$rline"); done < <(sp_roster)
