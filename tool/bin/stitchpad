@@ -197,7 +197,11 @@ EOF
     } > "$tmp"
     sp_write_inplace "$tmp" "$PAD_MD"
     rm -f "$body"
-    sp_commit "repair: restore missing roster header"
+    if ! sp_commit_or_fail "repair: restore missing roster header"; then
+      sp_unlock
+      echo "stitchpad: restore-roster commit failed — roster may not be durable; message NOT posted" >&2
+      exit 1
+    fi
     sp_unlock
     echo "✓ roster restored from $backup"
     ;;
@@ -3748,7 +3752,11 @@ PY
         if [ -n "$assignee" ] && sp_user_exists "$assignee"; then
           printf '\n## @%s · %s\n\n**task %s assigned:** %s\n' "$assignee" "$(date -u '+%H:%M')" "$id" "$title" >> "$PAD_MD"
         fi
-        sp_commit "task $id: $title" "$(basename "$PAD_TASKS")" "$(basename "$PAD_MD")"
+        if ! sp_commit_or_fail "task $id: $title" "$(basename "$PAD_TASKS")" "$(basename "$PAD_MD")"; then
+          sp_unlock
+          echo "stitchpad: task $id commit failed — card may not be durable; $id NOT created" >&2
+          exit 1
+        fi
         sp_unlock
         echo "$id created"
         ;;
@@ -3816,7 +3824,13 @@ PY
         sp_write_inplace "$tmp" "$tfile"; rc=$?
         [ "$rc" -eq 1 ] && { sp_unlock; exit 1; }
         # rc=2 → status already was $new_status: no write, no commit, no churn
-        if [ "$rc" -eq 0 ]; then sp_commit "task $id → $new_status" "$(basename "$tfile")"; fi
+        if [ "$rc" -eq 0 ]; then
+          if ! sp_commit_or_fail "task $id → $new_status" "$(basename "$tfile")"; then
+            sp_unlock
+            echo "stitchpad: task move commit failed — card may not be durable; $id status NOT changed" >&2
+            exit 1
+          fi
+        fi
         sp_unlock
         echo "$id → $new_status"
         ;;
@@ -3853,7 +3867,13 @@ PY
         ' "$tfile" > "$tmp"
         sp_write_inplace "$tmp" "$tfile"; rc=$?
         [ "$rc" -eq 1 ] && { sp_unlock; exit 1; }
-        if [ "$rc" -eq 0 ]; then sp_commit "task $id metadata updated" "$(basename "$tfile")"; fi
+        if [ "$rc" -eq 0 ]; then
+          if ! sp_commit_or_fail "task $id metadata updated" "$(basename "$tfile")"; then
+            sp_unlock
+            echo "stitchpad: task edit commit failed — card may not be durable; $id NOT updated" >&2
+            exit 1
+          fi
+        fi
         sp_unlock
         echo "$id updated"
         ;;

@@ -1226,6 +1226,18 @@ sp_verify_commit_landed() {
   return 1
 }
 
+# Shared post-condition: commit + verify count advanced. Returns 0 only when
+# the commit landed (or was a verifiable no-op). Callers that claim a durable
+# effect MUST gate on this — printing "✓ done" after an unchecked sp_commit
+# is the false-success class this closes.
+sp_commit_or_fail() {
+  local msg="$1"; shift 2>/dev/null || true
+  local pre_count
+  pre_count="$(sp_commit_count)"
+  sp_commit "$msg" "$@" || return 1
+  sp_verify_commit_landed "$pre_count"
+}
+
 # Append a small italic system/presence line to the pad (join/leave, etc.).
 # Not a message — no @sender — so it never trips mention detection or the gate.
 sp_system() {
