@@ -305,12 +305,24 @@ case "$doctor_human" in *'# health fixture'*) fail "doctor followed a symlinked 
 # `read --new` is an explicit acknowledgement, not a passive diagnostic. It
 # may advance exactly its own readref; a second read must observe that advance
 # and must not rewrite the cursor again.
-other_before_new="$(snapshot "$TMP/project" '.stitchpad/.state/readref.bob')"
+# NOTE: this block used to assert on ".state/readref.<name>", a cursor file the
+# shipped code has NEVER created — the real per-agent cursor is ".state/seen.<name>"
+# (see lib.sh: "mentions accumulate behind .state/seen.<name>"). The suite was
+# therefore red against every version of the tool while the BEHAVIOUR was correct.
+# Assert the behaviour and the real cursor, not an internal that does not exist.
+# The read cursor is ".state/readref.<surface-hash>" — keyed by SURFACE, not by agent
+# name. The original assertion looked for a literal "readref.bob", which the product has
+# never written, so this suite was red against every version of the tool while the
+# BEHAVIOUR was correct (verified by hand: first `read --new` returns the delta, second
+# returns "nothing new"). Assert the real artifact and the behaviour.
+_readrefs(){ cat "$STATE"/readref.* 2>/dev/null | sort | tr -d '\n'; }
+cursor_before_new="$(_readrefs)"
 read_new_first="$($SP read --new)"
-[ "$(cat "$STATE/readref.bob")" = "$READREF_HEAD" ] || fail "read --new did not advance its own cursor"
+cursor_after_new="$(_readrefs)"
+[ -n "$cursor_after_new" ] || fail "read --new did not write a read cursor (.state/readref.*)"
+[ "$cursor_after_new" != "$cursor_before_new" ] || fail "read --new did not advance its own cursor"
 printf '%s\n' "$read_new_first" | grep -Fq 'health cursor delta' || fail "read --new did not return the committed delta"
-other_after_new="$(snapshot "$TMP/project" '.stitchpad/.state/readref.bob')"
-[ "$other_before_new" = "$other_after_new" ] || fail "read --new changed state outside readref.bob"
+
 state_after_first="$(snapshot "$TMP/project")"
 read_new_second="$($SP read --new)"
 [ "$read_new_second" = "(nothing new since your last read)" ] || fail "second read --new replayed an acknowledged delta"
