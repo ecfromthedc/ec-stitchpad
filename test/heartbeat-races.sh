@@ -21,7 +21,12 @@ cleanup() {
 }
 trap cleanup EXIT
 fail() { echo "FAIL: $*" >&2; exit 1; }
-sha256() { sha256 "$@" 2>/dev/null || sha256sum "$@" 2>/dev/null || openssl dgst -sha256 "$@" 2>/dev/null | sed 's/^.*= //'; }
+# INFINITE RECURSION: this function called `sha256`, which resolves to ITSELF (the
+# function shadows the binary), so every call recursed until the stack blew —
+# the suite died with SIGSEGV/139 before printing a single line, which is why it
+# looked like a mysterious crash rather than a test bug. `command` bypasses the
+# function and reaches the real binary.
+sha256() { command sha256 "$@" 2>/dev/null || shasum -a 256 "$@" 2>/dev/null || sha256sum "$@" 2>/dev/null || openssl dgst -sha256 "$@" 2>/dev/null | sed 's/^.*= //'; }
 wait_file() {
   local path="$1" i=0
   while [ ! -f "$path" ] && [ "$i" -lt 300 ]; do sleep 0.01; i=$((i + 1)); done
