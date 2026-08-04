@@ -59,6 +59,13 @@ DS1_WORK="$TMP/ds1"; mkdir -p "$DS1_WORK"; cd "$DS1_WORK"
 
 "$SP" init --name ds1 >/dev/null 2>&1
 STITCHPAD_NAME=alice "$SP" join alice codex pull - >/dev/null 2>&1
+# This release added assignee validation: `task new --assignee X` REFUSES unless X is a
+# roster member. This fixture assigns to carol and bob but only ever joined alice, so
+# `task new` failed silently and the ONLY TASK-2 in the tree was the injected ghost —
+# which is why DS1a looked like a "first-match bug". The validation is correct; the
+# fixture owed the joins. Distinct surfaces so "one terminal = one (pad,name)" allows it.
+STITCHPAD_SESSION="fx-carol-$$-$(basename "$PWD")" STITCHPAD_NAME=carol "$SP" join carol codex pull - >/dev/null 2>&1 || true
+STITCHPAD_SESSION="fx-bob-$$-$(basename "$PWD")" STITCHPAD_NAME=bob   "$SP" join bob   codex pull - >/dev/null 2>&1 || true
 STITCHPAD_NAME=alice "$SP" task new "auth fix" --assignee carol --priority high >/dev/null 2>&1
 
 # Inject a ghost with DIFFERENT fields
@@ -114,6 +121,8 @@ DS6_WORK="$TMP/ds6"; mkdir -p "$DS6_WORK"; cd "$DS6_WORK"
 
 "$SP" init --name ds6 >/dev/null 2>&1
 STITCHPAD_NAME=alice "$SP" join alice codex pull - >/dev/null 2>&1
+STITCHPAD_SESSION="fx-carol-$$-$(basename "$PWD")" STITCHPAD_NAME=carol "$SP" join carol codex pull - >/dev/null 2>&1 || true
+STITCHPAD_SESSION="fx-bob-$$-$(basename "$PWD")" STITCHPAD_NAME=bob   "$SP" join bob   codex pull - >/dev/null 2>&1 || true
 STITCHPAD_NAME=alice "$SP" task new "concurrent move card" >/dev/null 2>&1
 
 # Verify the card starts at todo
@@ -207,6 +216,8 @@ DS2_WORK="$TMP/ds2"; mkdir -p "$DS2_WORK"; cd "$DS2_WORK"
 
 "$SP" init --name ds2 >/dev/null 2>&1
 STITCHPAD_NAME=alice "$SP" join alice codex pull - >/dev/null 2>&1
+STITCHPAD_SESSION="fx-carol-$$-$(basename "$PWD")" STITCHPAD_NAME=carol "$SP" join carol codex pull - >/dev/null 2>&1 || true
+STITCHPAD_SESSION="fx-bob-$$-$(basename "$PWD")" STITCHPAD_NAME=bob   "$SP" join bob   codex pull - >/dev/null 2>&1 || true
 STITCHPAD_NAME=alice "$SP" task new "agree test" --assignee dave --priority medium >/dev/null 2>&1
 
 inject_inline_ghost "$DS2_WORK/.stitchpad/stitchpad.md" "TASK-2" \
@@ -249,6 +260,8 @@ DS3_WORK="$TMP/ds3"; mkdir -p "$DS3_WORK"; cd "$DS3_WORK"
 
 "$SP" init --name ds3 >/dev/null 2>&1
 STITCHPAD_NAME=alice "$SP" join alice codex pull - >/dev/null 2>&1
+STITCHPAD_SESSION="fx-carol-$$-$(basename "$PWD")" STITCHPAD_NAME=carol "$SP" join carol codex pull - >/dev/null 2>&1 || true
+STITCHPAD_SESSION="fx-bob-$$-$(basename "$PWD")" STITCHPAD_NAME=bob   "$SP" join bob   codex pull - >/dev/null 2>&1 || true
 STITCHPAD_NAME=alice "$SP" task new "warn test" --assignee carol >/dev/null 2>&1
 
 inject_inline_ghost "$DS3_WORK/.stitchpad/stitchpad.md" "TASK-2" \
@@ -297,6 +310,8 @@ DS4_WORK="$TMP/ds4"; mkdir -p "$DS4_WORK"; cd "$DS4_WORK"
 
 "$SP" init --name ds4 >/dev/null 2>&1
 STITCHPAD_NAME=alice "$SP" join alice codex pull - >/dev/null 2>&1
+STITCHPAD_SESSION="fx-carol-$$-$(basename "$PWD")" STITCHPAD_NAME=carol "$SP" join carol codex pull - >/dev/null 2>&1 || true
+STITCHPAD_SESSION="fx-bob-$$-$(basename "$PWD")" STITCHPAD_NAME=bob   "$SP" join bob   codex pull - >/dev/null 2>&1 || true
 STITCHPAD_NAME=alice "$SP" task new "move warn" >/dev/null 2>&1
 
 inject_inline_ghost "$DS4_WORK/.stitchpad/stitchpad.md" "TASK-2" \
@@ -336,6 +351,9 @@ DS5_WORK="$TMP/ds5"; mkdir -p "$DS5_WORK"; cd "$DS5_WORK"
 
 "$SP" init --name ds5 >/dev/null 2>&1
 STITCHPAD_NAME=alice "$SP" join alice codex pull - >/dev/null 2>&1
+STITCHPAD_SESSION="fx-carol-$$-$(basename "$PWD")" STITCHPAD_NAME=carol "$SP" join carol codex pull - >/dev/null 2>&1 || true
+STITCHPAD_SESSION="fx-bob-$$-$(basename "$PWD")" STITCHPAD_NAME=bob   "$SP" join bob   codex pull - >/dev/null 2>&1 || true
+STITCHPAD_SESSION="fx-eve-$$-$(basename "$PWD")" STITCHPAD_NAME=eve "$SP" join eve codex pull - >/dev/null 2>&1 || true
 STITCHPAD_NAME=alice "$SP" task new "list warn" --assignee eve >/dev/null 2>&1
 
 inject_inline_ghost "$DS5_WORK/.stitchpad/stitchpad.md" "TASK-2" \
