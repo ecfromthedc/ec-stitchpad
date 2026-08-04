@@ -150,38 +150,6 @@ sp_init_paths_readonly() {
     echo "stitchpad: pad git directory is a symlink — refusing" >&2
     return 1
   fi
-  # P18/P5: auto-heal a missing pad git when the pad file exists.
-  # Pad git is load-bearing (read --new deltas, say auto-commits, compaction
-  # audit trail) but the only code that ever initialized it lived in
-  # sp_init_paths — which was unreachable when sp_init_paths_readonly failed
-  # first.  Move auto-create BEFORE the missing-git check so every path heals.
-  if [ ! -d "$PAD_GIT" ] && [ -f "$PAD_MD" ] && command -v git >/dev/null 2>&1; then
-    git --git-dir="$PAD_GIT" --work-tree="$PAD_DIR" init -q 2>/dev/null || true
-    git --git-dir="$PAD_GIT" --work-tree="$PAD_DIR" add stitchpad.md 2>/dev/null || true
-    git --git-dir="$PAD_GIT" --work-tree="$PAD_DIR" -c user.name=stitchpad -c user.email=pad@local \
-      commit -q -m "bootstrap: pad git (re)initialized" 2>/dev/null || true
-  fi
-  # P5: a missing pad git makes the pad unrecognisable to every read command.
-  # Without it, roster prints zero rows (indistinguishable from an idle fleet),
-  # sessions can't project, and the doctor has nothing to health-check.
-  # Read-only commands must fail LOUD instead of silently degrading.
-  # This fires only when auto-create couldn't heal (e.g., PAD_MD also missing,
-  # git command unavailable, or init/commit failed).
-  if [ ! -d "$PAD_GIT" ]; then
-    echo "stitchpad: pad git directory is missing — this pad is broken" >&2
-    echo "  The pad git history at $PAD_GIT was deleted." >&2
-    echo "  Restore from a backup or re-init with:  cd $(dirname "$PAD_DIR") && stitchpad init --name <name>" >&2
-    echo "  Existing pad content in $PAD_MD will be imported into the new git history." >&2
-    return 1
-  fi
-  # P5: a pad git that exists but is broken (corrupt config, missing objects)
-  # must also fail loud.  rev-parse --git-dir exits 128 on a corrupt config.
-  if ! sgit rev-parse --git-dir >/dev/null 2>&1; then
-    echo "stitchpad: pad git is corrupt — rev-parse failed on $PAD_GIT" >&2
-    echo "  The git repository is present but unreadable (corrupt HEAD or config)." >&2
-    echo "  Restore from backup or re-init with:  cd $(dirname "$PAD_DIR") && stitchpad init --name <name>" >&2
-    return 1
-  fi
   PAD_STATE="$PAD_DIR/.state"
   # Task cards live in a SIBLING file so a `task move` never rewrites (or
   # commits) the whole conversation. Legacy inline ```task blocks in the pad are
@@ -197,7 +165,15 @@ sp_init_paths() {
   # passive/read-only commands and runs outside the pad mutation lock. Only
   # sp_lock may reconcile a promoted write generation.
   sp_ensure_outer_git_ignore
-# (moved to sp_init_paths_readonly — auto-creates before P5 check)
+  # Pad git is load-bearing (read --new deltas, say auto-commits, compaction
+  # audit trail) but NOTHING ever initialized it — sp_commit just no-ops when
+  # it's absent, so a pad without it degrades silently. Self-heal on first use.
+  if [ ! -d "$PAD_GIT" ] && [ -f "$PAD_MD" ] && command -v git >/dev/null 2>&1; then
+    git --git-dir="$PAD_GIT" --work-tree="$PAD_DIR" init -q 2>/dev/null || true
+    git --git-dir="$PAD_GIT" --work-tree="$PAD_DIR" add stitchpad.md 2>/dev/null || true
+    git --git-dir="$PAD_GIT" --work-tree="$PAD_DIR" -c user.name=stitchpad -c user.email=pad@local \
+      commit -q -m "bootstrap: pad git (re)initialized" 2>/dev/null || true
+  fi
 }
 
 # Evidence label (TASK-6): stamp the current environment + immutable candidate
@@ -1380,16 +1356,10 @@ sp_commit() {
   # RP-2: capture staged blob hashes BEFORE commit for post-commit byte
   # verification.  A hook that keeps the path but replaces content passes
   # Z1 but commits tampered bytes — we verify exact blob match vs HEAD.
-  # P19: entries are recorded per staged FILE ("<path>:<blobhash>"), never
-  # per pathspec.  A DIRECTORY pathspec (archive) must expand to its files:
-  # comparing a file's blob hash against `ls-tree` of the directory yields
-  # the TREE hash, so every archive commit was falsely reported uncommitted
-  # (pad rewritten + cursors frozen, error text on a durable success).
-  local _rp2_hashes="" _p _rp2_entries
+  local _rp2_hashes="" _p _ph
   for _p in "${paths[@]}"; do
-    _rp2_entries="$(sgit ls-files --stage -- "$_p" 2>/dev/null \
-      | awk -F'\t' '{ split($1, m, " "); print $2 ":" m[2] }')" || _rp2_entries=""
-    [ -n "$_rp2_entries" ] && _rp2_hashes="${_rp2_hashes}${_rp2_entries}"$'\n'
+    _ph="$(sgit ls-files --stage -- "$_p" 2>/dev/null | awk '{print $2}')" || _ph=""
+    [ -n "$_ph" ] && _rp2_hashes="${_rp2_hashes}${_p}:${_ph}"$'\n'
   done
   _rp2_hashes="${_rp2_hashes%$'\n'}"
   # I1: identity preflight — every commit must carry the agent's declared
@@ -1458,11 +1428,6 @@ sp_commit() {
       done <<< "$_rp2_hashes"
       [ "$_rp2_ok" -eq 1 ] || return 1
     fi
-    # P19 auto-narration: every durable commit emits a pad line so the
-    # operator can SEE progress without asking.  One concise line per
-    # meaningful event, not per command.  Best-effort — a narration
-    # failure never rolls back the commit it describes.
-    sp_narrate "commit: $msg" 2>/dev/null || true
     return 0
   fi
   # H5b: commit failed (exit != 0). Check HEAD moved AND index is clean.
@@ -1509,43 +1474,11 @@ sp_commit() {
   #            tamper class, real git failure) → refuse honestly.
   if [ -n "$_head_after" ] \
      && sgit diff --quiet HEAD -- "${paths[@]}" 2>/dev/null; then
-    # P19 auto-narration for JH4 concurrent commit race recovery
-    sp_narrate "commit: $msg" 2>/dev/null || true
     return 0
   fi
   # H5b: HEAD didn't move and our bytes are not in HEAD — real failure.
   return 1
 }
-
-# ── P19 auto-narration ───────────────────────────────────────────────────
-# Every durable event (commit landed, lane taken, card closed) emits a
-# concise pad line automatically — driven by the artifact contract, not
-# by the agent choosing to call `say`.  Best-effort: a narration failure
-# never rolls back the primary operation.
-sp_narrate() {
-  local _nr_text="$1" _nr_from _nr_ts _nr_depoch _nr_commit_rc
-  [ -n "$_nr_text" ] || return 0
-  [ -n "${PAD_DIR:-}" ] && [ -f "${PAD_MD:-}" ] || return 0
-  _nr_from="$(sp_me 2>/dev/null)" || _nr_from=""
-  [ -n "$_nr_from" ] || return 0
-  [ "$_nr_from" = "stitchpad" ] && return 0  # Bootstrap commits aren't agent events
-  # Derive the timestamp — consistent with date-divider when available
-  if type sp_date_divider_hhmm >/dev/null 2>&1; then
-    _nr_ts="$(sp_date_divider_hhmm 2>/dev/null)" || _nr_ts="$(date '+%I:%M %p')"
-  else
-    _nr_ts="$(date '+%I:%M %p')"
-  fi
-  # Append the narration line to the pad.  Use a compact format that is
-  # distinguishable from human conversation: `### @name event · HH:MM AM`
-  printf '\n### %s %s · %s\n' "@${_nr_from}" "$_nr_text" "$_nr_ts" >> "$PAD_MD"
-  # P19 REFINEMENT: narration must NOT mint its own commit. Doing so doubled the
-  # commit count on every durable write and broke heal-roster-regression (expected 3,
-  # got 5) — a narration side-effect must never change the pad's commit semantics.
-  # The line is appended to PAD_MD and rides along in the NEXT commit, or is picked up
-  # by the watcher. Best-effort: never roll back or delay the primary operation.
-  return 0
-}
-
 
 # ── Roster parsing (the magic: roster is IN the markdown) ────────────
 # Emits "name|adapter|wake|target" per participant from the ```roster fence.
@@ -1654,11 +1587,11 @@ sp_tasks() {
   local _tf=(); while IFS= read -r _f; do _tf+=("$_f"); done < <(sp_task_files)
   local _sp_tasks_output
   _sp_tasks_output="$(awk -v fn="$filter_name" -v fs="$filter_status" '
-    BEGIN { id=""; title=""; status=""; priority=""; assignee=""; labels=""; created=""; desc="" }
+    BEGIN { id=""; title=""; status=""; priority=""; assignee=""; labels=""; created=""; estimate=""; desc="" }
     # multiple inputs (pad + tasks.md): never let an unterminated block in one
     # file bleed into the next
     FNR==1                           { inblk=0; meta=0; id=""; code_fence=0 }
-    /^```task /                      { inblk=1; meta=1; id=$2; gsub(/^ *| *$/,"",id); title=""; status="todo"; priority="none"; assignee=""; labels=""; created=""; desc="" }
+    /^```task /                      { inblk=1; meta=1; id=$2; gsub(/^ *| *$/,"",id); title=""; status="todo"; priority="none"; assignee=""; labels=""; created=""; estimate=""; desc="" }
     # E-18: only a TOP-LEVEL ``` (code_fence==0) closes the task block.
     # Nested ``` pairs inside the body (e.g. a code block in the description)
     # toggle code_fence and do NOT terminate the task.
@@ -1667,7 +1600,7 @@ sp_tasks() {
       # duplicate blocks: tasks.md is read second via sp_task_files ordering,
       # so its version naturally wins for cross-file duplicates (LAST wins).
       if (!(id in seen)) { order[++nord]=id; seen[id]=1 }
-      data[id] = id "|" title "|" status "|" priority "|" assignee "|" labels "|" created "|" desc
+      data[id] = id "|" title "|" status "|" priority "|" assignee "|" labels "|" created "|" estimate "|" desc
       fa[id]=assignee; fst[id]=status; id="" } }
     inblk && /^---/                   { meta=0; next }
     inblk && !meta && /^```[^t]/ {
@@ -1696,6 +1629,7 @@ sp_tasks() {
       if (line ~ /^assignee:/) { gsub(/^assignee: */, "", line); assignee=line }
       if (line ~ /^labels:/)   { gsub(/^labels: */, "", line); labels=line }
       if (line ~ /^created:/)  { gsub(/^created: */, "", line); created=line }
+      if (line ~ /^estimate:/) { gsub(/^estimate:[[:space:]]*/, "", line); estimate=line }
     }
     END { for (i=1; i<=nord; i++) { k=order[i]
       if ((fn=="" || fa[k]==fn) && (fs=="" || fst[k]==fs)) print data[k] } }
@@ -1709,6 +1643,235 @@ sp_tasks() {
     done <<< "$_sp_tasks_output"
   fi
   printf '%s\n' "$_sp_tasks_output"
+}
+
+# ── P20+P21: Task Oversight Board + ETA Projection ──────────────────────
+# The board answers questions the operator should never have to ask: "eta?",
+# "hows it going", "u still going?", "why is this card not done?".
+#
+# sp_task_board — enriched `stitchpad task list` with per-card owner liveness,
+#   artifact presence, and staleness flags.  A card whose owner is inactive
+#   past the threshold is flagged on the board without operator action.
+#
+# sp_task_eta — wall-clock projection modelling parallelism (busiest-owner
+#   chain + serialised tail).  An operator budgets agents and tokens without
+#   asking anyone.
+
+TASK_OWNER_STALE_SECONDS="${TASK_OWNER_STALE_SECONDS:-3600}"
+
+# sp_task_board — rich kanban-like view with liveness + artifacts.
+# Reads sp_tasks pipe-delimited output (id|title|status|priority|assignee|labels|created|estimate|desc)
+# and cross-references session registry for owner activity.
+sp_task_board() {
+  local _proj _tasks _now _line _id _title _status _priority _assignee _labels _created _est _desc
+  local _owner_status _owner_age _art_check _artifact_file _present _flag
+  _proj="$(sp_session_registry_project 2>/dev/null || echo '[]')"
+  _tasks="$(sp_tasks "$@")"
+  _now="$(date +%s)"
+
+  printf '%-10s %-12s %-12s %-10s %-12s %-14s %-14s %-10s %s\n' \
+    "TASK" "STATUS" "PRIORITY" "OWNER" "OWNER-LIVE" "ARTIFACT" "AGE" "EST" "TITLE"
+  printf '%-10s %-12s %-12s %-10s %-12s %-14s %-14s %-10s %s\n' \
+    "----------" "------------" "------------" "----------" "------------" "--------------" "--------------" "----------" "-------------------------"
+
+  while IFS='|' read -r _id _title _status _priority _assignee _labels _created _est _desc; do
+    [ -n "$_id" ] || continue
+    # Owner liveness from session registry
+    _owner_status="-"; _owner_age=""
+    _flag=""
+    if [ -n "$_assignee" ]; then
+      _owner_status="$(echo "$_proj" | python3 -c "
+import json, sys
+data = json.load(sys.stdin)
+for s in data:
+    if s.get('name','') == '$_assignee':
+        print(s.get('status',''))
+        sys.exit(0)
+print('unknown')
+" 2>/dev/null)"
+      [ -z "$_owner_status" ] && _owner_status="unknown"
+      _owner_age="$(echo "$_proj" | python3 -c "
+import json, sys
+data = json.load(sys.stdin)
+for s in data:
+    if s.get('name','') == '$_assignee':
+        la = s.get('last_activity',0)
+        if la: print(int($_now) - la)
+        sys.exit(0)
+print('?')
+" 2>/dev/null)"
+      [ -z "$_owner_age" ] && _owner_age="?"
+      # Staleness: owner idle > TASK_OWNER_STALE_SECONDS and card not done
+      if [ "$_status" != "done" ] && [ "$_status" != "in_review" ]; then
+        case "$_owner_status" in
+          terminal|stale) _flag="STALE" ;;
+          idle)
+            if [ "$_owner_age" != "?" ] && [ "$_owner_age" -gt "$TASK_OWNER_STALE_SECONDS" ] 2>/dev/null; then
+              _flag="STALE"
+            fi ;;
+        esac
+      fi
+    fi
+    # Artifact check
+    _artifact_file=""
+    _present="-"
+    if [ -n "$_assignee" ] && [ -f "$PAD_STATE/artifact-expect.$_assignee" ]; then
+      _artifact_file="$(head -1 "$PAD_STATE/artifact-expect.$_assignee")"
+      if [ -n "$_artifact_file" ] && [ -e "$_artifact_file" ]; then
+        _present="yes"
+      elif [ -n "$_artifact_file" ]; then
+        _present="NO"
+      fi
+    fi
+    # Truncate long fields for column alignment
+    [ "${#_title}" -gt 40 ] && _title="${_title:0:37}..."
+    [ "${#_artifact_file}" -gt 24 ] && _artifact_file="${_artifact_file:0:21}..."
+    [ "${#_est}" -gt 8 ] && _est="${_est:0:8}"
+
+    local _owner_display="${_assignee:-unassigned}"
+    [ "${#_owner_display}" -gt 10 ] && _owner_display="${_owner_display:0:7}..."
+    local _live_display="${_owner_status}"
+    [ -n "$_owner_age" ] && [ "$_owner_age" != "?" ] && _live_display="${_owner_status} ${_owner_age}s" 2>/dev/null
+    [ "${#_live_display}" -gt 12 ] && _live_display="${_live_display:0:12}"
+
+    printf '%-10s %-12s %-12s %-10s %-12s %-14s %-14s %-10s %s' \
+      "$_id" "$_status" "$_priority" "$_owner_display" "$_live_display" \
+      "${_artifact_file:- -}" "${_present}" "${_est:- -}" "$_title"
+    if [ -n "$_flag" ]; then printf '  ⚠ %s' "$_flag"; fi
+    printf '\n'
+  done <<< "$_tasks"
+}
+
+# sp_task_eta — wall-clock projection modelling parallelism.
+# Model: busiest-owner chain + serialised tail.
+#   per_owner_minutes[owner] = sum of estimate for all non-done cards assigned to owner
+#   busiest = max(per_owner_minutes)  — cards on different owners run in parallel
+#   tail = sum of estimate for unassigned cards  — no owner = no parallel slot
+#   projection = busiest + tail
+# Default estimate: 15 minutes per card (configurable via TASK_DEFAULT_ESTIMATE_MINUTES).
+sp_task_eta() {
+  local _tasks _line _id _title _status _assignee _est _mins
+  local _default_est="${TASK_DEFAULT_ESTIMATE_MINUTES:-15}"
+
+  _tasks="$(sp_tasks)"
+
+  # Shell arrays indexed by owner name
+  local owners="" ow_min="" ow_cards=""
+  local tail_mins=0 tail_count=0 busiest_owner="" busiest_mins=0 total_cards=0 active_cards=0
+  local _proj _now
+  _proj="$(sp_session_registry_project 2>/dev/null || echo '[]')"
+  _now="$(date +%s)"
+
+  while IFS='|' read -r _id _title _status _priority _assignee _labels _created _est _desc; do
+    [ -n "$_id" ] || continue
+    total_cards=$((total_cards + 1))
+    # Only non-done cards count toward ETA
+    case "$_status" in done|in_review) continue ;; esac
+    active_cards=$((active_cards + 1))
+
+    # Parse estimate: "15m" -> 15, "3 hours" -> 180, "1h" -> 60, default to 15
+    mins="$_default_est"
+    if [ -n "$_est" ]; then
+      _clean="$(echo "$_est" | tr -d ' ')"
+
+      # Python expression parser
+      mins="$(echo "$_est" | python3 -c "
+import re, sys
+s = sys.stdin.read().strip().lower()
+# Try simple 'Nm' format
+m = re.match(r'^(\d+(?:\.\d+)?)\s*m(?:in(?:ute)?s?)?$', s)
+if m: print(int(float(m.group(1)))); sys.exit(0)
+# Try 'Nh' format
+m = re.match(r'^(\d+(?:\.\d+)?)\s*h(?:our)?s?$', s)
+if m: print(int(float(m.group(1))*60)); sys.exit(0)
+# Try 'N hours'
+m = re.match(r'^(\d+(?:\.\d+)?)\s*hours?$', s)
+if m: print(int(float(m.group(1))*60)); sys.exit(0)
+print($_default_est)
+" 2>/dev/null || echo "$_default_est")"
+    fi
+    # Ensure integer
+    case "$mins" in ''|*[!0-9]*) mins="$_default_est" ;; esac
+
+    if [ -z "$_assignee" ]; then
+      tail_mins=$((tail_mins + mins))
+      tail_count=$((tail_count + 1))
+    else
+      # Accumulate per-owner
+      local found=0
+      local _ow_idx=1
+      for o in $owners; do
+        if [ "$o" = "$_assignee" ]; then
+          local _prev_min _prev_cards
+          _prev_min=$(echo "$ow_min" | awk -v idx=$_ow_idx '{print $idx}')
+          _prev_cards=$(echo "$ow_cards" | awk -v idx=$_ow_idx '{print $idx}')
+          local _new_min=$((_prev_min + mins))
+          local _new_cards=$((_prev_cards + 1))
+          # Rebuild ow_min and ow_cards with new values at this index
+          ow_min=$(echo "$ow_min" | awk -v idx=$_ow_idx -v v=$_new_min '{
+            for(i=1;i<=NF;i++) printf("%s%s", (i==idx?v:$i), (i==NF?"":" ")); print ""}')
+          ow_cards=$(echo "$ow_cards" | awk -v idx=$_ow_idx -v v=$_new_cards '{
+            for(i=1;i<=NF;i++) printf("%s%s", (i==idx?v:$i), (i==NF?"":" ")); print ""}')
+          found=1; break
+        fi
+        _ow_idx=$((_ow_idx + 1))
+      done
+      if [ "$found" -eq 0 ]; then
+        owners="$owners $_assignee"
+        ow_min="$ow_min $mins"
+        ow_cards="$ow_cards 1"
+      fi
+    fi
+  done <<< "$_tasks"
+
+  # Find busiest owner
+  local _idx=1
+  for o in $owners; do
+    local _m
+    _m=$(echo "$ow_min" | awk -v idx=$_idx '{print $idx}')
+    [ -z "$_m" ] && _m=0
+    if [ "$_m" -gt "$busiest_mins" ] 2>/dev/null; then
+      busiest_mins=$_m
+      busiest_owner="$o"
+    fi
+    _idx=$((_idx + 1))
+  done
+
+  local projection=$((busiest_mins + tail_mins))
+
+  echo ""
+  echo "ETA PROJECTION"
+  echo "=============="
+  echo "  Active cards:     $active_cards (of $total_cards total)"
+  echo "  Busiest owner:    ${busiest_owner:-none} (${busiest_mins}m across chains)"
+  echo "  Unassigned tail:  ${tail_mins}m (${tail_count} cards)"
+  echo "  ─────────────────────────────────────"
+  printf "  Wall-clock est:   %dm (~%.1fh)\n" "$projection" "$(python3 -c "print($projection/60.0)" 2>/dev/null || echo "?")"
+
+  if [ -n "$owners" ]; then
+    echo ""
+    echo "Per-owner breakdown:"
+    local _idx2=1
+    for o in $owners; do
+      local _cm _cc
+      _cm=$(echo "$ow_min" | awk -v idx=$_idx2 '{print $idx}')
+      _cc=$(echo "$ow_cards" | awk -v idx=$_idx2 '{print $idx}')
+      # Check liveness
+      local _live="$(echo "$_proj" | python3 -c "
+import json, sys
+data = json.load(sys.stdin)
+for s in data:
+    if s.get('name','') == '$o':
+        print(s.get('status',''))
+        sys.exit(0)
+print('unknown')
+" 2>/dev/null)"
+      [ -z "$_live" ] && _live="unknown"
+      printf "    %-12s %4s cards, %4sm  (%s)\n" "$o" "${_cc:-0}" "${_cm:-0}" "$_live"
+      _idx2=$((_idx2 + 1))
+    done
+  fi
+  echo ""
 }
 
 # Create tasks.md (with its header) if it does not exist yet. Callers hold the lock.
@@ -3038,7 +3201,7 @@ sp_reap_duplicate_watchers_for_pad() {
 ensure_watcher() {
   [ -n "${PAD_DIR:-}" ] || sp_init_paths || return 0
   local watch_lock="$PAD_STATE/watch.lock.d"
-  local watch_log="$PAD_STATE/watch.log" watch_generation lock_gen
+  local watch_log="$PAD_STATE/watch.log" watch_generation
   sp_watch_stage_reap || true
   # Only spawn if someone is alive and listening
   sp_any_alive || return 0
@@ -3049,18 +3212,6 @@ ensure_watcher() {
       sp_watcher_alive && return 0
     fi
   fi
-  # P13: only nuke a dead/stale lock before the mkdir race. If a concurrent
-  # caller just won mkdir and wrote a fresh generation, the lock is active
-  # startup — do NOT kill it; wait for its owner to appear instead.
-  lock_gen="$(cat "$watch_lock/generation" 2>/dev/null || true)"
-  if [ -n "$lock_gen" ] && sp_watch_launcher_lease_is_fresh "$watch_lock" "$lock_gen"; then
-    sleep 0.3
-    sp_watcher_alive && return 0
-    # Still not visible but generation is fresh — don't nuke it, return so
-    # a later ensure (heartbeat tick) can try again.
-    return 0
-  fi
-  # Lock is absent, dead, or stale — safe to stop and try to acquire.
   sp_stop_watchers_for_pad
   # ATOMIC acquire: exactly one caller wins.
   if ! mkdir "$watch_lock" 2>/dev/null; then
@@ -3094,7 +3245,7 @@ ensure_watcher() {
   }
   date -u +%Y-%m-%dT%H:%M:%SZ > "$watch_lock/ts"
   # Spawn the watcher. No trap — the watcher removes the lock on exit.
-  ( STITCHPAD_HOME="$STITCHPAD_HOME" STITCHPAD_PAD_DIR="$PAD_DIR" STITCHPAD_WATCH_GENERATION="$watch_generation" \
+  ( STITCHPAD_PAD_DIR="$PAD_DIR" STITCHPAD_WATCH_GENERATION="$watch_generation" \
       bash "$STITCHPAD_HOME/bin/watch.sh" >>"$watch_log" 2>&1 ) &
   # The watcher atomically claims owner and publishes its own PID. Until then,
   # ts supplies only a brief startup grace—never signal authority.
