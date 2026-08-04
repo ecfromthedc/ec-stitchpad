@@ -89,6 +89,12 @@ printf '444444' > "$R1_PAD_STATE/session-activity.$R1_SID_B"
 
 # Create a REAL orphan journal under SID A — stamps SID A's identity
 R1_ORPHAN="$(STITCHPAD_SESSION="$R1_SID_A" sp_session_registry_journal_begin "$R1_SID_A")"
+# R7 liveness: journal_begin stamps .alive with the CREATING pid, and recovery
+# correctly skips journals whose owner is still running (that is what stops a
+# concurrent operation being destroyed). This fixture creates the journal from its
+# OWN live shell, so it was never actually an orphan. Simulate a CRASHED owner by
+# clearing the liveness marker — otherwise we assert away a protection we want.
+rm -f "${R1_ORPHAN}/.alive" 2>/dev/null || true
 [ -n "$R1_ORPHAN" ] && [ -d "$R1_ORPHAN" ] || { bad "R1_setup: could not create orphan journal"; exit 1; }
 
 # Mutate SID A's marker (simulating mid-op crash)
@@ -141,6 +147,12 @@ printf '666666' > "$R2_PAD_STATE/session-activity.$R2_SID"
 
 # Create a REAL orphan journal under SID (stamps the sid)
 R2_ORPHAN="$(STITCHPAD_SESSION="$R2_SID" sp_session_registry_journal_begin "$R2_SID")"
+# R7 liveness: journal_begin stamps .alive with the CREATING pid, and recovery
+# correctly skips journals whose owner is still running (that is what stops a
+# concurrent operation being destroyed). This fixture creates the journal from its
+# OWN live shell, so it was never actually an orphan. Simulate a CRASHED owner by
+# clearing the liveness marker — otherwise we assert away a protection we want.
+rm -f "${R2_ORPHAN}/.alive" 2>/dev/null || true
 [ -n "$R2_ORPHAN" ] && [ -d "$R2_ORPHAN" ] || { bad "R2_setup: could not create orphan journal"; exit 1; }
 
 # Crash mutation: corrupt the activity marker
@@ -190,6 +202,12 @@ PAD_STATE="$R3_PAD_STATE"
 
 # Create a REAL orphan journal (stamps base SHA)
 R3_ORPHAN="$(STITCHPAD_SESSION="$R3_SID" sp_session_registry_journal_begin "$R3_SID")"
+# R7 liveness: journal_begin stamps .alive with the CREATING pid, and recovery
+# correctly skips journals whose owner is still running (that is what stops a
+# concurrent operation being destroyed). This fixture creates the journal from its
+# OWN live shell, so it was never actually an orphan. Simulate a CRASHED owner by
+# clearing the liveness marker — otherwise we assert away a protection we want.
+rm -f "${R3_ORPHAN}/.alive" 2>/dev/null || true
 [ -n "$R3_ORPHAN" ] && [ -d "$R3_ORPHAN" ] || { bad "R3_setup: could not create orphan journal"; exit 1; }
 
 # Simulate crash: a different committed operation advances HEAD

@@ -124,6 +124,12 @@ PAD_STATE="$C1_PAD_STATE"
 
 # Create a REAL orphan journal by calling journal_begin and never cleaning it
 C1_ORPHAN="$(STITCHPAD_SESSION="$C1_SID" sp_session_registry_journal_begin "$C1_SID")"
+# R7 liveness: journal_begin stamps .alive with the CREATING pid, and recovery
+# correctly skips journals whose owner is still running (that is what stops a
+# concurrent operation being destroyed). This fixture creates the journal from its
+# OWN live shell, so it was never actually an orphan. Simulate a CRASHED owner by
+# clearing the liveness marker — otherwise we assert away a protection we want.
+rm -f "${C1_ORPHAN}/.alive" 2>/dev/null || true
 [ -n "$C1_ORPHAN" ] && [ -d "$C1_ORPHAN" ] || { bad "C1_setup: could not create orphan journal"; exit 1; }
 
 # Now run say — it should recover the orphan, restore pre-crash state, and post
@@ -152,8 +158,20 @@ C1_ORPHANS="$(find "$C1_PAD_STATE" -maxdepth 1 -name '.registry-journal.*' -type
 # Create first orphan, then create second (which recovers first), verify
 # second exists and the say recovers it.
 C1_ORPHAN_A="$(STITCHPAD_SESSION="$C1_SID" sp_session_registry_journal_begin "$C1_SID")"
+# R7 liveness: journal_begin stamps .alive with the CREATING pid, and recovery
+# correctly skips journals whose owner is still running (that is what stops a
+# concurrent operation being destroyed). This fixture creates the journal from its
+# OWN live shell, so it was never actually an orphan. Simulate a CRASHED owner by
+# clearing the liveness marker — otherwise we assert away a protection we want.
+rm -f "${C1_ORPHAN_A}/.alive" 2>/dev/null || true
 [ -d "$C1_ORPHAN_A" ] || { bad "C1e_setup: could not create first orphan"; }
 C1_ORPHAN_B="$(STITCHPAD_SESSION="$C1_SID" sp_session_registry_journal_begin "$C1_SID")"
+# R7 liveness: journal_begin stamps .alive with the CREATING pid, and recovery
+# correctly skips journals whose owner is still running (that is what stops a
+# concurrent operation being destroyed). This fixture creates the journal from its
+# OWN live shell, so it was never actually an orphan. Simulate a CRASHED owner by
+# clearing the liveness marker — otherwise we assert away a protection we want.
+rm -f "${C1_ORPHAN_B}/.alive" 2>/dev/null || true
 [ -d "$C1_ORPHAN_B" ] || { bad "C1e_setup: could not create second orphan (first may have been recovered)"; }
 # C1_ORPHAN_A may already be gone (recovered by second journal_begin) — that's fine
 
