@@ -102,6 +102,29 @@ else bad "H2i: say still fails after heal" "$H2I_OUT"; fi
 if echo "$H2I_OUT" | grep -q 'posted'; then ok "H2j: say prints 'posted' after heal"
 else bad "H2j: say did not print 'posted'" "$H2I_OUT"; fi
 
+
+	# H2k: healed pad has correct STRUCTURE — the --- separator must exist
+	# between the roster closing fence and the body (not just membership count).
+	# A missing separator means the roster fence runs directly into the header.
+	# This gate catches the bash 3.2 printf '---\n\n' bug where --- is parsed
+	# as an option and silently dropped.
+	_has_sep=0
+	if awk '
+	  /^```roster/ { in_r=1; next }
+	  in_r && /^```/ { in_r=0; after_r=1; next }
+	  after_r && /^[[:space:]]*$/ { next }
+	  after_r && /^---[[:space:]]*$/ { found=1; exit }
+	  after_r && /^# / { exit }
+	  END { if (found) exit 0; else exit 1 }
+	' "$PAD_MD" 2>/dev/null; then
+	  _has_sep=1
+	fi
+	if [ "$_has_sep" -eq 1 ]; then ok "H2k: healed pad has --- separator between roster and body"
+	else bad "H2k: healed pad MISSING --- separator — roster fence runs directly into body (bash 3.2 printf bug)"; fi
+
+	# H2l: healed pad header is present and correct (not missing due to printf failure)
+	if head -1 "$PAD_MD" | grep -q '^# 🧵 #'; then ok "H2l: healed pad starts with correct header (# 🧵 #)"
+	else bad "H2l: healed pad header missing or malformed" "$(head -1 "$PAD_MD")"; fi
 cd "$ROOT"
 
 # ===========================================================================

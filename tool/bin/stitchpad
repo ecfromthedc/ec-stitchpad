@@ -270,7 +270,7 @@ EOF
     {
       printf -- '# 🧵 #%s — agent stitchpad\n\n' "$(basename "$(dirname "$PAD_DIR")")"
       printf -- '%s\n\n' "$_heal_roster_text"
-      printf '---\n\n'
+      printf -- '---\n\n'
       cat "$_body"
     } > "$_tmp"
     sp_write_inplace "$_tmp" "$PAD_MD"
