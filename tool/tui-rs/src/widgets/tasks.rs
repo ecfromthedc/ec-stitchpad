@@ -320,14 +320,36 @@ pub fn render_detail(task: &Task, area: Rect, buf: &mut Buffer) {
         .render(inner, buf);
 }
 
-/// Collect every ```task <ID> block from the pad and parse its key:value frontmatter
-/// + description body. Key:value (not pipe) means titles/descriptions hold any char.
-/// Unreadable pad or no blocks → empty (view shows its empty state).
+/// Collect every ```task <ID> block from the pad AND tasks.md, parse key:value
+/// frontmatter + description body.  tasks.md is read LAST so a migrated card
+/// wins over a stale inline copy of the same id.  Display order is first-seen
+/// (pad first, then tasks.md).  Unreadable files or no blocks → empty.
 fn parse_tasks() -> Vec<Task> {
-    match std::fs::read_to_string(crate::pad_file()) {
-        Ok(s) => parse_tasks_str(&s),
-        Err(_) => Vec::new(),
+    let pad = std::fs::read_to_string(crate::pad_file()).unwrap_or_default();
+    let tasks = std::fs::read_to_string(crate::tasks_file()).unwrap_or_default();
+    parse_tasks_merged(&pad, &tasks)
+}
+
+/// Merge tasks from two sources: pad_str (stitchpad.md/pasture.md) read first,
+/// tasks_str (tasks.md) read second.  Duplicate ids: last writer wins.
+/// Display order: first-seen (pad first, then tasks.md-only entries).
+fn parse_tasks_merged(pad_str: &str, tasks_str: &str) -> Vec<Task> {
+    let mut order: Vec<String> = Vec::new();
+    let mut data: std::collections::HashMap<String, Task> = std::collections::HashMap::new();
+
+    for s in [pad_str, tasks_str] {
+        for t in parse_tasks_str(s) {
+            if t.id.is_empty() {
+                continue;
+            }
+            if !data.contains_key(&t.id) {
+                order.push(t.id.clone());
+            }
+            data.insert(t.id.clone(), t);
+        }
     }
+
+    order.iter().filter_map(|id| data.remove(id)).collect()
 }
 
 fn parse_tasks_str(pad: &str) -> Vec<Task> {
@@ -651,5 +673,66 @@ the body
     fn truncate_reserves_ellipsis() {
         assert_eq!(truncate("hello world", 8), "hello w…");
         assert_eq!(truncate("short", 8), "short");
+    }
+
+    // ── TASK-26: dual-file merge (pad + tasks.md) with last-wins dedup ──
+
+    const TASKSM: &str = "\
+# 📋 tasks
+
+```task TASK-3
+title: from tasks.md only
+status: in_progress
+priority: high
+assignee: alice
+---
+tasks.md body
+```
+```task TASK-1
+title: overwritten title from tasks.md
+status: done
+priority: low
+assignee: bob
+---
+tasks.md overwrites pad body
+```
+";
+
+    #[test]
+    fn tasks_from_tasksmd_only() {
+        let tasks = parse_tasks_merged("# just a pad\nno tasks here\n", TASKSM);
+        let t3: Vec<_> = tasks.iter().filter(|t| t.id == "TASK-3").collect();
+        assert_eq!(t3.len(), 1, "TASK-3 from tasks.md should be visible");
+        assert_eq!(t3[0].title, "from tasks.md only");
+        assert_eq!(t3[0].status, "in_progress");
+    }
+
+    #[test]
+    fn tasks_from_pad_only() {
+        let tasks = parse_tasks_merged(PAD, "# just tasks\nno blocks\n");
+        let t2: Vec<_> = tasks.iter().filter(|t| t.id == "TASK-2").collect();
+        assert_eq!(t2.len(), 1, "TASK-2 from pad should be visible");
+        assert_eq!(t2[0].title, "tasks TUI tab");
+    }
+
+    #[test]
+    fn dedup_task_1_last_wins_from_tasksmd() {
+        let tasks = parse_tasks_merged(PAD, TASKSM);
+        let t1: Vec<_> = tasks.iter().filter(|t| t.id == "TASK-1").collect();
+        assert_eq!(t1.len(), 1, "TASK-1 should appear exactly once (dedup)");
+        assert_eq!(t1[0].title, "overwritten title from tasks.md",
+            "tasks.md version must win");
+        assert_eq!(t1[0].status, "done");
+        assert_eq!(t1[0].assignee, "bob");
+        assert_eq!(t1[0].description, "tasks.md overwrites pad body");
+    }
+
+    #[test]
+    fn merge_preserves_first_seen_order() {
+        let tasks = parse_tasks_merged(PAD, TASKSM);
+        assert_eq!(tasks.len(), 3);
+        assert_eq!(tasks[0].id, "TASK-1");
+        assert_eq!(tasks[1].id, "TASK-2");
+        assert_eq!(tasks[2].id, "TASK-3");
     }
 }

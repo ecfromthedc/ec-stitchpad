@@ -50,6 +50,9 @@ pub fn pad_file() -> PathBuf {
     let p = d.join("pasture.md");
     if p.is_file() { p } else { d.join("stitchpad.md") }
 }
+pub fn tasks_file() -> PathBuf {
+    pad_dir().join("tasks.md")
+}
 pub fn pad_state() -> String {
     pad_dir().join(".state").to_string_lossy().into_owned()
 }
