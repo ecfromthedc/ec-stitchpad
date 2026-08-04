@@ -285,6 +285,12 @@ EOF
     target="${3:--}"
     adapter="${4:-}"
     sp_user_exists "$who" || { echo "stitchpad: @$who not in roster" >&2; exit 1; }
+    # TASK-9 / F9-3: refuse set-wake when the name has case-aliased duplicates
+    _dup="$(sp_roster_case_duplicate "$who" || true)"
+    if [ -n "$_dup" ]; then
+      echo "stitchpad: case-aliased duplicate name '@$who' in roster — refused; disambiguate before set-wake" >&2
+      exit 1
+    fi
     sp_stop_delivery_worker "$who"
     if sp_delivery_ocean_unresolved_after_stop "$who"; then
       echo "stitchpad: refusing to retarget @$who — Ocean acceptance/cancellation outcome is unresolved" >&2
@@ -1618,7 +1624,15 @@ PY
     sp_lock || exit 1
     if [ ! -f "$PAD_MD" ] || ! grep -q '^```roster[[:space:]]*$' "$PAD_MD" 2>/dev/null; then
       sp_unlock
-      echo "stitchpad: pad roster is missing — refusing to post; restore stitchpad.md from its isolated history" >&2
+      echo "stitchpad: pad roster is missing — refusing to post; run 'stitchpad heal-roster' to recover the roster from pad history" >&2
+      exit 1
+    fi
+    # Also refuse an EMPTY roster (fence present but no members): the pad
+    # must self-heal from history rather than wedging.
+    _say_roster_count="$(sp_roster_members_count "$PAD_MD")"
+    if [ "$_say_roster_count" -eq 0 ]; then
+      sp_unlock
+      echo "stitchpad: pad roster is EMPTY — refusing to post; run 'stitchpad heal-roster' to recover the roster from pad history" >&2
       exit 1
     fi
 

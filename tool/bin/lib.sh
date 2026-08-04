@@ -1094,6 +1094,76 @@ PY
   return 1
 }
 
+# ── Roster recovery guard ──────────────────────────────────────────────
+# TASK-9 / F9-1: a .ready generation must not bypass the roster guard. A
+# recovery replay that would drop the roster fence or empty a populated
+# roster is quarantined instead.  Member-dropping (killed-leave recovery)
+# IS allowed through — the guard protects the roster as a structure, not
+# per-member cardinality.
+sp_roster_members_count() {
+  local content="$1"
+  awk '
+    /^```roster/ { inblk=1; next }
+    /^```/ && inblk { inblk=0 }
+    inblk && $0 !~ /^[[:space:]]*#/ && $0 !~ /^[[:space:]]*$/ {
+      n=split($0, f, /[[:space:]]*\|[[:space:]]*/)
+      if (n>=2) { c++ }
+    }
+    END { print c+0 }
+  ' "$content"
+}
+
+sp_roster_has_fence() {
+  grep -q '^```roster[[:space:]]*$' "$1" 2>/dev/null
+}
+
+# Returns 0 if the transition from live → proposed is safe for the roster.
+# Refuses (returns 1) when:
+#  - Live has a roster fence but proposed does not
+#  - Live roster is populated (>0 members) but proposed has 0
+# Member-dropping (live N > proposed M > 0) is ALLOWED.
+sp_roster_transition_guard() {
+  local proposed="$1" live="${2:-$PAD_MD}"
+  [ -f "$proposed" ] || return 0
+  local live_count proposed_count live_fence proposed_fence
+  live_count="$(sp_roster_members_count "$live")"
+  proposed_count="$(sp_roster_members_count "$proposed")"
+  # Populated→EMPTY: refuse
+  if [ "$live_count" -gt 0 ] && [ "$proposed_count" -eq 0 ]; then
+    echo "stitchpad: rewrite would replace $live_count members with an EMPTY roster — refused" >&2
+    return 1
+  fi
+  # Fence-dropping: refuse when live has members (a pad with members must keep its fence)
+  if [ "$live_count" -gt 0 ]; then
+    if sp_roster_has_fence "$live" && ! sp_roster_has_fence "$proposed"; then
+      echo "stitchpad: rewrite would drop the roster fence while $live_count members are present — refused" >&2
+      return 1
+    fi
+  fi
+  return 0
+}
+
+sp_roster_quarantine() {
+  local ready="$1" generation="$2" quarantine
+  quarantine="${ready}.refused.${generation}"
+  mv "$ready" "$quarantine" 2>/dev/null || return 1
+  echo "stitchpad: roster guard refused generation $generation — quarantined at $(basename "$quarantine")" >&2
+  return 0
+}
+
+# Check for case-insensitive name duplicates in the roster. Returns the
+# duplicate name on stdout if found, empty string otherwise.
+sp_roster_case_duplicate() {
+  local who="$1"
+  local count
+  count="$(sp_roster | awk -F'|' -v w="$who" 'tolower($1)==tolower(w){c++} END{print c+0}')"
+  if [ "$count" -gt 1 ]; then
+    echo "$who"
+    return 0
+  fi
+  return 1
+}
+
 sp_recover_inplace() {
   local target="${1:-$PAD_MD}" ready generation
   [ -n "$target" ] || return 0
@@ -1117,6 +1187,12 @@ sp_recover_inplace() {
   }
   if sp_ready_owner_is_live "$ready"; then
     echo "stitchpad: live writer still owns recovery generation for $(basename "$target")" >&2
+    return 1
+  fi
+  # TASK-9: roster guard before recovery. If the generation would destroy
+  # the roster, quarantine it instead of applying it.
+  if ! sp_roster_transition_guard "$ready/content" "$target"; then
+    sp_roster_quarantine "$ready" "$generation"
     return 1
   fi
   echo "stitchpad: recovering interrupted write of $(basename "$target")" >&2
