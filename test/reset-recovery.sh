@@ -1,5 +1,9 @@
 #!/usr/bin/env bash
 set -euo pipefail
+# Fixtures must not inherit the caller's ambient session identity: sp_this_surface()
+# falls back to $CLAUDE_CODE_SESSION_ID/$CODEX_SESSION_ID, which makes every simulated
+# agent in this suite share ONE surface and trip "one terminal = one (pad,name)".
+unset CLAUDE_CODE_SESSION_ID CODEX_SESSION_ID 2>/dev/null || true
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 SP="$ROOT/tool/bin/stitchpad"

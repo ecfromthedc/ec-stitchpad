@@ -1,4 +1,8 @@
 #!/usr/bin/env bash
+# Fixtures must not inherit the caller's ambient session identity: sp_this_surface()
+# falls back to $CLAUDE_CODE_SESSION_ID/$CODEX_SESSION_ID, which makes every simulated
+# agent in this suite share ONE surface and trip "one terminal = one (pad,name)".
+unset CLAUDE_CODE_SESSION_ID CODEX_SESSION_ID 2>/dev/null || true
 # crosslane-f3-f6.sh — regression gates for the fx1 cross-lane findings F3-F6
 # (integration candidate review, sealed 2026-08-03). Bash 3.2 compatible.
 # Isolated mktemp fixtures, mocked relay via PATH curl, no network, no side

@@ -15,10 +15,15 @@ mkdir -p "$TMP/home"
 export HOME="$TMP/home"
 export STITCHPAD_HEARTBEAT_AUTOSTART=0
 unset HERDR_PANE_ID HERDR_TAB_ID HERDR_ENV HERDR_SOCKET_PATH HERDR_WORKSPACE_ID 2>/dev/null || true
+# A fixture must NOT inherit the caller's ambient session identity. sp_this_surface()
+# falls back to $CLAUDE_CODE_SESSION_ID / $CODEX_SESSION_ID, so when this suite runs
+# inside an agent session BOTH joins below get the SAME surface and the second is
+# refused by "one terminal = one (pad,name)". Two simulated agents = two surfaces.
+unset CLAUDE_CODE_SESSION_ID CODEX_SESSION_ID STITCHPAD_SESSION 2>/dev/null || true
 cd "$TMP"
 "$SP" init --name color-bash32 >/dev/null
-"$SP" join dale codex pull - >/dev/null
-"$SP" join custom-seat codex pull - >/dev/null
+STITCHPAD_SESSION="fx-dale-$$"        "$SP" join dale codex pull - >/dev/null
+STITCHPAD_SESSION="fx-custom-seat-$$" "$SP" join custom-seat codex pull - >/dev/null
 
 [ "$(/bin/bash "$SP" color dale)" = '#00d000' ] \
   || fail "Apple Bash 3.2-compatible override lookup failed"
