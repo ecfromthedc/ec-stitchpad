@@ -19,6 +19,7 @@ HERE="$(cd -P "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 SP="$HERE/../tool/bin/stitchpad"
 
 WORK="$(mktemp -d "${TMPDIR:-/tmp}/sp-elr.XXXXXX")"
+cd "$WORK" || exit 1   # fixture must own its cwd (fx5)
 writer_pid=""
 crash_pid=""
 cleanup() {
@@ -193,20 +194,22 @@ grep -q 'writer A' "$pad_md" && grep -q 'writer B' "$pad_md" \
 echo "--- G3: mutant (no empty-lock reclaim) ---"
 
 WORK2="$(mktemp -d "${TMPDIR:-/tmp}/sp-elr2.XXXXXX")"
+cd "$WORK2" || exit 1
 PAD_DIR2="$WORK2/.stitchpad"
+HOME2="$WORK2/home"; mkdir -p "$HOME2"   # G3 needs its own terminal store (one terminal = one pad)
 LOCK2="$PAD_DIR2/.state/.lock"
-HOME="$WORK/home" STITCHPAD_NAME=tester STITCHPAD_PAD_DIR="$PAD_DIR2" \
+HOME="$HOME2" STITCHPAD_NAME=tester STITCHPAD_PAD_DIR="$PAD_DIR2" \
   STITCHPAD_HEARTBEAT_AUTOSTART=0 "$SP" init "$PAD_DIR2" >/dev/null 2>&1 || true
-HOME="$WORK/home" STITCHPAD_NAME=tester STITCHPAD_PAD_DIR="$PAD_DIR2" \
+HOME="$HOME2" STITCHPAD_NAME=tester STITCHPAD_PAD_DIR="$PAD_DIR2" \
   STITCHPAD_HEARTBEAT_AUTOSTART=0 "$SP" join tester cli pull - >/dev/null 2>&1 || true
 
-HOME="$WORK/home" STITCHPAD_NAME=tester STITCHPAD_PAD_DIR="$PAD_DIR2" \
+HOME="$HOME2" STITCHPAD_NAME=tester STITCHPAD_PAD_DIR="$PAD_DIR2" \
   STITCHPAD_HEARTBEAT_AUTOSTART=0 "$SP" say "mutant baseline" >/dev/null 2>&1 || true
 
 BARRIER3="$WORK2/barrier"
 (
   trap - EXIT
-  HOME="$WORK/home" STITCHPAD_PAD_DIR="$PAD_DIR2" STITCHPAD_NAME=tester \
+  HOME="$HOME2" STITCHPAD_PAD_DIR="$PAD_DIR2" STITCHPAD_NAME=tester \
     STITCHPAD_HEARTBEAT_AUTOSTART=0 \
     STITCHPAD_LOCK_TEST_BEFORE_OWNER_BARRIER="$BARRIER3" \
     exec "$SP" say 'killed before lock ownership'
@@ -219,7 +222,7 @@ kill -KILL "$crash_pid" 2>/dev/null || true; wait "$crash_pid" 2>/dev/null || tr
 # MUTANT: SP_LOCK_EMPTY_RECLAIM absurdly high so it never fires
 G3_START=$(date +%s)
 SP_LOCK_EMPTY_RECLAIM=99999 \
-  HOME="$WORK/home" STITCHPAD_NAME=tester STITCHPAD_PAD_DIR="$PAD_DIR2" \
+  HOME="$HOME2" STITCHPAD_NAME=tester STITCHPAD_PAD_DIR="$PAD_DIR2" \
   STITCHPAD_HEARTBEAT_AUTOSTART=0 \
   "$SP" say "should fail" > "$WORK2/g3-post.out" 2>&1 || true
 G3_END=$(date +%s)

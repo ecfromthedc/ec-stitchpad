@@ -111,9 +111,35 @@ case "$cmd" in
     ;;
 
   init)
-    name="$(basename "$PWD")"
-    [ "${1:-}" = "--name" ] && name="$2"
-    dir="$PWD/.stitchpad"; mkdir -p "$dir/.state"
+    # F-INIT: `init` used to IGNORE a positional path argument entirely and always
+    # create the pad in $PWD/.stitchpad — reporting success while the caller's
+    # requested directory got nothing. That is the false-success family in the most
+    # fundamental command, and it is why test/empty-lock-reclaim-gate.sh never once
+    # passed: it calls `init "$PAD_DIR"` and then every later command says
+    # "no pasture found". Honor the argument, and refuse anything we do not understand.
+    _init_root="$PWD"
+    while [ "$#" -gt 0 ]; do
+      case "$1" in
+        --name) name="$2"; shift 2 ;;
+        -*)
+          echo "stitchpad: init: unknown option '$1'" >&2
+          exit 2 ;;
+        *)
+          # A positional argument is the pad location. Accept either the project
+          # dir or the .stitchpad dir itself, so both call styles work.
+          case "$1" in
+            */.stitchpad) _init_root="$(dirname "$1")" ;;
+            *)            _init_root="$1" ;;
+          esac
+          shift ;;
+      esac
+    done
+    mkdir -p "$_init_root" 2>/dev/null || {
+      echo "stitchpad: init: cannot create '$_init_root'" >&2; exit 1; }
+    _init_root="$(cd -P "$_init_root" 2>/dev/null && pwd)" || {
+      echo "stitchpad: init: unusable directory" >&2; exit 1; }
+    [ -n "${name:-}" ] || name="$(basename "$_init_root")"
+    dir="$_init_root/.stitchpad"; mkdir -p "$dir/.state"
     md="$dir/stitchpad.md"
     if [ -f "$md" ]; then echo "stitchpad already exists: $md"; exit 0; fi
     cat > "$md" <<EOF
@@ -160,8 +186,8 @@ EOF
     # The entire pad is runtime state with its own isolated Git history. Ignore
     # it from the outer repo so `git stash -u` / `git clean` cannot temporarily
     # remove stitchpad.md while agents and the bridge are still writing.
-    if [ -f "$PWD/.gitignore" ]; then
-      grep -Fqx '.stitchpad/' "$PWD/.gitignore" 2>/dev/null || printf '\n# stitchpad runtime (isolated history)\n.stitchpad/\n' >> "$PWD/.gitignore"
+    if [ -f "$_init_root/.gitignore" ]; then
+      grep -Fqx '.stitchpad/' "$_init_root/.gitignore" 2>/dev/null || printf '\n# stitchpad runtime (isolated history)\n.stitchpad/\n' >> "$_init_root/.gitignore"
     fi
     PAD_DIR="$dir"; sp_ensure_outer_git_ignore; unset PAD_DIR
     echo "✓ stitchpad #$name created at $md"
