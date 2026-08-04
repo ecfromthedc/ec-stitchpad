@@ -3662,7 +3662,24 @@ except: print("")' 2>/dev/null)"
     exec "$0" say --image "$file" ${caption:+"$caption"}
     ;;
 
-  roster|who)  sp_init_paths_readonly || exit 1; sp_roster ;;
+  roster|who)
+    sp_init_paths_readonly || exit 1
+    # P5 (NARROW): a deleted pad git makes roster print ZERO ROWS and exit 0 —
+    # indistinguishable from an idle fleet. That cost the captain a full cycle and a
+    # near-misdiagnosis of a DESTROYED pad as a quiet one. Fail loud HERE, in the read
+    # command the operator actually looks at.
+    # Deliberately NOT in sp_init_paths: pro4's version lived there and broke pillar
+    # recover-migrated-pad, websec, heal-roster and authority-redesign, because
+    # journal/recovery paths legitimately operate on empty or not-yet-initialised git
+    # dirs. Blast radius belongs at the call site, not in shared init.
+    if [ -n "${PAD_GIT:-}" ] && [ ! -d "$PAD_GIT" ]; then
+      echo "stitchpad: pad git is MISSING — this pad is broken, not empty" >&2
+      echo "  expected history at: $PAD_GIT" >&2
+      echo "  an empty roster here means the PAD is gone, not that nobody joined" >&2
+      echo "  recover:  cd $(dirname "${PAD_DIR:-.}") && stitchpad init --name <name>" >&2
+      exit 1
+    fi
+    sp_roster ;;
 
   sessions)
     # Read-only projection of the session registry: who ran here, on which

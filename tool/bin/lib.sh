@@ -150,25 +150,6 @@ sp_init_paths_readonly() {
     echo "stitchpad: pad git directory is a symlink — refusing" >&2
     return 1
   fi
-  # P5: a missing pad git makes the pad unrecognisable to every read command.
-  # Without it, roster prints zero rows (indistinguishable from an idle fleet),
-  # sessions can't project, and the doctor has nothing to health-check.
-  # Read-only commands must fail LOUD instead of silently degrading.
-  if [ ! -d "$PAD_GIT" ]; then
-    echo "stitchpad: pad git directory is missing — this pad is broken" >&2
-    echo "  The pad git history at $PAD_GIT was deleted." >&2
-    echo "  Restore from a backup or re-init with:  cd $(dirname "$PAD_DIR") && stitchpad init --name <name>" >&2
-    echo "  Existing pad content in $PAD_MD will be imported into the new git history." >&2
-    return 1
-  fi
-  # P5: a pad git that exists but is broken (corrupt config, missing objects)
-  # must also fail loud.  rev-parse --git-dir exits 128 on a corrupt config.
-  if ! sgit rev-parse --git-dir >/dev/null 2>&1; then
-    echo "stitchpad: pad git is corrupt — rev-parse failed on $PAD_GIT" >&2
-    echo "  The git repository is present but unreadable (corrupt HEAD or config)." >&2
-    echo "  Restore from backup or re-init with:  cd $(dirname "$PAD_DIR") && stitchpad init --name <name>" >&2
-    return 1
-  fi
   PAD_STATE="$PAD_DIR/.state"
   # Task cards live in a SIBLING file so a `task move` never rewrites (or
   # commits) the whole conversation. Legacy inline ```task blocks in the pad are
