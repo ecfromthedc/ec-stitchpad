@@ -244,6 +244,13 @@ while IFS='|' read -r suite obs_p obs_f obs_rc; do
 
   # Unparseable
   if [ "$obs_p" = "?" ]; then
+    # EXIT-CODE-ONLY suites print no counts at all (e.g. "bridge-heartbeat-interval ok").
+    # They are NOT format drift — declaring them unmeasurable is how real coverage gets
+    # quarantined away. If the baseline is 0/0, judge them purely on exit status.
+    if [ "$obs_rc" = "0" ] && [ "${bl_p:-0}" = "0" ] && [ "${bl_f:-0}" = "0" ]; then
+      printf "%-41s %10s %10s %10s %-16s\n" "$suite" "exit-only" "rc=0" "-" "GREEN"
+      continue
+    fi
     FAILS=$((FAILS + 1))
     if [ "$obs_rc" != "0" ]; then
       printf "%-41s %10s %10s %10s %-16s\n" "$suite" "${bl_p:-?} pass" "PARSE_ERR" "?" "CRASHED"
