@@ -10,3 +10,4 @@ recovery-hardening3-regression.sh 67 0
 fixture-reap-gate.sh 9 0
 watcher-containment-gate.sh 10 0
 fixture-bleed-gate.sh 5 0
+pad-narration-gate.sh 7 0

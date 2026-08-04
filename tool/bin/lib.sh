@@ -1452,6 +1452,11 @@ sp_commit() {
       done <<< "$_rp2_hashes"
       [ "$_rp2_ok" -eq 1 ] || return 1
     fi
+    # P19 auto-narration: every durable commit emits a pad line so the
+    # operator can SEE progress without asking.  One concise line per
+    # meaningful event, not per command.  Best-effort — a narration
+    # failure never rolls back the commit it describes.
+    sp_narrate "commit: $msg" 2>/dev/null || true
     return 0
   fi
   # H5b: commit failed (exit != 0). Check HEAD moved AND index is clean.
@@ -1498,10 +1503,52 @@ sp_commit() {
   #            tamper class, real git failure) → refuse honestly.
   if [ -n "$_head_after" ] \
      && sgit diff --quiet HEAD -- "${paths[@]}" 2>/dev/null; then
+    # P19 auto-narration for JH4 concurrent commit race recovery
+    sp_narrate "commit: $msg" 2>/dev/null || true
     return 0
   fi
   # H5b: HEAD didn't move and our bytes are not in HEAD — real failure.
   return 1
+}
+
+# ── P19 auto-narration ───────────────────────────────────────────────────
+# Every durable event (commit landed, lane taken, card closed) emits a
+# concise pad line automatically — driven by the artifact contract, not
+# by the agent choosing to call `say`.  Best-effort: a narration failure
+# never rolls back the primary operation.
+sp_narrate() {
+  local _nr_text="$1" _nr_from _nr_ts _nr_depoch _nr_commit_rc
+  [ -n "$_nr_text" ] || return 0
+  [ -n "${PAD_DIR:-}" ] && [ -f "${PAD_MD:-}" ] || return 0
+  _nr_from="$(sp_me 2>/dev/null)" || _nr_from=""
+  [ -n "$_nr_from" ] || return 0
+  [ "$_nr_from" = "stitchpad" ] && return 0  # Bootstrap commits aren't agent events
+  # Derive the timestamp — consistent with date-divider when available
+  if type sp_date_divider_hhmm >/dev/null 2>&1; then
+    _nr_ts="$(sp_date_divider_hhmm 2>/dev/null)" || _nr_ts="$(date '+%I:%M %p')"
+  else
+    _nr_ts="$(date '+%I:%M %p')"
+  fi
+  # Append the narration line to the pad.  Use a compact format that is
+  # distinguishable from human conversation: `### @name event · HH:MM AM`
+  printf '\n### %s %s · %s\n' "@${_nr_from}" "$_nr_text" "$_nr_ts" >> "$PAD_MD"
+  # Commit the narration — best-effort, never roll back the primary operation
+  if type _sp_date_divider_now_epoch >/dev/null 2>&1; then
+    _nr_depoch="$(_sp_date_divider_now_epoch 2>/dev/null)" || _nr_depoch=""
+  fi
+  if [ -n "$_nr_depoch" ] && type sgit >/dev/null 2>&1 && [ -d "${PAD_GIT:-}" ]; then
+    sgit -c "user.name=$_nr_from" -c "user.email=${_nr_from}@ocean.local" \
+      add "$(basename "$PAD_MD")" 2>/dev/null || true
+    GIT_COMMITTER_DATE="@${_nr_depoch}" GIT_AUTHOR_DATE="@${_nr_depoch}" \
+      sgit -c "user.name=$_nr_from" -c "user.email=${_nr_from}@ocean.local" \
+      commit -q -m "$_nr_from: $_nr_text" >/dev/null 2>/dev/null || true
+  elif type sgit >/dev/null 2>&1 && [ -d "${PAD_GIT:-}" ]; then
+    sgit -c "user.name=$_nr_from" -c "user.email=${_nr_from}@ocean.local" \
+      add "$(basename "$PAD_MD")" 2>/dev/null || true
+    sgit -c "user.name=$_nr_from" -c "user.email=${_nr_from}@ocean.local" \
+      commit -q -m "$_nr_from: $_nr_text" >/dev/null 2>/dev/null || true
+  fi
+  return 0
 }
 
 # ── Roster parsing (the magic: roster is IN the markdown) ────────────

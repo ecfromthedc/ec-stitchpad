@@ -85,7 +85,7 @@ sp_autostart_name() {
 sp_maybe_start_heartbeat() {
   [ "${STITCHPAD_HEARTBEAT_AUTOSTART:-1}" = "0" ] && return 0
   case "$cmd" in
-    init|instructions|prompt-context|doctor|health|status|roster|who|sessions|read|heartbeat|hook|bind-session|whoami|leave|stop|daemon|watch|migration-check|reset|keeper|compact|restore-roster|scope|authority|color|operator|help|-h|--help) return 0 ;;
+    init|instructions|prompt-context|doctor|health|status|roster|who|lanes|sessions|read|heartbeat|hook|bind-session|whoami|leave|stop|daemon|watch|migration-check|reset|keeper|compact|restore-roster|scope|authority|color|operator|help|-h|--help) return 0 ;;
   esac
   sp_init_paths >/dev/null 2>&1 || return 0
   local who
@@ -3712,6 +3712,24 @@ except: print("")' 2>/dev/null)"
     shift || true
     caption="$*"
     exec "$0" say --image "$file" ${caption:+"$caption"}
+    ;;
+
+  lanes)
+    # P19: compact activity view — last narration event per seat so the
+    # operator can see the fleet working without scrolling the full pad.
+    sp_init_paths_readonly || exit 1
+    awk '
+      /^### @[a-zA-Z0-9_-]+ / {
+        match($0, /@[a-zA-Z0-9_-]+/)
+        name = substr($0, RSTART+1, RLENGTH-1)
+        rest = substr($0, RSTART+RLENGTH)
+        sub(/^ */, "", rest)
+        last[name] = rest
+      }
+      END {
+        for (n in last) printf "%-16s%s\n", n, last[n]
+      }
+    ' "$PAD_MD" | sort
     ;;
 
   roster|who)
