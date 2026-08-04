@@ -2010,7 +2010,17 @@ PY
     _ssurf="$(sp_this_surface)"
     if [ -n "$_ssurf" ]; then
       _holder="$(sp_term_lock_check "$_ssurf" "$from")" || {
-        echo "stitchpad: REFUSED — this terminal is bound to ${_holder%%|*} (as @$(echo "$_holder" | cut -d'|' -f2)), not $PAD_DIR. cd there or 'stitchpad leave' first." >&2; exit 1; }
+        # sp_term_lock_check refuses when the pad OR the name differs, but this
+        # message only ever talked about the pad — so a NAME mismatch printed the
+        # same path twice ("bound to X ... not X") and named a cause that was not
+        # the cause. Report the axis that actually differs.
+        _hpad="${_holder%%|*}"; _hname="$(printf '%s' "$_holder" | cut -d'|' -f2)"
+        if [ "$_hpad" = "$PAD_DIR" ]; then
+          echo "stitchpad: REFUSED — this terminal is claimed by @$_hname, but you are @${from:-<no identity>}. Same pad ($PAD_DIR); the IDENTITY differs. Run 'stitchpad leave' to release it, or set STITCHPAD_NAME=$_hname." >&2
+        else
+          echo "stitchpad: REFUSED — this terminal is bound to $_hpad (as @$_hname), not $PAD_DIR. cd there or 'stitchpad leave' first." >&2
+        fi
+        exit 1; }
     else
       # MP-2 fail-closed: identity env is fully process-controlled, so a
       # ghost-poster clears it to disable the surface guard above. With no

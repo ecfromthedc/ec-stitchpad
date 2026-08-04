@@ -125,15 +125,15 @@ run_suite() {
   output="$(printf '%s' "$output" | perl -pe 's/\e\[[0-9;]*[mK]//g' 2>/dev/null || printf '%s' "$output")"
   result_line="$(echo "$output" | grep -iE 'results:' | tail -1 || true)"
   if [ -n "$result_line" ]; then
-    p="$(echo "$result_line" | grep -oE '[0-9]+ PASS' | grep -oE '[0-9]+' || true)"
+    p="$(echo "$result_line" | grep -oE '[0-9]+ PASS' | grep -oE '[0-9]+' | tail -1 || true)"
     if [ -n "$p" ]; then
-      f="$(echo "$result_line" | grep -oE '[0-9]+ FAIL' | grep -oE '[0-9]+' || echo 0)"
+      f="$(echo "$result_line" | grep -oE '[0-9]+ FAIL' | grep -oE '[0-9]+' | tail -1 || echo 0)"
       echo "$suite|$p|$f|$rc"
       return 0
     fi
-    p="$(echo "$result_line" | grep -oE '[0-9]+ passed' | grep -oE '[0-9]+' || true)"
+    p="$(echo "$result_line" | grep -oE '[0-9]+ passed' | grep -oE '[0-9]+' | tail -1 || true)"
     if [ -n "$p" ]; then
-      f="$(echo "$result_line" | grep -oE '[0-9]+ failed' | grep -oE '[0-9]+' || echo 0)"
+      f="$(echo "$result_line" | grep -oE '[0-9]+ failed' | grep -oE '[0-9]+' | tail -1 || echo 0)"
       echo "$suite|$p|$f|$rc"
       return 0
     fi
@@ -162,7 +162,7 @@ run_suite() {
   fi
   p="$(echo "$output" | grep -oiE 'PASS: [0-9]+' | grep -oE '[0-9]+' | tail -1 || true)"
   if [ -n "$p" ]; then echo "$suite|$p|0|$rc"; return 0; fi
-  p="$(echo "$output" | grep -oiE 'all [0-9]+' | grep -oE '[0-9]+' || true)"
+  p="$(echo "$output" | grep -oiE 'all [0-9]+' | grep -oE '[0-9]+' | tail -1 || true)"
   if [ -n "$p" ]; then
     echo "$suite|$p|0|$rc"
     return 0
@@ -239,7 +239,14 @@ RFILE="$(mktemp "${TMPDIR:-/tmp}/tripwire-results.XXXXXX")"
 
 for suite in "${RUN_LIST[@]}"; do
   echo "tripwire: running $suite ..." >&2
-  run_suite "$suite" >> "$RFILE"
+  # EXACTLY ONE record per suite. A parse rule that matched twice used to emit a
+  # multi-line record, and the report loop then read the overflow as its own
+  # suite — that is where the phantom row named "6" came from, and it also ate
+  # the rc field of the real row (watcher-singleton-gate showed "rc=?" and a
+  # bogus +2 INFLATED while three clean runs of it are 6/0 rc=0). The rules are
+  # anchored with `tail -1` now; this call-site guard makes the invariant
+  # structural so no future rule can re-invent a suite.
+  run_suite "$suite" | head -1 >> "$RFILE"
 done
 
 # ── also list quarantined suites so reviewers see them ──────────────────────

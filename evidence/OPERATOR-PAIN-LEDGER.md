@@ -317,3 +317,96 @@ P28. THE ENTIRE BUILD WAS VALIDATED THROUGH THE CLI, NOT THROUGH HERDR.
            the equivalent of the human-flow rehearsal, but through herdr.
      GATE: run the core flow suite twice — once with HERDR_* set, once unset — and require
      both to pass. A product that only works with its own integration disabled is not shipped.
+
+## TIER 0 — FOUND WHILE SELF-HOSTING IN HERDR (these blocked the captain live)
+
+P29. THE CLAIM-HOOK ACCUSES A PHANTOM AGENT AND BLOCKS EVERY WRITE.  **PROVEN, LIVE.**
+     The captain's first Edit of the session was denied with:
+       "stitchpad: @ blocked — another agent holds a fresh write-lease on this
+        file (...). Coordinate on the pad or wait for their release."
+     `stitchpad claims` printed "(no active claims)". There was no other agent.
+     `claim` documents THREE outcomes in its own comment block — 0 = I hold it,
+     1 = someone else holds a FRESH lease, 2 = no identity — and claim-hook
+     treated every non-zero as case 1. The real cause was rc=2 (no identity).
+     The named "holder" was `${holder:-$fp}` falling back to the file's own path,
+     so the message accused the file of holding itself.
+     COST: every Edit and Write in the session; the captain had to route all file
+     changes through Bash for the rest of the build.
+     GATE: deny only on rc=1; fail open otherwise. Mutant-proven — reintroducing
+     the non-zero test reproduces the denial verbatim; the fix returns allow.
+     ⚠️ STILL LIVE FOR EC: the hook Claude Code actually runs is
+     ~/.stitchpad/adapters/claim-hook.sh (the OLD checkout). Until that install is
+     refreshed, EVERY Claude Code session under $HOME is denied every file write.
+
+P30. THE PAD WALK-UP HAS NO BOUNDARY — IT ESCAPES INTO $HOME.
+     sp_find_pad() (lib.sh:103) and claim-hook's inline copy both walk up until
+     "/". With a ~/.stitchpad present, EVERY directory under the operator's home
+     resolves as "inside that pad" — including worktrees that correctly have no
+     pad of their own. This is what made P29 fire in a tree with no .stitchpad,
+     and it directly contradicts the hook's own stated intent ("not in a pad →
+     allow, else we'd block every write in every non-pad project").
+     FIXED at the call site (claim-hook stops at $HOME). sp_find_pad itself is
+     NOT yet bounded — deliberately deferred, because changing pad resolution for
+     every command at release time would require re-measuring all 72 suites.
+     EXPLICITLY DEFERRED, not silently.
+
+P31. A CRASHED SUITE REPORTS SUCCESS.  **THE GATE COULD NOT SEE CRASHES.**
+     bash 3.2 (macOS default): when `set -e`/`set -u` ABORTS a script the EXIT
+     trap still runs, and if the trap's last command SUCCEEDS the shell exits 0.
+     Proven on this machine:
+       cleanup(){ true; }; trap cleanup EXIT; set -u; echo "$UNSET"   -> rc=0
+       same without the trap                                          -> rc=1
+       explicit `exit 1` with the same trap                            -> rc=1
+     70 of 77 suites install an EXIT trap, and five are baselined 0/0 — judged on
+     exit code ALONE — so for those a mid-run crash was recorded as a clean pass.
+     This is how oversight-gate.sh died at assertion 6 of 14 and still exited 0.
+     GATE: the tripwire now classifies a fatal shell diagnostic as CRASHED
+     regardless of exit status. Fixed at ONE point rather than in 70 fixtures.
+
+P32. BASH 3.2 FOLDS A UTF-8 LEAD BYTE INTO A VARIABLE NAME.
+     "$X→$Y" dies with `X<0xe2>: unbound variable`, rc=127; "${X}→${Y}" is fine.
+     Six sites carried this landmine, including PRODUCTION code —
+     tool/bin/stitchpad's wake nudge `your open tasks: $_open— move each ...`.
+     It is invisible until the line is reached, and then it is fatal.
+     This is what corrupted oversight-gate.sh, which was then baselined 14/0 by a
+     builder who never reached assertion 14. All six braced.
+
+P33. THE TERMINAL-BINDING REFUSAL PRINTS THE SAME PATH TWICE.
+     test-ponytail-instructions fails with:
+       "REFUSED — this terminal is bound to <PATH> (as @fable), not <PATH>."
+     — the two paths are IDENTICAL. sp_term_lock_check refuses when the pad OR
+     the NAME differs (lib.sh:2482), but the message only ever talks about the
+     pad. A name mismatch is therefore reported as an impossible pad mismatch.
+     Same lying-error family as P29: the message names a cause that is not the
+     cause, and an operator reading it cannot act on it.
+
+P34. FIXTURES SHARE ONE TERMINAL AND THE GUARD CORRECTLY REFUSES THEM.
+     ONE TERMINAL = ONE PAD (and one identity) is a real product rule, and three
+     suites predated it: they join a second pad, or post as a second identity,
+     on the SAME surface. Every call in those blocks was >/dev/null 2>&1, so the
+     refusal was invisible and `set -e` killed the suite mid-run:
+       rc1-c11-c13-regression       died at assertion 2 of 13
+       test-ponytail-instructions   died before its only assertion
+       pad-io-and-archive           13 failures, ALL of them after "crash recovery"
+     The fixtures owed the guard a distinct surface, which is exactly what
+     STITCHPAD_TERMINAL_NAMESPACE exists for. FIXED for rc1 (2 -> 13/0) and
+     ponytail (-> 1/0 PASS); pad-io recovered 4 of 13 (63 -> 67). The assertion
+     was never weakened — the simulation was made real.
+
+P35. `join` REPORTS SUCCESS AND LEAVES YOU WITH NO IDENTITY.  (UX, by design.)
+     CLI `join` prints "✓ alpha joined" and exits 0, after which `whoami` is
+     empty and every following command refuses with "no identity — call the MCP
+     join tool first (or set STITCHPAD_NAME for CLI/testing)". The refusal text
+     documents the intent, so this is not a false success in the P17 sense — but
+     the success line still overstates what happened, and it cost this session a
+     debugging detour while building the P28 gate. `join` should say which
+     identity path it actually established.
+
+P36. TWO SUITES ENCODE OPPOSITE POLICY FOR CONFUSABLE NAMES.  **NEEDS EC.**
+     roster-validation-gate asserts unicode/confusable names must be REJECTED
+     ('davé', 'dáve'); the pro3-f3-unicode lane implements NORMALIZING them
+     (NFKD+casefold) so they collapse onto one roster row. Both cannot be right.
+     Checked out pro3-f3b (41d5522) and ran roster-validation against it: still
+     9/3, so absorbing that lane would NOT close this. This is an operator
+     decision, not an implementation detail, and it is why roster-validation is
+     recorded KNOWN-RED rather than "fixed".

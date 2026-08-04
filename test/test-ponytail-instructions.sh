@@ -136,7 +136,10 @@ rejoined="$("$SP" join fable herdr pull -)"
 one_marker "$joined" "new join did not inject exactly once"
 one_marker "$rejoined" "rejoin did not rebuild context exactly once"
 
-STITCHPAD_NAME=operator "$SP" say '@fable review the other model' >/dev/null
+# ONE TERMINAL = ONE PAD (and one identity). This terminal is claimed by @fable
+# from the join above, so posting as @operator on the SAME surface is refused —
+# correctly. The fixture needs a second surface, not a weaker guard.
+STITCHPAD_NAME=operator STITCHPAD_TERMINAL_NAMESPACE=ponytail-operator "$SP" say '@fable review the other model' >/dev/null
 wake="$("$SP" wake fable --peek)"
 one_marker "$wake" "shared Stop/Herdr/Pi wake did not inject exactly once"
 printf '%s' "$wake" | grep -q 'NEW from @operator' || fail "wake lost the addressed message"

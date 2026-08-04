@@ -208,6 +208,11 @@ echo "── crash recovery"
 barrier="$WORK/active-promotion"
 (
   trap - EXIT
+  # Each background writer simulates a SEPARATE agent process. Without its own
+  # terminal surface it races the main thread for the one terminal claim, and
+  # the crash-recovery simulation never arms — which is why all 13 failures in
+  # this suite began exactly at "crash recovery".
+  STITCHPAD_TERMINAL_NAMESPACE="padio-paused-writer" \
   HOME="$WORK/home" STITCHPAD_PAD_DIR="$WORK/.stitchpad" STITCHPAD_NAME=tester \
     STITCHPAD_WRITE_TEST_AFTER_PROMOTION_BARRIER="$barrier" \
     exec "$SP" join paused-writer claude pull -
@@ -247,6 +252,11 @@ grep -q '^paused-writer[[:space:]]*|' "$PAD" \
 crash_barrier="$WORK/crash-promotion"
 (
   trap - EXIT
+  # Each background writer simulates a SEPARATE agent process. Without its own
+  # terminal surface it races the main thread for the one terminal claim, and
+  # the crash-recovery simulation never arms — which is why all 13 failures in
+  # this suite began exactly at "crash recovery".
+  STITCHPAD_TERMINAL_NAMESPACE="padio-crash-writer" \
   HOME="$WORK/home" STITCHPAD_PAD_DIR="$WORK/.stitchpad" STITCHPAD_NAME=tester \
     STITCHPAD_WRITE_TEST_AFTER_PROMOTION_BARRIER="$crash_barrier" \
     exec "$SP" join crash-writer claude pull -
@@ -282,6 +292,11 @@ grep -q '^recovery-trigger[[:space:]]*|' "$PAD" \
 signal_barrier="$WORK/signal-promotion"
 (
   trap - EXIT
+  # Each background writer simulates a SEPARATE agent process. Without its own
+  # terminal surface it races the main thread for the one terminal claim, and
+  # the crash-recovery simulation never arms — which is why all 13 failures in
+  # this suite began exactly at "crash recovery".
+  STITCHPAD_TERMINAL_NAMESPACE="padio-signal-writer" \
   HOME="$WORK/home" STITCHPAD_PAD_DIR="$WORK/.stitchpad" STITCHPAD_NAME=tester \
     STITCHPAD_WRITE_TEST_AFTER_PROMOTION_BARRIER="$signal_barrier" \
     exec "$SP" join signal-writer claude pull -

@@ -64,6 +64,14 @@ fi
 mkdir -p "$tmp/proj2"; ( cd "$tmp/proj2" && git init -q )
 (
   cd "$tmp/proj2"
+  # ONE TERMINAL = ONE PAD. This block is the fixture's SECOND pad, and the
+  # terminal is still bound to $tmp/proj, so `join` here is refused — silently,
+  # because every call in this block is >/dev/null 2>&1, and the refusal then
+  # killed the whole suite at assertion 2 of 13 under `set -e`. The pad guard is
+  # correct; the fixture owes it a distinct surface. That is what
+  # STITCHPAD_TERMINAL_NAMESPACE is for (see the GAP-2 note in lib.sh).
+  export STITCHPAD_TERMINAL_NAMESPACE="rc1-proj2"
+  cd "$tmp/proj2"
   "$SP" init --name c13gap >/dev/null 2>&1
   "$SP" join alice claude >/dev/null 2>&1
   STITCHPAD_NAME=alice "$SP" say 'zz-one plain' >/dev/null 2>&1
