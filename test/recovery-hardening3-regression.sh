@@ -139,6 +139,7 @@ printf 'OOO333' > "$PAD_STATE/session-activity.$O"
 # bound session) while STITCHPAD_SESSION=O (the operator's own env session).
 export STITCHPAD_SESSION="$O"
 E1_JOURNAL="$(sp_session_registry_journal_begin "$L")"
+rm -f "$E1_JOURNAL/.alive" 2>/dev/null || true  # R7: simulate crash — process died
 [ -n "$E1_JOURNAL" ] && [ -d "$E1_JOURNAL" ] || { bad "E1_setup: could not create journal"; }
 
 # Crash mid-leave: mutate L's files (simulating in-progress leave writes that
@@ -202,6 +203,7 @@ PAD_MD="$E2A_PAD_MD"
 PAD_STATE="$E2A_PAD_STATE"
 
 E2A_ORPHAN="$(STITCHPAD_SESSION="$E2A_SID" sp_session_registry_journal_begin "$E2A_SID")"
+rm -f "$E2A_ORPHAN/.alive" 2>/dev/null || true  # R7: simulate crash
 [ -n "$E2A_ORPHAN" ] && [ -d "$E2A_ORPHAN" ] || { bad "E2A_setup: could not create orphan"; }
 
 # Unrelated commit advances HEAD (R3 shape — content diverges from HEAD too,
@@ -260,6 +262,7 @@ PAD_STATE="$E2B_PAD_STATE"
 # (say path: write then commit), THEN crashes before journal_commit removes
 # the journal. Live content == HEAD content exactly.
 E2B_ORPHAN_A="$(STITCHPAD_SESSION="$E2B_SID" sp_session_registry_journal_begin "$E2B_SID")"
+rm -f "$E2B_ORPHAN_A/.alive" 2>/dev/null || true  # R7: simulate crash
 [ -n "$E2B_ORPHAN_A" ] && [ -d "$E2B_ORPHAN_A" ] || { bad "E2Ba_setup: could not create orphan"; }
 
 echo "the operation's own write" >> "$E2B_PAD_MD"
@@ -285,6 +288,7 @@ grep -q "the operation's own write" "$E2B_PAD_MD" && \
 # shape) — live content DIVERGES from HEAD (uncommitted crash residue still
 # sitting in the file). Must NOT be silently archived.
 E2B_ORPHAN_B="$(STITCHPAD_SESSION="$E2B_SID" sp_session_registry_journal_begin "$E2B_SID")"
+rm -f "$E2B_ORPHAN_B/.alive" 2>/dev/null || true  # R7: simulate crash
 [ -n "$E2B_ORPHAN_B" ] && [ -d "$E2B_ORPHAN_B" ] || { bad "E2Bd_setup: could not create orphan"; }
 
 echo "unrelated third party commit" >> "$E2B_PAD_MD"
@@ -330,6 +334,7 @@ PAD_MD="$E3_PAD_MD"
 PAD_STATE="$E3_PAD_STATE"
 
 E3_ORPHAN="$(STITCHPAD_SESSION="$E3_SID" sp_session_registry_journal_begin "$E3_SID")"
+rm -f "$E3_ORPHAN/.alive" 2>/dev/null || true  # R7: simulate crash
 [ -n "$E3_ORPHAN" ] && [ -d "$E3_ORPHAN" ] || { bad "E3_setup: could not create orphan"; }
 
 # Poison the journal's state-root pin so rollback's C2 check fails and
