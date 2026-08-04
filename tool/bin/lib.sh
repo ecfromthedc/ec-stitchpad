@@ -1380,10 +1380,16 @@ sp_commit() {
   # RP-2: capture staged blob hashes BEFORE commit for post-commit byte
   # verification.  A hook that keeps the path but replaces content passes
   # Z1 but commits tampered bytes — we verify exact blob match vs HEAD.
-  local _rp2_hashes="" _p _ph
+  # P19: entries are recorded per staged FILE ("<path>:<blobhash>"), never
+  # per pathspec.  A DIRECTORY pathspec (archive) must expand to its files:
+  # comparing a file's blob hash against `ls-tree` of the directory yields
+  # the TREE hash, so every archive commit was falsely reported uncommitted
+  # (pad rewritten + cursors frozen, error text on a durable success).
+  local _rp2_hashes="" _p _rp2_entries
   for _p in "${paths[@]}"; do
-    _ph="$(sgit ls-files --stage -- "$_p" 2>/dev/null | awk '{print $2}')" || _ph=""
-    [ -n "$_ph" ] && _rp2_hashes="${_rp2_hashes}${_p}:${_ph}"$'\n'
+    _rp2_entries="$(sgit ls-files --stage -- "$_p" 2>/dev/null \
+      | awk -F'\t' '{ split($1, m, " "); print $2 ":" m[2] }')" || _rp2_entries=""
+    [ -n "$_rp2_entries" ] && _rp2_hashes="${_rp2_hashes}${_rp2_entries}"$'\n'
   done
   _rp2_hashes="${_rp2_hashes%$'\n'}"
   # I1: identity preflight — every commit must carry the agent's declared
