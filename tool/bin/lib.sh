@@ -1296,7 +1296,18 @@ sp_commit() {
     [ -n "$_ph" ] && _rp2_hashes="${_rp2_hashes}${_p}:${_ph}"$'\n'
   done
   _rp2_hashes="${_rp2_hashes%$'\n'}"
-  if sgit commit -q -m "$msg" >/dev/null 2>/dev/null; then
+  # I1: identity preflight — every commit must carry the agent's declared
+  # identity via inline -c flags. Without this, git falls back to shared repo
+  # config and parallel workers silently overwrite each other's authorship
+  # (pro3's commit was authored "pro7@ocean.local" — observed live).
+  # Resolve via sp_me when available; fall back to "stitchpad" for contexts
+  # where no session binding exists yet (bootstrap, tests, watch.sh).
+  local _commit_who=""
+  _commit_who="$(sp_me 2>/dev/null)" || _commit_who=""
+  [ -z "$_commit_who" ] && _commit_who="stitchpad"
+  # Commit with inline identity — never touch shared git config.
+  if sgit -c "user.name=$_commit_who" -c "user.email=${_commit_who}@ocean.local" \
+       commit -q -m "$msg" >/dev/null 2>/dev/null; then
     # C3: commit exited 0, but a pre-commit hook that empties the index
     # makes git produce an EMPTY commit — HEAD advances, index is clean,
     # but our write bytes are in neither HEAD nor HEAD~1.  Journaled
