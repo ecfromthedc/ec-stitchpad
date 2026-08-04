@@ -30,6 +30,30 @@ STITCHPAD="$ROOT/tool/bin/stitchpad"
 # operator's own ~/.stitchpad-terminals/<surface> and collide with live
 # seats. See fx2-harness-hygiene-1b8eed4.md.
 unset HERDR_PANE_ID HERDR_TAB_ID HERDR_ENV HERDR_SOCKET_PATH HERDR_WORKSPACE_ID 2>/dev/null || true
+
+# ── pro3 structural tmpdir: one parent, export TMPDIR, single EXIT trap ──
+_SYS_TMP="${TMPDIR:-/tmp}"
+
+# Startup sweep: remove stale sp-run.* from prior SIGKILL-interrupted runs
+_STALE_SWEPT=0
+for _d in $(find "$_SYS_TMP" -maxdepth 1 -name 'sp-run.*' -type d 2>/dev/null); do
+  rm -rf "$_d" 2>/dev/null || true
+  _STALE_SWEPT=$((_STALE_SWEPT + 1))
+done
+[ "$_STALE_SWEPT" -gt 0 ] && echo "  (swept $_STALE_SWEPT stale prior-run sp-run.* dirs)" >&2 || true
+
+# Create per-run parent; every fixture mktemp lands inside via TMPDIR
+_RUN_TMP="$(mktemp -d "$_SYS_TMP/sp-run.XXXXXXXX")"
+export TMPDIR="$_RUN_TMP"
+# Teardown: rm -rf the entire tree.  Prove RED: set STITCHPAD_TEST_LEAK=1
+# to skip the rm so the gate catches the leak.
+_teardown() {
+  if [ "${STITCHPAD_TEST_LEAK:-0}" != "1" ]; then
+    rm -rf "$_RUN_TMP" 2>/dev/null || true
+  fi
+}
+trap _teardown EXIT
+
 # Authority model (C2/C2b): operator flows require a credential rooted at
 # $HOME/.stitchpad/operator.key — isolate HOME so the fixture NEVER touches
 # the operator's real key, then mint a fixture credential.
@@ -38,7 +62,7 @@ export HOME="$H3_HOME"
 # A-4/A-5 fix: explicit override keeps this fixture off the real operator key
 export STITCHPAD_OPERATOR_KEY_PATH="$H3_HOME/.stitchpad/operator.key"
 export STITCHPAD_OPERATOR_KEY_OVERRIDE_ACK=1
-trap 'rm -rf "$H3_HOME"' EXIT
+# H3_HOME covered by _RUN_TMP EXIT trap (pro3)
 "$STITCHPAD" operator keygen >/dev/null 2>&1 || true
 OP_TOK="$(cat "$HOME/.stitchpad/operator.key" 2>/dev/null)"
 
@@ -84,7 +108,7 @@ echo ""
 echo "--- E1: leave-path manifest misalignment (passed sid != env sid) ---"
 
 E1_WORK="$(mktemp -d "${TMPDIR:-/tmp}/sp-h3-e1.XXXXXX")"
-trap 'rm -rf "$E1_WORK"' RETURN 2>/dev/null || true
+# E1_WORK covered by _RUN_TMP EXIT trap (pro3)
 
 make_pad "$E1_WORK/test-pad" "e1-pad"
 E1_PAD_DIR="$E1_WORK/test-pad/.stitchpad"
@@ -859,7 +883,6 @@ printf 'jh5b staged line\n' >> "$JH5_PAD_DIR/stitchpad.md"
 ) > "$JH5_WORK/jh5b.out" 2>&1
 if grep -q '^JH5B_RC=1$' "$JH5_WORK/jh5b.out"; then
   ok "JH5b: sp_commit still refuses when the working tree differs from HEAD"
-  rm -rf "$JH5_WORK"
 else
   bad "JH5b: sp_commit accepted an uncommitted write (got: $(grep JH5B_RC "$JH5_WORK/jh5b.out"))"
   echo "  JH5 debug preserved: $JH5_WORK" >&2
@@ -923,7 +946,6 @@ _rc=$?
 [ "$_rc" -eq 0 ] && ok "H1c: valid PAD_STATE path still passes containment" \
   || bad "H1c: valid path incorrectly rejected"
 
-rm -rf "$R6_WORK"
 
 # H2+H9b: hardlink refusal
 echo ""
@@ -938,7 +960,6 @@ _nlink="$(python3 -c "import os; print(os.lstat('$H2_WORK/inside/.state/sessions
 [ "$_nlink" -gt 1 ] && ok "H2a: hardlink detected (nlink=$_nlink)" \
   || bad "H2a: hardlink not detected (nlink=$_nlink)"
 
-rm -rf "$H2_WORK"
 
 # H4: reset gate requires STITCHPAD_I_AM_OPERATOR
 echo ""
@@ -981,7 +1002,6 @@ _rc=$?
 [ "$_rc" -ne 0 ] && ok "H4c: roster seat denied even with operator flag" \
   || bad "H4c: roster seat cleared counters even with flag"
 
-rm -rf "$H4_WORK"
 
 # H6/H10/H5b/H11b: code-verified logic gates
 echo ""
@@ -1017,7 +1037,6 @@ grep -qi "stale git index.lock" "$N2_WORK/n2a.out" && \
   ok "N2a-diag: self-heal diagnostic printed" \
   || bad "N2a-diag: self-heal happened silently (no diagnostic)"
 
-rm -rf "$N2_WORK"
 
 # N2b: a FRESH index.lock (age < 15s, a plausible in-flight writer) must
 # NOT be removed — never blindly clobber a potentially live commit.
@@ -1033,7 +1052,28 @@ STITCHPAD_PAD_DIR="$N2B_PAD_DIR" STITCHPAD_NAME=alice \
   ok "N2b: fresh index.lock preserved (not blindly removed — real concurrency stays safe)" \
   || bad "N2b: fresh index.lock was removed (unsafe — could clobber a live writer)"
 
-rm -rf "$N2B_WORK"
+
+# ── pro3 tmpdir gate ──────────────────────────────────────────────────
+# Run teardown NOW (rm -rf _RUN_TMP unless STITCHPAD_TEST_LEAK=1), then
+# assert zero residue.  RED proof: STITCHPAD_TEST_LEAK=1 skips the rm,
+# gate FAILS because _RUN_TMP still exists.
+_teardown
+
+# Gate: _RUN_TMP must be gone
+if [ ! -d "$_RUN_TMP" ]; then
+  ok "GATE-TMPDIR: _RUN_TMP removed (all fixture tmpdirs cleaned, swept $_STALE_SWEPT stale)"
+else
+  _LEAKED=$(find "$_RUN_TMP" -mindepth 1 -maxdepth 2 -type d 2>/dev/null | wc -l | tr -d ' ')
+  bad "GATE-TMPDIR: _RUN_TMP still exists with $_LEAKED subdirs (leak!)"
+fi
+
+# Gate: no sp-run.* residue in system tmp
+_AFTER=$(find "$_SYS_TMP" -maxdepth 1 -name 'sp-run.*' -type d 2>/dev/null | wc -l | tr -d ' ')
+if [ "$_AFTER" -eq 0 ]; then
+  ok "GATE-TMPDIR: zero stale sp-run.* dirs in _SYS_TMP"
+else
+  bad "GATE-TMPDIR: $_AFTER sp-run.* dirs leaked in _SYS_TMP"
+fi
 
 # ============================================================================
 # Results
