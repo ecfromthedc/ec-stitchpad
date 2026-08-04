@@ -3772,29 +3772,38 @@ PY
         id="${1:-}"; new_status="${2:-}"
         [ -z "$id" ] && { echo "usage: stitchpad task move <id> <status> [--from <current-status>]" >&2; exit 1; }
         [ -z "$new_status" ] && { echo "usage: stitchpad task move <id> <status> [--from <current-status>]" >&2; exit 1; }
-        # Parse optional --from for CAS (compare-and-set) guard
         _move_from=""
         if [ "${3:-}" = "--from" ]; then _move_from="${4:-}"; fi
-        sp_lock || exit 1
-        # Edit only the file that actually holds the card. A migrated task lives
-        # in tasks.md, so moving it never touches (or re-commits) the pad; a
-        # legacy inline task is still edited where it sits. An unknown id fails
-        # instead of rewriting the whole pad for nothing.
-        tfile="$(sp_task_file "$id")" || { sp_unlock; echo "stitchpad: no such task: $id" >&2; exit 1; }
-        # F5 CAS: if --from was specified, re-read current status under the lock
-        # and refuse if it no longer matches.  Two concurrent moves on one card
-        # produce exactly one success + one explicit refusal, never two successes.
-        if [ -n "$_move_from" ]; then
-          _move_current="$(awk -v tid="$id" '
+        # Resolve which file holds the card BEFORE the lock so we can snapshot
+        # its current status for the default CAS baseline.
+        tfile="$(sp_task_file "$id")" || { echo "stitchpad: no such task: $id" >&2; exit 1; }
+        # F5 CAS: when --from is NOT passed, read the card's current status
+        # BEFORE acquiring the lock.  This becomes the default expected-from
+        # value.  If another writer changes the card between this read and the
+        # lock, the under-lock re-read catches it and refuses.
+        _move_seen=""
+        if [ -z "$_move_from" ]; then
+          _move_seen="$(awk -v tid="$id" '
             /^```task / && $2==tid  { inblk=1; inmeta=1; next }
             inblk && inmeta && /^status:/ { sub(/^status:[[:space:]]*/,""); print; exit }
             /^```$/ && inblk          { exit }
           ' "$tfile")"
-          if [ -n "$_move_current" ] && [ "$_move_current" != "$_move_from" ]; then
-            sp_unlock
-            echo "stitchpad: REFUSED — $id is '$_move_current', not '$_move_from' (changed by another writer); re-read and retry with --from '$_move_current'"
-            exit 1
-          fi
+        fi
+        sp_lock || exit 1
+        # F5 CAS: re-read current status under the lock.  Compare against the
+        # explicit --from value when given, or the pre-lock snapshot otherwise.
+        # Two concurrent moves on one card produce exactly one success + one
+        # explicit refusal, never two successes.
+        _move_current="$(awk -v tid="$id" '
+          /^```task / && $2==tid  { inblk=1; inmeta=1; next }
+          inblk && inmeta && /^status:/ { sub(/^status:[[:space:]]*/,""); print; exit }
+          /^```$/ && inblk          { exit }
+        ' "$tfile")"
+        _move_expected="${_move_from:-$_move_seen}"
+        if [ -n "$_move_expected" ] && [ -n "$_move_current" ] && [ "$_move_current" != "$_move_expected" ]; then
+          sp_unlock
+          echo "stitchpad: REFUSED — $id is '$_move_current', not '$_move_expected' (changed by another writer); re-read and retry with --from '$_move_current'"
+          exit 1
         fi
         sp_task_detect_duplicate "$id" || true  # warn if ghost exists in the other file
         tmp="$(sp_stage "$tfile")"

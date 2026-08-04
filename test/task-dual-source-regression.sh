@@ -98,6 +98,104 @@ fi
 
 cd "$ROOT"
 
+
+# ===========================================================================
+# DS6: concurrent task move WITHOUT --from — default CAS refuses loser
+# Two simultaneous `task move` on the same card with different targets and
+# no --from flag must produce exactly one success + one explicit refusal.
+# The old code gated CAS behind "if [ -n "$_move_from" ]" and the default
+# (flag-free) path silently clobbered with exit 0 for the loser.
+# ===========================================================================
+echo ""
+echo "=== DS6: concurrent move without --from ==="
+echo ""
+
+DS6_WORK="$TMP/ds6"; mkdir -p "$DS6_WORK"; cd "$DS6_WORK"
+
+"$SP" init --name ds6 >/dev/null 2>&1
+STITCHPAD_NAME=alice "$SP" join alice codex pull - >/dev/null 2>&1
+STITCHPAD_NAME=alice "$SP" task new "concurrent move card" >/dev/null 2>&1
+
+# Verify the card starts at todo
+DS6_PRE="$("$SP" task show TASK-1 2>&1)"
+if echo "$DS6_PRE" | grep -q "status: todo"; then
+  ok "DS6a: card starts at todo"
+else
+  bad "DS6a: card not at todo" "$DS6_PRE"
+fi
+
+# Run two concurrent moves on the same card, different targets, no --from
+DS6_A_OUTFILE="$TMP/ds6_alice_out"; DS6_B_OUTFILE="$TMP/ds6_bob_out"
+DS6_A_RC=0; DS6_B_RC=0
+
+STITCHPAD_NAME=alice "$SP" task move TASK-1 in_progress > "$DS6_A_OUTFILE" 2>&1 &
+DS6_A_PID=$!
+STITCHPAD_NAME=bob "$SP" task move TASK-1 done > "$DS6_B_OUTFILE" 2>&1 &
+DS6_B_PID=$!
+
+wait $DS6_A_PID; DS6_A_RC=$?
+wait $DS6_B_PID; DS6_B_RC=$?
+
+DS6_A_OUT="$(cat "$DS6_A_OUTFILE")"; DS6_B_OUT="$(cat "$DS6_B_OUTFILE")"
+rm -f "$DS6_A_OUTFILE" "$DS6_B_OUTFILE"
+
+# DS6b: exactly one exit 0, exactly one non-zero — never two successes
+_success_count=0
+[ "$DS6_A_RC" -eq 0 ] && _success_count=$((_success_count+1))
+[ "$DS6_B_RC" -eq 0 ] && _success_count=$((_success_count+1))
+if [ "$_success_count" -eq 1 ]; then
+  ok "DS6b: exactly one success (rc=0), one refusal (rc!=0) — alice_rc=$DS6_A_RC bob_rc=$DS6_B_RC"
+else
+  bad "DS6b: expected 1 success, got $_success_count (alice_rc=$DS6_A_RC bob_rc=$DS6_B_RC)"
+fi
+
+# DS6c: the refused side says REFUSED
+_refused_output=""
+if [ "$DS6_A_RC" -ne 0 ]; then _refused_output="$DS6_A_OUT"; fi
+if [ "$DS6_B_RC" -ne 0 ]; then _refused_output="$_refused_output$DS6_B_OUT"; fi
+if echo "$_refused_output" | grep -qi "REFUSED"; then
+  ok "DS6c: refused side says REFUSED"
+else
+  bad "DS6c: no REFUSED in refused output" "$_refused_output"
+fi
+
+# DS6d: final state matches exactly one target (the winner), not both
+DS6_FINAL="$("$SP" task show TASK-1 2>&1)"
+_final_in_progress=0; _final_done=0
+echo "$DS6_FINAL" | grep -q "status: in_progress" && _final_in_progress=1
+echo "$DS6_FINAL" | grep -q "status: done" && _final_done=1
+if [ "$_final_in_progress" -eq 1 ] && [ "$_final_done" -eq 0 ]; then
+  ok "DS6d: final status is in_progress (alice won)"
+elif [ "$_final_in_progress" -eq 0 ] && [ "$_final_done" -eq 1 ]; then
+  ok "DS6d: final status is done (bob won)"
+else
+  bad "DS6d: ambiguous final status — in_progress=$_final_in_progress done=$_final_done"
+fi
+
+# DS6e: the winner's output matches the final status
+DS6_FINAL_STATUS=""
+echo "$DS6_FINAL" | grep -q "status: in_progress" && DS6_FINAL_STATUS="in_progress"
+echo "$DS6_FINAL" | grep -q "status: done" && DS6_FINAL_STATUS="done"
+_winner_output=""
+if [ "$DS6_A_RC" -eq 0 ]; then _winner_output="$DS6_A_OUT"; else _winner_output="$DS6_B_OUT"; fi
+if echo "$_winner_output" | grep -q "TASK-1 → $DS6_FINAL_STATUS"; then
+  ok "DS6e: winner output matches final status ($DS6_FINAL_STATUS)"
+else
+  bad "DS6e: winner output does not match final" "winner=[$_winner_output] final=[$DS6_FINAL_STATUS]"
+fi
+
+# DS6f: --from still works as an explicit assertion (reset, then move with --from)
+# First reset to backlog so --from backlog is meaningful
+STITCHPAD_NAME=alice "$SP" task move TASK-1 backlog >/dev/null 2>&1 || true
+DS6F_OUT="$(STITCHPAD_NAME=alice "$SP" task move TASK-1 in_progress --from backlog 2>&1)" || DS6F_RC=$?
+if [ "${DS6F_RC:-0}" -eq 0 ] && echo "$DS6F_OUT" | grep -q "TASK-1 → in_progress"; then
+  ok "DS6f: --from explicit assertion still works (backlog->in_progress)"
+else
+  bad "DS6f: --from move failed" "$DS6F_OUT (rc=$DS6F_RC)"
+fi
+
+cd "$ROOT"
+
 # ===========================================================================
 # DS2: list and show agree on every field
 # ===========================================================================
