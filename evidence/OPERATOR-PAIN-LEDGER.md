@@ -261,3 +261,59 @@ P27. A RUNNING TEST FIXTURE CAN STEAL THE OPERATOR'S TERMINAL IDENTITY.
      bound to its ORIGINAL pad and can still post.
      WORKAROUND USED: STITCHPAD_STEAL=1 — which is exactly the invariant-defeating escape
      hatch we tell seats never to use, and I had to use it to talk to my own arena.
+
+## ⭐ THE CAPSTONE FINDING — EC named it, and it reframes this entire build
+
+EC: "YOURE SUPPOSED TO BE ABLE TO DISPATCH but for some reason werent? the whole point of
+this is to be able to command multi model agent fleets and for it to be reliable."
+
+**Correct. The captain's orchestration failures were not incidental — they ARE the product
+defect, and every one maps to a documented pain point.** This session is the most thorough
+possible evidence for why these features must exist, because a competent operator with full
+access, unlimited retries and 48 hours STILL could not run the fleet reliably.
+
+| What went wrong while orchestrating | Root cause | Point |
+|---|---|---|
+| 6 kimi turns + 4 codex turns died silently; I told EC "kimi is non-functional" (FALSE — 28 commits) | `wake` returns `{"ok":true,"status":"running"}` for a model the daemon reports **ready=false**, exit 0 | **P1** |
+| Could not distinguish "agent failed" from "agent thinking" — ever | No turn error surface at all: no /turns endpoint, no last_error | **P2** |
+| Reported seats idle-with-nothing when they had committed 39–82 min earlier | No artifact contract; silence is indistinguishable from work | **P3** |
+| Ten turns lost to `kimi-k3` vs `k3` | Model ids unvalidated at dispatch | **P4** |
+| Arena looked dead at its busiest; EC had to ask "i dont see yall cooking" | Pad does not narrate; progress appears only if an agent remembers | **P19** |
+| EC asked "eta?" EIGHT times; every answer a hand-rolled guess, several wrong | No board ETA, no projection, no live card state | **P20/P21** |
+| EC could not ask a working agent anything; captain was the only channel | Pinging a busy agent returns silence — no ack, no queue signal | **P22** |
+| Twice told EC a seat produced nothing when it had | Evidence has three possible homes; "is it sealed?" has three answers | **P7** |
+| Fixes never protected the fleet building them | No self-hosting: 2,513 lines of fixes while the fleet ran the old tool | **P23** |
+
+**The conclusion that matters:** an orchestrator cannot be reliable on top of a dispatch
+layer that reports success for dead work, an agent layer that cannot say "I failed", and a
+board that cannot show what is happening. Fleet command is not a prompt-engineering problem —
+it is these nine features. Until they exist, every operator will burn the hours EC burned,
+and every captain will misreport the way this one did.
+
+**This is why the operator-experience layer is not "polish". It is the product.**
+
+P28. THE ENTIRE BUILD WAS VALIDATED THROUGH THE CLI, NOT THROUGH HERDR.
+     EC: "its probably a problem that i been doing this thru claude terminal n not herdr."
+     He is right, and the numbers are stark.
+     OBSERVED: **37 of 75 suites explicitly `unset HERDR_PANE_ID HERDR_TAB_ID HERDR_ENV
+     HERDR_SOCKET_PATH HERDR_WORKSPACE_ID`** — i.e. half the test suite is written to
+     DISABLE the real integration surface before it runs. Every dispatch I made this build
+     went through `ocean-heartbeat wake` on the CLI. Every pad operation went through
+     `stitchpad` on the CLI. EC watched in the UI but could not act from it (P22), while I
+     acted from a terminal EC could not see (P19).
+     WHAT THIS MEANS: the operator surface is BIFURCATED. The product was hardened along
+     the path nobody is meant to use in production, and the path a real operator WILL use —
+     herdr panes, the sidebar, the task board, agent mentions — is the least exercised part
+     of the system. Our 62-GREEN tripwire says almost nothing about it.
+     Note also sp_this_surface() prefers HERDR_PANE_ID and only falls back to session ids;
+     the terminal-identity defects (P12, P27) live in that fallback — the path we forced
+     ourselves onto by unsetting HERDR everywhere.
+     REQUIRED:
+       (a) A herdr-path test lane: at least the core flows (join, say, read, task, mention,
+           lane take/close) exercised WITH HERDR_* set, not unset.
+       (b) Stop blanket-unsetting HERDR in fixtures; isolate via the terminal NAMESPACE
+           (P12's fix) so tests can run on the real surface safely.
+       (c) An end-to-end "operator does a full session in the UI" rehearsal before shipping —
+           the equivalent of the human-flow rehearsal, but through herdr.
+     GATE: run the core flow suite twice — once with HERDR_* set, once unset — and require
+     both to pass. A product that only works with its own integration disabled is not shipped.
