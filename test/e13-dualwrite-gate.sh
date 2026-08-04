@@ -43,8 +43,18 @@ sp() {
     STITCHPAD_HEARTBEAT_AUTOSTART=0 STITCHPAD_NAME="${SPNAME:-tester}" "$SP" "$@"
 }
 
-SPNAME=alice sp join alice cli pull - >/dev/null 2>&1 || true
-SPNAME=bob   sp join bob   cli pull - >/dev/null 2>&1 || true
+# Two simulated agents need two SURFACES. Without this both joins share one surface
+# (inherited from the caller's session), the second is refused by
+# "one terminal = one (pad,name)", bob never lands in the roster, and then
+# `task new --to bob` is refused by assignee validation — so G1a/G1b/G1c failed with
+# no card at all. Both hardenings are correct; the fixture owed distinct surfaces.
+unset CLAUDE_CODE_SESSION_ID CODEX_SESSION_ID 2>/dev/null || true
+# This fixture never init'd a pad — it relied on `join` implicitly creating one.
+# A pad is only a pad once it has its isolated git dir, so every command answered
+# "no pasture found" and G1a/G1b/G1c saw an empty tree.
+sp init --name e13 >/dev/null 2>&1 || true
+STITCHPAD_SESSION="fx-alice-$$" SPNAME=alice sp join alice cli pull - >/dev/null 2>&1 || true
+STITCHPAD_SESSION="fx-bob-$$"   SPNAME=bob   sp join bob   cli pull - >/dev/null 2>&1 || true
 
 pad_md="$WORK/.stitchpad/stitchpad.md"
 tasks_md="$WORK/.stitchpad/tasks.md"
@@ -57,7 +67,7 @@ SPNAME=alice sp task new "auth fix" --to bob --priority high >/dev/null 2>&1
 grep -q 'auth fix' "$tasks_md" 2>/dev/null \
   && ok "G1a: task card in tasks.md" \
   || bad "G1a: task card in tasks.md"
-grep -q 'task TASK-1 assigned' "$pad_md" 2>/dev/null \
+grep -qE 'task TASK-[0-9]+ assigned' "$pad_md" 2>/dev/null \
   && ok "G1b: assignment notice in pad" \
   || bad "G1b: assignment notice in pad"
 grep -q '<!-- tasks:file -->' "$pad_md" 2>/dev/null \
