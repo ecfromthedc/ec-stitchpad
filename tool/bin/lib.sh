@@ -1587,11 +1587,11 @@ sp_tasks() {
   local _tf=(); while IFS= read -r _f; do _tf+=("$_f"); done < <(sp_task_files)
   local _sp_tasks_output
   _sp_tasks_output="$(awk -v fn="$filter_name" -v fs="$filter_status" '
-    BEGIN { id=""; title=""; status=""; priority=""; assignee=""; labels=""; created=""; desc="" }
+    BEGIN { id=""; title=""; status=""; priority=""; assignee=""; labels=""; created=""; estimate=""; desc="" }
     # multiple inputs (pad + tasks.md): never let an unterminated block in one
     # file bleed into the next
     FNR==1                           { inblk=0; meta=0; id=""; code_fence=0 }
-    /^```task /                      { inblk=1; meta=1; id=$2; gsub(/^ *| *$/,"",id); title=""; status="todo"; priority="none"; assignee=""; labels=""; created=""; desc="" }
+    /^```task /                      { inblk=1; meta=1; id=$2; gsub(/^ *| *$/,"",id); title=""; status="todo"; priority="none"; assignee=""; labels=""; created=""; estimate=""; desc="" }
     # E-18: only a TOP-LEVEL ``` (code_fence==0) closes the task block.
     # Nested ``` pairs inside the body (e.g. a code block in the description)
     # toggle code_fence and do NOT terminate the task.
@@ -1600,7 +1600,7 @@ sp_tasks() {
       # duplicate blocks: tasks.md is read second via sp_task_files ordering,
       # so its version naturally wins for cross-file duplicates (LAST wins).
       if (!(id in seen)) { order[++nord]=id; seen[id]=1 }
-      data[id] = id "|" title "|" status "|" priority "|" assignee "|" labels "|" created "|" desc
+      data[id] = id "|" title "|" status "|" priority "|" assignee "|" labels "|" created "|" estimate "|" desc
       fa[id]=assignee; fst[id]=status; id="" } }
     inblk && /^---/                   { meta=0; next }
     inblk && !meta && /^```[^t]/ {
@@ -1629,6 +1629,7 @@ sp_tasks() {
       if (line ~ /^assignee:/) { gsub(/^assignee: */, "", line); assignee=line }
       if (line ~ /^labels:/)   { gsub(/^labels: */, "", line); labels=line }
       if (line ~ /^created:/)  { gsub(/^created: */, "", line); created=line }
+      if (line ~ /^estimate:/) { gsub(/^estimate:[[:space:]]*/, "", line); estimate=line }
     }
     END { for (i=1; i<=nord; i++) { k=order[i]
       if ((fn=="" || fa[k]==fn) && (fs=="" || fst[k]==fs)) print data[k] } }
@@ -1642,6 +1643,235 @@ sp_tasks() {
     done <<< "$_sp_tasks_output"
   fi
   printf '%s\n' "$_sp_tasks_output"
+}
+
+# ── P20+P21: Task Oversight Board + ETA Projection ──────────────────────
+# The board answers questions the operator should never have to ask: "eta?",
+# "hows it going", "u still going?", "why is this card not done?".
+#
+# sp_task_board — enriched `stitchpad task list` with per-card owner liveness,
+#   artifact presence, and staleness flags.  A card whose owner is inactive
+#   past the threshold is flagged on the board without operator action.
+#
+# sp_task_eta — wall-clock projection modelling parallelism (busiest-owner
+#   chain + serialised tail).  An operator budgets agents and tokens without
+#   asking anyone.
+
+TASK_OWNER_STALE_SECONDS="${TASK_OWNER_STALE_SECONDS:-3600}"
+
+# sp_task_board — rich kanban-like view with liveness + artifacts.
+# Reads sp_tasks pipe-delimited output (id|title|status|priority|assignee|labels|created|estimate|desc)
+# and cross-references session registry for owner activity.
+sp_task_board() {
+  local _proj _tasks _now _line _id _title _status _priority _assignee _labels _created _est _desc
+  local _owner_status _owner_age _art_check _artifact_file _present _flag
+  _proj="$(sp_session_registry_project 2>/dev/null || echo '[]')"
+  _tasks="$(sp_tasks "$@")"
+  _now="$(date +%s)"
+
+  printf '%-10s %-12s %-12s %-10s %-12s %-14s %-14s %-10s %s\n' \
+    "TASK" "STATUS" "PRIORITY" "OWNER" "OWNER-LIVE" "ARTIFACT" "AGE" "EST" "TITLE"
+  printf '%-10s %-12s %-12s %-10s %-12s %-14s %-14s %-10s %s\n' \
+    "----------" "------------" "------------" "----------" "------------" "--------------" "--------------" "----------" "-------------------------"
+
+  while IFS='|' read -r _id _title _status _priority _assignee _labels _created _est _desc; do
+    [ -n "$_id" ] || continue
+    # Owner liveness from session registry
+    _owner_status="-"; _owner_age=""
+    _flag=""
+    if [ -n "$_assignee" ]; then
+      _owner_status="$(echo "$_proj" | python3 -c "
+import json, sys
+data = json.load(sys.stdin)
+for s in data:
+    if s.get('name','') == '$_assignee':
+        print(s.get('status',''))
+        sys.exit(0)
+print('unknown')
+" 2>/dev/null)"
+      [ -z "$_owner_status" ] && _owner_status="unknown"
+      _owner_age="$(echo "$_proj" | python3 -c "
+import json, sys
+data = json.load(sys.stdin)
+for s in data:
+    if s.get('name','') == '$_assignee':
+        la = s.get('last_activity',0)
+        if la: print(int($_now) - la)
+        sys.exit(0)
+print('?')
+" 2>/dev/null)"
+      [ -z "$_owner_age" ] && _owner_age="?"
+      # Staleness: owner idle > TASK_OWNER_STALE_SECONDS and card not done
+      if [ "$_status" != "done" ] && [ "$_status" != "in_review" ]; then
+        case "$_owner_status" in
+          terminal|stale) _flag="STALE" ;;
+          idle)
+            if [ "$_owner_age" != "?" ] && [ "$_owner_age" -gt "$TASK_OWNER_STALE_SECONDS" ] 2>/dev/null; then
+              _flag="STALE"
+            fi ;;
+        esac
+      fi
+    fi
+    # Artifact check
+    _artifact_file=""
+    _present="-"
+    if [ -n "$_assignee" ] && [ -f "$PAD_STATE/artifact-expect.$_assignee" ]; then
+      _artifact_file="$(head -1 "$PAD_STATE/artifact-expect.$_assignee")"
+      if [ -n "$_artifact_file" ] && [ -e "$_artifact_file" ]; then
+        _present="yes"
+      elif [ -n "$_artifact_file" ]; then
+        _present="NO"
+      fi
+    fi
+    # Truncate long fields for column alignment
+    [ "${#_title}" -gt 40 ] && _title="${_title:0:37}..."
+    [ "${#_artifact_file}" -gt 24 ] && _artifact_file="${_artifact_file:0:21}..."
+    [ "${#_est}" -gt 8 ] && _est="${_est:0:8}"
+
+    local _owner_display="${_assignee:-unassigned}"
+    [ "${#_owner_display}" -gt 10 ] && _owner_display="${_owner_display:0:7}..."
+    local _live_display="${_owner_status}"
+    [ -n "$_owner_age" ] && [ "$_owner_age" != "?" ] && _live_display="${_owner_status} ${_owner_age}s" 2>/dev/null
+    [ "${#_live_display}" -gt 12 ] && _live_display="${_live_display:0:12}"
+
+    printf '%-10s %-12s %-12s %-10s %-12s %-14s %-14s %-10s %s' \
+      "$_id" "$_status" "$_priority" "$_owner_display" "$_live_display" \
+      "${_artifact_file:- -}" "${_present}" "${_est:- -}" "$_title"
+    if [ -n "$_flag" ]; then printf '  ⚠ %s' "$_flag"; fi
+    printf '\n'
+  done <<< "$_tasks"
+}
+
+# sp_task_eta — wall-clock projection modelling parallelism.
+# Model: busiest-owner chain + serialised tail.
+#   per_owner_minutes[owner] = sum of estimate for all non-done cards assigned to owner
+#   busiest = max(per_owner_minutes)  — cards on different owners run in parallel
+#   tail = sum of estimate for unassigned cards  — no owner = no parallel slot
+#   projection = busiest + tail
+# Default estimate: 15 minutes per card (configurable via TASK_DEFAULT_ESTIMATE_MINUTES).
+sp_task_eta() {
+  local _tasks _line _id _title _status _assignee _est _mins
+  local _default_est="${TASK_DEFAULT_ESTIMATE_MINUTES:-15}"
+
+  _tasks="$(sp_tasks)"
+
+  # Shell arrays indexed by owner name
+  local owners="" ow_min="" ow_cards=""
+  local tail_mins=0 tail_count=0 busiest_owner="" busiest_mins=0 total_cards=0 active_cards=0
+  local _proj _now
+  _proj="$(sp_session_registry_project 2>/dev/null || echo '[]')"
+  _now="$(date +%s)"
+
+  while IFS='|' read -r _id _title _status _priority _assignee _labels _created _est _desc; do
+    [ -n "$_id" ] || continue
+    total_cards=$((total_cards + 1))
+    # Only non-done cards count toward ETA
+    case "$_status" in done|in_review) continue ;; esac
+    active_cards=$((active_cards + 1))
+
+    # Parse estimate: "15m" -> 15, "3 hours" -> 180, "1h" -> 60, default to 15
+    mins="$_default_est"
+    if [ -n "$_est" ]; then
+      _clean="$(echo "$_est" | tr -d ' ')"
+
+      # Python expression parser
+      mins="$(echo "$_est" | python3 -c "
+import re, sys
+s = sys.stdin.read().strip().lower()
+# Try simple 'Nm' format
+m = re.match(r'^(\d+(?:\.\d+)?)\s*m(?:in(?:ute)?s?)?$', s)
+if m: print(int(float(m.group(1)))); sys.exit(0)
+# Try 'Nh' format
+m = re.match(r'^(\d+(?:\.\d+)?)\s*h(?:our)?s?$', s)
+if m: print(int(float(m.group(1))*60)); sys.exit(0)
+# Try 'N hours'
+m = re.match(r'^(\d+(?:\.\d+)?)\s*hours?$', s)
+if m: print(int(float(m.group(1))*60)); sys.exit(0)
+print($_default_est)
+" 2>/dev/null || echo "$_default_est")"
+    fi
+    # Ensure integer
+    case "$mins" in ''|*[!0-9]*) mins="$_default_est" ;; esac
+
+    if [ -z "$_assignee" ]; then
+      tail_mins=$((tail_mins + mins))
+      tail_count=$((tail_count + 1))
+    else
+      # Accumulate per-owner
+      local found=0
+      local _ow_idx=1
+      for o in $owners; do
+        if [ "$o" = "$_assignee" ]; then
+          local _prev_min _prev_cards
+          _prev_min=$(echo "$ow_min" | awk -v idx=$_ow_idx '{print $idx}')
+          _prev_cards=$(echo "$ow_cards" | awk -v idx=$_ow_idx '{print $idx}')
+          local _new_min=$((_prev_min + mins))
+          local _new_cards=$((_prev_cards + 1))
+          # Rebuild ow_min and ow_cards with new values at this index
+          ow_min=$(echo "$ow_min" | awk -v idx=$_ow_idx -v v=$_new_min '{
+            for(i=1;i<=NF;i++) printf("%s%s", (i==idx?v:$i), (i==NF?"":" ")); print ""}')
+          ow_cards=$(echo "$ow_cards" | awk -v idx=$_ow_idx -v v=$_new_cards '{
+            for(i=1;i<=NF;i++) printf("%s%s", (i==idx?v:$i), (i==NF?"":" ")); print ""}')
+          found=1; break
+        fi
+        _ow_idx=$((_ow_idx + 1))
+      done
+      if [ "$found" -eq 0 ]; then
+        owners="$owners $_assignee"
+        ow_min="$ow_min $mins"
+        ow_cards="$ow_cards 1"
+      fi
+    fi
+  done <<< "$_tasks"
+
+  # Find busiest owner
+  local _idx=1
+  for o in $owners; do
+    local _m
+    _m=$(echo "$ow_min" | awk -v idx=$_idx '{print $idx}')
+    [ -z "$_m" ] && _m=0
+    if [ "$_m" -gt "$busiest_mins" ] 2>/dev/null; then
+      busiest_mins=$_m
+      busiest_owner="$o"
+    fi
+    _idx=$((_idx + 1))
+  done
+
+  local projection=$((busiest_mins + tail_mins))
+
+  echo ""
+  echo "ETA PROJECTION"
+  echo "=============="
+  echo "  Active cards:     $active_cards (of $total_cards total)"
+  echo "  Busiest owner:    ${busiest_owner:-none} (${busiest_mins}m across chains)"
+  echo "  Unassigned tail:  ${tail_mins}m (${tail_count} cards)"
+  echo "  ─────────────────────────────────────"
+  printf "  Wall-clock est:   %dm (~%.1fh)\n" "$projection" "$(python3 -c "print($projection/60.0)" 2>/dev/null || echo "?")"
+
+  if [ -n "$owners" ]; then
+    echo ""
+    echo "Per-owner breakdown:"
+    local _idx2=1
+    for o in $owners; do
+      local _cm _cc
+      _cm=$(echo "$ow_min" | awk -v idx=$_idx2 '{print $idx}')
+      _cc=$(echo "$ow_cards" | awk -v idx=$_idx2 '{print $idx}')
+      # Check liveness
+      local _live="$(echo "$_proj" | python3 -c "
+import json, sys
+data = json.load(sys.stdin)
+for s in data:
+    if s.get('name','') == '$o':
+        print(s.get('status',''))
+        sys.exit(0)
+print('unknown')
+" 2>/dev/null)"
+      [ -z "$_live" ] && _live="unknown"
+      printf "    %-12s %4s cards, %4sm  (%s)\n" "$o" "${_cc:-0}" "${_cm:-0}" "$_live"
+      _idx2=$((_idx2 + 1))
+    done
+  fi
+  echo ""
 }
 
 # Create tasks.md (with its header) if it does not exist yet. Callers hold the lock.

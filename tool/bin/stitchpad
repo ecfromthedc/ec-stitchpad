@@ -4105,15 +4105,16 @@ PY
     sub="${1:-list}"; shift 2>/dev/null || true
     case "$sub" in
       new)
-        # stitchpad task new "title" [--priority high] [--to name] [--labels a,b] [--desc text]
+        # stitchpad task new "title" [--priority high] [--to name] [--labels a,b] [--desc text] [--estimate 30m]
         title="${1:-Untitled}"; shift 2>/dev/null || true
-        priority="none"; assignee=""; labels=""; desc=""
+        priority="none"; assignee=""; labels=""; desc=""; estimate=""
         while [ $# -gt 0 ]; do
           case "$1" in
             --priority) priority="$2"; shift 2 ;;
             --to|--assignee) assignee="$2"; shift 2 ;;
             --labels) labels="$2"; shift 2 ;;
             --desc) desc="$2"; shift 2 ;;
+            --estimate) estimate="$2"; shift 2 ;;
             *) shift ;;
           esac
         done
@@ -4136,7 +4137,7 @@ PY
         id="TASK-$(( existing + 1 ))"
         # Build the block — always include all core fields so edit can find them
         ts="$(date -u '+%m-%d %H:%M')"
-        block="\`\`\`task $id"$'\n'"title: $title"$'\n'"status: todo"$'\n'"priority: $priority"$'\n'"assignee: ${assignee:-}"$'\n'"labels: ${labels:-}"$'\n'"created: $ts"$'\n'"---"$'\n'"${desc:-$id created}"$'\n'"\`\`\`"
+        block="\`\`\`task $id"$'\n'"title: $title"$'\n'"status: todo"$'\n'"priority: $priority"$'\n'"assignee: ${assignee:-}"$'\n'"labels: ${labels:-}"$'\n'"created: $ts"$'\n'"estimate: ${estimate:-}"$'\n'"---"$'\n'"${desc:-$id created}"$'\n'"\`\`\`"
         # Tasks are written to the SIBLING tasks.md, not the conversation. A
         # ticket op no longer rewrites or re-commits the whole transcript.
         # (Legacy inline blocks in the pad are still read — see sp_tasks.)
@@ -4231,6 +4232,18 @@ TASKSEOF
         sp_tasks "$@"
         ;;
 
+      board)
+        # P21: rich task board with owner liveness, artifact presence, staleness
+        #   stitchpad task board [--mine <name>] [--status <status>]
+        sp_task_board "$@"
+        ;;
+
+      eta)
+        # P20: wall-clock projection modelling parallelism
+        #   stitchpad task eta
+        sp_task_eta
+        ;;
+
       show)
         tid="${1:?usage: stitchpad task show <TASK-N>}"
         # tasks.md wins: show the authoritative copy, not whichever file awk
@@ -4311,15 +4324,16 @@ TASKSEOF
 
       edit)
         id="${1:-}"; shift 2>/dev/null || true
-        [ -z "$id" ] && { echo "usage: stitchpad task edit <id> [--priority X] [--to name] [--labels X]" >&2; exit 1; }
+        [ -z "$id" ] && { echo "usage: stitchpad task edit <id> [--priority X] [--to name] [--labels X] [--estimate 30m]" >&2; exit 1; }
         # F4: Collect field updates BEFORE locking — validate assignee against
         # roster so a ghost assignee is refused without holding the lock.
-        new_priority=""; new_assignee=""; new_labels=""
+        new_priority=""; new_assignee=""; new_labels=""; new_estimate=""
         while [ $# -gt 0 ]; do
           case "$1" in
             --priority) new_priority="$2"; shift 2 ;;
             --to|--assignee) new_assignee="$2"; shift 2 ;;
             --labels) new_labels="$2"; shift 2 ;;
+            --estimate) new_estimate="$2"; shift 2 ;;
             *) shift ;;
           esac
         done
@@ -4331,11 +4345,12 @@ TASKSEOF
         tfile="$(sp_task_file "$id")" || { sp_unlock; echo "stitchpad: no such task: $id" >&2; exit 1; }
         sp_task_detect_duplicate "$id" || true  # warn if ghost exists in the other file
         tmp="$(sp_stage "$tfile")"
-        awk -v tid="$id" -v np="$new_priority" -v na="$new_assignee" -v nl="$new_labels" '
+        awk -v tid="$id" -v np="$new_priority" -v na="$new_assignee" -v nl="$new_labels" -v ne="$new_estimate" '
           /^```task / && $2==tid { inblk=1; inmeta=1 }
           inblk && inmeta && np!="" && /^priority:/ { sub(/priority:.*/, "priority: " np) }
           inblk && inmeta && na!="" && /^assignee:/ { sub(/assignee:.*/, "assignee: " na) }
           inblk && inmeta && nl!="" && /^labels:/ { sub(/labels:.*/, "labels: " nl) }
+          inblk && inmeta && ne!="" && /^estimate:/ { sub(/estimate:.*/, "estimate: " ne) }
           /^```$/ && inblk { inblk=0 }
           { print }
         ' "$tfile" > "$tmp"
@@ -4387,7 +4402,7 @@ TASKSEOF
         echo "✓ migrated $n_inline task block(s) → $PAD_TASKS"
         ;;
 
-      *) echo "usage: stitchpad task {new|list|show|move|edit|migrate}" >&2; exit 1 ;;
+      *) echo "usage: stitchpad task {new|list|board|eta|show|move|edit|migrate}" >&2; exit 1 ;;
     esac
     ;;
 
