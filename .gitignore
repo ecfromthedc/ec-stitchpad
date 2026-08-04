@@ -24,3 +24,4 @@ tool/stitchpad-git/
 
 # stitchpad runtime (isolated history)
 .stitchpad/
+__pycache__/
