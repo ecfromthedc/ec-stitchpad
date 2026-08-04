@@ -105,7 +105,8 @@ run_suite() {
   # have pushed them into quarantine and DELETED real coverage (the exact abuse this
   # build set out to stop). Strip ANSI colour first and match case-insensitively:
   #   "RESULTS: 30 passed, 0 failed"  and  "Results: \033[32m30 passed\033[0m, ..."
-  output="$(printf '%s' "$output" | sed -E 's/\x1b\[[0-9;]*[mK]//g')"
+  # macOS sed has no \x1b escape — strip ANSI portably with a literal ESC via tr/perl.
+  output="$(printf '%s' "$output" | perl -pe 's/\e\[[0-9;]*[mK]//g' 2>/dev/null || printf '%s' "$output")"
   result_line="$(echo "$output" | grep -iE 'results:' | tail -1 || true)"
   if [ -n "$result_line" ]; then
     p="$(echo "$result_line" | grep -oE '[0-9]+ PASS' | grep -oE '[0-9]+' || true)"
@@ -122,7 +123,7 @@ run_suite() {
     fi
   fi
 
-  p="$(echo "$output" | grep -E '^Passed:' | tail -1 | grep -oE '[0-9]+' || true)"
+  p="$(echo "$output" | grep -iE '^passed:' | tail -1 | grep -oE '[0-9]+' || true)"
   if [ -n "$p" ]; then
     f="$(echo "$output" | grep -E '^Failed:' | tail -1 | grep -oE '[0-9]+' || echo 0)"
     echo "$suite|$p|$f|$rc"
@@ -130,7 +131,22 @@ run_suite() {
   fi
 
   # Special case: "All N ... gates PASSED" (single-line all-pass output)
-  p="$(echo "$output" | grep -oE 'All [0-9]+' | grep -oE '[0-9]+' || true)"
+  # Suites report counts in several honest shapes; a narrow matcher turns a WORKING
+  # suite into FORMAT-DRIFT, which tempts an operator to quarantine it and silently
+  # delete real coverage. Accept every shape that exists in this repo:
+  #   "Results: 30 passed, 0 failed"   (handled above)
+  #   "6 passed, 0 failed"             — bare, no prefix
+  #   "PASS: 15 delivery supervision"  — PASS: N
+  #   "ALL 9 GATES PASSED"             — handled below
+  #   "bridge-heartbeat-interval ok"   — NO counts: exit-code-only, judged on rc alone
+  p="$(echo "$output" | grep -oiE '[0-9]+ passed' | grep -oE '[0-9]+' | tail -1 || true)"
+  if [ -n "$p" ]; then
+    f="$(echo "$output" | grep -oiE '[0-9]+ failed' | grep -oE '[0-9]+' | tail -1 || echo 0)"
+    echo "$suite|$p|${f:-0}|$rc"; return 0
+  fi
+  p="$(echo "$output" | grep -oiE 'PASS: [0-9]+' | grep -oE '[0-9]+' | tail -1 || true)"
+  if [ -n "$p" ]; then echo "$suite|$p|0|$rc"; return 0; fi
+  p="$(echo "$output" | grep -oiE 'all [0-9]+' | grep -oE '[0-9]+' || true)"
   if [ -n "$p" ]; then
     echo "$suite|$p|0|$rc"
     return 0
