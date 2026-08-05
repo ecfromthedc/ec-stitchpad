@@ -36,15 +36,33 @@ ADAPTER_DIR="$STITCHPAD_HOME/adapters"
 
 # ── Pad resolution ──────────────────────────────────────────────────
 # Find the pad dir: explicit $PAD_DIR, else nearest .stitchpad up the tree.
+# The install home is ~/.stitchpad -> <checkout>/tool, which matches the very
+# marker name this walk-up looks for — and the checkout ships tool/stitchpad.md,
+# so it reads as a fully valid pad. Without this guard every directory under
+# $HOME resolves to it: writes land in the tracked repo file, and the claim hook
+# denies Write/Edit machine-wide. Never treat the install home as a pad.
+sp_is_install_home() {
+  local cand="$1" home
+  home="$(cd "${STITCHPAD_HOME:-$HOME/.stitchpad}" 2>/dev/null && pwd -P)" || return 1
+  cand="$(cd "$cand" 2>/dev/null && pwd -P)" || return 1
+  [ "$cand" = "$home" ]
+}
+
 sp_find_pad() {
   if [ -n "${PAD_DIR:-}" ]; then echo "$PAD_DIR"; return; fi
   local d="${1:-$PWD}"
   while [ "$d" != "/" ]; do
-    # A pad is only a pad if it carries its isolated git dir. Guarding on the
-    # marker dir alone makes $HOME look like a pad, because ~/.stitchpad IS the
-    # tool home — every write anywhere under $HOME then demands a claim lease.
-    { [ -d "$d/.pasture/pasture-git" ] || [ -d "$d/.pasture/stitchpad-git" ]; } && { echo "$d/.pasture"; return; }
-    [ -d "$d/.stitchpad/stitchpad-git" ] && { echo "$d/.stitchpad"; return; }
+    # WHY this guard exists at all (kept from the arena branch): ~/.stitchpad IS
+    # the tool home, so guarding on the marker directory alone makes $HOME look
+    # like a pad and every write anywhere beneath it starts demanding a claim
+    # lease. master solves it with the named helper rather than by inferring a
+    # pad from its git dir, so use the helper — it is what the rest of master's
+    # pad resolution expects, and it is why the inline walk-up workaround in
+    # tool/bin/stitchpad can be deleted on this branch.
+    [ -d "$d/.pasture" ] && ! sp_is_install_home "$d/.pasture" \
+      && { echo "$d/.pasture"; return; }     # migrated pad wins
+    [ -d "$d/.stitchpad" ] && ! sp_is_install_home "$d/.stitchpad" \
+      && { echo "$d/.stitchpad"; return; }   # legacy accepted
     d="$(dirname "$d")"
   done
   return 1
@@ -282,7 +300,28 @@ sp_recover_inplace() {
   mt="$(stat -f %m "$ready" 2>/dev/null || stat -c %Y "$ready" 2>/dev/null || echo 0)"
   [ $(( now - mt )) -lt 5 ] && return 0
   echo "stitchpad: recovering interrupted write of $(basename "$target")" >&2
-  cat "$ready" > "$target" && rm -f "$ready" 2>/dev/null
+  # DEFECT: this was `cat "$ready" > "$target"`. The redirection TRUNCATES the
+  # target before cat has read a byte, so a concurrent `say` reading the pad in
+  # that window sees ZERO bytes, the roster guard fires, and the post is refused
+  # with "pad roster is missing" — a silently dropped operator message. It also
+  # made the suite ~50% flaky in every mode.
+  # Same cure as sp_write_inplace: overwrite through the existing inode with
+  # `dd conv=notrunc`, and shorten afterwards only when the new content really is
+  # smaller. Deliberately NOT write-then-rename: the pad's inode must stay stable
+  # or every tail-following watcher rewinds to offset 0 and replays history.
+  # No retry loop — a retry would hide this behind a green run.
+  local _rec_new _rec_old
+  _rec_new="$(wc -c < "$ready" | tr -d ' ')"
+  _rec_old="$(wc -c < "$target" 2>/dev/null | tr -d ' ')"; _rec_old="${_rec_old:-0}"
+  if dd if="$ready" of="$target" conv=notrunc bs=65536 2>/dev/null; then
+    if [ "${_rec_new:-0}" -lt "$_rec_old" ]; then
+      # Guarded exactly as sp_write_inplace guards it: if .ready vanished under
+      # us, `cat missing > target` would blank the pad. Stale tail beats nothing.
+      perl -e 'truncate($ARGV[0], $ARGV[1]) or exit 1' "$target" "$_rec_new" 2>/dev/null \
+        || { [ -s "$ready" ] && cat "$ready" > "$target"; }
+    fi
+    rm -f "$ready" 2>/dev/null
+  fi
   return 0
 }
 
@@ -362,6 +401,28 @@ sp_roster() {
       }
     }
   ' "$PAD_MD"
+}
+
+# Model annotation for one roster member, or empty when unannotated.
+# The roster tolerates a 3rd model column (name|adapter|MODEL|wake|target) but
+# sp_roster deliberately drops it to keep its 4-field contract stable for every
+# consumer. Adapters that can pin a model (ocean) read it through here instead.
+sp_model_for() {
+  local want="$1"
+  awk -v want="$want" '
+    /^```roster/ { inblk=1; next }
+    /^```/       { inblk=0 }
+    inblk {
+      line=$0
+      gsub(/^[ \t]+|[ \t]+$/, "", line)
+      if (line == "" || line ~ /^#/) next
+      n=split(line, f, /[ \t]*\|[ \t]*/)
+      if (n>=5 && f[3] !~ /^(push|pull)$/) {
+        name=f[1]; gsub(/^[ \t]+|[ \t]+$/, "", name)
+        if (name == want) { print f[3]; exit }
+      }
+    }
+  ' "$PAD_MD" 2>/dev/null
 }
 
 # Roster filtered to LIVE sessions: an agent is shown only if its heartbeat

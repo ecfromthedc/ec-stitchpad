@@ -1757,18 +1757,16 @@ except: print("")' 2>/dev/null)"
     [ -z "$fp" ] && exit 0   # no file target (not a file write) → allow
     # Claims only apply INSIDE a pad. No .stitchpad here → not a shared worktree,
     # fail-open (else we'd block every write in every non-pad project). Walk up like the CLI does.
-    _d="$PWD"; _pad=""
-    # The stitchpad INSTALL dir carries its own stitchpad-git, and ~/.stitchpad
-    # resolves into it. Without this guard the walk-up matches at $HOME for every
-    # path beneath it, so no project under $HOME ever reaches the fail-open below.
-    _install="$(cd "$HOME/.stitchpad" 2>/dev/null && pwd -P || true)"
-    while [ "$_d" != "/" ]; do
-      if [ -d "$_d/.stitchpad/stitchpad-git" ]; then
-        _real="$(cd "$_d/.stitchpad" 2>/dev/null && pwd -P || true)"
-        if [ -z "$_install" ] || [ "$_real" != "$_install" ]; then _pad="$_d/.stitchpad"; break; fi
-      fi
-      _d="$(dirname "$_d")"
-    done
+    # WORKAROUND DELETED. This branch carried an inline install-dir walk-up here
+    # only because it was 4 commits behind master and lacked sp_find_pad's
+    # install-home guard. master fixes it properly, so the duplicate walk is gone
+    # and there is one pad resolver again — verified: sp_is_install_home(~/.pasture)
+    # is TRUE and sp_find_pad($HOME) returns nothing, so no project under $HOME
+    # demands a claim lease.
+    # Use the shared resolver so the install-home guard (sp_is_install_home)
+    # applies here too — ~/.stitchpad symlinks to the checkout's tool/ dir, which
+    # ships stitchpad.md and so read as a valid pad, denying every write under $HOME.
+    _pad="$(sp_find_pad "$PWD" 2>/dev/null || true)"
     [ -z "$_pad" ] && exit 0   # not in a pad → allow
     # Try to lease it. `claim` exits 0 if I get/hold it, non-zero if someone else holds a fresh one.
     "$0" claim "$fp" >/dev/null 2>&1; _rc=$?

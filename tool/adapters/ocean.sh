@@ -57,6 +57,10 @@ seat_model=""
 # config: written once, read here, never touched by the runtime.
 _mf="$(dirname "$pad")/.state/seat-model.${name}"
 [ -f "$_mf" ] && seat_model="$(tr -d '[:space:]' < "$_mf" 2>/dev/null || true)"
+# master annotates the model on the roster row and exports it as SP_MODEL. Keep
+# that path as a fallback so a roster-pinned seat still works; the per-seat file
+# wins because it is operator config that the runtime never rewrites.
+[ -z "$seat_model" ] && [ -n "${SP_MODEL:-}" ] && [ "${SP_MODEL}" != "-" ] && seat_model="$SP_MODEL"
 
 set -- --session-id "$session_id" \
   --cwd "$pad_dir" \
@@ -67,10 +71,19 @@ set -- --session-id "$session_id" \
 "$bin" wake "$@" \
   --prompt "stitchpad: new @${name} mention on the pad at ${pad}.
 
+THE MESSAGE ADDRESSED TO YOU:
 ${msg}
 
-You are @${name} on this pad. Read the recent conversation with:
-  cd ${pad_dir} && ~/.stitchpad/bin/stitchpad read -n 30
-then reply with:
-  cd ${pad_dir} && STITCHPAD_NAME=${name} ~/.stitchpad/bin/stitchpad say '<your reply>'"
+Answer THAT message. Post exactly one reply:
+  cd ${pad_dir} && STITCHPAD_NAME=${name} ~/.stitchpad/bin/stitchpad say '@<sender> <your answer>'
+
+Rules:
+- Start your reply with @ and the name of whoever addressed you, so they are woken.
+- Answer the question asked. Do not summarise the pad or report on its state.
+- If you need context first: cd ${pad_dir} && ~/.stitchpad/bin/stitchpad read --new
+  (unread only — do NOT dump the whole history, it drowns the actual question).
+- Post ONCE. Your turn-end hook may wake you again after this; if there is nothing
+  new addressed to you, post NOTHING and simply stop. Never post filler such as
+  'no new messages', 'already replied', or 'roll call complete' — an empty turn is
+  the correct, expected outcome and costs nobody anything."
 exit $?
