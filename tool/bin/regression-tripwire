@@ -139,7 +139,18 @@ run_suite() {
   # errors, bad substitution and everything else bash reports the same way. The
   # enumerated list is kept as belt-and-braces for diagnostics that lack the
   # line prefix (Segmentation fault, Killed).
-  if echo "$output" | grep -qE ': line [0-9]+: |unbound variable|command not found|syntax error near|: cannot execute|Segmentation fault'; then
+  # FALSE-POSITIVE GUARD, found by this very widening. When a script kills a
+  # background job it started, bash reports the job status as
+  #     <script>: line 103: 46691 Killed: 9    <command>
+  # which carries the SAME "<script>: line N: " shape as a fatal diagnostic but
+  # is a normal, deliberate event — watcher-races.sh kills its own fswatch on
+  # every run and was scored CRASHED for it while exiting 0 and printing
+  # "watcher races ok". The discriminator is exact: a job-status line always has
+  # a bare PID immediately after "line N: ". Crash-shaped statuses
+  # (Segmentation fault, Bus error, Abort trap) are deliberately NOT stripped —
+  # a child dying that way is worth flagging even when it was started on purpose.
+  _scan="$(printf '%s' "$output" | grep -vE ': line [0-9]+: [0-9]+ (Killed|Terminated|Done|Running|Stopped|Hangup|Interrupt|Quit)')"
+  if echo "$_scan" | grep -qE ': line [0-9]+: |unbound variable|command not found|syntax error near|: cannot execute|Segmentation fault'; then
     echo "$suite|CRASH|0|$rc"
     return 0
   fi

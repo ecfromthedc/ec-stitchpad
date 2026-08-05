@@ -309,6 +309,39 @@ echo "Passed:  $pass"
 echo "Failed:  $fail"
 echo ""
 
+# ── Crash detection must tell a FATAL DIAGNOSTIC from a JOB STATUS ─────────
+# The gate detects crashes by matching the SHAPE of a bash fatal diagnostic
+# ("<script>: line <N>: ..."), because enumerating messages only ever catches the
+# ones somebody thought of — a suite dying on `x=$((1/0))` printed
+# "line 8: 1/0: division by 0", carried on with a wrong value and exited 0.
+# But bash uses that SAME shape to report the status of a background job the
+# script killed on purpose:
+#     <script>: line 103: 46691 Killed: 9    <command>
+# watcher-races.sh does exactly this on every run and was scored CRASHED while
+# exiting 0 and printing "watcher races ok". The discriminator is a bare PID
+# immediately after "line N: ". Crash-shaped statuses are NOT stripped.
+crash_scan() {
+  local out="$1" scan
+  scan="$(printf '%s' "$out" | grep -vE ': line [0-9]+: [0-9]+ (Killed|Terminated|Done|Running|Stopped|Hangup|Interrupt|Quit)')"
+  echo "$scan" | grep -qE ': line [0-9]+: |unbound variable|command not found|syntax error near|: cannot execute|Segmentation fault'
+}
+
+crash_scan 'test/watcher-races.sh: line 103: 46691 Killed: 9    fswatch -0 pad' \
+  && bad "crash-scan: a deliberate job kill was scored as a CRASH" \
+  || ok  "crash-scan: a deliberate job kill is NOT a crash"
+crash_scan 'suite.sh: line 8: 1/0: division by 0' \
+  && ok  "crash-scan: division by 0 is a crash (the shape catches it)" \
+  || bad "crash-scan: division by 0 was MISSED"
+crash_scan 'suite.sh: line 12: PROJ1: unbound variable' \
+  && ok  "crash-scan: unbound variable is a crash" \
+  || bad "crash-scan: unbound variable was MISSED"
+crash_scan 'suite.sh: line 4: 999 Segmentation fault: 11  ./thing' \
+  && ok  "crash-scan: a segfaulting child is still a crash" \
+  || bad "crash-scan: segfault job status was wrongly stripped"
+crash_scan 'all good here, 30 passed, 0 failed' \
+  && bad "crash-scan: clean output scored as a crash" \
+  || ok  "crash-scan: clean output is clean"
+
 if [ "$fail" -eq 0 ]; then
   echo "tripwire-gate: ALL GATES PASSED"
   exit 0
