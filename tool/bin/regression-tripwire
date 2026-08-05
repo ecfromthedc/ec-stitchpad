@@ -418,9 +418,6 @@ if [ "$FAILS" -gt 0 ]; then
   exit 1
 fi
 
-_voiderr=""
-[ "$VOIDS" -gt 0 ] && _voiderr=" ($VOIDS VOID — re-run in a quiet window)"
-
 # kimi-adv: this printed "TRIPWIRE: PASSED" and then exited 2 whenever any suite
 # VOIDed — the same self-contradiction as the EXIT-trap bug (P41): a board that
 # reads PASSED while the process reports failure. A VOID means the run could not
