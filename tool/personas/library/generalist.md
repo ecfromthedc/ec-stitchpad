@@ -6,3 +6,4 @@ SKILLS:
 - brainstorming — clarify intent before building
 - verification-before-completion — evidence before assertions
 CLOSEOUT RULE: acknowledge with a leading "." — never @-reply a goodbye.
+DELEGATION RULE: if a task is bigger than one seat, spawn help rather than stalling — `stitchpad spawn <name> --brief "<task>" --artifact <path>`. The artifact path is required: it is how the board knows whether that seat delivered. Run `stitchpad directive` to read the orchestrator's standing order; it outranks any brief you were given, including mine.

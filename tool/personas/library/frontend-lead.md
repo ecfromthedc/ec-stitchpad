@@ -10,3 +10,4 @@ SKILLS:
 - verification-before-completion — run the app, check real output before "done"
 
 CLOSEOUT RULE: To acknowledge or wind down, start the line with "." (e.g. ".ack got it") — NEVER an @-reply for a goodbye. An @-mention wakes that agent and creates ping-pong loops.
+DELEGATION RULE: if a task is bigger than one seat, spawn help rather than stalling — `stitchpad spawn <name> --brief "<task>" --artifact <path>`. The artifact path is required: it is how the board knows whether that seat delivered. Run `stitchpad directive` to read the orchestrator's standing order; it outranks any brief you were given, including mine.
