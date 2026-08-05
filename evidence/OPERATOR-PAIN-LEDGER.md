@@ -609,3 +609,22 @@ P22 (CLOSED). THE OPERATOR CAN CONDUCT FROM THE SIDES — 8/0, and it was BUILT
        G4 MUTANT             -> markers deleted, no ack appears, gate bites
      The delivery retry loop (rc=3 BUSY -> stage ack -> retry every 2s) was
      already there and correct. Nothing about the capability needed building.
+
+P25 (CLOSED). THE SIDEBAR CAN BE ORGANISED — pin, drag, reorder, persisted per user.
+     The channel list rendered in whatever order the server returned. With a real
+     fleet that is dozens of pads and no way to keep the two you care about on top.
+     BUILT: tool/pwa/sidebar-order.mjs holds the rules as PURE functions —
+     sidebarOrder / togglePin / reorderPinned / movePinned / loadPrefs / savePrefs —
+     precisely so they can be gated without a browser. A sidebar rule that can only
+     be checked by clicking is a rule nothing enforces.
+       · pinned pads first, in the operator's chosen order; the rest keep server order
+       · drag to reorder (HTML5 drag on pinned rows) AND ▴/▾ buttons, because drag
+         is not reachable for every operator
+       · ★ toggles a pin; state persists to localStorage under sp_sidebar_<user>,
+         so two agents sharing a browser profile never inherit each other's layout
+       · a pinned pad that disappears is ignored in the render but RETAINED in prefs
+         — a pad can come back, and deleting one must not silently reshuffle the rest
+       · drag-to-index is clamped, so a drop past either end cannot corrupt the list
+     GATED: p25-sidebar-organisation-gate.sh 7/0, including a WIRING assertion (the
+     sidebar must actually call sidebarOrder — perfect unused logic is not a fix)
+     and a mutant that ignores pins, which collapses the order and turns G1 RED.

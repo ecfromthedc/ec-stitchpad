@@ -8,6 +8,7 @@
 //   transport  — websocket to the PadHub DO + polling fallback (unchanged logic)
 //   components — App / Login / Sidebar / Log / Composer / cards stay imperative
 import { html, render, useState, useEffect, useLayoutEffect, useRef } from "./vendor/preact-standalone.module.js";
+import { loadPrefs, savePrefs, sidebarOrder, isPinned, togglePin, reorderPinned, movePinned } from "./sidebar-order.mjs";
 
 // ── helpers (unchanged from the vanilla app) ─────────────────
 const RELAY = location.origin;
@@ -134,8 +135,20 @@ const store = {
   summary: null, summaryOpen: false, summarizing: false,
   doctor: null, doctorOpen: false, boardOpen: false,
   dmView: "chat", terms: {},
+  // P25: sidebar layout, per user. Order IS the display order.
+  sidebar: loadPrefs(localStorage, localStorage.getItem("sp_me") || "smaths"),
   authed: false, loginErr: "",
 };
+// P25 sidebar layout mutators — persist per user, then repaint.
+function setSidebar(next) {
+  store.sidebar = next;
+  savePrefs(localStorage, store.me, next);
+  publish();
+}
+export function pinPad(name) { setSidebar(togglePin(store.sidebar, name)); }
+export function nudgePad(name, d) { setSidebar(movePinned(store.sidebar, name, d)); }
+export function dropPad(name, i) { setSidebar(reorderPinned(store.sidebar, name, i)); }
+
 const subs = new Set();
 const publish = () => subs.forEach(f => f());
 const useStore = () => { const [, set] = useState(0); useEffect(() => { const f = () => set(x => x + 1); subs.add(f); return () => subs.delete(f); }, []); return store; };
@@ -484,7 +497,24 @@ function Sidebar({ drawer, setDrawer }) {
     <h1><span style="width:22px;height:22px;display:inline-flex"><${LOGO}/></span>pasture</h1>
     <div class="sect">Pastures</div>
     <div id="chanlist">
-      ${s.pads.map(p => html`<div key=${p.name} class=${"chan" + (p.name === s.pad && !s.dmWith ? " on" : "")} onClick=${() => { setDrawer(false); if (p.name === s.pad) closeDM(); else switchPad(p.name); }}><span class="h">#</span>${p.name}</div>`)}
+      ${sidebarOrder(s.pads, s.sidebar).map((p, i) => {
+        const pinned = isPinned(s.sidebar, p.name);
+        return html`<div key=${p.name}
+          class=${"chan" + (p.name === s.pad && !s.dmWith ? " on" : "") + (pinned ? " pinned" : "")}
+          draggable=${pinned}
+          onDragStart=${e => { e.dataTransfer.setData("text/plain", p.name); e.dataTransfer.effectAllowed = "move"; }}
+          onDragOver=${e => { if (pinned) { e.preventDefault(); e.dataTransfer.dropEffect = "move"; } }}
+          onDrop=${e => { e.preventDefault(); const n = e.dataTransfer.getData("text/plain"); if (n) dropPad(n, i); }}
+          onClick=${() => { setDrawer(false); if (p.name === s.pad) closeDM(); else switchPad(p.name); }}>
+          <span class="h">#</span><span class="chan-name">${p.name}</span>
+          ${pinned ? html`<span class="chan-move">
+              <button title="move up" onClick=${e => { e.stopPropagation(); nudgePad(p.name, -1); }}>▴</button>
+              <button title="move down" onClick=${e => { e.stopPropagation(); nudgePad(p.name, 1); }}>▾</button>
+            </span>` : null}
+          <button class=${"chan-pin" + (pinned ? " on" : "")} title=${pinned ? "unpin" : "pin"}
+            onClick=${e => { e.stopPropagation(); pinPad(p.name); }}>${pinned ? "★" : "☆"}</button>
+        </div>`;
+      })}
     </div>
     <div class="sect">Direct Messages</div>
     <div id="dmlist">

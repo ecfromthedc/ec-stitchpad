@@ -5,5 +5,3 @@
 # a free pass — it documents a measurement gap that must be justified.
 # Additions to this file require a commit message explaining WHY the suite
 # cannot be reliably measured.
-help-discoverability-gate.sh requires: terminal-width (~80 cols) for help output assertions
-terminal-isolation-gate.sh DEFERRED — fixture-isolation semantics unresolved; tracked as P12 follow-up

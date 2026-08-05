@@ -38,6 +38,14 @@ button{font:inherit}
 .chan:hover{background:var(--paper-3)}
 .chan.on{background:var(--accent);color:#fff;font-weight:600}
 .chan .h{opacity:.5;font-weight:400}
+/* P25 sidebar organisation: pin star, reorder arrows, pinned emphasis. */
+.chan .chan-name{flex:1;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.chan .chan-pin,.chan .chan-move button{background:none;border:0;cursor:pointer;padding:0 2px;font-size:13px;color:inherit;opacity:0;transition:opacity .13s var(--ease)}
+.chan:hover .chan-pin,.chan:hover .chan-move button,.chan .chan-pin.on{opacity:.75}
+.chan .chan-pin.on{color:var(--accent)}
+.chan.on .chan-pin.on{color:#fff}
+.chan.pinned{font-weight:600}
+.chan[draggable="true"]{cursor:grab}
 .chan.on .h{opacity:.8}
 .dm-item{gap:9px}
 .dmav{width:24px;height:24px;border-radius:7px;flex:0 0 24px;display:flex;align-items:center;justify-content:center;font-size:10px;font-weight:800;overflow:hidden;position:relative}
