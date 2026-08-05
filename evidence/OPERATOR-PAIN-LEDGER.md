@@ -547,6 +547,50 @@ P39 (REOPENED — DIAGNOSED, NOT FIXED). THE WATCHER IS KILLED BY ITS OWN CALLER
           Publishing the marker BEFORE the test barrier (to close the remaining
           mkdir->publish window) then made watcher-races ITSELF flaky, 2 of 3.
           Reverted. The idea is still right; the placement needs a rested head.
+     *** ROOT CAUSE FOUND 2026-08-05 — and it is NOT what attempts 1-6 assumed. ***
+     Six attempts chased "a concurrent caller KILLS the winner's watcher". Wrong.
+     Instrumenting the product's silent return paths and the gate's discarded
+     stderr, then catching a live failure, shows the watcher is never started at
+     all. Evidence, in time order, from one failing run of 8 concurrent callers:
+       ln: .../watch.lock.d/generation: No such file or directory   lock_exists=n
+       P39X[9739] lock dir missing
+       P39X[9741] ln rc=1 ... No such file or directory  lock_exists=y
+     and from an earlier catch, six of eight callers reported "WON mkdir" — which
+     is impossible for one atomic mkdir unless the directory keeps disappearing.
+     THE SEQUENCE:
+       1. caller A wins `mkdir "$watch_lock"`
+       2. the lock directory is DELETED OUT FROM UNDER A, between
+          sp_watch_generation_write's `[ -d "$lock" ]` check and its `ln`
+       3. A's generation write fails, so A rmdirs and returns 0 SILENTLY
+       4. caller B now wins mkdir, and repeats — a cascade of "winners"
+       5. nobody ever reaches the spawn, so watch.log is NEVER CREATED
+     That last fact is the tell: a killed watcher leaves a log; this leaves none.
+     Also confirmed NOT the cause: sp_any_alive (verdict ALIVE, heartbeat pid live,
+     age 25s) and sp_watcher_alive (requires the lock, which was absent).
+     STILL UNKNOWN: which remover deletes it in step 2. The graced reclaims
+     (sp_watch_empty_lock_reclaim / sp_watch_generation_only_lock_reclaim) both
+     honour STITCHPAD_WATCH_START_GRACE and were observed REFUSING ("watcher
+     admission is still within startup grace"). One un-graced deleter was found
+     and is described below; closing it alone did not fix the rate.
+     ONE UN-GRACED DELETER FOUND (not shipped — no measured improvement):
+       sp_stop_watchers_for_pad's else-branch is a bare `rmdir "$watch_lock"`
+       with no grace and no ownership check. The guard above it only returns
+       early when the lock ALREADY EXISTS, so a caller that evaluated it just
+       before the winner's mkdir falls through and deletes a brand-new lock.
+       Replacing it with sp_watch_empty_lock_reclaim is strictly safer and
+       principled, but measured 3 failures in 13 vs 2 in 15 baseline — i.e. no
+       evidence it helps, so it was NOT shipped. Do not re-derive it; measure it
+       together with whatever the remaining deleter turns out to be.
+     THE FIX THIS POINTS AT: the vulnerable state is "lock exists, generation not
+     yet written". Eliminate it — build the lock in a staging directory that
+     ALREADY contains its generation and rename it into place, so a lock is never
+     observable without ownership evidence. That changes an invariant
+     watcher-races asserts ("a SIGKILL at the admission barrier leaves an EMPTY
+     lock"), so the suite must be updated deliberately alongside it.
+     MEASURED RATE at the committed state: 2 failures in 15 isolated runs
+     (~1 in 7). watcher-races is NOT flaky — 8/8 green; the one red observed
+     earlier was contention from a still-winding-down probe run.
+
      WHAT THE NEXT PASS SHOULD DO: stop reasoning from the lock's mtime. The
      winner should publish an explicit "spawning" marker with its own pid the
      moment it wins the mkdir, and sp_stop_watchers_for_pad should skip any
