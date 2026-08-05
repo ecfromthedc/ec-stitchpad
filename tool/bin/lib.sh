@@ -3214,9 +3214,25 @@ sp_stop_watchers_for_pad() {
     # otherwise a delayed owner link can land in a successor generation.
     sp_watch_cancel_generation "$watch_lock" "$generation" || return 1
   else
-    # Only an empty pre-generation startup lock is safe to remove without
-    # ownership evidence.
-    rmdir "$watch_lock" 2>/dev/null || true
+    # P39. This was a bare `rmdir` with NO grace and NO ownership check, and an
+    # independent probe (k3) caught it red-handed. Its log, one failing run:
+    #     won-mkdir       49290
+    #     stop-rmdir-late 49291   <- 49291 deletes the lock 49290 just won
+    #     won-mkdir       49291   <- so 49291 wins it too
+    #     genwrite-fail   49290   <- 49290's generation write fails, lock gone
+    # Totals for that run: 16 won-mkdir, 12 genwrite-fail, 9 stop-rmdir-late,
+    # only 4 spawned. Six "winners" of ONE atomic mkdir is the signature.
+    # The guard further up only returns early when the lock ALREADY EXISTS at
+    # that instant; a caller that evaluated it a moment before the real winner's
+    # mkdir falls through to here and deletes a brand-new, legitimately-owned
+    # lock. The owner's generation write then fails with ENOENT, it tears down
+    # silently, and the next caller repeats — so no watcher is ever spawned and
+    # watch.log is never even created.
+    # sp_watch_empty_lock_reclaim does the same job but honours
+    # STITCHPAD_WATCH_START_GRACE, so a lock younger than the grace is left to
+    # its acquirer. A genuinely abandoned empty lock is still reclaimed once it
+    # ages past the grace, so crash recovery (watcher-races) is unchanged.
+    sp_watch_empty_lock_reclaim "$watch_lock" 2>/dev/null || true
   fi
   while IFS='|' read -r p sha start64 command64; do
     [ -n "$p" ] || continue
@@ -3245,8 +3261,24 @@ sp_stop_watchers_for_pad() {
   if [ -n "$generation" ]; then
     sp_watch_generation_cleanup "$watch_lock" "$generation" 2>/dev/null || true
   else
-    rmdir "$watch_lock" 2>/dev/null || true
+    # P39, the DOMINANT deleter — k3's probe labelled this one "stop-rmdir-late"
+    # and caught 9 hits in a single failing run against only 4 spawns.
+    # Its window is far wider than the earlier site: we reach here AFTER the
+    # process-wait loop above, which can spin for a full second. A caller that
+    # entered with no lock ($generation empty) can sit in that second while a
+    # DIFFERENT caller legitimately wins mkdir — and then this bare rmdir deletes
+    # that brand-new, owned lock. The owner's generation write fails with ENOENT,
+    # it tears down silently, the next caller wins mkdir, and the cascade repeats
+    # until nobody spawns at all and watch.log is never created.
+    # Only remove a lock we can PROVE is abandoned: the graced reclaim refuses
+    # anything younger than STITCHPAD_WATCH_START_GRACE and only removes an empty
+    # one, so a live acquirer keeps its lock while a genuinely orphaned lock is
+    # still reclaimed once it ages out.
+    sp_watch_empty_lock_reclaim "$watch_lock" 2>/dev/null || true
   fi
+  # Teardown is "complete" only if nothing is left. If a live acquirer now owns a
+  # fresh lock that is honestly NOT complete, and the explicit stop path reports
+  # it rather than claiming success.
   [ -z "${remaining:-}" ] && [ ! -d "$watch_lock" ]
 }
 
