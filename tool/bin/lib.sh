@@ -1583,7 +1583,14 @@ sp_roster_live() {
   local now; now=$(date +%s)
   sp_roster | while IFS='|' read -r name adapter wake target; do
     [ -n "$name" ] || continue
+    # Writer/reader key mismatch, proved by execution: `join --role operator`
+    # writes .state/role.<name>, but this loop only ever read .state/runtime.<name>
+    # — which NOTHING in the tree writes. So the "operators are always kept"
+    # guarantee three lines up was silently false: an operator with no heartbeat
+    # (which is every operator, by design) vanished from the live roster.
+    # runtime.* is still honoured first in case an external runtime writes it.
     local rt; rt="$(cat "$PAD_STATE/runtime.$name" 2>/dev/null || true)"
+    [ -n "$rt" ] || rt="$(cat "$PAD_STATE/role.$name" 2>/dev/null || true)"
     if [ "$rt" = "operator" ] || [ "$rt" = "human" ]; then
       printf '%s|%s|%s|%s\n' "$name" "$adapter" "$wake" "$target"; continue
     fi
