@@ -1793,7 +1793,10 @@ print('?')
     _present="-"
     if [ -n "$_assignee" ] && [ -f "$PAD_STATE/artifact-expect.$_assignee" ]; then
       _artifact_file="$(head -1 "$PAD_STATE/artifact-expect.$_assignee")"
-      if [ -n "$_artifact_file" ] && [ -e "$_artifact_file" ]; then
+      # Was a duplicated `[ -e ]` test — a second definition of a question that
+      # already had one. Use the shared oracle so this can never drift from
+      # sp_artifact_verify (and so an empty stub reads NO here too).
+      if [ -n "$_artifact_file" ] && sp_artifact_produced "$_artifact_file"; then
         _present="yes"
       elif [ -n "$_artifact_file" ]; then
         _present="NO"
@@ -3402,14 +3405,31 @@ sp_artifact_declare() {
 # sp_artifact_verify <name>
 # Check every artifact declared for <name> exists on disk.  Returns 0 if all
 # present (or none declared), 1 if any missing (prints missing paths to stderr).
+# sp_artifact_produced <path>
+# THE oracle for "did this artifact actually get produced". Existence is NOT
+# sufficiency, proved live: a dispatched seat returned rc=0 having written only
+# the stub header it was told to create first, and the board scored it present.
+# An empty file and no file are the same amount of work. A directory with no
+# entries likewise.
+sp_artifact_produced() {
+  local path="${1:-}"
+  [ -n "$path" ] || return 1
+  if [ -d "$path" ]; then
+    [ -n "$(ls -A "$path" 2>/dev/null)" ] || return 1
+    return 0
+  fi
+  [ -s "$path" ]
+}
+
 sp_artifact_verify() {
   local name="${1:?usage: sp_artifact_verify <name>}" claim_file path missing=0
   claim_file="$PAD_STATE/artifact-expect.$name"
   [ -f "$claim_file" ] || return 0  # no claim = nothing to verify
   while IFS= read -r path; do
     [ -n "$path" ] || continue
-    if [ ! -e "$path" ]; then
-      echo "  missing: $path" >&2
+    if ! sp_artifact_produced "$path"; then
+      if [ -e "$path" ]; then echo "  empty: $path" >&2
+      else echo "  missing: $path" >&2; fi
       missing=1
     fi
   done < "$claim_file"

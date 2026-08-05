@@ -167,28 +167,42 @@ REGEOF
 echo "completed" > "$PAD_STATE/session-end.sid-alice"
 sp_artifact_declare alice "$TMP/alice-should-exist.txt" 2>/dev/null
 
+# ── EMPTY IS NOT PRODUCED ────────────────────────────────────────────
+# Proved live during the blind-spot sweep: a dispatched seat returned rc=0 having
+# written ONLY the stub header it was told to create first. The artifact existed,
+# the board scored it present, and zero work had happened. An empty file and no
+# file are the same amount of work.
+EMPTYDIR="$TMP/emptycheck"; mkdir -p "$EMPTYDIR"
+: > "$EMPTYDIR/empty.md"
+printf 'real content\n' > "$EMPTYDIR/full.md"
+mkdir -p "$EMPTYDIR/emptydir" "$EMPTYDIR/fulldir"; : > "$EMPTYDIR/fulldir/x"
+
+produced() { ( source "$STITCHPAD_HOME/bin/lib.sh" 2>/dev/null; sp_artifact_produced "$1" ); }
+
+produced "$EMPTYDIR/full.md"   && ok "E1: a non-empty file counts as produced" \
+                               || bad "E1: a non-empty file was rejected"
+produced "$EMPTYDIR/empty.md"  && bad "E2: an EMPTY file counted as produced -- blindness" \
+                               || ok "E2: an empty file does NOT count as produced"
+produced "$EMPTYDIR/nothere"   && bad "E3: a missing file counted as produced" \
+                               || ok "E3: a missing file does not count as produced"
+produced "$EMPTYDIR/fulldir"   && ok "E4: a non-empty directory counts as produced" \
+                               || bad "E4: a non-empty directory was rejected"
+produced "$EMPTYDIR/emptydir"  && bad "E5: an EMPTY directory counted as produced" \
+                               || ok "E5: an empty directory does NOT count as produced"
+
 # Mutate: make sp_artifact_verify always return 0
 python3 - "$LIB" << 'PYEOF'
 import sys
 text = open(sys.argv[1]).read()
-old = '''sp_artifact_verify() {
-  local name="${1:?usage: sp_artifact_verify <name>}" claim_file path missing=0
-  claim_file="$PAD_STATE/artifact-expect.$name"
-  [ -f "$claim_file" ] || return 0  # no claim = nothing to verify
-  while IFS= read -r path; do
-    [ -n "$path" ] || continue
-    if [ ! -e "$path" ]; then
-      echo "  missing: $path" >&2
-      missing=1
-    fi
-  done < "$claim_file"
-  return "$missing"
-}'''
+# Anchor on the SIGNATURE only and inject an early return. The previous mutant
+# pasted the entire function body as its anchor, so any legitimate edit to that
+# body made the mutation fail to apply -- and a mutant that does not apply is
+# INCONCLUSIVE, never a pass. (It stopped applying the moment the empty-artifact
+# rule was added, which is how this was caught.)
+old = 'sp_artifact_verify() {'
 new = '''sp_artifact_verify() {
-  # MUTANT: always returns 0 — blindness re-introduced.
-  # A seat that produces nothing is indistinguishable from one working.
-  return 0
-}'''
+  return 0  # MUTANT: blindness re-introduced -- a seat that produces nothing
+            # becomes indistinguishable from one that is working.'''
 assert old in text, "MUTATION FAILED: sp_artifact_verify not found"
 text2 = text.replace(old, new)
 assert text2 != text, "MUTATION had no effect"
