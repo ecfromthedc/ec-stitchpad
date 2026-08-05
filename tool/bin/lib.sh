@@ -611,25 +611,37 @@ sp_engagement() {
       if (author==who) {                                          # my own block:
         if (silent || buf ~ /(^|[ \t])@[a-z0-9_-]/) {           # a silent ack OR a real @-address reply
           last_reply=n                                           # last reply ordinal
-          # Try to extract the first @-target: the first non-who agent name address.
-          # This is the sender we replied TO, used for same-sender gate narrowing.
+          # Extract the FIRST @-target: the sender we replied TO.
           # PORTABLE: no gawk match()-with-array; uses substr + sub.
-          split(buf, tokens, /[ \t\n]+/)
-          for (i in tokens) {
-            if (i > 20) break
+          # INDEXED loop, not "for (i in tokens)" — awk array iteration order is
+          # unspecified, so the old form could pick an arbitrary @-token as the
+          # reply target rather than the first one.
+          nt = split(buf, tokens, /[ \t\n]+/)
+          rt = ""
+          for (i = 1; i <= nt && i <= 20; i++) {
             t = tolower(tokens[i])
             if (t ~ /^@[a-z0-9_-]+/) {
               name = substr(t, 2)
               sub(/[^a-z0-9_-].*$/, "", name)
-              if (name != "" && name != "all" && name != who) { reply_target = name; break }
+              if (name != "" && name != "all" && name != who) { rt = name; break }
             }
+          }
+          if (rt != "") {
+            reply_target = rt
+            # PER-SENDER REPLY LEDGER: ordinal of my most recent reply to each
+            # sender. This is what makes "answered" a property of the MENTION
+            # rather than a property of the seat.
+            reply_to[rt] = n
           }
         }
       } else if (!silent && body_mentions(who)) {
-        # FIFO cursor: record the FIRST mention after `since`, never overwrite.
-        # The seen cursor steps one ordinal per delivery; this returns the next
-        # unanswered mention instead of jumping to the newest.
-        if (!last_mention && n > since) { last_mention=n; mention_sender=author }
+        # Collect EVERY candidate after "since", in order. The old code pinned
+        # last_mention to the first one and never overwrote it, so the gate
+        # compared my NEWEST reply against the OLDEST mention: reply once, and
+        # every later mention from that sender was declared handled. The caller
+        # exits before advancing seen, so the pin was permanent — and because a
+        # pinned ordinal can never be displaced, the seat went deaf to EVERYONE.
+        if (n > since) { m_ord[++mc] = n; m_from[mc] = author }
       }
     }
     /^## @/ {
@@ -659,7 +671,20 @@ sp_engagement() {
     # snippets from counting as an address. Real addresses survive because only the
     # backtick-delimited content is blanked, not the surrounding text.
     { line = tolower($0); gsub(/`[^`]*`/, " ", line); buf = buf " " line }
-    END { flush(); print (last_mention+0) " " (mention_sender) " " (last_reply+0) " " (reply_target) }
+    END {
+      flush()
+      # The oldest candidate that is genuinely UNANSWERED: no reply by me to that
+      # sender, newer than the mention itself. Ascending order preserves the FIFO
+      # stepping the seen cursor depends on.
+      last_mention = 0; mention_sender = ""
+      for (j = 1; j <= mc; j++) {
+        snd = m_from[j]
+        if (!(snd in reply_to) || reply_to[snd] < m_ord[j]) {
+          last_mention = m_ord[j]; mention_sender = snd; break
+        }
+      }
+      print (last_mention+0) " " (mention_sender) " " (last_reply+0) " " (reply_target)
+    }
   ' "$PAD_MD"
 }
 

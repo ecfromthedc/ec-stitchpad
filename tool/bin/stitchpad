@@ -1457,14 +1457,12 @@ except Exception:
     fi
     read -r oldest_mention_to_me mention_sender last_reply_by_me reply_target <<<"$(sp_engagement "$who" "$_since")"
     [ "${oldest_mention_to_me:-0}" -eq 0 ] && exit 0   # no unanswered mention after seen → nothing to do
-    # REPLY-CLEARS-GATE narrowed to same-sender: my reply only clears the gate
-    # when it's directed at the SAME sender who mentioned me. Replying to X no
-    # longer swallows Y's unanswered mention.
-    if [ "${last_reply_by_me:-0}" -gt "$oldest_mention_to_me" ] \
-       && [ -n "${mention_sender:-}" ] && [ -n "${reply_target:-}" ] \
-       && [ "$reply_target" = "$mention_sender" ]; then
-      exit 0   # my reply to the SAME sender is newer than their mention → handled
-    fi
+    # REPLY-CLEARS-GATE now lives entirely in sp_engagement, which resolves it
+    # PER MENTION against a per-sender reply ledger. The check that used to sit
+    # here compared my NEWEST reply against the OLDEST candidate mention, which
+    # is what made a seat permanently deaf; with a correct oracle it is provably
+    # dead code, and leaving a stale duplicate of the invariant is exactly how
+    # the bug would return.
     # --peek-ordinal: gate is open (mention unanswered) → print the ordinal, done.
     # Uses the already-computed oldest_mention_to_me from sp_engagement; independent
     # of the seen cursor on purpose. Pending stamps answer "owes a reply" while
