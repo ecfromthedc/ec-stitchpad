@@ -594,9 +594,28 @@ sp_latest_to() {
 sp_engagement() {
   local who="$1"
   local since="${2:-0}"  # skip mentions with ordinal <= since (FIFO cursor)
-  # roster names, for the implicit-silent word list below: only AGENT authors get
-  # their bare "ack"/"noted" posts silenced. A human operator typing "@pi ack"
-  # means "wake pi" — guessing it silent made operator pings vanish (the pi bug).
+
+  # ── Rust fast-path: wake-gate binary, byte-identical to the awk oracle ──
+  # Gate env: PASTURE_RUST_GATE=1 enables; default OFF because it is new.
+  # The binary lives at $STITCHPAD_HOME/wake-gate/target/debug/wake-gate for
+  # dev builds; a release install would put it directly in $STITCHPAD_HOME/bin/.
+  if [ "${PASTURE_RUST_GATE:-0}" = "1" ]; then
+    local rust_bin
+    if [ -x "$STITCHPAD_HOME/wake-gate/target/debug/wake-gate" ]; then
+      rust_bin="$STITCHPAD_HOME/wake-gate/target/debug/wake-gate"
+    elif [ -x "$STITCHPAD_HOME/bin/wake-gate" ]; then
+      rust_bin="$STITCHPAD_HOME/bin/wake-gate"
+    fi
+    if [ -n "${rust_bin:-}" ] && [ -f "$PAD_MD" ]; then
+      "$rust_bin" "$PAD_MD" "$who" "$since" 2>/dev/null && return 0
+    fi
+    # Fall through to awk if binary not found or pad missing
+  fi
+
+  # ── awk oracle (original, battle-tested) ──
+   # roster names, for the implicit-silent word list below: only AGENT authors get
+   # their bare "ack"/"noted" posts silenced. A human operator typing "@pi ack"
+   # means "wake pi" — guessing it silent made operator pings vanish (the pi bug).
   local agents
   agents="$(sp_roster 2>/dev/null | cut -d'|' -f1 | tr 'A-Z' 'a-z' | paste -sd, -)"
   awk -v who="$(printf '%s' "$1" | tr 'A-Z' 'a-z')" -v agents="$agents" -v since="$since" '
