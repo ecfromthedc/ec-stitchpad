@@ -72,7 +72,7 @@ test-health-readonly.sh 1 0
 test-ponytail-instructions.sh 1 0
 test-provider-availability.sh 8 0
 test-runner.sh 0 0
-tripwire-gate.sh 34 0
+tripwire-gate.sh 33 0
 wake-regression.sh 0 0
 watcher-containment-gate.sh 10 0
 watcher-ordering-gate.sh 3 0

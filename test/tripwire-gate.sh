@@ -304,11 +304,6 @@ rm -rf "$FIXTURE"; tw_clean
 echo ""
 
 # ═════════════════════════════════════════════════════════════════════════
-echo "=== RESULTS ==="
-echo "Passed:  $pass"
-echo "Failed:  $fail"
-echo ""
-
 # ── Crash detection must tell a FATAL DIAGNOSTIC from a JOB STATUS ─────────
 # The gate detects crashes by matching the SHAPE of a bash fatal diagnostic
 # ("<script>: line <N>: ..."), because enumerating messages only ever catches the
@@ -345,6 +340,11 @@ crash_scan 'suite.sh: line 4: 999 Segmentation fault: 11  ./thing' \
 crash_scan 'all good here, 30 passed, 0 failed' \
   && bad "crash-scan: clean output scored as a crash" \
   || ok  "crash-scan: clean output is clean"
+
+echo "=== RESULTS ==="
+echo "Passed:  $pass"
+echo "Failed:  $fail"
+echo ""
 
 if [ "$fail" -eq 0 ]; then
   echo "tripwire-gate: ALL GATES PASSED"
