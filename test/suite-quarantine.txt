@@ -6,6 +6,5 @@
 # Additions to this file require a commit message explaining WHY the suite
 # cannot be reliably measured.
 help-discoverability-gate.sh requires: terminal-width (~80 cols) for help output assertions
-pad-narration-gate.sh DEFERRED capability (P19 self-narrating pad) — designed 2026-08-04, not complete; see PR scorecard
 operator-conduct-gate.sh DEFERRED capability (P22 operator conducting) — designed 2026-08-04, not complete; see PR scorecard
 terminal-isolation-gate.sh DEFERRED — fixture-isolation semantics unresolved; tracked as P12 follow-up

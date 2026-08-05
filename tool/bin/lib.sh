@@ -1348,7 +1348,7 @@ sp_commit() {
   _v1_who="$(sp_me 2>/dev/null)" || _v1_who=""
   if [ -n "$_v1_who" ] && [ "$_v1_who" != "stitchpad" ]; then
     if ! sp_user_exists "$_v1_who" 2>/dev/null; then
-      case "$_v1_who" in *[!a-zA-Z0-9_-]*) ;; *)
+      case "$_v1_who" in *[!abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789_-]*) ;; *)
         _v1_tmp="$(sp_stage "$PAD_MD")"
         awk -v line="$_v1_who | cli | pull | -" '
           /^```roster/ { inblk=1; print; next }
@@ -2187,6 +2187,14 @@ sp_engagement() {
     # fence lines themselves and their contents are excluded from the mention buffer.
     /^[[:space:]]*```/ { infence = !infence; next }
     infence { next }
+    # P19 narration (`### @name event · HH:MM`) is a system-generated progress
+    # marker, not an address. sp_narrate writes the name after "### ", so the
+    # body_mentions regex `(^|[ \t])@name` matched it and every narrated lane
+    # became a PHANTOM MENTION of the agent that had just acted — the Stop hook
+    # then replayed a closed recovery forever (caught by reset-recovery.sh).
+    # sp_system lines are already safe because they open with "*@", and "*" is
+    # not whitespace. Same reasoning as the fence rule above: never wakes anyone.
+    /^###[[:space:]]*@/ { next }
     # first non-empty content line decides silent-ack (leading "." or "[ack]")
     !seen_body && /[^[:space:]]/ {
       seen_body=1
@@ -3373,14 +3381,20 @@ for s in data:
     local cn="${claim##*/artifact-expect.}"
     echo "$names" | grep -qxF "$cn" 2>/dev/null || names="$names"$'\n'"$cn"
   done
-  # From roster
-  if [ -f "$PAD_DIR/roster.csv" ]; then
-    while IFS='|' read -r rn rest; do
-      [ -n "$rn" ] && echo "$names" | grep -qxF "$rn" 2>/dev/null || names="$names"$'\n'"$rn"
-    done < "$PAD_DIR/roster.csv"
-  fi
+  # From roster. This used to read "$PAD_DIR/roster.csv" — a file NOTHING in the
+  # codebase has ever written. The roster lives in the ```roster``` fence inside
+  # stitchpad.md, so the read always came back empty and `lanes` reported
+  # "no lanes — empty roster" while `roster` printed the members one line above.
+  # sp_roster is the canonical reader (name|adapter|wake|target).
+  # The old condition was `[ -n "$rn" ] && ... || names=...`, which appended an
+  # EMPTY name whenever rn was blank — guard with an explicit continue instead.
+  while IFS='|' read -r rn rest; do
+    rn="$(printf '%s' "$rn" | tr -d '[:space:]')"
+    [ -n "$rn" ] || continue
+    echo "$names" | grep -qxF "$rn" 2>/dev/null || names="$names"$'\n'"$rn"
+  done <<< "$(sp_roster 2>/dev/null || true)"
   names="$(echo "$names" | sort -u | sed '/^$/d')"
-  [ -z "$names" ] && { echo "no lanes — empty roster"; return 0; }
+  [ -z "$names" ] && { echo "no lanes — no roster members and no artifact claims"; return 0; }
   printf '%-12s %-12s %6s %-20s %-12s %-16s\n' "LANE" "STATUS" "AGE" "ARTIFACT" "PRESENT" "VERDICT"
   printf '%-12s %-12s %6s %-20s %-12s %-16s\n' "------------" "------------" "------" "--------------------" "------------" "----------------"
   local _now; _now="$(date +%s)"

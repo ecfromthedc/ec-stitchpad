@@ -445,7 +445,7 @@ EOF
         _rec_key="${_ra%% *}"  # first space-delimited word
       fi
       [ -n "$_rec_key" ] && ! sp_user_exists "$_rec_key" 2>/dev/null || continue
-      case "$_rec_key" in *[!a-zA-Z0-9_-]*) continue ;; esac
+      case "$_rec_key" in *[!abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789_-]*) continue ;; esac
       _rec_added="${_rec_added:+$_rec_added }$_rec_key"
     done <<< "$_rec_authors"
     if [ -z "$_rec_added" ]; then
@@ -587,7 +587,15 @@ EOF
     # F3: Name validation — same allowlist as rename. Unicode/homoglyph names
     # are rejected because they bypass the tolower duplicate guard and create
     # ghost roster rows.
-    case "$who" in *[!a-zA-Z0-9_-]*) echo "stitchpad: bad name '$who' (allowed: a-z 0-9 _ -)" >&2; exit 1;; esac
+    # The class is ENUMERATED, not a range. `[!a-zA-Z0-9_-]` is collation-
+    # dependent: under LANG=en_US.UTF-8 (what agents actually run with) bash
+    # folds accented letters INTO the a-z range, so "davé" matched [a-zA-Z] and
+    # sailed through — the allowlist only bit under LC_ALL=C. Proven:
+    #   LC_ALL=en_US.UTF-8 bash -c 'case "davé" in *[!a-zA-Z0-9_-]*) ...'  -> no match
+    #   LC_ALL=C           bash -c '...same...'                            -> match
+    # That is how @dave, @davé and @dáve ended up as three roster rows the
+    # operator cannot tell apart. Enumeration has no collation semantics.
+    case "$who" in *[!abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789_-]*) echo "stitchpad: bad name '$who' (allowed: a-z 0-9 _ -)" >&2; exit 1;; esac
     # F3: Case-ambiguous duplicate: sp_user_exists uses tolower, so 'Dave'
     # matches 'dave' — re-joining the same seat is idempotent (exit 0).
     # ORDER MATTERS. The duplicate-name check used to run FIRST and exit 0, which
@@ -629,6 +637,11 @@ EOF
       echo "stitchpad: join failed — roster commit did not complete; worktree may be dirty, @$who may not be in the roster" >&2
       exit 1
     fi
+    # P19: the lane is taken — narrate it. sp_narrate appends `### @name ... · HH:MM`
+    # and NEVER commits (a self-committing narration doubled commit counts and
+    # broke heal-roster). Placed AFTER the commit above so we never narrate a
+    # lane that did not durably land.
+    STITCHPAD_NAME="$who" sp_narrate "took a lane in the roster as @$who ($adapter)" 2>/dev/null || true
     # Persist role/level for bridge profiles push + roster cards.
     [ -n "$_role" ] && printf '%s' "$_role" > "$PAD_STATE/role.$who"
     [ -n "$_level" ] && printf '%s' "$_level" > "$PAD_STATE/level.$who"
@@ -744,7 +757,7 @@ EOF
     sp_init_paths || exit 1
     old="${1:?usage: stitchpad rename <old> <new>}"
     new="${2:?usage: stitchpad rename <old> <new>}"
-    case "$new" in *[!a-zA-Z0-9_-]*) echo "stitchpad: bad name '$new' (allowed: a-z 0-9 _ -)" >&2; exit 1;; esac
+    case "$new" in *[!abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789_-]*) echo "stitchpad: bad name '$new' (allowed: a-z 0-9 _ -)" >&2; exit 1;; esac
     sp_user_exists "$old" || { echo "stitchpad: @$old not in roster" >&2; exit 1; }
     sp_user_exists "$new" && { echo "stitchpad: @$new already in roster" >&2; exit 1; }
     sp_stop_delivery_worker "$old"
@@ -2645,7 +2658,7 @@ PY
       _me="$(sp_me)"
       _head="$(sgit rev-parse HEAD 2>/dev/null || true)"
       if [ -n "$_me" ] && [ -n "$_head" ]; then
-        case "$_me" in *[!a-zA-Z0-9_-]*) echo "stitchpad: invalid identity for read cursor" >&2; exit 1 ;; esac
+        case "$_me" in *[!abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789_-]*) echo "stitchpad: invalid identity for read cursor" >&2; exit 1 ;; esac
         # E-17: roster handles can exceed 255 bytes (filesystem name limit).
         # Hash the identity so the cursor key is always a fixed safe length,
         # regardless of handle length.  Once broken by a long handle the
@@ -3862,7 +3875,7 @@ PY
       _wake="${_doc_wakes[_di]}"; _target="${_doc_targets[_di]}"
       issues=()
       _doc_name_safe=1
-      case "$_name" in ''|*[!a-zA-Z0-9_-]*) _doc_name_safe=0 ;; esac
+      case "$_name" in ''|*[!abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789_-]*) _doc_name_safe=0 ;; esac
 
       # Operator/human members are NOT agents — they read & post, they don't get
       # woken. So they're exempt from wake-health checks (no target is expected,
@@ -3895,7 +3908,7 @@ PY
 
       # Check 2: adapter is installed. Avoid a hard-coded allowlist so a real
       # adapter such as herdr becomes diagnosable as soon as its script lands.
-      case "$_adapter" in ''|*[!a-zA-Z0-9_-]*) _adapter_ok=0 ;; *) _adapter_ok=1 ;; esac
+      case "$_adapter" in ''|*[!abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789_-]*) _adapter_ok=0 ;; *) _adapter_ok=1 ;; esac
       if [ "$_adapter_ok" -eq 0 ] || [ ! -f "$ADAPTER_DIR/$_adapter.sh" ]; then
         issues+=("missing adapter script '$_adapter.sh'")
         (( err++ ))
@@ -4308,6 +4321,8 @@ TASKSEOF
           echo "stitchpad: task $id commit failed — card may not be durable; $id NOT created" >&2
           exit 1
         fi
+        # P19: commit landed — narrate the card, never self-committing.
+        sp_narrate "opened task $id: $title" 2>/dev/null || true
         sp_unlock
         echo "$id created"
         ;;
@@ -4402,6 +4417,9 @@ TASKSEOF
             exit 1
           fi
         fi
+        # P19: card moved — narrate every transition, so the board shows live
+        # progress without an agent remembering to `say` (P21 leans on this too).
+        [ "$rc" -eq 0 ] && { sp_narrate "moved $id → $new_status" 2>/dev/null || true; }
         sp_unlock
         echo "$id → $new_status"
         ;;

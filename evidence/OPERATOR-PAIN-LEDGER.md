@@ -412,14 +412,29 @@ P35. `join` REPORTS SUCCESS AND LEAVES YOU WITH NO IDENTITY.  (UX, by design.)
      debugging detour while building the P28 gate. `join` should say which
      identity path it actually established.
 
-P36. TWO SUITES ENCODE OPPOSITE POLICY FOR CONFUSABLE NAMES.  **NEEDS EC.**
-     roster-validation-gate asserts unicode/confusable names must be REJECTED
-     ('davé', 'dáve'); the pro3-f3-unicode lane implements NORMALIZING them
-     (NFKD+casefold) so they collapse onto one roster row. Both cannot be right.
-     Checked out pro3-f3b (41d5522) and ran roster-validation against it: still
-     9/3, so absorbing that lane would NOT close this. This is an operator
-     decision, not an implementation detail, and it is why roster-validation is
-     recorded KNOWN-RED rather than "fixed".
+P36. "CONFUSABLE NAME POLICY CONFLICT" — **I MISDIAGNOSED THIS. IT WAS A BUG.**
+     I reported to EC that roster-validation (REJECT confusables) and the
+     pro3-f3-unicode lane (NORMALIZE them) encoded contradictory policy and that
+     an operator decision was required. That was wrong, and the evidence for
+     "conflict" was thin: I saw the suite red, saw another lane doing something
+     different, and inferred intent instead of reading the code.
+     The REJECT policy was ALREADY implemented at the join and rename sites and
+     was simply being BYPASSED:
+       case "$who" in *[!a-zA-Z0-9_-]*) reject ;; esac
+     `[a-zA-Z]` is a COLLATION range. Under LANG=en_US.UTF-8 — what every agent
+     actually runs with — bash folds accented letters into it, so "davé" matched
+     [a-zA-Z] and passed. The guard only bit under LC_ALL=C. Proven both ways:
+       LC_ALL=en_US.UTF-8  ->  no match (allowlist bypassed)
+       LC_ALL=C            ->  match    (allowlist holds)
+     That is how @dave, @davé and @dáve became three roster rows an operator
+     cannot tell apart — a homograph impersonation route in a system where
+     authority is name-based (TASK-5 scope, operator grants, roster deny).
+     FIXED: the class is ENUMERATED at all 7 sites (no ranges, no collation).
+     roster-validation 9/3 -> 12/0. Mutant-proven: restoring the range
+     reproduces exactly 9/3 with the same three failures.
+     NOTE: grep-based `[a-zA-Z0-9_-]` classes in the mention parser have the same
+     collation exposure. Not changed here — mention parsing has a wide blast
+     radius and deserves its own measured pass. EXPLICITLY DEFERRED.
 
 P37. THE REAL HERDR PANE RESOLVES A SURFACE BUT CARRIES NO IDENTITY.
      Exercised by hand from inside a live herdr pane (HERDR_PANE_ID=w4:p3), self-
