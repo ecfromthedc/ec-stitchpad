@@ -1,0 +1,19 @@
+seat	since	ordinal	sender	last_reply	reply_target
+alice	0	0	5	bob	
+alice	1	0	5	bob	
+alice	2	0	5	bob	
+alice	3	0	5	bob	
+alice	4	0	5	bob	
+alice	5	0	5	bob	
+bob	0	5	alice	4	charlie
+bob	1	5	alice	4	charlie
+bob	2	5	alice	4	charlie
+bob	3	5	alice	4	charlie
+bob	4	5	alice	4	charlie
+bob	5	0	4	charlie	
+charlie	0	4	bob	2	bob
+charlie	1	4	bob	2	bob
+charlie	2	4	bob	2	bob
+charlie	3	4	bob	2	bob
+charlie	4	0	2	bob	
+charlie	5	0	2	bob	

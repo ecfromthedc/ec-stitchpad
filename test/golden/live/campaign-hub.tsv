@@ -1,0 +1,313 @@
+seat	since	ordinal	sender	last_reply	reply_target
+fable	0	18	eric	49	codex
+fable	1	18	eric	49	codex
+fable	2	18	eric	49	codex
+fable	3	18	eric	49	codex
+fable	4	18	eric	49	codex
+fable	5	18	eric	49	codex
+fable	6	18	eric	49	codex
+fable	7	18	eric	49	codex
+fable	8	18	eric	49	codex
+fable	9	18	eric	49	codex
+fable	10	18	eric	49	codex
+fable	11	18	eric	49	codex
+fable	12	18	eric	49	codex
+fable	13	18	eric	49	codex
+fable	14	18	eric	49	codex
+fable	15	18	eric	49	codex
+fable	16	18	eric	49	codex
+fable	17	18	eric	49	codex
+fable	18	0	49	codex	
+fable	19	0	49	codex	
+fable	20	0	49	codex	
+fable	21	0	49	codex	
+fable	22	0	49	codex	
+fable	23	0	49	codex	
+fable	24	0	49	codex	
+fable	25	0	49	codex	
+fable	26	0	49	codex	
+fable	27	0	49	codex	
+fable	28	0	49	codex	
+fable	29	0	49	codex	
+fable	30	0	49	codex	
+fable	31	0	49	codex	
+fable	32	0	49	codex	
+fable	33	0	49	codex	
+fable	34	0	49	codex	
+fable	35	0	49	codex	
+fable	36	0	49	codex	
+fable	37	0	49	codex	
+fable	38	0	49	codex	
+fable	39	0	49	codex	
+fable	40	0	49	codex	
+fable	41	0	49	codex	
+fable	42	0	49	codex	
+fable	43	0	49	codex	
+fable	44	0	49	codex	
+fable	45	0	49	codex	
+fable	46	0	49	codex	
+fable	47	0	49	codex	
+fable	48	0	49	codex	
+fable	49	0	49	codex	
+fable	50	0	49	codex	
+fable	51	0	49	codex	
+codex	0	18	eric	45	glm
+codex	1	18	eric	45	glm
+codex	2	18	eric	45	glm
+codex	3	18	eric	45	glm
+codex	4	18	eric	45	glm
+codex	5	18	eric	45	glm
+codex	6	18	eric	45	glm
+codex	7	18	eric	45	glm
+codex	8	18	eric	45	glm
+codex	9	18	eric	45	glm
+codex	10	18	eric	45	glm
+codex	11	18	eric	45	glm
+codex	12	18	eric	45	glm
+codex	13	18	eric	45	glm
+codex	14	18	eric	45	glm
+codex	15	18	eric	45	glm
+codex	16	18	eric	45	glm
+codex	17	18	eric	45	glm
+codex	18	46	deepseek	45	glm
+codex	19	46	deepseek	45	glm
+codex	20	46	deepseek	45	glm
+codex	21	46	deepseek	45	glm
+codex	22	46	deepseek	45	glm
+codex	23	46	deepseek	45	glm
+codex	24	46	deepseek	45	glm
+codex	25	46	deepseek	45	glm
+codex	26	46	deepseek	45	glm
+codex	27	46	deepseek	45	glm
+codex	28	46	deepseek	45	glm
+codex	29	46	deepseek	45	glm
+codex	30	46	deepseek	45	glm
+codex	31	46	deepseek	45	glm
+codex	32	46	deepseek	45	glm
+codex	33	46	deepseek	45	glm
+codex	34	46	deepseek	45	glm
+codex	35	46	deepseek	45	glm
+codex	36	46	deepseek	45	glm
+codex	37	46	deepseek	45	glm
+codex	38	46	deepseek	45	glm
+codex	39	46	deepseek	45	glm
+codex	40	46	deepseek	45	glm
+codex	41	46	deepseek	45	glm
+codex	42	46	deepseek	45	glm
+codex	43	46	deepseek	45	glm
+codex	44	46	deepseek	45	glm
+codex	45	46	deepseek	45	glm
+codex	46	49	fable	45	glm
+codex	47	49	fable	45	glm
+codex	48	49	fable	45	glm
+codex	49	0	45	glm	
+codex	50	0	45	glm	
+codex	51	0	45	glm	
+glm	0	1	fable	43	codex
+glm	1	6	fable	43	codex
+glm	2	6	fable	43	codex
+glm	3	6	fable	43	codex
+glm	4	6	fable	43	codex
+glm	5	6	fable	43	codex
+glm	6	10	fable	43	codex
+glm	7	10	fable	43	codex
+glm	8	10	fable	43	codex
+glm	9	10	fable	43	codex
+glm	10	18	eric	43	codex
+glm	11	18	eric	43	codex
+glm	12	18	eric	43	codex
+glm	13	18	eric	43	codex
+glm	14	18	eric	43	codex
+glm	15	18	eric	43	codex
+glm	16	18	eric	43	codex
+glm	17	18	eric	43	codex
+glm	18	22	fable	43	codex
+glm	19	22	fable	43	codex
+glm	20	22	fable	43	codex
+glm	21	22	fable	43	codex
+glm	22	42	deepseek	43	codex
+glm	23	42	deepseek	43	codex
+glm	24	42	deepseek	43	codex
+glm	25	42	deepseek	43	codex
+glm	26	42	deepseek	43	codex
+glm	27	42	deepseek	43	codex
+glm	28	42	deepseek	43	codex
+glm	29	42	deepseek	43	codex
+glm	30	42	deepseek	43	codex
+glm	31	42	deepseek	43	codex
+glm	32	42	deepseek	43	codex
+glm	33	42	deepseek	43	codex
+glm	34	42	deepseek	43	codex
+glm	35	42	deepseek	43	codex
+glm	36	42	deepseek	43	codex
+glm	37	42	deepseek	43	codex
+glm	38	42	deepseek	43	codex
+glm	39	42	deepseek	43	codex
+glm	40	42	deepseek	43	codex
+glm	41	42	deepseek	43	codex
+glm	42	44	deepseek	43	codex
+glm	43	44	deepseek	43	codex
+glm	44	45	codex	43	codex
+glm	45	48	fable	43	codex
+glm	46	48	fable	43	codex
+glm	47	48	fable	43	codex
+glm	48	49	fable	43	codex
+glm	49	0	43	codex	
+glm	50	0	43	codex	
+glm	51	0	43	codex	
+deepseek	0	1	fable	50	eric
+deepseek	1	6	fable	50	eric
+deepseek	2	6	fable	50	eric
+deepseek	3	6	fable	50	eric
+deepseek	4	6	fable	50	eric
+deepseek	5	6	fable	50	eric
+deepseek	6	12	fable	50	eric
+deepseek	7	12	fable	50	eric
+deepseek	8	12	fable	50	eric
+deepseek	9	12	fable	50	eric
+deepseek	10	12	fable	50	eric
+deepseek	11	12	fable	50	eric
+deepseek	12	15	fable	50	eric
+deepseek	13	15	fable	50	eric
+deepseek	14	15	fable	50	eric
+deepseek	15	19	fable	50	eric
+deepseek	16	19	fable	50	eric
+deepseek	17	19	fable	50	eric
+deepseek	18	19	fable	50	eric
+deepseek	19	22	fable	50	eric
+deepseek	20	22	fable	50	eric
+deepseek	21	22	fable	50	eric
+deepseek	22	49	fable	50	eric
+deepseek	23	49	fable	50	eric
+deepseek	24	49	fable	50	eric
+deepseek	25	49	fable	50	eric
+deepseek	26	49	fable	50	eric
+deepseek	27	49	fable	50	eric
+deepseek	28	49	fable	50	eric
+deepseek	29	49	fable	50	eric
+deepseek	30	49	fable	50	eric
+deepseek	31	49	fable	50	eric
+deepseek	32	49	fable	50	eric
+deepseek	33	49	fable	50	eric
+deepseek	34	49	fable	50	eric
+deepseek	35	49	fable	50	eric
+deepseek	36	49	fable	50	eric
+deepseek	37	49	fable	50	eric
+deepseek	38	49	fable	50	eric
+deepseek	39	49	fable	50	eric
+deepseek	40	49	fable	50	eric
+deepseek	41	49	fable	50	eric
+deepseek	42	49	fable	50	eric
+deepseek	43	49	fable	50	eric
+deepseek	44	49	fable	50	eric
+deepseek	45	49	fable	50	eric
+deepseek	46	49	fable	50	eric
+deepseek	47	49	fable	50	eric
+deepseek	48	49	fable	50	eric
+deepseek	49	0	50	eric	
+deepseek	50	0	50	eric	
+deepseek	51	0	50	eric	
+captain	0	0	0	0	
+captain	1	0	0	0	
+captain	2	0	0	0	
+captain	3	0	0	0	
+captain	4	0	0	0	
+captain	5	0	0	0	
+captain	6	0	0	0	
+captain	7	0	0	0	
+captain	8	0	0	0	
+captain	9	0	0	0	
+captain	10	0	0	0	
+captain	11	0	0	0	
+captain	12	0	0	0	
+captain	13	0	0	0	
+captain	14	0	0	0	
+captain	15	0	0	0	
+captain	16	0	0	0	
+captain	17	0	0	0	
+captain	18	0	0	0	
+captain	19	0	0	0	
+captain	20	0	0	0	
+captain	21	0	0	0	
+captain	22	0	0	0	
+captain	23	0	0	0	
+captain	24	0	0	0	
+captain	25	0	0	0	
+captain	26	0	0	0	
+captain	27	0	0	0	
+captain	28	0	0	0	
+captain	29	0	0	0	
+captain	30	0	0	0	
+captain	31	0	0	0	
+captain	32	0	0	0	
+captain	33	0	0	0	
+captain	34	0	0	0	
+captain	35	0	0	0	
+captain	36	0	0	0	
+captain	37	0	0	0	
+captain	38	0	0	0	
+captain	39	0	0	0	
+captain	40	0	0	0	
+captain	41	0	0	0	
+captain	42	0	0	0	
+captain	43	0	0	0	
+captain	44	0	0	0	
+captain	45	0	0	0	
+captain	46	0	0	0	
+captain	47	0	0	0	
+captain	48	0	0	0	
+captain	49	0	0	0	
+captain	50	0	0	0	
+captain	51	0	0	0	
+kimi	0	0	0	0	
+kimi	1	0	0	0	
+kimi	2	0	0	0	
+kimi	3	0	0	0	
+kimi	4	0	0	0	
+kimi	5	0	0	0	
+kimi	6	0	0	0	
+kimi	7	0	0	0	
+kimi	8	0	0	0	
+kimi	9	0	0	0	
+kimi	10	0	0	0	
+kimi	11	0	0	0	
+kimi	12	0	0	0	
+kimi	13	0	0	0	
+kimi	14	0	0	0	
+kimi	15	0	0	0	
+kimi	16	0	0	0	
+kimi	17	0	0	0	
+kimi	18	0	0	0	
+kimi	19	0	0	0	
+kimi	20	0	0	0	
+kimi	21	0	0	0	
+kimi	22	0	0	0	
+kimi	23	0	0	0	
+kimi	24	0	0	0	
+kimi	25	0	0	0	
+kimi	26	0	0	0	
+kimi	27	0	0	0	
+kimi	28	0	0	0	
+kimi	29	0	0	0	
+kimi	30	0	0	0	
+kimi	31	0	0	0	
+kimi	32	0	0	0	
+kimi	33	0	0	0	
+kimi	34	0	0	0	
+kimi	35	0	0	0	
+kimi	36	0	0	0	
+kimi	37	0	0	0	
+kimi	38	0	0	0	
+kimi	39	0	0	0	
+kimi	40	0	0	0	
+kimi	41	0	0	0	
+kimi	42	0	0	0	
+kimi	43	0	0	0	
+kimi	44	0	0	0	
+kimi	45	0	0	0	
+kimi	46	0	0	0	
+kimi	47	0	0	0	
+kimi	48	0	0	0	
+kimi	49	0	0	0	
+kimi	50	0	0	0	
+kimi	51	0	0	0	

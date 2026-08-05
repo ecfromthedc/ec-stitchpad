@@ -1,0 +1,40 @@
+seat	since	ordinal	sender	last_reply	reply_target
+alice	0	0	11	bob	
+alice	1	0	11	bob	
+alice	2	0	11	bob	
+alice	3	0	11	bob	
+alice	4	0	11	bob	
+alice	5	0	11	bob	
+alice	6	0	11	bob	
+alice	7	0	11	bob	
+alice	8	0	11	bob	
+alice	9	0	11	bob	
+alice	10	0	11	bob	
+alice	11	0	11	bob	
+alice	12	0	11	bob	
+bob	0	3	alice	12	charlie
+bob	1	3	alice	12	charlie
+bob	2	3	alice	12	charlie
+bob	3	11	alice	12	charlie
+bob	4	11	alice	12	charlie
+bob	5	11	alice	12	charlie
+bob	6	11	alice	12	charlie
+bob	7	11	alice	12	charlie
+bob	8	11	alice	12	charlie
+bob	9	11	alice	12	charlie
+bob	10	11	alice	12	charlie
+bob	11	0	12	charlie	
+bob	12	0	12	charlie	
+charlie	0	11	alice	0	
+charlie	1	11	alice	0	
+charlie	2	11	alice	0	
+charlie	3	11	alice	0	
+charlie	4	11	alice	0	
+charlie	5	11	alice	0	
+charlie	6	11	alice	0	
+charlie	7	11	alice	0	
+charlie	8	11	alice	0	
+charlie	9	11	alice	0	
+charlie	10	11	alice	0	
+charlie	11	12	bob	0	
+charlie	12	0	0	0	
