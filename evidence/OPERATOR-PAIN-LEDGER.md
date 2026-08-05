@@ -511,9 +511,29 @@ P39 (REOPENED — DIAGNOSED, NOT FIXED). THE WATCHER IS KILLED BY ITS OWN CALLER
      spawned within the grace is never shot by a concurrent caller.
      COST OF LEAVING IT: watcher-singleton-gate fails ~1 run in 5, so a green board
      needs a re-run to trust. The shipped behaviour self-heals on the next call.
-     KEPT from the attempt: nothing in lib.sh (fully reverted to the last measured
-     state). The sampling fix in the GATE (wait for a settled count) was kept —
-     it removes a real second race and is independent of this.
+     KEPT from the attempts: nothing in lib.sh (fully reverted to the last
+     measured state). The sampling fix in the GATE (wait for a settled count) was
+     kept — it removes a real second race and is independent of this.
+     THREE APPROACHES TRIED, ALL REVERTED — recorded so the next pass does not
+     repeat them:
+       1. Move sp_stop_watchers_for_pad BEHIND the atomic acquire.
+          -> watcher-races RED: that function IS the empty-lock reclaimer and must
+             run before the acquire for a single call to recover.
+       2. Gate it on "no lock present" before the acquire.
+          -> P39 flake returns: with N callers at t=0 no lock exists yet, so all N
+             still run the stop path and the last one shoots the winner.
+       3. Guard the PROCESS KILL by generation age (the same
+          STITCHPAD_WATCH_START_GRACE the reclaim paths already honour).
+          -> P39 still flaked AND watcher-races went RED. The grace is measured
+             from the lock's mtime, which the winner keeps touching as it writes
+             generation/launcher/ts, so the window does not mean what it looks
+             like it means here.
+     WHAT THE NEXT PASS SHOULD DO: stop reasoning from the lock's mtime. The
+     winner should publish an explicit "spawning" marker with its own pid the
+     moment it wins the mkdir, and sp_stop_watchers_for_pad should skip any
+     generation whose spawning marker names a LIVE pid. That is an ownership
+     fact, not a timing heuristic — and every attempt above failed because it
+     was a timing heuristic.
 
 P40. TASK/MESSAGE SEPARATION vs P19 NARRATION — a REAL requirements conflict
      (unlike P36, which I wrongly called one).
