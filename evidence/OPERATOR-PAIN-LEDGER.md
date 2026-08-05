@@ -571,3 +571,16 @@ P41. THE RELEASE GATE PRINTED "PASSED" AND EXITED 1 — EVERY RUN, ALL BUILD.
      with "exit 0 (expected 0, got 1)".
      This is the same family as P31 (an EXIT trap masking a crash to 0) — the
      same mechanism, pointed the other way.
+
+P38 (CLOSED). `task list` is readable again — and still machine-parseable.
+     Every card printed as ONE pipe-delimited line with the whole body inline;
+     TASK-1 in the live arena is ~700 characters. The board was unusable exactly
+     when an operator wanted to see where the fleet was.
+     The pipe format is load-bearing (suites parse '^TASK-N|'), so it survives
+     BYTE FOR BYTE anywhere stdout is not a terminal. A terminal gets a rendered
+     board: ID / STATUS / OWNER / PRI / TITLE, truncated to the real width.
+     Explicit --human and --porcelain flags force either path, so BOTH are
+     testable without a terminal — a rendering only reachable interactively is a
+     rendering nothing gates.
+     GATED: p38-task-list-readable-gate.sh 5/0. Longest rendered line 83 chars.
+     Mutant (render by default) breaks machine parsing and turns G1 RED.

@@ -86,3 +86,4 @@ p29-p30-claim-hook-gate.sh 7 0
 p32-multibyte-variable-gate.sh 4 0
 p33-terminal-refusal-message-gate.sh 4 0
 pad-narration-gate.sh 8 0
+p38-task-list-readable-gate.sh 5 0

@@ -4357,7 +4357,41 @@ TASKSEOF
         ;;
 
       list)
-        sp_tasks "$@"
+        # P38: this printed ONE pipe-delimited line per card with the entire body
+        # inline — TASK-1 ran to ~700 characters and six cards filled a screen, so
+        # the board was unreadable exactly when an operator needed to see where the
+        # fleet was. The machine format is load-bearing (suites parse '^TASK-N|'),
+        # so it is preserved BYTE FOR BYTE for pipes, redirects, and --porcelain.
+        # Only an interactive terminal gets the rendered board.
+        # --human forces the board, --porcelain forces the machine format. The
+        # explicit flags exist so BOTH paths are testable without a terminal —
+        # a rendering that can only be exercised interactively is a rendering
+        # nothing gates.
+        _tl_human=0
+        [ "${1:-}" = "--human" ] && { _tl_human=1; shift; }
+        if [ "${1:-}" = "--porcelain" ]; then
+          shift
+          sp_tasks "$@"
+        elif [ "$_tl_human" = "1" ] || [ -t 1 ]; then
+          _tl_cols="$(tput cols 2>/dev/null || echo 100)"
+          case "$_tl_cols" in ''|*[!0-9]*) _tl_cols=100 ;; esac
+          sp_tasks "$@" | awk -F'|' -v cols="$_tl_cols" '
+            BEGIN {
+              w = cols - 40; if (w < 20) w = 20
+              printf "%-9s %-12s %-10s %-6s %s\n", "ID", "STATUS", "OWNER", "PRI", "TITLE"
+              printf "%-9s %-12s %-10s %-6s %s\n", "---------", "------------", "----------", "------", "-----"
+            }
+            $1 != "" {
+              title = $2; owner = ($5 == "" ? "-" : $5); pri = ($4 == "" ? "-" : $4)
+              gsub(/\n/, " ", title)
+              if (length(title) > w) title = substr(title, 1, w - 1) "…"
+              printf "%-9s %-12s %-10s %-6s %s\n", $1, $3, owner, pri, title
+              n++
+            }
+            END { if (n == 0) print "(no tasks yet — stitchpad task new \"...\")" }'
+        else
+          sp_tasks "$@"
+        fi
         ;;
 
       board)
