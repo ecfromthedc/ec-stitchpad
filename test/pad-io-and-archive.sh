@@ -9,6 +9,14 @@ set -uo pipefail
 
 HERE="$(cd -P "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 SP="$HERE/../tool/bin/stitchpad"
+# P12: sp_this_surface() falls back to the runner's session id, and the tripwire
+# blanks HERDR_* but NOT CLAUDE_CODE_SESSION_ID. This fixture was therefore
+# claiming the CAPTAIN'S OWN terminal — the refusal read
+#   "terminal <captain-session-uuid> is live as @tester"
+# and every crash-recovery join failed against it. Fixtures own their surface.
+unset STITCHPAD_SESSION CLAUDE_CODE_SESSION_ID CODEX_SESSION_ID 2>/dev/null || true
+export STITCHPAD_TERMINAL_NAMESPACE="padio-main"
+
 WORK="$(mktemp -d "${TMPDIR:-/tmp}/sp-padio.XXXXXX")"
 writer_pid=""
 crash_pid=""
@@ -295,7 +303,7 @@ fi
 kill -KILL "$crash_pid" 2>/dev/null || true
 wait "$crash_pid" 2>/dev/null || true
 crash_pid=""
-SP_LOCK_STALE=0 sp join recovery-trigger claude pull - >/dev/null 2>&1 \
+SP_LOCK_STALE=0 STITCHPAD_TERMINAL_NAMESPACE=padio-recovery sp join recovery-trigger claude pull - >/dev/null 2>&1 \
   && ok "next mutator recovers an abandoned proven generation" \
   || bad "next mutator recovers an abandoned proven generation"
 grep -q '^crash-writer[[:space:]]*|' "$PAD" \
@@ -336,7 +344,7 @@ writer_pid=""
 grep -q '^signal-writer[[:space:]]*|' "$PAD" \
   && bad "signaled writer continued mutation after unlock" \
   || ok "signaled writer does not mutate after unlock"
-sp join signal-recovery claude pull - >/dev/null 2>&1 \
+STITCHPAD_TERMINAL_NAMESPACE=padio-signal-recovery sp join signal-recovery claude pull - >/dev/null 2>&1 \
   && ok "next mutator recovers the signaled writer generation" \
   || bad "next mutator recovers the signaled writer generation"
 grep -q '^signal-writer[[:space:]]*|' "$PAD" \
@@ -376,6 +384,9 @@ grep -q 'writer after empty-lock crash' "$PAD" \
 retire_barrier="$WORK/after-ready-retire"
 (
   trap - EXIT
+  # Own surface, like every other background writer here — this one was missed,
+  # so it raced the main thread for the terminal claim and its barrier never armed.
+  STITCHPAD_TERMINAL_NAMESPACE="padio-retired-writer" \
   HOME="$WORK/home" STITCHPAD_PAD_DIR="$WORK/.stitchpad" STITCHPAD_NAME=tester \
     STITCHPAD_WRITE_TEST_AFTER_RETIRE_BARRIER="$retire_barrier" \
     exec "$SP" join retired-writer claude pull -
@@ -387,7 +398,7 @@ for _ in $(seq 1 100); do [ -f "$retire_barrier.ready" ] && break; sleep 0.02; d
   && ok "writer retires canonical ready before cleanup" \
   || bad "writer retires canonical ready before cleanup"
 kill -KILL "$writer_pid" 2>/dev/null || true; wait "$writer_pid" 2>/dev/null || true; writer_pid=""
-SP_LOCK_STALE=0 sp join after-retire claude pull - >/dev/null 2>&1 \
+SP_LOCK_STALE=0 STITCHPAD_TERMINAL_NAMESPACE=padio-after-retire sp join after-retire claude pull - >/dev/null 2>&1 \
   && ok "next mutator crosses an applied-generation crash" \
   || bad "next mutator crosses an applied-generation crash"
 grep -q '^retired-writer[[:space:]]*|' "$PAD" \

@@ -504,3 +504,22 @@ P40. TASK/MESSAGE SEPARATION vs P19 NARRATION — a REAL requirements conflict
      card state to the pad turns it RED exactly as the checksum did.
      TO REVERSE: restore the cksum equality in pad-io-and-archive.sh and drop the
      two sp_narrate calls in the task arms of tool/bin/stitchpad.
+
+P34 (CLOSED). pad-io-and-archive: 63/13 -> 77/0, deterministic over 3 runs.
+     All 13 failures were ONE cause wearing three coats: ONE TERMINAL = ONE PAD.
+     The suite simulates several concurrent agents, but they all shared a single
+     terminal surface, so every crash-recovery join was refused and the barriers
+     never armed. The refusals were invisible because every call was
+     `>/dev/null 2>&1` — surfacing one line of stderr is what solved the rest:
+       "REFUSED — terminal fae3da2b-… is live as @tester"
+     and that id was the CAPTAIN'S OWN Claude session. sp_this_surface falls back
+     to the runner's session id, and the tripwire blanks HERDR_* but NOT
+     CLAUDE_CODE_SESSION_ID — so the fixture had claimed the operator's terminal.
+     That is P12 and P27 biting a suite nobody had ever seen run to completion.
+     FIX (fixture only — no product assertion weakened):
+       · unset the inherited session ids; the fixture owns "padio-main"
+       · each of the 4 background writers gets its own surface (one was missed
+         in the first pass — an audit of all four found it)
+       · each "next mutator" recovery join gets its own surface, because it
+         represents a DIFFERENT agent process
+     The product guard was right every time. The simulation was wrong.
