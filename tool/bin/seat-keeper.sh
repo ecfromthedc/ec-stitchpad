@@ -219,25 +219,29 @@ while IFS= read -r repo; do
         decision="unknown (${state#unknown:}) — not waking"
         ;;
       idle)
-        # Effect check: we woke it about mention #N last pass. If #N is STILL the
-        # unanswered one, that wake did nothing. Count it rather than repeating
-        # it forever. A different ordinal, or none, is progress.
-        if [ -f "$OBS" ] && [ -n "$pending" ] && [ "$(cat "$OBS" 2>/dev/null)" = "$pending" ]; then
-          strikes=$(( strikes + 1 ))
-          echo "$strikes" > "$STRIKE" 2>/dev/null
-        elif [ -f "$OBS" ]; then
-          strikes=0; rm -f "$OBS" "$STRIKE" 2>/dev/null
+        now=$(date +%s)
+        last=$(cat "$LASTF" 2>/dev/null || echo 0)
+        case "$last" in ''|*[!0-9]*) last=0 ;; esac
+        since=$(( now - last ))
+
+        # EFFECT CHECK — evaluated only when a repeat wake is actually DUE.
+        # Counting once per keeper pass instead counts COOLDOWN passes as failures:
+        # at a 2-minute cron against a 10-minute drain interval that quarantines a
+        # seat in ~6 minutes, before the first repeat wake has even been sent. A
+        # strike must mean "I woke it again about the SAME mention, and nothing moved".
+        if [ "$since" -ge "$DRAIN_MIN_S" ]; then
+          if [ -f "$OBS" ] && [ -n "$pending" ] && [ "$(cat "$OBS" 2>/dev/null)" = "$pending" ]; then
+            strikes=$(( strikes + 1 )); echo "$strikes" > "$STRIKE" 2>/dev/null
+          elif [ -f "$OBS" ]; then
+            strikes=0; rm -f "$OBS" "$STRIKE" 2>/dev/null
+          fi
         fi
 
         if [ "$strikes" -ge "$MAX_STRIKES" ]; then
           log_rl "$ST/.keeper-quarantine.$name" \
-            "QUARANTINED $name ($repo): $strikes consecutive wakes left mention #$pending unanswered — the wake is not landing. Not waking again until someone looks. Clear with: rm $STRIKE"
-          decision="QUARANTINED after $strikes no-op wakes"
+            "QUARANTINED $name ($repo): $strikes repeat wakes left mention #$pending unanswered — the wake is not landing. Not waking again until someone looks. Clear with: rm $STRIKE"
+          decision="QUARANTINED after $strikes repeat wakes"
         else
-          now=$(date +%s)
-          last=$(cat "$LASTF" 2>/dev/null || echo 0)
-          case "$last" in ''|*[!0-9]*) last=0 ;; esac
-          since=$(( now - last ))
 
           reason=""; prompt=""
           case "$pending" in
