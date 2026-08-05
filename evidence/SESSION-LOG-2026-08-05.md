@@ -188,3 +188,21 @@ Two conclusions, both load-bearing:
   conflict blocks across 7 files, run the full gate, push, open ONE PR upstream.
 - `git add -A` remains BANNED in this repo (untracked credential-shaped
   wrangler.*.toml, relay state, machine-local keeper.conf). Add by explicit path.
+
+### End-to-end proof that the board now tells the truth
+
+Two sub-agents spawned under contract. One delivered real content; one left an
+empty stub — the exact behaviour three live model seats exhibited earlier today.
+
+```
+LANE         STATUS          AGE ARTIFACT             PRESENT      VERDICT
+lead         active           1s -                    -            WORKING
+worker1      unknown          ?s /var/folders/5j/y... NO           FAILED
+worker2      unknown          ?s /var/folders/5j/y... YES          DONE
+```
+
+`worker1` wrote a file and still reads **FAILED**, because an empty artifact is
+not a produced artifact. Before this session it would have read present/DONE and
+been indistinguishable from `worker2`. That difference is the entire point of the
+work: an orchestrator can now see which seats actually delivered without reading
+any agent's mind, which is the one thing the daemon cannot tell them (P45).
