@@ -3320,7 +3320,55 @@ except: print("")' 2>/dev/null)"
     fi
     echo "→ watcher restarted"
     ;;
-  watch)   exec "$STITCHPAD_HOME/bin/watch.sh" ;;
+  watch)
+    # This arm was `exec watch.sh` with NO argument handling, so EVERY argument
+    # was silently discarded. `stitchpad watch start` ran the watcher in the
+    # FOREGROUND forever (which is what hung operator-conduct-gate at G1), and —
+    # worse — `stitchpad watch stop` STARTED one too. An operator asking to stop
+    # got the exact opposite, blocking their terminal, with no error.
+    # Real subcommands now; an unknown one is refused instead of ignored.
+    case "${1:-}" in
+      ''|--foreground|fg)
+        exec "$STITCHPAD_HOME/bin/watch.sh"
+        ;;
+      start)
+        sp_init_paths || exit 1
+        if sp_watcher_alive; then
+          echo "✓ watcher already running for $(basename "$(dirname "$PAD_DIR")")"
+          exit 0
+        fi
+        ensure_watcher || true
+        # ensure_watcher spawns detached; give it a bounded moment to publish.
+        _w_i=0
+        while [ "$_w_i" -lt 40 ]; do
+          sp_watcher_alive && break
+          sleep 0.25; _w_i=$((_w_i + 1))
+        done
+        if sp_watcher_alive; then
+          echo "✓ watcher started"
+        else
+          echo "stitchpad: watcher did not start (is any agent alive? a watcher only runs when someone is listening)" >&2
+          exit 1
+        fi
+        ;;
+      stop)
+        sp_init_paths || exit 1
+        sp_stop_watchers_for_pad
+        if sp_watcher_alive; then
+          echo "stitchpad: watcher still running after stop" >&2; exit 1
+        fi
+        echo "✓ watcher stopped"
+        ;;
+      status)
+        sp_init_paths_readonly || exit 1
+        if sp_watcher_alive; then echo "✓ watcher running"; else echo "no watcher running"; exit 1; fi
+        ;;
+      *)
+        echo "usage: stitchpad watch [start|stop|status]   (no argument = run in the foreground)" >&2
+        exit 1
+        ;;
+    esac
+    ;;
   daemon)  exec "$STITCHPAD_HOME/bin/daemon.sh" "${@}" ;;
 
   bridge)

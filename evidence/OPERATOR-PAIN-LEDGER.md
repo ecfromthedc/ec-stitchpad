@@ -584,3 +584,28 @@ P38 (CLOSED). `task list` is readable again — and still machine-parseable.
      rendering nothing gates.
      GATED: p38-task-list-readable-gate.sh 5/0. Longest rendered line 83 chars.
      Mutant (render by default) breaks machine parsing and turns G1 RED.
+
+P22 (CLOSED). THE OPERATOR CAN CONDUCT FROM THE SIDES — 8/0, and it was BUILT
+     all along. The gate hung, so nobody ever saw it work. Two defects hid it:
+
+     1. `watch)` was `exec watch.sh` with NO argument handling, so every argument
+        was silently discarded. `stitchpad watch start` ran the watcher in the
+        FOREGROUND forever — that is what hung the gate at G1 — and, worse,
+        `stitchpad watch stop` STARTED one too. An operator asking to stop got
+        the exact opposite, blocking their terminal, with no error at all.
+        FIXED: real subcommands (start / stop / status; bare = foreground), and
+        an unknown subcommand is REFUSED rather than ignored.
+     2. tool/adapters/test-busy.sh wrote its markers to "${PAD_STATE}/..." but
+        PAD_STATE is set by sp_init_paths, which an adapter never calls — sourcing
+        lib.sh only defines functions. Every marker went to "/.test-busy.*",
+        silently failed, and the gate reported "agent log missing" as though the
+        capability were unbuilt. FIXED: derive PAD_STATE from the pad path in the
+        documented adapter contract (event, to, stitchpad.md, task-text-file).
+
+     With those two closed the whole P22 contract passes as designed:
+       G1 busy agent @pinged -> immediate ack on the pad, naming @pro5, saying queued
+       G2 agent freed        -> the queued mention is delivered and answered in lane
+       G3 idle agent         -> answers immediately, with NO spurious mid-lane ack
+       G4 MUTANT             -> markers deleted, no ack appears, gate bites
+     The delivery retry loop (rc=3 BUSY -> stage ack -> retry every 2s) was
+     already there and correct. Nothing about the capability needed building.

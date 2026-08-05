@@ -16,6 +16,17 @@ name="${2:-}"; pad="${3:-}"; taskfile="${4:-}"
 src="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 source "$src/bin/lib.sh" 2>/dev/null || true
 
+# PAD_STATE is set by sp_init_paths, which an adapter never calls — sourcing
+# lib.sh only defines functions. So every marker below was being written to
+# "/.test-busy.*" (an empty prefix), which silently failed and left the P22 gate
+# reporting "agent log missing" as if the capability were unbuilt. The adapter
+# contract is `adapter.sh <event> <to> <stitchpad.md> <task-text-file>`, so the
+# state dir is derivable from $3.
+if [ -z "${PAD_STATE:-}" ] && [ -n "$pad" ]; then
+  PAD_STATE="$(cd "$(dirname "$pad")" 2>/dev/null && pwd)/.state"
+fi
+[ -n "${PAD_STATE:-}" ] || { echo "[test-busy.sh] cannot resolve PAD_STATE" >&2; exit 1; }
+
 # Read control
 control="${PAD_STATE:-}/.test-busy.control"
 if [ -f "$control" ]; then
