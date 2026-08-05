@@ -472,3 +472,35 @@ NOT gated). Writing them was not bookkeeping: the P29/P30 gate proved the first
 P30 fix did not actually close the reported scenario, and the P32 gate's own
 mutant check was silently INCONCLUSIVE (perl's END block overrode `exit 0`, so it
 would have scored a broken mutant as a pass) — the exact trap TASK-4 warns about.
+
+P39. A FLAKY GATE IS A LYING GATE — watcher-singleton-gate fails ~1 run in 3.
+     Measured standalone on a quiet machine, same tree, no edits in flight:
+       run1 6/0   run2 6/0   run3 4/2
+     It is NOT caused by this session's changes (it flakes at the current tip and
+     it flaked before the P19 work). It is the P10/P13 family — watcher churn and
+     cross-suite watcher leakage — surfacing inside a single suite.
+     WHY IT MATTERS MORE THAN ITS SIZE: the tripwire is the release gate. A suite
+     that fails one run in three means a green board is luck, and the honest
+     response to a red board becomes "just re-run it" — which is how a real
+     regression gets waved through. Every measurement this session had to be
+     re-run to tell flake from defect, and that is now the single biggest tax on
+     the loop.
+     NOT FIXED. EXPLICITLY DEFERRED — needs the watcher singleton to be made
+     deterministic under contention, not a baseline adjustment.
+
+P40. TASK/MESSAGE SEPARATION vs P19 NARRATION — a REAL requirements conflict
+     (unlike P36, which I wrongly called one).
+     pad-io-and-archive asserted, byte-exact, that ticket ops never modify the
+     conversation:  cksum(pad) before == cksum(pad) after.
+     P19 requires task progress to appear on the pad BY DEFAULT. Both cannot hold.
+     RESOLVED, and the reasoning is on the record so EC can reverse it: the hazard
+     the checksum protects is E-13 DUAL WRITE — the same MUTABLE card state living
+     in two files and diverging. A narration line is append-only HISTORY of an
+     event that already happened; nothing ever reads card state back out of it, so
+     it cannot diverge. The checksum was stronger than the contract it was written
+     to defend. It is now replaced by two narrower assertions: ticket ops may add
+     NOTHING to the conversation except `### @name` narration, and no task card
+     fence may ever leak into the pad. Mutant-proven — making a ticket op write
+     card state to the pad turns it RED exactly as the checksum did.
+     TO REVERSE: restore the cksum equality in pad-io-and-archive.sh and drop the
+     two sp_narrate calls in the task arms of tool/bin/stitchpad.

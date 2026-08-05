@@ -68,12 +68,33 @@ check "new task card is in tasks.md" "$(grep -c "^\`\`\`task $T1\$" "$TASKS")" "
 grep -q '<!-- tasks:file -->' "$PAD" && ok "pad carries a pointer to tasks.md" \
   || bad "pad carries a pointer to tasks.md"
 
-padsum_before="$(cksum < "$PAD")"
+# TASK/MESSAGE SEPARATION — the invariant, restated to match its own purpose.
+# This was a byte-exact `cksum` equality, which also forbade P19 progress
+# narration ("### @tester moved TASK-2 -> done"). The hazard this check exists to
+# stop is E-13 DUAL WRITE: the same mutable card state living in two files and
+# diverging. A narration line is append-only HISTORY of an event that already
+# happened — it cannot diverge from tasks.md, because nothing ever reads card
+# state back out of it. The checksum was therefore stronger than the contract it
+# was written to protect, and it blocked a requirement the operator asked for
+# (P19: the pad must show progress BY DEFAULT).
+# The replacement is narrower where it matters: task ops may add NOTHING to the
+# conversation except narration lines — no task card fence, no conversation
+# block, no card fields. If a ticket op ever writes card state into the pad
+# again, this fails exactly as the checksum did.
+cp "$PAD" "$WORK/pad-before-tickets"
 T2="$(sp task new "second task" 2>/dev/null | awk '{print $1}')"
 sp task move "$T2" done >/dev/null 2>&1
 sp task edit "$T2" --to tester >/dev/null 2>&1
-padsum_after="$(cksum < "$PAD")"
-check "ticket ops no longer touch the conversation at all" "$padsum_before" "$padsum_after"
+_added="$(diff "$WORK/pad-before-tickets" "$PAD" | grep '^>' | sed 's/^> //' | grep -v '^[[:space:]]*$' || true)"
+_illegal="$(printf '%s\n' "$_added" | grep -v '^### @' | grep -v '^[[:space:]]*$' || true)"
+if [ -z "$_illegal" ]; then
+  ok "ticket ops add only P19 narration to the conversation (no card state)"
+else
+  bad "ticket ops wrote non-narration content into the conversation: $(printf '%s' "$_illegal" | head -2 | tr '\n' ' ')"
+fi
+printf '%s\n' "$_added" | grep -q '^```task' \
+  && bad "ticket ops wrote a task CARD into the pad (E-13 dual write)" \
+  || ok "no task card fence leaked into the conversation"
 
 check "task list sees pad template + both new tasks" "$(sp task list | wc -l | tr -d ' ')" "3"
 check "$T2 status" "$(sp task list | awk -F'|' -v t="$T2" '$1==t{print $3}')" "done"

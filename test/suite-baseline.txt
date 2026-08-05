@@ -46,7 +46,7 @@ p26-relay-channel-gate.sh 9 0
 # giving each background writer its own terminal surface recovered 4 (63->67).
 # The remaining 9 are a real product lane, NOT a fixture bug. Deferred EXPLICITLY
 # — see the PR scorecard. The suite still runs and still prints every failure.
-pad-io-and-archive.sh 67 9
+pad-io-and-archive.sh 68 9
 pad-runtime-safety.sh 1 0
 pad-visibility-gate.sh 16 0
 phaseb-hardening-regression.sh 26 0
