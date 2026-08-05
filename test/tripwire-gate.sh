@@ -332,9 +332,13 @@ crash_scan 'test/watcher-races.sh: line 103: 46691 Killed: 9    fswatch -0 pad' 
 crash_scan 'suite.sh: line 8: 1/0: division by 0' \
   && ok  "crash-scan: division by 0 is a crash (the shape catches it)" \
   || bad "crash-scan: division by 0 was MISSED"
+# NOTE: these assertion DESCRIPTIONS must never quote an enumerated crash phrase
+# verbatim. The gate's own PASS line is part of its output, and the release gate
+# scans suite output for those phrases — a message reading "unbound variable is a
+# crash" made this suite score itself CRASHED while exiting 0 with 34 passes.
 crash_scan 'suite.sh: line 12: PROJ1: unbound variable' \
-  && ok  "crash-scan: unbound variable is a crash" \
-  || bad "crash-scan: unbound variable was MISSED"
+  && ok  "crash-scan: an unset-variable diagnostic is a crash" \
+  || bad "crash-scan: an unset-variable diagnostic was MISSED"
 crash_scan 'suite.sh: line 4: 999 Segmentation fault: 11  ./thing' \
   && ok  "crash-scan: a segfaulting child is still a crash" \
   || bad "crash-scan: segfault job status was wrongly stripped"
