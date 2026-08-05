@@ -687,3 +687,52 @@ record, and set `finished_at` when the turn actually finishes. Until then, treat
 every dispatch as unobservable and make the artifact contract carry the whole
 weight. Dispatch prompts must name the artifact path FIRST and state plainly that
 chat output is discarded.
+
+---
+
+## P46 — a dispatched agent does the first concrete instruction and stops (OPEN — build this)
+
+EC: *"why is it that only narrow dispatches work? isn't that a constraint we should
+fix? ... some of these agent deployments are limited in their scopes."*
+
+Correct, and it is fixable on our side. First, the evidence, because the shape is
+narrower than "broad prompts fail":
+
+| dispatch | model | result |
+|---|---|---|
+| 86-line open-ended audit | k3 | wrote its file header, stopped. rc=0 |
+| same, dispatch lens | deepseek-v4-flash | wrote stub, stopped. rc=0 |
+| same, write-path lens | deepseek-v4-flash | wrote stub, stopped. rc=0 |
+| **two explicit shell commands** | deepseek-v4-flash | **both executed, file correct** |
+| four specific claims to verify | k3 | wrote the four-heading scaffold, stopped. rc=0 |
+
+The last row is the decisive one. That prompt was *narrow* — four numbered claims —
+and it still produced only a scaffold. So the rule is NOT "narrow works, broad
+fails". It is: **a wake turn reliably executes a short explicit sequence of
+actions, and does not reliably sustain open-ended investigation.** The two-command
+probe succeeded because the entire task *was* two commands. Every other seat did
+the first concrete thing it was told (create the file) and stopped.
+
+Ruled out by execution: not dispatch (the probe proves multi-step turns work), not
+permissions (every seat wrote its stub), not prompt visibility (round two put the
+artifact path in the first five lines and said chat output is discarded).
+
+**Why this is ours to fix.** How long a single turn persists belongs to Ocean and
+the model. What belongs to us is that a dispatch is currently **one shot with no
+feedback loop**: the turn ends, nobody checks the contract, and nobody tells the
+agent it is not finished. Under P45 the orchestrator cannot even read what the
+agent said, so the silence is total.
+
+**The fix: contract-driven supervision.** After a dispatched turn ends, verify the
+artifact (`sp_artifact_produced`, which already exists and already knows an empty
+file is not work). If it is missing or unchanged since the previous round, re-wake
+the SAME session with the same brief plus a delta — "your artifact is still empty;
+continue from where you stopped, do not start over" — up to N rounds, surfacing
+each round on `stitchpad lanes`. Long work then completes across many turns instead
+of having to fit inside one, and the scope limit EC is feeling disappears without
+depending on any model getting better.
+
+This belongs in `stitchpad spawn` (and any dispatch path), not in a per-pad script:
+it is exactly the generic pasture capability the fleet keeps needing. Sizing note:
+the per-round delta must be small and must forbid restarting, or a re-woken agent
+rewrites its stub every round and the loop makes no progress.

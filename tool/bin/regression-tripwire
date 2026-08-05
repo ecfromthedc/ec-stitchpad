@@ -149,8 +149,19 @@ run_suite() {
   # a bare PID immediately after "line N: ". Crash-shaped statuses
   # (Segmentation fault, Bus error, Abort trap) are deliberately NOT stripped —
   # a child dying that way is worth flagging even when it was started on purpose.
-  _scan="$(printf '%s' "$output" | grep -vE ': line [0-9]+: [0-9]+ (Killed|Terminated|Done|Running|Stopped|Hangup|Interrupt|Quit)')"
-  if echo "$_scan" | grep -qE ': line [0-9]+: |unbound variable|command not found|syntax error near|: cannot execute|Segmentation fault'; then
+  # Enumerating the status WORDS repeats the mistake this whole check exists to
+  # fix — a run under load produced a status line no word in that list matched.
+  # The structural rule is enough and needs no list: a job-status line always has
+  # a bare PID immediately after "line N: ", where a fatal diagnostic never does.
+  # Crash-shaped statuses are re-admitted explicitly, so a child that segfaults is
+  # still reported even though it was started on purpose.
+  # NOTE the `|| true` on both: a grep that matches nothing exits 1, and under
+  # `set -e` that status propagates out of the assignment and kills this
+  # classifier outright — which is how a first attempt at this filter turned 21
+  # of the gate's own assertions red.
+  _scan="$(printf '%s' "$output" | grep -vE ': line [0-9]+: [0-9]+ [A-Za-z]' || true)"
+  _hardstat="$(printf '%s' "$output" | grep -E ': line [0-9]+: [0-9]+ .*(Segmentation fault|Bus error|Abort trap|Illegal instruction|Trace/BPT)' || true)"
+  if [ -n "$_hardstat" ] || echo "$_scan" | grep -qE ': line [0-9]+: |unbound variable|command not found|syntax error near|: cannot execute|Segmentation fault'; then
     echo "$suite|CRASH|0|$rc"
     return 0
   fi

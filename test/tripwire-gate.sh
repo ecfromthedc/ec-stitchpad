@@ -317,7 +317,10 @@ echo ""
 # immediately after "line N: ". Crash-shaped statuses are NOT stripped.
 crash_scan() {
   local out="$1" scan
-  scan="$(printf '%s' "$out" | grep -vE ': line [0-9]+: [0-9]+ (Killed|Terminated|Done|Running|Stopped|Hangup|Interrupt|Quit)')"
+  local hard
+  scan="$(printf '%s' "$out" | grep -vE ': line [0-9]+: [0-9]+ [A-Za-z]' || true)"
+  hard="$(printf '%s' "$out" | grep -E ': line [0-9]+: [0-9]+ .*(Segmentation fault|Bus error|Abort trap|Illegal instruction|Trace/BPT)' || true)"
+  [ -n "$hard" ] && return 0
   echo "$scan" | grep -qE ': line [0-9]+: |unbound variable|command not found|syntax error near|: cannot execute|Segmentation fault'
 }
 
@@ -334,6 +337,9 @@ crash_scan 'suite.sh: line 8: 1/0: division by 0' \
 crash_scan 'suite.sh: line 12: PROJ1: unbound variable' \
   && ok  "crash-scan: an unset-variable diagnostic is a crash" \
   || bad "crash-scan: an unset-variable diagnostic was MISSED"
+crash_scan 'suite.sh: line 77: 1234 Suspended (tty output)   ./thing' \
+  && bad "crash-scan: an UNENUMERATED job status was scored as a CRASH" \
+  || ok  "crash-scan: an unenumerated job status is still not a crash"
 crash_scan 'suite.sh: line 4: 999 Segmentation fault: 11  ./thing' \
   && ok  "crash-scan: a segfaulting child is still a crash" \
   || bad "crash-scan: segfault job status was wrongly stripped"
