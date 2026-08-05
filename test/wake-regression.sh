@@ -459,4 +459,50 @@ EOF
 	[ ! -f "$case13/.stitchpad/.state/pending.agent" ] \
 	  || fail 'ocean successful delivery left replay-causing pending stamp'
 
+	# Regression 14: Per-sender reply ledger — the deafness gate.
+	# The old sp_engagement pinned last_mention to the FIRST mention found
+	# and the caller compared the NEWEST reply against it. Once bob replied
+	# to alice, bob's global last_reply advanced past alice's first mention,
+	# so every later mention — from alice or anyone — was falsely declared
+	# "handled." Four of six live seats were in this state.
+	#
+	# 14a: alice→bob, bob→alice, alice→bob ⇒ bob must have a pending mention.
+	# Bob's reply at ordinal 2 answers alice's mention at ordinal 1, but
+	# alice's second mention at ordinal 3 came AFTER bob's reply and is
+	# unanswered.
+	case14a="$tmp/case14a"
+	mkdir "$case14a"
+	cd "$case14a"
+	"$SP" init --name case14a >/dev/null
+	"$SP" join bob codex >/dev/null
+	stop_watcher "$case14a"
+	STITCHPAD_NAME=alice "$SP" say '@bob first ping' >/dev/null
+	STITCHPAD_NAME=bob "$SP" say '@alice thanks for the first ping' >/dev/null
+	STITCHPAD_NAME=alice "$SP" say '@bob second ping after my reply' >/dev/null
+	out14a="$("$SP" wake bob --peek)"
+	contains "$out14a" 'second ping after my reply' \
+	  || fail 'per-sender ledger (14a): second mention from same sender masked by earlier reply'
+	if contains "$out14a" 'first ping'; then
+	  fail 'per-sender ledger (14a): already-replied mention re-appeared'
+	fi
+
+	# 14b: Cross-sender — replying to X must not clear Y's unanswered mention.
+	# Alice and charlie both mention agent. Agent replies to alice without
+	# consuming either mention first. Charlie's mention must survive.
+	case14b="$tmp/case14b"
+	mkdir "$case14b"
+	cd "$case14b"
+	"$SP" init --name case14b >/dev/null
+	"$SP" join agent codex >/dev/null
+	stop_watcher "$case14b"
+	STITCHPAD_NAME=alice "$SP" say '@agent alice pings agent' >/dev/null
+	STITCHPAD_NAME=charlie "$SP" say '@agent charlie also pings agent' >/dev/null
+	STITCHPAD_NAME=agent "$SP" say '@alice got it alice' >/dev/null
+	out14b="$("$SP" wake agent --peek)"
+	contains "$out14b" 'charlie also pings agent' \
+	  || fail 'per-sender ledger (14b): reply to alice swallowed charlie mention'
+	if contains "$out14b" 'alice pings agent'; then
+	  fail 'per-sender ledger (14b): already-replied alice mention re-appeared'
+	fi
+
 	printf 'wake regression ok\n'
