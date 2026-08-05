@@ -3425,6 +3425,17 @@ sp_artifact_clear() {
   rm -f "$PAD_STATE/artifact-expect.$name"
 }
 
+# sp_wake_mode_for <name> — the roster's wake column for a seat: pull|push|"".
+# Roster rows are `name | adapter | wake | target`.
+sp_wake_mode_for() {
+  local name="${1:-}" row
+  [ -n "$name" ] || return 0
+  row="$(sp_roster 2>/dev/null | awk -F'|' -v n="$name" '
+    { gsub(/^[ \t]+|[ \t]+$/, "", $1); gsub(/^[ \t]+|[ \t]+$/, "", $3)
+      if (tolower($1) == tolower(n)) { print $3; exit } }')"
+  printf '%s' "$row"
+}
+
 # ── P42 Delegation Contract — sub-agent spawning ─────────────────────────
 # EC: "they also need the ability to spawn their own sub-agents if they need to,
 # all within this context ... and it should always be following the orchestrator's

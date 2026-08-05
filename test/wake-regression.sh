@@ -475,11 +475,18 @@ fi
 
 	# Build: one mention consumed (seen=1), second stamped pending=2 then
 	# consumed (turn crashed), third mention posted — watcher must defer.
+	# These two `wake` calls are FIXTURE ONLY — they exist to drive the seen
+	# cursor to a known state before the watcher's defer branch is exercised
+	# below; nothing here asserts wake-on-push semantics. @agent is a PUSH seat
+	# (herdr), and P43 now refuses a push-seat wake issued by anyone OTHER than
+	# that seat, because that shape prints the message to the caller and burns
+	# the cursor without delivering. Name the seat, which is what every real
+	# caller does (see adapters/herdr.sh) — the assertions are unchanged.
 	STITCHPAD_NAME=fable "$SP" say '@agent first mention' >/dev/null
-	"$SP" wake agent >/dev/null                                      # seen=1
+	STITCHPAD_NAME=agent "$SP" wake agent >/dev/null                 # seen=1
 	STITCHPAD_NAME=smaths "$SP" say '@agent second - CRITICAL' >/dev/null
 	printf '2' > "$case10/.stitchpad/.state/pending.agent"           # crash stamp
-	"$SP" wake agent >/dev/null                                      # seen=2
+	STITCHPAD_NAME=agent "$SP" wake agent >/dev/null                 # seen=2
 	STITCHPAD_NAME=other "$SP" say '@agent third mention' >/dev/null
 
 	# Start watcher backgrounded, CAPTURE output, trigger fswatch.

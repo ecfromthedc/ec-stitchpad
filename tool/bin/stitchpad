@@ -3076,6 +3076,28 @@ PY
         exit="$_rc" 2>/dev/null || true
       exit "$_rc"
     }
+    # ── PUSH-SEAT MISDIRECTION GUARD ─────────────────────────────────────
+    # `wake` RENDERS to this process's stdout and then advances seen.<name>.
+    # For a PULL seat that is exactly right: the agent ran the command itself and
+    # read the output. For a PUSH seat targeted BY SOMEBODY ELSE it is total loss
+    # — the text lands in the orchestrator's terminal, the cursor moves so the
+    # message is never retried, and the agent is never told anything. Measured on
+    # the live pad: seen.kimi had advanced to 5 while the daemon showed no turn
+    # since the previous day. That is the single most expensive shape in this
+    # system: it looks exactly like success.
+    # Push delivery belongs to the watcher (mention → fire_adapter → adapter).
+    # Refuse, name the fix, and DO NOT touch the cursor. Self-wake and every
+    # --peek/--peek-ordinal inspection are unaffected.
+    if [ "$relay_mode" -eq 0 ] && [ "$peek" -eq 0 ]; then
+      _caller="$(sp_me 2>/dev/null || true)"; [ -n "$_caller" ] || _caller="${STITCHPAD_NAME:-}"
+      if [ "$_caller" != "$who" ] && [ "$(sp_wake_mode_for "$who")" = "push" ]; then
+        echo "stitchpad: REFUSED — @$who is a PUSH seat; \`wake\` would print its message here and burn its cursor without delivering anything." >&2
+        echo "  to actually reach @$who:  stitchpad say \"@$who <your message>\"   (the watcher dispatches it)" >&2
+        echo "  no watcher running?       stitchpad watch start" >&2
+        echo "  just want to look?        stitchpad wake $who --peek   (non-consuming)" >&2
+        _wake_record push_misdirect 1
+      fi
+    fi
     # Relay-mode wake: download pad from relay, run local wake logic against it
     if [ "$relay_mode" -eq 1 ]; then
       relay="${STITCHPAD_RELAY:-}"; token="${STITCHPAD_TOKEN:-}"; pad="${STITCHPAD_PAD:-}"
