@@ -1703,7 +1703,14 @@ except Exception:
       exit 0   # muted locally; leave seen untouched so the mention queues
     fi
     # Unanswered → compact one-liner wake message (no "untrusted" alarm noise).
-    _latest="$(sp_latest_to "$who" "$_since")"
+    # Render EXACTLY the mention the oracle chose. sp_latest_to has its own
+    # independent scan ("first block after since that mentions me"), so passing
+    # the raw cursor let the two disagree: sp_engagement would correctly open the
+    # gate on a later unanswered mention while sp_latest_to rendered an EARLIER,
+    # already-answered one — waking an agent about a message it had already
+    # replied to. Anchoring to oldest_mention_to_me - 1 makes the renderer follow
+    # the oracle by construction rather than by coincidence.
+    _latest="$(sp_latest_to "$who" "$(( oldest_mention_to_me - 1 ))")"
     _sender="$(printf '%s\n' "$_latest" | sed -n 's/^## @\([^ ]*\).*/\1/p' | head -1)"
     [ -n "$_sender" ] || _sender="$who"
     _snip="$(printf '%s\n' "$_latest" | grep -v '^## ' | grep -v '^[[:space:]]*$' | head -1 | sed 's/^[[:space:]]*//' | cut -c1-120)"
@@ -1751,12 +1758,27 @@ except: print("")' 2>/dev/null)"
     # Claims only apply INSIDE a pad. No .stitchpad here → not a shared worktree,
     # fail-open (else we'd block every write in every non-pad project). Walk up like the CLI does.
     _d="$PWD"; _pad=""
-    while [ "$_d" != "/" ]; do [ -d "$_d/.stitchpad/stitchpad-git" ] && { _pad="$_d/.stitchpad"; break; }; _d="$(dirname "$_d")"; done
+    # The stitchpad INSTALL dir carries its own stitchpad-git, and ~/.stitchpad
+    # resolves into it. Without this guard the walk-up matches at $HOME for every
+    # path beneath it, so no project under $HOME ever reaches the fail-open below.
+    _install="$(cd "$HOME/.stitchpad" 2>/dev/null && pwd -P || true)"
+    while [ "$_d" != "/" ]; do
+      if [ -d "$_d/.stitchpad/stitchpad-git" ]; then
+        _real="$(cd "$_d/.stitchpad" 2>/dev/null && pwd -P || true)"
+        if [ -z "$_install" ] || [ "$_real" != "$_install" ]; then _pad="$_d/.stitchpad"; break; fi
+      fi
+      _d="$(dirname "$_d")"
+    done
     [ -z "$_pad" ] && exit 0   # not in a pad → allow
     # Try to lease it. `claim` exits 0 if I get/hold it, non-zero if someone else holds a fresh one.
-    if "$0" claim "$fp" >/dev/null 2>&1; then
-      exit 0   # claim held by me → allow the write
-    fi
+    "$0" claim "$fp" >/dev/null 2>&1; _rc=$?
+    [ "$_rc" -eq 0 ] && exit 0   # claim held by me → allow the write
+    # ONLY exit 1 means "another agent holds a fresh lease" — the single answer
+    # that may block a write. Every other non-zero is stitchpad failing to DECIDE
+    # (exit 2 = no identity; sp_init_paths failure). Treating those as a conflict
+    # denied every Write/Edit by every identity-less session under $HOME and blamed
+    # a holder that does not exist. Undecidable must never read as denied.
+    [ "$_rc" -ne 1 ] && exit 0
     holder="$("$0" claims 2>/dev/null | grep -F "$fp" | head -1)"
     reason="stitchpad: @$(sp_me 2>/dev/null) blocked — another agent holds a fresh write-lease on this file (${holder:-$fp}). Coordinate on the pad or wait for their release (stale leases free after 600s)."
     # PreToolUse deny contract (current Claude): hookSpecificOutput.permissionDecision=deny.
