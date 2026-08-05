@@ -91,3 +91,4 @@ operator-conduct-gate.sh 8 0
 terminal-isolation-gate.sh 7 0
 help-discoverability-gate.sh 86 0
 p25-sidebar-organisation-gate.sh 7 0
+p42-subagent-spawn-gate.sh 12 0

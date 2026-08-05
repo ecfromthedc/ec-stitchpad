@@ -130,7 +130,16 @@ run_suite() {
   # This is exactly how oversight-gate.sh reported rc=0 while dying at assertion
   # 6 of 14 with "PROJ1<0xe2>: unbound variable", and how it got a false 14/0
   # baseline. A fatal shell diagnostic in the output IS a crash, whatever rc says.
-  if echo "$output" | grep -qE 'unbound variable|command not found|syntax error near|: cannot execute|Segmentation fault'; then
+  # kimi-adv (adversarial review) broke this by enumeration: a suite that dies on
+  # `x=$((1/0))` prints "line 8: 1/0: division by 0", keeps running with a wrong
+  # value, and exits 0 through its EXIT trap — GREEN despite crashing. Enumerating
+  # messages can only ever catch the ones somebody thought of.
+  # Match the SHAPE of a bash fatal diagnostic instead: "<script>: line <N>: ...".
+  # That catches division by 0, unbound variable, command not found, syntax
+  # errors, bad substitution and everything else bash reports the same way. The
+  # enumerated list is kept as belt-and-braces for diagnostics that lack the
+  # line prefix (Segmentation fault, Killed).
+  if echo "$output" | grep -qE ': line [0-9]+: |unbound variable|command not found|syntax error near|: cannot execute|Segmentation fault'; then
     echo "$suite|CRASH|0|$rc"
     return 0
   fi
@@ -412,6 +421,13 @@ fi
 _voiderr=""
 [ "$VOIDS" -gt 0 ] && _voiderr=" ($VOIDS VOID — re-run in a quiet window)"
 
-echo "TRIPWIRE: PASSED — all $PARSED enforced suites green${_voiderr}"
-[ "$VOIDS" -gt 0 ] && exit 2
+# kimi-adv: this printed "TRIPWIRE: PASSED" and then exited 2 whenever any suite
+# VOIDed — the same self-contradiction as the EXIT-trap bug (P41): a board that
+# reads PASSED while the process reports failure. A VOID means the run could not
+# be measured, which is not a pass. Say so, and keep the distinct exit code.
+if [ "$VOIDS" -gt 0 ]; then
+  echo "TRIPWIRE: INCONCLUSIVE — $PARSED suites green, but $VOIDS VOID (mkdtemp failed); re-run in a quiet window"
+  exit 2
+fi
+echo "TRIPWIRE: PASSED — all $PARSED enforced suites green"
 exit 0

@@ -3425,6 +3425,120 @@ sp_artifact_clear() {
   rm -f "$PAD_STATE/artifact-expect.$name"
 }
 
+# ── P42 Delegation Contract — sub-agent spawning ─────────────────────────
+# EC: "they also need the ability to spawn their own sub-agents if they need to,
+# all within this context ... and it should always be following the orchestrator's
+# request."
+#
+# Two halves, and the second is the one that matters. Spawning is easy; the hard
+# part is that a sub-agent three levels down still answers to the orchestrator and
+# is still SCORED. So delegation here is a contract, not a fork():
+#   · every spawn declares an artifact (P3) — an unscoreable seat cannot be created
+#   · every spawn inherits the orchestrator's standing directive VERBATIM, down
+#     the whole chain, so depth cannot dilute the original request
+#   · lineage is durable, so `lanes` can attribute a silent seat to whoever spawned it
+#   · depth and fan-out are bounded, because an agent that can spawn agents can
+#     spawn a fork bomb, and this fleet runs on the operator's laptop
+#
+# State lives in $PAD_STATE/spawn.<child>.{parent,brief,at}; the directive is one
+# pad-wide file. All plain text — readable with `cat` when something goes wrong,
+# which is the standard the rest of this tool holds itself to.
+
+STITCHPAD_SPAWN_MAX_DEPTH="${STITCHPAD_SPAWN_MAX_DEPTH:-3}"
+STITCHPAD_SPAWN_MAX_CHILDREN="${STITCHPAD_SPAWN_MAX_CHILDREN:-5}"
+
+# sp_directive_set <text>   — record the orchestrator's standing directive.
+# sp_directive              — print it (empty if never set).
+# This is what "always follow the orchestrator's request" is MADE of: the text is
+# copied into every spawn brief at every depth, so a sub-sub-agent reads the
+# operator's actual words, not its parent's paraphrase of them.
+sp_directive_set() {
+  local text="${1:?usage: sp_directive_set <text>}"
+  printf '%s\n' "$text" > "$PAD_STATE/orchestrator-directive.tmp.$$" || return 1
+  mv "$PAD_STATE/orchestrator-directive.tmp.$$" "$PAD_STATE/orchestrator-directive"
+}
+sp_directive() {
+  [ -f "$PAD_STATE/orchestrator-directive" ] && cat "$PAD_STATE/orchestrator-directive" || true
+}
+
+# sp_spawn_record <child> <parent> <brief>
+sp_spawn_record() {
+  local child="${1:?}" parent="${2:?}" brief="${3:-}"
+  printf '%s\n' "$parent" > "$PAD_STATE/spawn.$child.parent" || return 1
+  printf '%s\n' "$brief"  > "$PAD_STATE/spawn.$child.brief"  || return 1
+  date -u +%Y-%m-%dT%H:%M:%SZ > "$PAD_STATE/spawn.$child.at"  || return 1
+  return 0
+}
+
+# sp_spawn_parent <child> — print the spawning agent, empty if root/unspawned.
+sp_spawn_parent() {
+  local child="${1:-}"
+  [ -n "$child" ] || return 0
+  [ -n "${PAD_STATE:-}" ] || return 0
+  [ -f "$PAD_STATE/spawn.$child.parent" ] && head -1 "$PAD_STATE/spawn.$child.parent" || true
+}
+
+# sp_spawn_depth <name> — 0 for a seat nobody spawned, 1 for its children, etc.
+# Cycle-safe by construction: the walk is capped at 64 hops, so a corrupted or
+# hand-edited state directory degrades to a refusal instead of hanging the caller.
+sp_spawn_depth() {
+  local name="${1:-}" depth=0 hops=0 parent
+  while [ "$hops" -lt 64 ]; do
+    parent="$(sp_spawn_parent "$name")"
+    [ -n "$parent" ] || break
+    depth=$((depth + 1)); hops=$((hops + 1)); name="$parent"
+  done
+  printf '%s' "$depth"
+}
+
+# sp_spawn_is_ancestor <maybe_ancestor> <name> — rc 0 when the first argument
+# appears anywhere up the second's parent chain. Guards against `a` spawning `b`
+# spawning `a`, which would make depth accounting meaningless.
+sp_spawn_is_ancestor() {
+  local anc="${1:-}" name="${2:-}" hops=0 parent
+  [ -n "$anc" ] || return 1
+  while [ "$hops" -lt 64 ]; do
+    parent="$(sp_spawn_parent "$name")"
+    [ -n "$parent" ] || return 1
+    [ "$parent" = "$anc" ] && return 0
+    name="$parent"; hops=$((hops + 1))
+  done
+  return 1
+}
+
+# sp_spawn_children <name> — direct children, one per line.
+sp_spawn_children() {
+  local name="${1:-}" f child
+  [ -n "$name" ] || return 0
+  [ -n "${PAD_STATE:-}" ] || return 0
+  for f in "$PAD_STATE"/spawn.*.parent; do
+    [ -f "$f" ] || continue
+    [ "$(head -1 "$f")" = "$name" ] || continue
+    child="${f##*/spawn.}"; child="${child%.parent}"
+    printf '%s\n' "$child"
+  done
+}
+
+# sp_spawn_tree [root] — indented lineage with each seat's artifact contract.
+# Printed by `stitchpad spawn --tree`; this is how an operator sees WHO asked for
+# a seat that is now silent, which was previously unrecoverable.
+sp_spawn_tree() {
+  local root="${1:-}" indent="${2:-}" child kids seat
+  if [ -z "$root" ]; then
+    for seat in $(sp_roster 2>/dev/null | cut -d'|' -f1 | tr -d ' '); do
+      [ -n "$seat" ] || continue
+      [ -n "$(sp_spawn_parent "$seat")" ] && continue   # not a root
+      sp_spawn_tree "$seat" ""
+    done
+    return 0
+  fi
+  local art; art="$(sp_artifact_expected "$root" | tr '\n' ' ')"
+  if [ -n "$art" ]; then printf '%s@%s → %s\n' "$indent" "$root" "$art"
+  else printf '%s@%s\n' "$indent" "$root"; fi
+  kids="$(sp_spawn_children "$root")"
+  for child in $kids; do sp_spawn_tree "$child" "$indent  "; done
+}
+
 # sp_lanes_display — produce a pipe-delimited lanes table.
 # Columns: name|session_status|last_age_s|artifact_expected|artifact_present|verdict
 # Verdicts: WORKING (artifact present), FAILED (artifact missing after terminal),

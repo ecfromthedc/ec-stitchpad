@@ -46,6 +46,10 @@
 #   stitchpad lanes [--json]             per-seat status, artifact expected vs present, verdict
 #   stitchpad pads [--scratch]            list pads; --scratch shows ephemeral ones
 #   stitchpad evidence list|verify        list sealed artifacts / verify their sha256 sidecars
+#   stitchpad spawn <name> --brief <t> --artifact <p>   delegate to a sub-agent under contract
+#   stitchpad spawn --tree                show the delegation lineage and each seat's contract
+#   stitchpad directive [text]            set/print the orchestrator standing order that
+#                                         every spawned sub-agent inherits verbatim
 #
 # The roster lives INSIDE stitchpad.md as a ```roster fenced block. To add an agent
 # from any runtime (pi/codex/cline/claude), drop an adapter in ~/.stitchpad/adapters
@@ -567,6 +571,136 @@ EOF
     echo "✓ roster healed from commit ${_heal_candidate:0:7} ($_heal_members member(s))"
     ;;
 
+  directive)
+    # `stitchpad directive "<text>"` — set the orchestrator's standing request.
+    # `stitchpad directive` — print it. Every spawn at every depth inherits this
+    # text VERBATIM, which is what keeps a depth-3 sub-agent answering to the
+    # operator rather than to its parent's summary of the operator.
+    sp_init_paths || exit 1
+    if [ $# -ge 1 ]; then
+      sp_directive_set "$*" || exit 1
+      echo "✓ orchestrator directive set — every spawned sub-agent will inherit it verbatim"
+    else
+      _d="$(sp_directive)"
+      if [ -n "$_d" ]; then printf '%s\n' "$_d"
+      else echo "stitchpad: no orchestrator directive set (stitchpad directive \"<text>\")" >&2; exit 1; fi
+    fi
+    ;;
+
+  spawn)
+    # stitchpad spawn <child> --brief <text> --artifact <path> [--artifact <path>]...
+    #                         [--model <m>] [--role <r>] [--adapter <a>]
+    # stitchpad spawn --tree
+    #
+    # Delegation with a contract. An agent that needs help creates a sub-agent
+    # itself instead of stalling until a human notices — but it cannot create one
+    # that is unscoreable or unattributable. Every refusal below names the fix,
+    # because a refusal an agent cannot act on is just a different kind of stall.
+    #
+    # DISPATCH REUSES `say`. That is deliberate and load-bearing: the mention →
+    # watcher → fire_adapter path is the one PROVEN to deliver. `stitchpad wake`
+    # on a push seat renders, advances seen.<name>, and delivers NOTHING — this
+    # command must never grow a second, private dispatch path with its own bugs.
+    # NOTE: the dispatcher above already did `cmd="$1"; shift`, so $1 is the
+    # child name here. Do not shift again — that silently ate the name and made
+    # every flag parse as a stray positional (caught by this command's own gate).
+    sp_init_paths || exit 1
+    if [ "${1:-}" = "--tree" ]; then sp_spawn_tree; exit 0; fi
+    _child="${1:-}"; shift || true
+    [ -n "$_child" ] || { echo "stitchpad: usage: stitchpad spawn <name> --brief <text> --artifact <path> [--model <m>]" >&2; exit 1; }
+    case "$_child" in *[!abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789_-]*)
+      echo "stitchpad: bad name '$_child' (allowed: a-z 0-9 _ -)" >&2; exit 1;; esac
+
+    _brief=""; _model=""; _role=""; _adapter="ocean"; _arts=""
+    while [ $# -gt 0 ]; do
+      case "$1" in
+        --brief)    _brief="${2:-}"; shift 2 ;;
+        --artifact) [ -n "${2:-}" ] || { echo "stitchpad: --artifact needs a path" >&2; exit 1; }
+                    _arts="$_arts$2
+"; shift 2 ;;
+        --model)    _model="${2:-}"; shift 2 ;;
+        --role)     _role="${2:-}";  shift 2 ;;
+        --adapter)  _adapter="${2:-ocean}"; shift 2 ;;
+        *) echo "stitchpad: unknown option '$1' for spawn" >&2; exit 1 ;;
+      esac
+    done
+
+    # The spawning agent must have an identity. An anonymous spawn produces a seat
+    # whose silence can never be attributed to anyone.
+    _parent="$(sp_me 2>/dev/null || true)"
+    [ -n "$_parent" ] || _parent="${STITCHPAD_NAME:-}"
+    [ -n "$_parent" ] || { echo "stitchpad: spawn refused — you have no identity on this pad, so nothing could be held accountable for @$_child. Join first (stitchpad join <you>), or export STITCHPAD_NAME." >&2; exit 1; }
+
+    [ -n "$_brief" ] || { echo "stitchpad: spawn refused — --brief is required. A sub-agent woken without a task reads the pad, finds nothing addressed to it, and idles." >&2; exit 1; }
+
+    # THE ARTIFACT CONTRACT IS MANDATORY. This is the whole point: the most
+    # expensive defect of this build was a seat that produced nothing being
+    # indistinguishable from a seat that was working. A spawn with no declared
+    # artifact recreates that defect one level down.
+    [ -n "$_arts" ] || { echo "stitchpad: spawn refused — --artifact is required. Name the file @$_child must produce; without it a silent seat and a working seat look identical on the board." >&2; exit 1; }
+
+    if sp_user_exists "$_child"; then
+      echo "stitchpad: spawn refused — @$_child is already in the roster. Pick another name, or address the existing seat with: stitchpad say \"@$_child ...\"" >&2; exit 1
+    fi
+
+    # Bounded delegation. An agent that can spawn agents can spawn a fork bomb,
+    # and this fleet runs on the operator's laptop.
+    if sp_spawn_is_ancestor "$_child" "$_parent"; then
+      echo "stitchpad: spawn refused — @$_child is an ancestor of @$_parent; that would make a delegation cycle." >&2; exit 1
+    fi
+    _depth="$(sp_spawn_depth "$_parent")"
+    if [ "$((_depth + 1))" -gt "$STITCHPAD_SPAWN_MAX_DEPTH" ]; then
+      echo "stitchpad: spawn refused — @$_parent is at depth $_depth; spawning would exceed STITCHPAD_SPAWN_MAX_DEPTH=$STITCHPAD_SPAWN_MAX_DEPTH. Do the work here, or ask your parent @$(sp_spawn_parent "$_parent") to widen the tree instead of deepening it." >&2; exit 1
+    fi
+    _kids="$(sp_spawn_children "$_parent" | grep -c . || true)"
+    if [ "$_kids" -ge "$STITCHPAD_SPAWN_MAX_CHILDREN" ]; then
+      echo "stitchpad: spawn refused — @$_parent already has $_kids sub-agents (limit $STITCHPAD_SPAWN_MAX_CHILDREN). Wait for one to deliver its artifact, then spawn again." >&2; exit 1
+    fi
+
+    # Roster row via the real join arm — never a private roster writer.
+    if [ -n "$_model" ]; then _adapter="$_adapter"; fi
+    _joinargs="$_child $_adapter push -"
+    if ! STITCHPAD_NAME="$_child" "$BIN_DIR/stitchpad" join $_joinargs ${_role:+--role "$_role"} >/dev/null 2>&1; then
+      echo "stitchpad: spawn failed — could not add @$_child to the roster" >&2; exit 1
+    fi
+    [ -n "$_model" ] && printf '%s' "$_model" > "$PAD_STATE/model.$_child" 2>/dev/null || true
+
+    # Contract + lineage BEFORE the wake, so the board is honest from the instant
+    # the sub-agent exists. Declaring after dispatch leaves a window where the
+    # seat is running with no expectation recorded against it.
+    _oldifs="$IFS"; IFS='
+'
+    set -f; sp_artifact_declare "$_child" $_arts || { IFS="$_oldifs"; set +f; echo "stitchpad: spawn failed — artifact contract not recorded" >&2; exit 1; }
+    set +f; IFS="$_oldifs"
+    sp_spawn_record "$_child" "$_parent" "$_brief" || { echo "stitchpad: spawn failed — lineage not recorded" >&2; exit 1; }
+
+    # The brief. The orchestrator's directive goes FIRST and verbatim, because a
+    # sub-agent must be able to tell what the operator asked for apart from what
+    # its parent inferred.
+    _msg="@$_child you were spawned by @$_parent (depth $((_depth + 1)))."
+    _dir="$(sp_directive)"
+    [ -n "$_dir" ] && _msg="$_msg
+
+STANDING ORDER FROM THE ORCHESTRATOR — this outranks your parent's brief; if the two conflict, follow this and say so on the pad:
+$_dir"
+    _msg="$_msg
+
+YOUR TASK (from @$_parent):
+$_brief
+
+ARTIFACT CONTRACT — you are scored on these paths existing when your turn ends:
+$(printf '%s' "$_arts" | sed 's/^/  · /')
+If you cannot produce one, say so on the pad and say WHY. A silent turn is scored FAILED.
+You may spawn your own sub-agents (stitchpad spawn <name> --brief ... --artifact ...) up to depth $STITCHPAD_SPAWN_MAX_DEPTH. Report back with: stitchpad say \"@$_parent ...\""
+
+    if ! STITCHPAD_NAME="$_parent" "$BIN_DIR/stitchpad" say "$_msg" >/dev/null; then
+      echo "stitchpad: spawn — @$_child is in the roster under contract, but the brief did not post. Re-send it with: stitchpad say \"@$_child ...\"" >&2; exit 1
+    fi
+    echo "✓ spawned @$_child (parent @$_parent, depth $((_depth + 1)), adapter $_adapter${_model:+, model $_model})"
+    printf '  contract: %s' "$(printf '%s' "$_arts" | tr '\n' ' ')"; echo
+    echo "  brief posted to the pad — the watcher delivers it; check with: stitchpad lanes"
+    ;;
+
   join)
     sp_init_paths || exit 1
     # Parse optional flags: --role <role> [--level junior|senior|lead|principal]
@@ -621,8 +755,17 @@ EOF
     # ONE TERMINAL = ONE PAD: claim the target terminal before touching the
     # roster; a terminal live in another pad refuses the join outright.
     _owner_pid="${STITCHPAD_HEARTBEAT_PARENT_PID:-$PPID}"
+    # ONE TERMINAL = ONE PAD applies to seats that OCCUPY a terminal. A push seat
+    # does not: it is driven by the daemon, and its "target" is an Ocean session,
+    # not a surface. Falling back to claiming the CALLER's surface for a targetless
+    # push seat was wrong in general — it meant an operator sitting in their own
+    # joined terminal could not enrol a push seat at all ("terminal X is live as
+    # @you"), and it is what blocked sub-agent spawning outright. Pull seats are
+    # unchanged: they still claim, and still refuse a terminal held by another pad.
     if [ "$target" != "-" ]; then sp_term_lock_claim "$target" "$who" "$_owner_pid" || exit 1
-    else _jsurf="$(sp_this_surface)"; [ -n "$_jsurf" ] && { sp_term_lock_claim "$_jsurf" "$who" "$_owner_pid" || exit 1; }; fi
+    elif [ "$wake" != "push" ]; then
+      _jsurf="$(sp_this_surface)"; [ -n "$_jsurf" ] && { sp_term_lock_claim "$_jsurf" "$who" "$_owner_pid" || exit 1; }
+    fi
     if sp_user_exists "$who"; then
       # Idempotent rejoin — but only for a terminal that just proved its claim
       # above. Idempotent means the same OBSERVABLE result, not just the same exit
