@@ -473,32 +473,27 @@ P30 fix did not actually close the reported scenario, and the P32 gate's own
 mutant check was silently INCONCLUSIVE (perl's END block overrode `exit 0`, so it
 would have scored a broken mutant as a pass) — the exact trap TASK-4 warns about.
 
-P39. THE WATCHER SOMETIMES NEVER STARTS — watcher-singleton-gate flakes ~1 in 5.
-     First read as a flaky test. It is not. DIAGNOSED, NOT FIXED.
-     Observed standalone on a quiet machine, same tree:
-       W1: exactly 1 fswatch after 8 concurrent calls (got 0)
-       W2: re-entry changed watcher count (0 -> 1)
-     The singleton invariant (never MORE than one) held in every single run — the
-     failure is always ZERO watchers, then one appearing on the NEXT call.
-     I first assumed a sampling race and rewrote W1/W2 to wait for a SETTLED
-     count instead of one sample. That was a real improvement and it did NOT fix
-     the flake — which is the evidence that the defect is in the product.
-     ROOT CAUSE (ensure_watcher, lib.sh ~3258): the spawn is an atomic
-     `mkdir "$watch_lock"`. Losers of that race sleep 0.3s, re-check
-     sp_watcher_alive, and if nothing is alive they RETURN 0 — the comment says
-     "unknown/ownerless contention fails closed". So if the winner has not
-     exec'd fswatch yet (or died between mkdir and exec), all other callers give
-     up and the pad is left LOCKED WITH NO WATCHER. The next cycle's
-     sp_stop_watchers_for_pad reconciles it, which is exactly the 0 -> 1 that W2
-     records one step later.
-     WHY IT MATTERS: for one full cycle the pad has a lock and no watcher, so
-     nobody is woken. That is P13 (watcher churn) with a name. And a release gate
-     that fails 1 run in 5 makes a green board luck and trains everyone to re-run
-     a red one.
-     NOT FIXED — deliberately. This is a concurrency path with an atomic-acquire
-     invariant; the fix is to break a lock whose owner is provably dead and spawn,
-     and it needs its own measured pass rather than a tired patch at the end of a
-     long session. EXPLICITLY DEFERRED with the diagnosis above.
+P39 (CLOSED). THE WATCHER WAS BEING KILLED BY ITS OWN CONCURRENT CALLERS.
+     watcher-singleton-gate flaked ~1 run in 5. Two wrong theories first — a
+     sampling race (fixed the sampling; still flaked) and a leaked lock directory
+     (fixed the leak; still flaked). Both were real improvements and both were
+     kept, but neither was the cause. The answer came from dumping state AT the
+     moment of failure instead of reasoning about it:
+       lock dir exists: no · owner: none · fswatch for this pad: 0
+       watch.sh procs: 14 · watch.log: EMPTY
+     No lock and no log means the watcher was not blocked from starting — it was
+     STARTED AND SHOT. ensure_watcher ran sp_stop_watchers_for_pad BEFORE the
+     atomic `mkdir` acquire, so with N concurrent callers a late arrival executed
+     the stop path and killed the watcher an earlier caller had just spawned. The
+     next uncontended call started one that lived, which is exactly the 0 -> 1
+     that W2 recorded one step later.
+     FIX: reconciliation is a WRITE to shared state, so it belongs BEHIND the
+     token that guards spawning, not in front of it. sp_stop_watchers_for_pad now
+     runs only after the caller wins the mkdir. The loser path additionally
+     breaks a lock whose owner is provably dead (and never spawns from there).
+     PROVEN: 10/10 green with the fix; the mutant (stop-before-acquire restored)
+     failed 3 of 7 runs. A race is proven over a RUN of samples, not one.
+     This was the last thing making a green board luck.
 
 P40. TASK/MESSAGE SEPARATION vs P19 NARRATION — a REAL requirements conflict
      (unlike P36, which I wrongly called one).

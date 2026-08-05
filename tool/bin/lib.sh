@@ -3253,16 +3253,33 @@ ensure_watcher() {
       sp_watcher_alive && return 0
     fi
   fi
-  sp_stop_watchers_for_pad
-  # ATOMIC acquire: exactly one caller wins.
+  # ATOMIC acquire FIRST — only the winner may reconcile.
+  # sp_stop_watchers_for_pad used to run HERE, before the acquire, and that is
+  # P39: with N concurrent callers, a late arrival ran the stop path and KILLED
+  # the watcher an earlier caller had just spawned. The diagnostic at the moment
+  # of failure was unambiguous — no lock dir, no owner, zero fswatch for this pad,
+  # empty watch.log — a watcher that was started and then shot. The very next
+  # (uncontended) ensure_watcher started one that survived, which is the 0 -> 1
+  # the gate recorded one step later.
+  # Reconciliation is a WRITE to shared state; it belongs behind the same token
+  # that guards spawning, not in front of it.
   if ! mkdir "$watch_lock" 2>/dev/null; then
     # Lost the race. Brief sleep lets winner write its PID, then re-check.
     sleep 0.3
     sp_watcher_alive && return 0
-    # Unknown/ownerless contention fails closed; a later ensure can retry after
-    # the exact stop path reconciles it.
+    # Ownerless/stale lock: the acquirer died before publishing. Break it so a
+    # later call can acquire — but never spawn from the loser path, and never
+    # touch a lock whose owner is alive.
+    if [ -d "$watch_lock" ] && ! sp_watcher_alive; then
+      _wl_pid="$(cat "$watch_lock/pid" 2>/dev/null || true)"
+      if [ -z "$_wl_pid" ] || ! kill -0 "$_wl_pid" 2>/dev/null; then
+        rm -rf "$watch_lock" 2>/dev/null || true
+      fi
+    fi
     return 0
   fi
+  # We hold the token. Now it is safe to clear dead/duplicate watchers.
+  sp_stop_watchers_for_pad
   if [ -n "${STITCHPAD_WATCH_TEST_AFTER_MKDIR_BARRIER:-}" ]; then
     local watch_mkdir_barrier="$STITCHPAD_WATCH_TEST_AFTER_MKDIR_BARRIER"
     printf '%s' ready > "$watch_mkdir_barrier.ready"
@@ -3276,12 +3293,24 @@ ensure_watcher() {
   if [ -n "${STITCHPAD_WATCH_TEST_AFTER_GENERATION_BARRIER:-}" ]; then
     local watch_generation_barrier="$STITCHPAD_WATCH_TEST_AFTER_GENERATION_BARRIER"
     sp_watch_test_barrier_wait "$watch_generation_barrier" "watch generation" || {
+      # Same rule as the launcher-write failure below: release the acquired lock.
       sp_watch_lock_remove_generation "$watch_lock" "$watch_generation" 2>/dev/null || true
+      rm -rf "$watch_lock" 2>/dev/null || true
       return 1
     }
   fi
   sp_watch_launcher_write "$watch_lock" "$watch_generation" || {
+    # RELEASE WHAT WE ACQUIRED. This path removed the generation but LEFT the
+    # lock directory standing. The lock is the atomic-acquire token: once it
+    # exists with no live owner, every later ensure_watcher loses the mkdir race,
+    # finds nothing alive, and returns 0 ("ownerless contention fails closed") —
+    # so the pad sits LOCKED WITH NO WATCHER and nobody is woken until some other
+    # call path happens to reconcile it. That is P39: watcher-singleton-gate saw
+    # 0 watchers ~1 run in 5, then 0 -> 1 one step later when the next
+    # ensure_watcher's sp_stop_watchers_for_pad cleared the orphan.
+    # An acquirer that cannot spawn MUST give the token back.
     sp_watch_lock_remove_generation "$watch_lock" "$watch_generation" 2>/dev/null || true
+    rm -rf "$watch_lock" 2>/dev/null || true
     return 0
   }
   date -u +%Y-%m-%dT%H:%M:%SZ > "$watch_lock/ts"
