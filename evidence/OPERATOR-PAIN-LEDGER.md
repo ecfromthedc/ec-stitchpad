@@ -634,3 +634,56 @@ P25 (CLOSED). THE SIDEBAR CAN BE ORGANISED — pin, drag, reorder, persisted per
      GATED: p25-sidebar-organisation-gate.sh 7/0, including a WIRING assertion (the
      sidebar must actually call sidebarOrder — perfect unused logic is not a fix)
      and a mutant that ignores pins, which collapses the order and turns G1 RED.
+
+---
+
+## P45 — a dispatched agent's turn is not observable (UNFIXED HERE — daemon-side)
+
+**Status: DOCUMENTED, not fixed. The fix is in Ocean, not in this repo.**
+
+Three review seats were dispatched at once against this tree (`k3`,
+`deepseek-v4-flash` x2), each with an explicit artifact path. All three returned
+**rc=0**. All three produced only the stub header they were told to write first.
+Zero findings between them.
+
+That is not the defect. The defect is that **nothing observable distinguished
+that outcome from success.** Proved by execution against the daemon:
+
+```
+$ curl -s .../v1/agent/sessions/201b2e76-...
+turns: 1
+turn keys: ['finished_at', 'id', 'prompt', 'session_id', 'started_at', 'status']
+  status= completed  started= 2026-08-05T15:02:38.721Z  finished= 2026-08-05T15:02:38.721Z
+```
+
+1. **There is no output field.** id, session_id, prompt, status, started_at,
+   finished_at — that is the entire turn record. An orchestrator cannot read one
+   word the agent said. `/messages` returns 405, `/transcript` and `/output` 404.
+   If the agent does not write to a path the orchestrator chose in advance, the
+   work is **unrecoverable**.
+2. **`status` is not a liveness signal.** `finished_at` equals `started_at` to the
+   millisecond while the agent went on to touch the filesystem five minutes later.
+   `completed` here means "the post was accepted", not "the work is done".
+3. **rc=0 from `ocean-heartbeat wake` therefore means "the turn was delivered",
+   never "the work happened."** Any orchestration keyed on exit status silently
+   loses work. This is the mechanical root of what EC keeps reporting as
+   "the agents aren't deploying" — they DO deploy; nothing reports what they did.
+
+Ruled out as causes, by execution:
+- Not a dispatch failure. A two-step probe on the same model and path executed
+  BOTH steps and produced the file. Multi-step turns work.
+- Not a permissions problem. Every seat successfully wrote its stub.
+- Not a prompt-visibility problem. Round two put the artifact path in the first
+  five lines with "text you print in chat is DISCARDED"; same outcome.
+
+**What this repo can do, and now does:** the artifact contract is the only
+observable an orchestrator actually controls, so it is now mandatory rather than
+advisory (P42), an empty artifact no longer counts as produced, and one oracle
+answers the question everywhere. A seat that produces nothing is now visibly
+FAILED on `stitchpad lanes` instead of indistinguishable from one that is working.
+
+**What Ocean must do:** expose turn output (or a transcript handle) on the turn
+record, and set `finished_at` when the turn actually finishes. Until then, treat
+every dispatch as unobservable and make the artifact contract carry the whole
+weight. Dispatch prompts must name the artifact path FIRST and state plainly that
+chat output is discarded.
