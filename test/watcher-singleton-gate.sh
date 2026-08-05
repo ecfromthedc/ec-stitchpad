@@ -74,17 +74,29 @@ for pid in $CHILD_PIDS; do wait "$pid" 2>/dev/null || true; done
 CHILD_PIDS=""
 echo "All $N callers done"
 
-# Poll for watcher: wait up to 10s for exactly 1 fswatch to appear
-_poll_i=0
-while [ "$_poll_i" -lt 40 ]; do
-  _fswatch_count=$(pgrep -f "fswatch.*$WORK" 2>/dev/null | wc -l | tr -d ' ')
-  [ "$_fswatch_count" -ge 1 ] && break
+# Wait for the count to SETTLE at exactly 1, not merely to reach >=1 once.
+# The old loop broke on the first sample >=1, slept 1s, then re-counted — so a
+# watcher that had not finished exec'ing fswatch, or that bounced once under
+# load, sampled as 0 and W1 failed ~1 run in 6 while the singleton invariant
+# (never MORE than one) held every time. That flake made a green board luck.
+# This still fails loudly if the watcher never starts (settles at 0) or if two
+# ever coexist (settles at 2) — the assertion is unchanged, the SAMPLING is fixed.
+_count_fswatch() { pgrep -f "fswatch.*$WORK" 2>/dev/null | wc -l | tr -d ' '; }
+_stable=0; _poll_i=0; _fswatch_count=0
+while [ "$_poll_i" -lt 80 ]; do
+  _now_count="$(_count_fswatch)"
+  if [ "$_now_count" -eq "$_fswatch_count" ]; then
+    _stable=$((_stable + 1))
+  else
+    _stable=1; _fswatch_count="$_now_count"
+  fi
+  # three consecutive identical samples of a non-zero count == settled
+  [ "$_stable" -ge 3 ] && [ "$_fswatch_count" -ge 1 ] && break
   sleep 0.25
   _poll_i=$((_poll_i + 1))
 done
-# Give it one more second to stabilize
-sleep 1
-_fswatch_count=$(pgrep -f "fswatch.*$WORK" 2>/dev/null | wc -l | tr -d ' ')
+# Assert on the SETTLED value. Re-sampling here is what the old code did and it
+# is exactly the race: the watcher can bounce between the settle and the sample.
 
 if [ "$_fswatch_count" -eq 1 ]; then
   ok "W1: exactly 1 fswatch after $N concurrent calls (got $_fswatch_count)"
@@ -94,13 +106,13 @@ fi
 
 # ── W2: steady-state — ensure_watcher is a no-op on re-entry ──────────────
 echo "--- W2: steady-state re-entry ---"
-_watchers_before=$(pgrep -f "fswatch.*$WORK" 2>/dev/null | wc -l | tr -d ' ')
+_watchers_before="$(_count_fswatch)"
 STITCHPAD_PAD_DIR="$PAD_DIR" env -i PATH="$PATH" HOME="$WORK/home" TMPDIR="${TMPDIR:-/tmp}" \
   STITCHPAD_PAD_DIR="$PAD_DIR" STITCHPAD_HEARTBEAT_AUTOSTART=0 \
   STITCHPAD_HOME="$TOOL" \
   "$SP" ensure-watcher >/dev/null 2>&1
 sleep 1
-_watchers_after=$(pgrep -f "fswatch.*$WORK" 2>/dev/null | wc -l | tr -d ' ')
+_watchers_after="$(_count_fswatch)"
 
 if [ "$_watchers_after" -eq "$_watchers_before" ] && [ "$_watchers_before" -ge 1 ]; then
   ok "W2: re-entry is no-op ($_watchers_before → $_watchers_after)"

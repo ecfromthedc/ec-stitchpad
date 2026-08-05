@@ -473,20 +473,32 @@ P30 fix did not actually close the reported scenario, and the P32 gate's own
 mutant check was silently INCONCLUSIVE (perl's END block overrode `exit 0`, so it
 would have scored a broken mutant as a pass) — the exact trap TASK-4 warns about.
 
-P39. A FLAKY GATE IS A LYING GATE — watcher-singleton-gate fails ~1 run in 3.
-     Measured standalone on a quiet machine, same tree, no edits in flight:
-       run1 6/0   run2 6/0   run3 4/2
-     It is NOT caused by this session's changes (it flakes at the current tip and
-     it flaked before the P19 work). It is the P10/P13 family — watcher churn and
-     cross-suite watcher leakage — surfacing inside a single suite.
-     WHY IT MATTERS MORE THAN ITS SIZE: the tripwire is the release gate. A suite
-     that fails one run in three means a green board is luck, and the honest
-     response to a red board becomes "just re-run it" — which is how a real
-     regression gets waved through. Every measurement this session had to be
-     re-run to tell flake from defect, and that is now the single biggest tax on
-     the loop.
-     NOT FIXED. EXPLICITLY DEFERRED — needs the watcher singleton to be made
-     deterministic under contention, not a baseline adjustment.
+P39. THE WATCHER SOMETIMES NEVER STARTS — watcher-singleton-gate flakes ~1 in 5.
+     First read as a flaky test. It is not. DIAGNOSED, NOT FIXED.
+     Observed standalone on a quiet machine, same tree:
+       W1: exactly 1 fswatch after 8 concurrent calls (got 0)
+       W2: re-entry changed watcher count (0 -> 1)
+     The singleton invariant (never MORE than one) held in every single run — the
+     failure is always ZERO watchers, then one appearing on the NEXT call.
+     I first assumed a sampling race and rewrote W1/W2 to wait for a SETTLED
+     count instead of one sample. That was a real improvement and it did NOT fix
+     the flake — which is the evidence that the defect is in the product.
+     ROOT CAUSE (ensure_watcher, lib.sh ~3258): the spawn is an atomic
+     `mkdir "$watch_lock"`. Losers of that race sleep 0.3s, re-check
+     sp_watcher_alive, and if nothing is alive they RETURN 0 — the comment says
+     "unknown/ownerless contention fails closed". So if the winner has not
+     exec'd fswatch yet (or died between mkdir and exec), all other callers give
+     up and the pad is left LOCKED WITH NO WATCHER. The next cycle's
+     sp_stop_watchers_for_pad reconciles it, which is exactly the 0 -> 1 that W2
+     records one step later.
+     WHY IT MATTERS: for one full cycle the pad has a lock and no watcher, so
+     nobody is woken. That is P13 (watcher churn) with a name. And a release gate
+     that fails 1 run in 5 makes a green board luck and trains everyone to re-run
+     a red one.
+     NOT FIXED — deliberately. This is a concurrency path with an atomic-acquire
+     invariant; the fix is to break a lock whose owner is provably dead and spawn,
+     and it needs its own measured pass rather than a tired patch at the end of a
+     long session. EXPLICITLY DEFERRED with the diagnosis above.
 
 P40. TASK/MESSAGE SEPARATION vs P19 NARRATION — a REAL requirements conflict
      (unlike P36, which I wrongly called one).
