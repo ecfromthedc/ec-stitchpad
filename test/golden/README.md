@@ -44,10 +44,18 @@ sp_engagement awk program produces `"<ordinal> <sender> <last_reply>
 
 # Run all goldens (every .md with matching .tsv)
 ./test/golden/harness.sh all
+
+# CI / one-shot runner — same corpus, plain pass/fail per file
+./test/golden/run-all.sh
 ```
 
-`harness.sh` runs under `env -i` just like the rest of the suite: set
-`STITCHPAD_HOME` to point at the tool directory.
+`harness.sh` and `run-all.sh` run under `env -i` just like the rest of the suite:
+set `STITCHPAD_HOME` to point at the tool directory.
+
+`run-all.sh` is the CI entry point: a thin for-loop that iterates every `.md`/`.tsv`
+pair, reports one line per corpus, and exits non-zero if any golden mismatches.
+It exists so no golden rots unreachable — the same failure mode that kept
+Regression 14 silent behind reg13.
 
 ## Synthetic corpus coverage
 
