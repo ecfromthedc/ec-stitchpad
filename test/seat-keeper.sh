@@ -95,7 +95,11 @@ mention_seen_before="$(cat "$tmp/.stitchpad/.state/seen.mentiononly" 2>/dev/null
 
 # Historical mention exists in the transcript but has already crossed seen.*.
 STITCHPAD_NAME=operator "$SP" say '@historical old mention already delivered' >/dev/null
-"$SP" wake historical >/dev/null
+# Fixture only: drives the seen cursor so @historical looks already-delivered.
+# @historical is a PUSH seat, and P43 refuses a push-seat wake issued by anyone
+# other than that seat (it would print the message to the caller and burn the
+# cursor without delivering). Name the seat, as every real caller does.
+STITCHPAD_NAME=historical "$SP" wake historical >/dev/null
 
 STITCHPAD_NAME=operator "$SP" say '@dnd do not disturb' >/dev/null
 touch "$tmp/.stitchpad/.state/dnd.dnd"

@@ -17,7 +17,14 @@ fail() { echo "FAIL: $*" >&2; exit 1; }
 contains() { case "$1" in *"$2"*) return 0;; *) return 1;; esac; }
 
 mkdir -p "$tmp/tool/bin" "$tmp/test"
-cp "$ROOT/tool/bin/stitchpad" "$ROOT/tool/bin/lib.sh" "$tmp/tool/bin/"
+# stitchpad sources date-divider.sh and session-registry.sh at startup. They were
+# missing from this sandbox, so EVERY invocation below printed two real bash
+# "No such file or directory" diagnostics and ran against a half-built tool —
+# and the suite still printed "test runner ok" and exited 0. It scored GREEN
+# until the release gate started matching the SHAPE of a bash fatal diagnostic
+# rather than an enumerated list of messages. Copy the whole sourced set.
+cp "$ROOT/tool/bin/stitchpad" "$ROOT/tool/bin/lib.sh" \
+   "$ROOT/tool/bin/date-divider.sh" "$ROOT/tool/bin/session-registry.sh" "$tmp/tool/bin/"
 
 cat > "$tmp/test/plain.sh" <<'EOF'
 #!/usr/bin/env bash
