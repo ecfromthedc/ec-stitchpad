@@ -1480,7 +1480,14 @@ except Exception:
       exit 0   # muted locally; leave seen untouched so the mention queues
     fi
     # Unanswered → compact one-liner wake message (no "untrusted" alarm noise).
-    _latest="$(sp_latest_to "$who" "$_since")"
+    # Render EXACTLY the mention the oracle chose. sp_latest_to has its own
+    # independent scan ("first block after since that mentions me"), so passing
+    # the raw cursor let the two disagree: sp_engagement would correctly open the
+    # gate on a later unanswered mention while sp_latest_to rendered an EARLIER,
+    # already-answered one — waking an agent about a message it had already
+    # replied to. Anchoring to oldest_mention_to_me - 1 makes the renderer follow
+    # the oracle by construction rather than by coincidence.
+    _latest="$(sp_latest_to "$who" "$(( oldest_mention_to_me - 1 ))")"
     _sender="$(printf '%s\n' "$_latest" | sed -n 's/^## @\([^ ]*\).*/\1/p' | head -1)"
     [ -n "$_sender" ] || _sender="$who"
     _snip="$(printf '%s\n' "$_latest" | grep -v '^## ' | grep -v '^[[:space:]]*$' | head -1 | sed 's/^[[:space:]]*//' | cut -c1-120)"
