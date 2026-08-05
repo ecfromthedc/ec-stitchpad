@@ -285,17 +285,6 @@ fi
 	# no crash recovery target, so the stamp must be cleared to prevent
 	# the next watcher cycle from deferring forever (the deadlock bug).
 	#
-	# ── Watcher tests guard ─────────────────────────────────────────
-	# Regressions 10–13 spawn the watcher daemon and are BY DEFAULT SKIPPED
-	# in `test/wake-regression.sh`. Reason: a real bash 3.2 bug (macOS
-	# default) in `tool/adapters/ocean.sh` — empty-array `[@]` expansion
-	# triggers "unbound variable" under `set -u` on bash 3.2 when no model
-	# column is annotated in the roster. This is a separate defect from the
-	# gate fix and is tracked independently.
-	#
-	# Set SP_WATCHER_TESTS=1 to run the watcher suite (requires a bash >= 4.4
-	# or a roster with an explicit model column for ocean-push seats).
-	if [ -n "${SP_WATCHER_TESTS:-}" ]; then
 
 	# --- Regression 10: Watcher defer-or-queue (production) ---
 	case10="$tmp/case10"
@@ -471,7 +460,6 @@ EOF
 	[ ! -f "$case13/.stitchpad/.state/pending.agent" ] \
 	  || fail 'ocean successful delivery left replay-causing pending stamp'
 
-	fi  # SP_WATCHER_TESTS guard — see watcher-tests note above
 
 	# Regression 14: Per-sender reply ledger — the deafness gate.
 	# The old sp_engagement pinned last_mention to the FIRST mention found
