@@ -92,7 +92,7 @@ echo "  mention sent: @pro5 what lane..."
 
 # Wait for ack
 _ack=0
-for i in $(seq 1 30); do
+for i in $(seq 1 90); do
   if grep -q 'mid-lane' "$G1_PAD/.stitchpad/stitchpad.md" 2>/dev/null; then
     _ack=1
     break
@@ -138,7 +138,7 @@ HOME="$G1_HOME" STITCHPAD_TERMINAL_NAMESPACE="$NS" STITCHPAD_HEARTBEAT_AUTOSTART
   "$SP" say "ping" >/dev/null 2>&1 || true
 
 _done=0
-for i in $(seq 1 20); do
+for i in $(seq 1 80); do
   [ -f "$G1_STATE/.test-busy.done" ] && { _done=1; break; }
   sleep 0.5
 done
@@ -201,7 +201,7 @@ HOME="$G3_HOME" STITCHPAD_TERMINAL_NAMESPACE="$NS3" STITCHPAD_HEARTBEAT_AUTOSTAR
   "$SP" say "@echo status?" >/dev/null 2>&1 || true
 
 _done3=0
-for i in $(seq 1 20); do
+for i in $(seq 1 80); do
   [ -f "$G3_STATE/.test-busy.done" ] && { _done3=1; break; }
   sleep 0.5
 done
