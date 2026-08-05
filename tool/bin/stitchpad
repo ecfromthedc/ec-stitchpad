@@ -1534,10 +1534,18 @@ except: print("")' 2>/dev/null)"
     # ships stitchpad.md and so read as a valid pad, denying every write under $HOME.
     _pad="$(sp_find_pad "$PWD" 2>/dev/null || true)"
     [ -z "$_pad" ] && exit 0   # not in a pad → allow
-    # Try to lease it. `claim` exits 0 if I get/hold it, non-zero if someone else holds a fresh one.
-    if "$0" claim "$fp" >/dev/null 2>&1; then
-      exit 0   # claim held by me → allow the write
-    fi
+    # Try to lease it. `claim` exits 0 if I get/hold it, 1 if someone else holds a fresh one.
+    "$0" claim "$fp" >/dev/null 2>&1; _rc=$?
+    [ "$_rc" -eq 0 ] && exit 0   # claim held by me → allow the write
+    # ONLY exit 1 is "another agent holds a fresh lease" — the single answer that
+    # may block a write. Every other non-zero is `claim` failing to DECIDE: exit 2
+    # is "no identity (set STITCHPAD_NAME or join)", and sp_init_paths failure also
+    # leaves non-zero. Reading those as a conflict denies every Write/Edit by every
+    # identity-less session inside a pad and blames a holder that does not exist —
+    # the deny even renders as "@ blocked", with an empty name where sp_me failed.
+    # Undecidable must never read as denied; fail open, the same way the no-pad and
+    # no-CLI paths above already do.
+    [ "$_rc" -ne 1 ] && exit 0
     holder="$("$0" claims 2>/dev/null | grep -F "$fp" | head -1)"
     reason="stitchpad: @$(sp_me 2>/dev/null) blocked — another agent holds a fresh write-lease on this file (${holder:-$fp}). Coordinate on the pad or wait for their release (stale leases free after 600s)."
     # PreToolUse deny contract (current Claude): hookSpecificOutput.permissionDecision=deny.
