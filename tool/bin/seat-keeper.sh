@@ -229,7 +229,12 @@ while IFS= read -r repo; do
         # at a 2-minute cron against a 10-minute drain interval that quarantines a
         # seat in ~6 minutes, before the first repeat wake has even been sent. A
         # strike must mean "I woke it again about the SAME mention, and nothing moved".
-        if [ "$since" -ge "$DRAIN_MIN_S" ]; then
+        # Once QUARANTINED, stop counting. A quarantined seat is never woken, so it
+        # never refreshes keeper-last; "since" therefore stays above the threshold and
+        # every subsequent pass would increment again — reporting "23 repeat wakes"
+        # when there were 3 wakes and 20 idle passes. A number in an alert that is not
+        # the thing it names is worse than no number.
+        if [ "$since" -ge "$DRAIN_MIN_S" ] && [ "$strikes" -lt "$MAX_STRIKES" ]; then
           if [ -f "$OBS" ] && [ -n "$pending" ] && [ "$(cat "$OBS" 2>/dev/null)" = "$pending" ]; then
             strikes=$(( strikes + 1 )); echo "$strikes" > "$STRIKE" 2>/dev/null
           elif [ -f "$OBS" ]; then
