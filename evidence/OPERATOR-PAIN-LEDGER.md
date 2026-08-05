@@ -486,27 +486,34 @@ P30 fix did not actually close the reported scenario, and the P32 gate's own
 mutant check was silently INCONCLUSIVE (perl's END block overrode `exit 0`, so it
 would have scored a broken mutant as a pass) — the exact trap TASK-4 warns about.
 
-P39 (CLOSED). THE WATCHER WAS BEING KILLED BY ITS OWN CONCURRENT CALLERS.
-     watcher-singleton-gate flaked ~1 run in 5. Two wrong theories first — a
-     sampling race (fixed the sampling; still flaked) and a leaked lock directory
-     (fixed the leak; still flaked). Both were real improvements and both were
-     kept, but neither was the cause. The answer came from dumping state AT the
-     moment of failure instead of reasoning about it:
-       lock dir exists: no · owner: none · fswatch for this pad: 0
-       watch.sh procs: 14 · watch.log: EMPTY
-     No lock and no log means the watcher was not blocked from starting — it was
-     STARTED AND SHOT. ensure_watcher ran sp_stop_watchers_for_pad BEFORE the
-     atomic `mkdir` acquire, so with N concurrent callers a late arrival executed
-     the stop path and killed the watcher an earlier caller had just spawned. The
-     next uncontended call started one that lived, which is exactly the 0 -> 1
-     that W2 recorded one step later.
-     FIX: reconciliation is a WRITE to shared state, so it belongs BEHIND the
-     token that guards spawning, not in front of it. sp_stop_watchers_for_pad now
-     runs only after the caller wins the mkdir. The loser path additionally
-     breaks a lock whose owner is provably dead (and never spawns from there).
-     PROVEN: 10/10 green with the fix; the mutant (stop-before-acquire restored)
-     failed 3 of 7 runs. A race is proven over a RUN of samples, not one.
-     This was the last thing making a green board luck.
+P39 (REOPENED — DIAGNOSED, NOT FIXED). THE WATCHER IS KILLED BY ITS OWN CALLERS.
+     I closed this, then REVERTED my own fix. Recording that honestly.
+     THE DIAGNOSIS IS SOLID, from state captured at the moment of failure:
+       lock dir: no · owner: none · fswatch for this pad: 0 · watch.log: EMPTY
+     No lock and no log means the watcher was started and SHOT.
+     sp_stop_watchers_for_pad runs BEFORE the atomic `mkdir` acquire, so with N
+     concurrent callers a late arrival runs the stop path and kills the watcher an
+     earlier caller just spawned. The next uncontended call starts one that lives —
+     the 0 -> 1 that W2 records a step later.
+     WHY MY FIX WAS REVERTED: moving the reconcile behind the acquire made
+     watcher-races RED — "watcher did not recover from empty admission lock".
+     sp_stop_watchers_for_pad IS the empty-lock reclaimer (lib.sh: no generation ->
+     sp_watch_empty_lock_reclaim), so it MUST run before the acquire for a single
+     call to recover a lock left by a SIGKILLed acquirer. I then tried gating it on
+     "no lock present", which reinstated the P39 flake. Two suites encode opposite
+     ordering requirements and I was trading one for the other at 1am.
+     THE REAL FIX, for a rested pass: the lock is already protected by
+     STITCHPAD_WATCH_START_GRACE (5s, applied in the reclaim paths at lib.sh ~2894
+     and ~2915) — but sp_stop_watchers_for_pad also kills watcher PROCESSES, and
+     that kill is NOT grace-guarded. Guard the process kill by generation age the
+     same way the lock reclaim already is, and both requirements hold at once:
+     an empty admission lock is still reclaimed on the same call, and a watcher
+     spawned within the grace is never shot by a concurrent caller.
+     COST OF LEAVING IT: watcher-singleton-gate fails ~1 run in 5, so a green board
+     needs a re-run to trust. The shipped behaviour self-heals on the next call.
+     KEPT from the attempt: nothing in lib.sh (fully reverted to the last measured
+     state). The sampling fix in the GATE (wait for a settled count) was kept —
+     it removes a real second race and is independent of this.
 
 P40. TASK/MESSAGE SEPARATION vs P19 NARRATION — a REAL requirements conflict
      (unlike P36, which I wrongly called one).

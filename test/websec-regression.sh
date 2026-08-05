@@ -79,10 +79,17 @@ const lines = app.split("\n");
 // marker-based extraction: helpers block ends right before \`const store\`
 const cut = lines.findIndex(l => /^const store/.test(l));
 if (cut < 0) { console.log("HARNESS-ERROR: store marker not found"); process.exit(2); }
-const helperSrc = lines.slice(0, cut).join("\n").replace(
+let helperSrc = lines.slice(0, cut).join("\n").replace(
   /import \{[^}]*\} from "\.\/vendor\/preact-standalone\.module\.js";/,
   "const html=()=>{};const render=()=>{};const useState=()=>[];const useEffect=()=>{};const useLayoutEffect=()=>{};const useRef=()=>({});"
 );
+// Strip ANY remaining ES import — this harness evaluates the helper prelude with
+// new Function(), where an `import` statement is a syntax error. It previously
+// stripped only the preact line by exact path, so the first additional import in
+// app.js (sidebar-order.mjs, P25) silently broke every C2/C5 assertion. The
+// harness's job is to extract the pure helpers; it must not care what else the
+// module imports.
+helperSrc = helperSrc.replace(/^\s*import\s+[^;]+;\s*$/gm, "");
 globalThis.location = { origin: "https://x" };
 globalThis.localStorage = { getItem: () => null, setItem: () => {} };
 const fn = new Function("globalThis",
