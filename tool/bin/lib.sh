@@ -281,7 +281,7 @@ sp_write_inplace() {
 }
 
 sp_recover_inplace() {
-  local target="${1:-$PAD_MD}" ready now mt
+  local target="${1:-$PAD_MD}" ready now mt newsize oldsize
   [ -n "$target" ] || return 0
   ready="$target.ready"
   [ -s "$ready" ] || { rm -f "$ready" 2>/dev/null; return 0; }
@@ -293,7 +293,23 @@ sp_recover_inplace() {
   mt="$(stat -f %m "$ready" 2>/dev/null || stat -c %Y "$ready" 2>/dev/null || echo 0)"
   [ $(( now - mt )) -lt 5 ] && return 0
   echo "stitchpad: recovering interrupted write of $(basename "$target")" >&2
-  cat "$ready" > "$target" && rm -f "$ready" 2>/dev/null
+  # Use the SAME inode-safe discipline as sp_write_inplace: dd conv=notrunc
+  # never truncates the target, so no reader (say, watcher) ever sees an empty
+  # or half-written file. The old `cat "$ready" > "$target"` truncated BEFORE
+  # reading, and a concurrent recovery could remove .ready between truncation
+  # and read — leaving the pad at 0 bytes and triggering the "pad roster is
+  # missing" fatal guard. That is the roster-race bug.
+  newsize="$(wc -c < "$ready" | tr -d ' ')"
+  oldsize="$(wc -c < "$target" 2>/dev/null | tr -d ' ')"; oldsize="${oldsize:-0}"
+  if dd if="$ready" of="$target" conv=notrunc bs=65536 2>/dev/null; then
+    if [ "$newsize" -lt "$oldsize" ]; then
+      perl -e 'truncate($ARGV[0], $ARGV[1]) or exit 1' "$target" "$newsize" 2>/dev/null \
+        || { [ -s "$ready" ] && cat "$ready" > "$target"; }
+    fi
+    rm -f "$ready" 2>/dev/null
+  else
+    echo "stitchpad: in-place recovery of $(basename "$target") failed — content preserved in $ready" >&2
+  fi
   return 0
 }
 

@@ -507,4 +507,35 @@ EOF
 	  fail 'per-sender ledger (14b): already-replied alice mention re-appeared'
 	fi
 
+	# Regression 15: sp_recover_inplace truncation race — concurrent say
+	# invocations must not observe the pad at 0 bytes. The old `cat >` in
+	# sp_recover_inplace truncated BEFORE the read, and two concurrent
+	# recoveries could race: process A truncates, process B opens the empty
+	# file between A's truncation and A's write, triggering the "pad roster
+	# is missing" fatal guard. This is a pre-existing master defect that
+	# made wake-regression.sh non-deterministic.
+	case15="$tmp/case15"
+	mkdir "$case15"
+	cd "$case15"
+	"$SP" init --name case15 >/dev/null
+	"$SP" join agent codex >/dev/null
+	stop_watcher "$case15"
+	# Plant a stale .ready file so sp_init_paths triggers recovery on every
+	# say invocation.
+	local_pad_md="$(find "$case15" -name 'stitchpad.md' -o -name 'pasture.md' | head -1)"
+	cp "$local_pad_md" "$local_pad_md.ready"
+	perl -e 'utime time-20, time-20, $ARGV[0]' "$local_pad_md.ready"
+	# Run 20 concurrent says — with the truncation bug, at least a few
+	# hit the "roster is missing" guard and exit non-zero.
+	declare -a _r15_pids=()
+	r15_fails=0
+	for _ in $(seq 1 20); do
+	  STITCHPAD_NAME=tester "$SP" say "concurrent post $$" &
+	  _r15_pids+=($!)
+	done
+	for _pid in "${_r15_pids[@]}"; do
+	  wait "$_pid" 2>/dev/null || r15_fails=$((r15_fails + 1))
+	done
+	[ "$r15_fails" -eq 0 ] || fail "sp_recover_inplace truncation race: $r15_fails of 20 concurrent says failed — roster check observed truncated pad"
+
 	printf 'wake regression ok\n'
