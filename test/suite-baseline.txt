@@ -81,7 +81,7 @@ watcher-singleton-gate.sh 6 0
 oversight-gate.sh 14 0
 
 websec-regression.sh 8 0
-p28-herdr-parity-gate.sh 5 0
+p28-herdr-parity-gate.sh 7 0
 p29-p30-claim-hook-gate.sh 7 0
 p32-multibyte-variable-gate.sh 4 0
 p33-terminal-refusal-message-gate.sh 4 0

@@ -403,14 +403,27 @@ P34. FIXTURES SHARE ONE TERMINAL AND THE GUARD CORRECTLY REFUSES THEM.
      ponytail (-> 1/0 PASS); pad-io recovered 4 of 13 (63 -> 67). The assertion
      was never weakened — the simulation was made real.
 
-P35. `join` REPORTS SUCCESS AND LEAVES YOU WITH NO IDENTITY.  (UX, by design.)
-     CLI `join` prints "✓ alpha joined" and exits 0, after which `whoami` is
-     empty and every following command refuses with "no identity — call the MCP
-     join tool first (or set STITCHPAD_NAME for CLI/testing)". The refusal text
-     documents the intent, so this is not a false success in the P17 sense — but
-     the success line still overstates what happened, and it cost this session a
-     debugging detour while building the P28 gate. `join` should say which
-     identity path it actually established.
+P35/P37 (CLOSED). A MANAGED-TERMINAL JOIN NOW LEAVES YOU WITH AN IDENTITY.
+     Reproduced by hand in a live herdr pane (HERDR_PANE_ID=w4:p3), self-hosted:
+       init 0 · join 0 ("joined") · whoami [] · say "no identity" · REFUSED
+     Two causes, both real:
+       1. `join` left target "-", but sp_me resolves a pane back to a roster row
+          by matching the terminal surface against the TARGET column — so a
+          managed pane matched nothing and had no identity. join now fills an
+          UNSET target with the resolved surface, and ONLY when HERDR_PANE_ID is
+          present, so the CLI path is untouched and still uses STITCHPAD_NAME
+          exactly as its own error text documents.
+       2. `whoami` read ONLY the session binding (or a pad default) and never the
+          full resolver — so even once sp_me could resolve the pane, "who am I"
+          answered nothing while `say` posted happily as that same agent. It now
+          falls back to sp_me: the question must be answered with the identity
+          the tool will actually use.
+     join's success line also stopped overstating: it now says which identity
+     path was established, or warns "roster only; this shell has NO identity yet".
+     VERIFIED in the live pane: whoami -> p37e, say -> "posted as @p37e" with no
+     STITCHPAD_NAME, read --new sees it.
+     GATED: p28-herdr-parity-gate G6/G7 (7/0). Mutant (binding removed) -> the
+     pane resolves whoami=<empty>, say rc=1.
 
 P36. "CONFUSABLE NAME POLICY CONFLICT" — **I MISDIAGNOSED THIS. IT WAS A BUG.**
      I reported to EC that roster-validation (REJECT confusables) and the

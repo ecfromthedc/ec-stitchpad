@@ -166,6 +166,58 @@ else
   bad "G5: MUTANT DID NOT APPLY — inconclusive, never treat as a pass"
 fi
 
+# ── G6/G7: P35+P37 — a managed-terminal join must LEAVE YOU WITH AN IDENTITY ──
+# Before this, `join` inside a herdr pane returned 0 and printed "joined", then
+# `whoami` was EMPTY and `say` refused with "no identity". Two causes:
+#   · join left target "-", and sp_me resolves a pane to a roster row by matching
+#     the surface against the TARGET column — so nothing matched;
+#   · `whoami` only ever read the session binding, never the full resolver, so
+#     even once sp_me could resolve it, "who am I" answered nothing.
+# NO STITCHPAD_NAME anywhere below — that is the whole point.
+identity_probe() { # $1=tool root → "whoami=<name> say=<rc>"
+  local root="$1" d="$TMP/ident-$(basename "$1")"
+  mkdir -p "$d/project" "$d/home"
+  ( cd "$d/project"
+    export STITCHPAD_HOME="$root" HOME="$d/home" PATH="$root/bin:$PATH"
+    export STITCHPAD_HEARTBEAT_AUTOSTART=0
+    unset STITCHPAD_NAME STITCHPAD_SESSION CLAUDE_CODE_SESSION_ID CODEX_SESSION_ID
+    export STITCHPAD_TERMINAL_NAMESPACE="p28-ident-$(basename "$root")"
+    export HERDR_PANE_ID="p28ident:pane$$" HERDR_TAB_ID="p28ident:tab$$"
+    export HERDR_WORKSPACE_ID="p28ident" HERDR_ENV=1
+    "$root/bin/stitchpad" init --name p28ident >/dev/null 2>&1
+    "$root/bin/stitchpad" join identbot claude pull - >/dev/null 2>&1
+    _w="$("$root/bin/stitchpad" whoami 2>/dev/null || true)"
+    "$root/bin/stitchpad" say "identity probe" >/dev/null 2>&1; _s=$?
+    printf 'whoami=%s say=%s\n' "${_w:-<empty>}" "$_s"
+  ) 2>/dev/null
+}
+
+IDENT="$(identity_probe "$ROOT/tool")"
+echo "--- managed-terminal identity (no STITCHPAD_NAME) ---"
+echo "      $IDENT"
+if printf '%s' "$IDENT" | grep -q 'whoami=identbot' && printf '%s' "$IDENT" | grep -q 'say=0'; then
+  ok "G6: a managed-terminal join leaves you with a working identity"
+else
+  bad "G6: join in a managed pane left no usable identity ($IDENT)"
+fi
+
+MUT2="$TMP/mutant-ident"
+cp -R "$ROOT/tool" "$MUT2"
+_BIND_LINE='[ -n "$_join_surface" ] && target="$_join_surface"'
+grep -vF "$_BIND_LINE" "$ROOT/tool/bin/stitchpad" > "$MUT2/bin/stitchpad"
+chmod +x "$MUT2/bin/stitchpad"
+if ! grep -qF "$_BIND_LINE" "$MUT2/bin/stitchpad"; then
+  IDENT_MUT="$(identity_probe "$MUT2")"
+  echo "      MUTANT: $IDENT_MUT"
+  if printf '%s' "$IDENT_MUT" | grep -q 'whoami=identbot'; then
+    bad "G7: MUTANT still resolved an identity — this gate cannot see the regression"
+  else
+    ok "G7: MUTANT — without the terminal binding the pane has no identity, gate bites"
+  fi
+else
+  bad "G7: MUTANT DID NOT APPLY — inconclusive, never treat as a pass"
+fi
+
 echo ""
 echo "Results: $pass passed, $fail failed"
 [ "$fail" -eq 0 ] || exit 1

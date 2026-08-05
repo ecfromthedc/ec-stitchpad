@@ -605,6 +605,19 @@ EOF
     # to a terminal that never held the claim. Claim the terminal FIRST, then treat
     # a duplicate as an idempotent rejoin.
     wake="${3:-pull}"; target="${4:--}"
+    # P35/P37: joining from a MANAGED TERMINAL must leave you with an identity.
+    # sp_me resolves a pane back to a roster row by matching this terminal id
+    # against the target column — so a join with target "-" resolved to nothing,
+    # and `join` returned 0 while `whoami` stayed EMPTY and `say` refused with
+    # "no identity". Verified by hand inside a live herdr pane (HERDR_PANE_ID=w4:p3)
+    # before this fix: init 0, join 0, whoami [], say REFUSED.
+    # Only fills an UNSET target, and only when a managed surface actually
+    # resolves — the CLI path (HERDR_* unset) is untouched and still uses
+    # STITCHPAD_NAME, exactly as its own error message documents.
+    if [ "$target" = "-" ] && [ -n "${HERDR_PANE_ID:-}" ]; then
+      _join_surface="$(sp_this_surface 2>/dev/null || true)"
+      [ -n "$_join_surface" ] && target="$_join_surface"
+    fi
     # ONE TERMINAL = ONE PAD: claim the target terminal before touching the
     # roster; a terminal live in another pad refuses the join outright.
     _owner_pid="${STITCHPAD_HEARTBEAT_PARENT_PID:-$PPID}"
@@ -653,7 +666,15 @@ EOF
       STITCHPAD_PAD_DIR="$PAD_DIR" "$BIN_DIR/stitchpad" bind-session "$target" "$who" >/dev/null \
         || { echo "stitchpad: failed to bind Ocean session $target to @$who" >&2; exit 1; }
     fi
-    echo "✓ $who joined (adapter=$adapter wake=$wake)"
+    # P35: say which identity path was actually established. "joined" alone
+    # overstated it — you could be in the roster and still be nobody.
+    if [ -n "${_join_surface:-}" ] && [ "$target" = "${_join_surface:-}" ]; then
+      echo "✓ $who joined (adapter=$adapter wake=$wake) — identity bound to this terminal"
+    elif [ -n "${STITCHPAD_NAME:-}" ] || [ -n "$(sp_me 2>/dev/null)" ]; then
+      echo "✓ $who joined (adapter=$adapter wake=$wake)"
+    else
+      echo "✓ $who joined (adapter=$adapter wake=$wake) — roster only; this shell has NO identity yet (export STITCHPAD_NAME=$who, or join from a managed terminal)"
+    fi
     # PERSONA INJECTION: role-based join takes precedence; fall back to name-based pack.
     _pack=""
     if [ -n "$_role" ] && [ -f "$STITCHPAD_HOME/personas/library/$_role.md" ]; then
@@ -1998,6 +2019,14 @@ PY
     else
       _wn="$(cat "$PAD_STATE/whoami" 2>/dev/null || true)"
     fi
+    # P37: fall back to the FULL resolver. whoami consulted only the session
+    # binding (or the pad default), so inside a managed herdr pane — where
+    # sp_me resolves the identity from the terminal surface via the roster —
+    # `whoami` printed NOTHING while `say` posted happily as that same agent.
+    # Verified in a live pane (HERDR_PANE_ID=w4:p3): surface term_6583ffdbadffef,
+    # roster row matched, sp_me could resolve it, whoami said [].
+    # "Who am I" must answer with the identity the tool will actually use.
+    [ -n "$_wn" ] || _wn="$(sp_me 2>/dev/null || true)"
     [ -n "$_wn" ] || exit 1
     printf '%s\n' "$_wn"
     ;;
