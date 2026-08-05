@@ -332,8 +332,9 @@ P29. THE CLAIM-HOOK ACCUSES A PHANTOM AGENT AND BLOCKS EVERY WRITE.  **PROVEN, L
      so the message accused the file of holding itself.
      COST: every Edit and Write in the session; the captain had to route all file
      changes through Bash for the rest of the build.
-     GATE: deny only on rc=1; fail open otherwise. Mutant-proven — reintroducing
-     the non-zero test reproduces the denial verbatim; the fix returns allow.
+     GATED: p29-p30-claim-hook-gate.sh 7/0 — G1 rc=2 allows, G2 a REAL planted
+     lease denies, G4 the denial names the real holder, G6 the mutant resurfaces
+     the phantom accusation.
      ⚠️ STILL LIVE FOR EC: the hook Claude Code actually runs is
      ~/.stitchpad/adapters/claim-hook.sh (the OLD checkout). Until that install is
      refreshed, EVERY Claude Code session under $HOME is denied every file write.
@@ -345,10 +346,19 @@ P30. THE PAD WALK-UP HAS NO BOUNDARY — IT ESCAPES INTO $HOME.
      pad of their own. This is what made P29 fire in a tree with no .stitchpad,
      and it directly contradicts the hook's own stated intent ("not in a pad →
      allow, else we'd block every write in every non-pad project").
-     FIXED at the call site (claim-hook stops at $HOME). sp_find_pad itself is
-     NOT yet bounded — deliberately deferred, because changing pad resolution for
-     every command at release time would require re-measuring all 72 suites.
-     EXPLICITLY DEFERRED, not silently.
+     FIXED at the call site, in TWO passes — and the first pass was wrong.
+     Stopping the walk only ABOVE $HOME still matched ~/.stitchpad on the way up,
+     so nested projects stayed governed; the scenario that blocked the captain was
+     NOT closed, and it only looked closed because the P29 rc fix was masking it.
+     p29-p30-claim-hook-gate G5/G7 caught that. The rule is now: a pad at $HOME
+     governs $HOME ITSELF, never a project nested beneath it. The comparison also
+     had to move to PHYSICAL paths — macOS TMPDIR ends in "/", so a raw string
+     compare against $HOME silently failed, and a boundary that silently stops
+     holding is worse than none.
+     sp_find_pad() itself is still unbounded — deliberately deferred, because
+     changing pad resolution for EVERY command at release time would require
+     re-measuring all 73 suites. EXPLICITLY DEFERRED, not silently.
+     GATED: p29-p30-claim-hook-gate.sh 7/0, both mutants bite.
 
 P31. A CRASHED SUITE REPORTS SUCCESS.  **THE GATE COULD NOT SEE CRASHES.**
      bash 3.2 (macOS default): when `set -e`/`set -u` ABORTS a script the EXIT
@@ -437,3 +447,13 @@ P38. `task list` IS UNREADABLE IN A TERMINAL.
      the presentation makes the board useless exactly when an operator is trying
      to see where the fleet is. Sits directly alongside P20/P21 (the board shows
      no ETA / no live progress) — same surface, same operator.
+
+--- GATES ADDED 2026-08-04 (closing the "fixed but ungated" gap) ---
+P29+P30  p29-p30-claim-hook-gate.sh          7/0   both mutants bite
+P32      p32-multibyte-variable-gate.sh      4/0   repo-wide lint + planted mutant
+P33      p33-terminal-refusal-message-gate.sh 4/0  mutant restores the duplicate path
+Each was previously 4 of 6 on the acceptance rule (in the tree, committed, but
+NOT gated). Writing them was not bookkeeping: the P29/P30 gate proved the first
+P30 fix did not actually close the reported scenario, and the P32 gate's own
+mutant check was silently INCONCLUSIVE (perl's END block overrode `exit 0`, so it
+would have scored a broken mutant as a pass) — the exact trap TASK-4 warns about.

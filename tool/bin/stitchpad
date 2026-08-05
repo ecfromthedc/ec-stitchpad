@@ -3064,10 +3064,19 @@ except: print("")' 2>/dev/null)"
     # made the captain's own worktree (which correctly has NO pad) claim-governed by
     # the home pad, and every Edit came back as a lease denial. Stop at $HOME: a pad
     # at $HOME governs $HOME itself, never an unrelated project nested beneath it.
-    _d="$PWD"; _pad=""
+    # Compare PHYSICAL paths. A raw string compare against $HOME is fragile: a
+    # trailing slash, a doubled slash (macOS TMPDIR ends in "/"), or a symlinked
+    # home all defeat it silently — and a boundary that silently stops holding is
+    # worse than none.
+    _pad=""; _d="$(pwd -P 2>/dev/null || pwd)"; _start="$_d"
+    _home_real=""; [ -n "${HOME:-}" ] && _home_real="$(cd -P "$HOME" 2>/dev/null && pwd || true)"
     while [ "$_d" != "/" ]; do
+      # A pad at $HOME governs $HOME ITSELF, never an unrelated project nested
+      # beneath it. Stopping only ABOVE $HOME was not enough — the operator's
+      # ~/.stitchpad still matched on the way up and claim-governed every repo
+      # under the home directory, which is the shape that blocked the captain.
+      if [ -n "$_home_real" ] && [ "$_d" = "$_home_real" ] && [ "$_start" != "$_home_real" ]; then break; fi
       [ -d "$_d/.stitchpad" ] && { _pad="$_d/.stitchpad"; break; }
-      [ -n "${HOME:-}" ] && [ "$_d" = "$HOME" ] && break   # never escape above $HOME
       _d="$(dirname "$_d")"
     done
     [ -z "$_pad" ] && exit 0   # not in a pad → allow
