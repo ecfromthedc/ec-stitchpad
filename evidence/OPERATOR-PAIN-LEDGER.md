@@ -359,6 +359,15 @@ P30. THE PAD WALK-UP HAS NO BOUNDARY — IT ESCAPES INTO $HOME.
      changing pad resolution for EVERY command at release time would require
      re-measuring all 73 suites. EXPLICITLY DEFERRED, not silently.
      GATED: p29-p30-claim-hook-gate.sh 7/0, both mutants bite.
+     SUPERSEDED 2026-08-05: master already solved this with sp_find_pad +
+     sp_is_install_home. Merging master let my hand-rolled bounded-$HOME walk be
+     DELETED — one pad resolver again instead of three. The gate now tests the
+     real mechanism: G5 asserts the install home is not a pad, G7 breaks
+     sp_is_install_home and watches $HOME resolve as /Users/ecfromthedc/.pasture.
+     Scope note, stated plainly: master guards the INSTALL home specifically. A
+     genuine non-install pad at $HOME still governs directories beneath it, which
+     is right — if you run `stitchpad init` at $HOME you meant it. My walk
+     forbade that too, which was broader than the defect ever was.
 
 P31. A CRASHED SUITE REPORTS SUCCESS.  **THE GATE COULD NOT SEE CRASHES.**
      bash 3.2 (macOS default): when `set -e`/`set -u` ABORTS a script the EXIT

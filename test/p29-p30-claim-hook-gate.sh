@@ -110,25 +110,32 @@ else
 fi
 rm -rf "$PAD/.state/claims"
 
-# ── G5 (P30): pad-less project under a PADDED $HOME must ALLOW ──────────────
-# This is the shape that broke the captain: the worktree correctly has no pad,
-# but the walk climbed into $HOME and governed it from there.
-( cd "$FAKE_HOME" && env -u HERDR_PANE_ID HOME="$FAKE_HOME" STITCHPAD_HOME="$ROOT/tool" \
-    STITCHPAD_NAME=alice STITCHPAD_TERMINAL_NAMESPACE=p29home \
-    "$ROOT/tool/bin/stitchpad" init --name p29home >/dev/null 2>&1 ) || true
-[ -d "$FAKE_HOME/.stitchpad" ] || { echo "FIXTURE FAILED: no pad at \$HOME" >&2; exit 1; }
-NOPAD="$FAKE_HOME/nested/project"; mkdir -p "$NOPAD"; echo y > "$NOPAD/file.txt"
+# ── G5 (P30): the INSTALL HOME must never read as a pad ─────────────────────
+# This is the shape that actually blocked the captain: ~/.stitchpad symlinks to
+# the checkout's tool/ dir, which ships a stitchpad.md, so the pad walk matched
+# at $HOME and every write under it demanded a claim lease.
+# The branch used to carry a hand-rolled bounded-$HOME walk here. master fixes it
+# properly with sp_find_pad + sp_is_install_home, so this now tests THAT — the
+# real mechanism — instead of a workaround that no longer exists.
+# NOTE the deliberate scope change: master guards the INSTALL home specifically.
+# A genuine, non-install pad at $HOME still governs directories beneath it, which
+# is correct — if you run `stitchpad init` at $HOME you meant it. The old walk
+# forbade that case too; that was broader than the defect.
+INSTALL_HOME="$TMP/install"; mkdir -p "$INSTALL_HOME"
+cp -R "$ROOT/tool" "$INSTALL_HOME/tool" 2>/dev/null || true
+NOPAD="$TMP/nested-project"; mkdir -p "$NOPAD"; echo y > "$NOPAD/file.txt"
 [ -d "$NOPAD/.stitchpad" ] && { echo "FIXTURE FAILED: nested project must have NO pad" >&2; exit 1; }
 
-# Give the HOME pad a fresh lease on the nested file, held by someone else, and
-# use a real identity — so if the walk reaches $HOME the hook MUST deny. Passing
-# here therefore proves the walk stopped, not merely that identity was missing.
-plant_foreign_lease "$FAKE_HOME/.stitchpad" "$NOPAD/file.txt" "bob"
-out="$(hook "$ROOT/tool" "$NOPAD" "$NOPAD/file.txt" "alice")"
-if denied "$out"; then
-  bad "G5: a pad-less project under a padded \$HOME was DENIED — the walk escaped again"
+_install_is_home="$(env -u HERDR_PANE_ID STITCHPAD_HOME="$HOME/.pasture" /bin/bash -c '
+  source "'"$ROOT"'/tool/bin/lib.sh" >/dev/null 2>&1
+  sp_is_install_home "$HOME/.pasture" && echo yes || echo no' 2>/dev/null)"
+_home_pad="$(env -u HERDR_PANE_ID STITCHPAD_HOME="$HOME/.pasture" /bin/bash -c '
+  source "'"$ROOT"'/tool/bin/lib.sh" >/dev/null 2>&1
+  sp_find_pad "$HOME" 2>/dev/null || true' 2>/dev/null)"
+if [ "$_install_is_home" = "yes" ] && [ -z "$_home_pad" ]; then
+  ok "G5: the install home is not a pad, so \$HOME resolves to none"
 else
-  ok "G5: a pad-less project under a padded \$HOME allows the write (walk stopped at \$HOME)"
+  bad "G5: install-home guard failed (is_install_home=$_install_is_home, find_pad(\$HOME)=$_home_pad)"
 fi
 
 # ── mutants ─────────────────────────────────────────────────────────────────
@@ -157,17 +164,25 @@ else
   bad "G6: MUTANT DID NOT APPLY — inconclusive, never treat as a pass"
 fi
 
-# G7: restore the unbounded walk
-if mutate "$TMP/mut-walk" \
-   '      if [ -n "$_home_real" ] && [ "$_d" = "$_home_real" ] && [ "$_start" != "$_home_real" ]; then break; fi' \
-   '      : # MUTANT: boundary removed' "G7"; then
-  # same identity as G5 — otherwise claim exits 2 and fails open for the OTHER
-  # reason, and the mutant would look harmless.
-  out="$(hook "$TMP/mut-walk" "$NOPAD" "$NOPAD/file.txt" "alice")"
-  if denied "$out"; then
-    ok "G7: MUTANT (unbounded walk) governs a pad-less project again — gate bites"
+# G7: MUTANT — break sp_is_install_home so the install home reads as a pad again.
+MUT_LIB="$TMP/mut-lib"; mkdir -p "$MUT_LIB"
+cp -R "$ROOT/tool" "$MUT_LIB/tool"
+python3 - "$MUT_LIB/tool/bin/lib.sh" <<'PY_MUT'
+import sys
+p = sys.argv[1]
+s = open(p, encoding='utf-8').read()
+old = '  [ "$cand" = "$home" ]'
+if s.count(old) != 1: sys.exit(9)
+open(p, 'w', encoding='utf-8').write(s.replace(old, '  false   # MUTANT: nothing is ever the install home'))
+PY_MUT
+if [ $? -eq 0 ] && grep -q 'MUTANT: nothing is ever the install home' "$MUT_LIB/tool/bin/lib.sh"; then
+  _mut_pad="$(env -u HERDR_PANE_ID STITCHPAD_HOME="$HOME/.pasture" /bin/bash -c '
+    source "'"$MUT_LIB"'/tool/bin/lib.sh" >/dev/null 2>&1
+    sp_find_pad "$HOME" 2>/dev/null || true' 2>/dev/null)"
+  if [ -n "$_mut_pad" ]; then
+    ok "G7: MUTANT — without the guard \$HOME resolves as a pad ($_mut_pad), gate bites"
   else
-    bad "G7: MUTANT applied but G5 still allowed — this gate cannot see the escape"
+    bad "G7: MUTANT applied but \$HOME still resolved to none — this gate cannot see the defect"
   fi
 else
   bad "G7: MUTANT DID NOT APPLY — inconclusive, never treat as a pass"
