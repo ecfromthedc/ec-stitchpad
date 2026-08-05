@@ -74,6 +74,13 @@ if [ "$active" = "busy" ]; then
 fi
 
 seat_model="$(sp_model_pin_requested "$state_dir" "$name")"
+# master annotates the model on the roster row and exports SP_MODEL. Keep that as
+# a FALLBACK so a roster-pinned seat still works; the explicit per-seat pin wins.
+# NOTE on master's form (model_args=()): an EMPTY array expanded unguarded under
+# `set -u` is fatal on stock bash 3.2.57 — "model_args[@]: unbound variable" — the
+# adapter exits 1, the wake gate never clears, and the seat goes silently deaf.
+# wake_args below is always initialised NON-EMPTY, so it cannot hit that.
+[ -z "$seat_model" ] && [ -n "${SP_MODEL:-}" ] && [ "${SP_MODEL}" != "-" ] && seat_model="$SP_MODEL"
 wake_args=(wake --session-id "$session_id" --cwd "$pad_dir" --client-type stitchpad \
   --timeout-seconds 600 --prompt "$prompt")
 [ -n "$seat_model" ] && wake_args+=(--model "$seat_model")

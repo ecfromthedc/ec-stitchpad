@@ -144,7 +144,13 @@ fire_adapter() {
   # in — without this, pad mentions to randy chronically defer and never land.
   local force=0
   [ -f "$PAD_STATE/forcewake.$name" ] && force=1
-  SP_WAKE="$wake" SP_TARGET="$target" SP_PAD_DIR="$PAD_DIR" SP_PAD_MD="$PAD_MD" \
+  # master adds a per-seat model from the roster's model column; empty when
+  # unannotated, so the adapter falls back to the daemon default exactly as before.
+  local model; model="$(sp_model_for "$name")"
+  # This branch adds delivery SUPERVISION: the adapter's pid is tracked so a busy
+  # seat's retry can be reasoned about, and the ack file is what lets a delivery be
+  # confirmed rather than assumed. Both are kept — they are orthogonal.
+  SP_WAKE="$wake" SP_TARGET="$target" SP_MODEL="$model" SP_PAD_DIR="$PAD_DIR" SP_PAD_MD="$PAD_MD" \
     SP_DELIVERY_ACK_FILE="$ack_file" STITCHPAD_FORCE_WAKE="$force" \
     bash "$script" mention "$name" "$PAD_MD" "$taskfile" </dev/null &
   DELIVERY_ADAPTER_PID=$!
