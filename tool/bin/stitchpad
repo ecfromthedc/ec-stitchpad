@@ -4949,7 +4949,15 @@ print('unknown')
     ;;
 
   help|-h|--help)
-    sed -n '2,44p' "$0" | sed 's/^# \{0,1\}//'
+    # Was `sed -n '2,44p'` — a HARDCODED line range. Every command documented
+    # below line 44 was invisible to `stitchpad help` while still satisfying the
+    # header-based discoverability gate: reconcile, lanes, pads and evidence had
+    # already fallen off the end unnoticed, and spawn/directive joined them the
+    # moment they were added. An agent cannot use a command it cannot see.
+    # Print the whole leading comment block instead, ending where the code
+    # begins. Self-maintaining: a command added to the header now appears in
+    # help automatically, and can never silently fall off the end again.
+    awk 'NR>=2 { if ($0 !~ /^#/) exit; sub(/^# ?/, ""); print }' "$0"
     ;;
 
   *)

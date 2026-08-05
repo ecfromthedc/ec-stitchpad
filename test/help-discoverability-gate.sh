@@ -76,6 +76,27 @@ echo "$HELP_OUT" | grep -q 'stitchpad leave' \
   && ok "help mentions leave" \
   || bad "help MISSING leave"
 
+# ── Test 4: the header and what `stitchpad help` PRINTS must agree ─────────
+# The gap this closes: help_doc_commands() reads the whole header block, but the
+# help arm printed a HARDCODED line range (`sed -n '2,44p'`). Everything
+# documented below line 44 satisfied Tests 1-3 while being invisible to an agent
+# that actually ran `stitchpad help` — reconcile, lanes, pads and evidence had
+# already fallen off the end unnoticed. A command an agent cannot see does not
+# exist to it, so the two surfaces must be compared, not each checked alone.
+missing_from_help=""
+for cmd in $HELP_DOC; do
+  is_internal "$cmd" && continue
+  # Match the command as a TOKEN, not as the literal "stitchpad <cmd>": the
+  # header documents alternations like `stitchpad start|stop|status|restart`,
+  # where "stitchpad stop" never appears as those two words in sequence.
+  echo "$HELP_OUT" | grep -qE "(^|[ |])$cmd([ |]|\$)" || missing_from_help="$missing_from_help $cmd"
+done
+if [ -z "$missing_from_help" ]; then
+  ok "every documented command is actually PRINTED by 'stitchpad help'"
+else
+  bad "documented but NOT printed by 'stitchpad help':$missing_from_help"
+fi
+
 # ── Verdict ────────────────────────────────────────────────────────────────
 echo ""
 if [ "$fail" -gt 0 ]; then
