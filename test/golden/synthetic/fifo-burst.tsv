@@ -1,13 +1,13 @@
-seat	since	ordinal	sender	last_reply	reply_target
-alice	0	0	5	bob	
-alice	1	0	5	bob	
-alice	2	0	5	bob	
-alice	3	0	5	bob	
-alice	4	0	5	bob	
-alice	5	0	5	bob	
-bob	0	1	alice	0	
-bob	1	2	alice	0	
-bob	2	3	alice	0	
-bob	3	4	alice	0	
-bob	4	5	alice	0	
-bob	5	0	0	0	
+seat	since	oracle_line
+alice	0	0  5 bob
+alice	1	0  5 bob
+alice	2	0  5 bob
+alice	3	0  5 bob
+alice	4	0  5 bob
+alice	5	0  5 bob
+bob	0	1 alice 0 
+bob	1	2 alice 0 
+bob	2	3 alice 0 
+bob	3	4 alice 0 
+bob	4	5 alice 0 
+bob	5	0  0 

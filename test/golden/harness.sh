@@ -49,9 +49,8 @@ roster_names() {
 }
 
 run_oracle() {
-  local seat="$1" since="$2" ord sender lr rt
-  read -r ord sender lr rt <<<"$(sp_engagement "$seat" "$since" 2>/dev/null)"
-  printf '%s\t%s\t%s\t%s\t%s\t%s\n' "$seat" "$since" "${ord:-0}" "${sender:-}" "${lr:-0}" "${rt:-}"
+  local seat="$1" since="$2"
+  printf '%s\t%s\t%s\n' "$seat" "$since" "$(sp_engagement "$seat" "$since" 2>/dev/null)"
 }
 
 # ── capture ──────────────────────────────────────────────────────────
@@ -62,7 +61,7 @@ capture() {
   n_ord=$(total_ordinals)
   ordinals=$((n_ord > 0 ? n_ord : 0))
 
-  printf 'seat\tsince\tordinal\tsender\tlast_reply\treply_target\n'
+  printf 'seat\tsince\toracle_line\n'
 
   seats="$(roster_names)"
   if [ -z "$seats" ]; then
@@ -133,14 +132,14 @@ case "$cmd" in
     echo "diffing $arg2 against $arg1 ..."
     if diff_golden "$arg1" "$arg2"; then
       echo "golden match — no change"
-      exit 0
     else
       echo "GOLDEN MISMATCH — prove which side is right before re-blessing."
-      exit 1
+      _rc=1
     fi
     ;;
   all)
     run_all
+    _rc=$?
     ;;
   *)
     echo "usage: harness.sh capture|diff|all <corpus.md> <out.tsv>" >&2; exit 2
@@ -149,3 +148,4 @@ esac
 
 # Cleanup transient pad dir
 rm -rf "$PAD_TMP" 2>/dev/null || true
+exit "${_rc:-0}"
