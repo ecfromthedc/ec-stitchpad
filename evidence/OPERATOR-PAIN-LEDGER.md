@@ -523,3 +523,31 @@ P34 (CLOSED). pad-io-and-archive: 63/13 -> 77/0, deterministic over 3 runs.
        · each "next mutator" recovery join gets its own surface, because it
          represents a DIFFERENT agent process
      The product guard was right every time. The simulation was wrong.
+
+P41. THE RELEASE GATE PRINTED "PASSED" AND EXITED 1 — EVERY RUN, ALL BUILD.
+     **The most serious defect found this session, and the hardest to see.**
+     regression-tripwire ends with a clean `exit 0` on a green board. Its EXIT
+     trap was:
+         trap 'kill -9 $(jobs -p) 2>/dev/null; _cleanup' EXIT
+     With no background jobs, `$(jobs -p)` is empty, so that is `kill -9` with NO
+     ARGUMENTS — which fails. Under `set -e` the failure ABORTS THE TRAP, so
+     (a) `_cleanup` never ran (the --sha path leaked its temp worktree), and
+     (b) the shell exited 1, overriding the `exit 0`.
+     Result: the board read
+         "TRIPWIRE: PASSED — all 68 enforced suites green"
+     and the process exited 1. Anything keying on the exit code — CI, the release
+     step, a human typing `regression-tripwire && git push` — saw FAILURE on a
+     fully green board, and rc=0 was literally unreachable. Red runs also exited
+     1, so the value looked correct and nobody questioned it.
+     WHY THE GATE MISSED IT — this is the part worth remembering:
+     tripwire-gate's setup_fixture sed-patched `|| true` into the EXIT trap of the
+     COPY under test. The gate guarding the gate SILENTLY REPAIRED the defect it
+     exists to catch, so T1 ("all GREEN -> exit 0") passed for months against a
+     build that is not the one we ship. A test fixture that patches the code under
+     test is not a test.
+     FIXED: the trap is a status-preserving function (`_rc=$?` ... `exit "$_rc"`),
+     and the fixture's workaround is GONE — tripwire-gate now runs the shipped
+     script byte for byte. Mutant-proven: restoring the old trap turns T1 RED
+     with "exit 0 (expected 0, got 1)".
+     This is the same family as P31 (an EXIT trap masking a crash to 0) — the
+     same mechanism, pointed the other way.

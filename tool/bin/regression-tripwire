@@ -48,7 +48,27 @@ else
   QUARANTINE="$TOP/test/suite-quarantine.txt"
   _cleanup() { true; }
 fi
-trap 'kill -9 $(jobs -p) 2>/dev/null; _cleanup' EXIT
+# An EXIT trap must NEVER change the exit status.
+# `kill -9 $(jobs -p)` with no background jobs is `kill -9` with NO ARGUMENTS,
+# which fails — and under `set -e` that aborts the trap, so _cleanup never ran
+# AND a clean `exit 0` came back as 1. This gate printed
+#     "TRIPWIRE: PASSED — all 68 enforced suites green"
+# and exited 1, every single run, for the whole build. Anything keying on the
+# exit code (CI, the release step, a human running `&& push`) saw failure on a
+# green board and success never existed.
+# It survived because tripwire-gate's setup_fixture sed-patched `|| true` into
+# its COPY — the gate guarding the gate quietly repaired the defect it exists to
+# catch, so T1 ("all GREEN -> exit 0") passed against a build nobody ships.
+# That workaround is removed; this trap is now correct in the real script.
+_on_exit() {
+  _rc=$?
+  set +e
+  _j="$(jobs -p 2>/dev/null)"
+  [ -n "$_j" ] && kill -9 $_j 2>/dev/null
+  _cleanup
+  exit "$_rc"
+}
+trap _on_exit EXIT
 
 [ -f "$BASELINE" ] || { echo "tripwire: FATAL — baseline not found: $BASELINE" >&2; exit 2; }
 [ -f "$QUARANTINE" ] || { echo "tripwire: FATAL — quarantine not found: $QUARANTINE" >&2; exit 2; }

@@ -62,8 +62,12 @@ setup_fixture() {
   mkdir -p "$FIXTURE/tool/bin" "$FIXTURE/test"
   cp "$HERE/../tool/bin/regression-tripwire" "$FIXTURE/tool/bin/regression-tripwire"
   chmod +x "$FIXTURE/tool/bin/regression-tripwire"
-  sed -i '' 's/kill -9 \$(jobs -p) 2>\/dev\/null/kill -9 \$(jobs -p) 2>\/dev\/null || true/' \
-    "$FIXTURE/tool/bin/regression-tripwire"
+  # NO WORKAROUND PATCH HERE. This used to sed `|| true` into the EXIT trap of
+  # the copy under test, which repaired the exact defect this gate exists to
+  # catch: the trap's failing `kill -9` (no background jobs) overrode a clean
+  # `exit 0` with 1, so the real tripwire printed PASSED and exited non-zero for
+  # the entire build while T1 happily asserted "exit 0" against the patched copy.
+  # The gate must test the shipped script, byte for byte.
 }
 
 write_bl() {
