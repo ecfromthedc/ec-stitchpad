@@ -91,3 +91,100 @@ TO DO: dispatch k3 + deepseek-v4-pro, let them fix what they find, THEN push.
 2. Dispatch k3 + deepseek-v4-pro on the adversarial brief; let them land fixes.
 3. THEN push captain-dogfood-v4 and update PR #10. Do not push before step 2 completes.
 4. Fix the dispatch defects above — that is the operator's actual pain.
+
+---
+
+## PART 2 — delegation contract, dispatch honesty, blind-spot sweep
+
+### Landed and gated since the last entry
+
+**e780866 / 4a09aef — P42 sub-agent spawning under an enforced contract**
+EC: *"they also need the ability to spawn their own sub-agents if they need to,
+all within this context ... and it should always be following the orchestrator's
+request."*
+
+- `stitchpad spawn <name> --brief <text> --artifact <path>...`
+  `--artifact` is MANDATORY. Spawning is the easy half; the contract is the
+  point. An unconstrained spawn recreates, one level down, the most expensive
+  defect of this build — a seat producing nothing looking exactly like a seat
+  that is working.
+- Lineage is durable (`.state/spawn.<child>.{parent,brief,at}`), so a silent seat
+  is attributable to whoever asked for it.
+- Depth (`STITCHPAD_SPAWN_MAX_DEPTH`, default 3) and fan-out
+  (`STITCHPAD_SPAWN_MAX_CHILDREN`, default 5) are bounded. An agent that can
+  spawn agents can fork-bomb the operator's laptop.
+- Delegation cycles and anonymous spawns refused; every refusal names the fix.
+- **Dispatch REUSES the mention → watcher → `fire_adapter` path.** Deliberate and
+  load-bearing: that is the path proven to deliver. This command must never grow
+  a second private dispatch path with its own bugs.
+- `stitchpad directive <text>` — the orchestrator's standing order, copied
+  VERBATIM into every spawn brief at every depth and marked as OUTRANKING the
+  parent's brief. This is what "always following the orchestrator's request" is
+  made of: depth cannot dilute the original ask.
+- `stitchpad spawn --tree` renders lineage + each seat's contract. Verified live
+  to depth 2 (lead → auditor → prober).
+
+**join: a push seat no longer claims the caller's terminal.**
+ONE TERMINAL = ONE PAD is for seats that OCCUPY a terminal. A push seat is
+daemon-driven; its target is an Ocean session, not a surface. The old fallback
+meant an operator sitting in their own joined terminal could not enrol a push
+seat at all — which blocked spawning outright. Pull seats unchanged and still
+refused (gate G12). terminal-isolation, websec, identity-survival, p33, p29-p30,
+empty-lock-reclaim all stay GREEN.
+
+**4d7a9a8 — P43 `wake` must not swallow a push seat's message**
+The single most expensive shape in this system, and the one EC keeps hitting as
+"the agents aren't deploying". Measured on the live pad: an orchestrator ran
+`stitchpad wake kimi`; the command rendered the message to the ORCHESTRATOR's
+terminal, advanced `.state/seen.kimi` to 5, and exited 0 — while the daemon
+showed no turn on that session since the previous DAY. Cursor moved, so it was
+never retried. **It looks exactly like success.**
+`wake` now refuses when the target is a push seat and the caller is not that
+seat, does not touch the cursor, and names the command that works. Self-wake and
+all `--peek`/`--peek-ordinal` inspection untouched.
+Note for whoever reads this next: the guard was FIRST written above the
+definition of `_wake_record`, so it fell through and did nothing — the exact
+"looks fine, does nothing" shape it exists to prevent. Its own gate caught it.
+`wake-regression` case10's two `wake agent` calls were fixture-only cursor
+drivers; they now name the seat, as every real caller does. **No assertion was
+weakened — the simulation was made realistic.** Suite GREEN.
+
+**P41 — regression-tripwire, both findings from kimi-adv, both proved by execution**
+- Crash detection matched an ENUMERATED message list, so a suite dying on
+  `x=$((1/0))` printed a bash diagnostic, continued with a wrong value and exited
+  0 — scored GREEN. Now matches the bash fatal-diagnostic SHAPE (`: line <N>: `),
+  which catches every diagnostic nobody thought to enumerate.
+- The VOID path printed `TRIPWIRE: PASSED` and then exited 2. A run that could
+  not be measured is not a pass. Now says INCONCLUSIVE and keeps exit 2.
+
+New gates, both registered in `test/suite-baseline.txt`:
+  `p42-subagent-spawn-gate.sh 12 0`   `p43-wake-push-misdirect-gate.sh 7 0`
+Both mutant-proved.
+
+### Blind-spot sweep (EC: "find any gap that is not gluing this machine together")
+Prompt at `/tmp/blindspot/PROMPT.md`. Three seats dispatched against
+`/private/tmp/wt-integrate`: `kimi-blind` (k3, whole system), `ds-dispatch`
+(flash, dispatch-only lens), `ds-writepath` (flash, state/write-target lens).
+
+**The sweep immediately reproduced the defect it was hunting.** Both DeepSeek
+seats returned **rc=0 and produced no artifact at all**. Kimi obeyed the
+"start writing the file EARLY" instruction and its file exists.
+
+Two conclusions, both load-bearing:
+1. **rc=0 from a dispatch means "the turn completed", NOT "the work happened."**
+   Any orchestration that treats exit code as success will silently lose work.
+   This is precisely why the P42 artifact contract is mandatory rather than
+   advisory.
+2. **An orchestrator cannot read what an agent said.** The daemon exposes
+   id/session_id/prompt/status/started_at/finished_at; `/messages` returns 405,
+   `/transcript` and `/output` 404. If the agent does not write to a path the
+   orchestrator chose, the work is unrecoverable. Dispatch prompts must state the
+   artifact path FIRST and treat chat output as discarded.
+
+### Still open
+- Full 83-suite tripwire run in a quiet window (targeted suites are green;
+  watcher-singleton and p29-p30 not yet re-run after P43).
+- Consolidate all four lineages onto fork `ecfromthedc/pasture`, resolve the 18
+  conflict blocks across 7 files, run the full gate, push, open ONE PR upstream.
+- `git add -A` remains BANNED in this repo (untracked credential-shaped
+  wrangler.*.toml, relay state, machine-local keeper.conf). Add by explicit path.
