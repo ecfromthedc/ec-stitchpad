@@ -528,6 +528,16 @@ P39 (REOPENED — DIAGNOSED, NOT FIXED). THE WATCHER IS KILLED BY ITS OWN CALLER
              from the lock's mtime, which the winner keeps touching as it writes
              generation/launcher/ts, so the window does not mean what it looks
              like it means here.
+     4./5. OWNERSHIP MARKER (the approach recommended below — I tried it).
+          The winner publishes its pid the moment it wins the mkdir; the stop path
+          skips a generation whose marker names a LIVE pid. Marker INSIDE the lock
+          broke sp_watch_empty_lock_reclaim (the lock is only reclaimable when
+          EMPTY), so the stop path reported "left unverified ownership evidence".
+          Moved to a sidecar OUTSIDE the lock: watcher-races went green 3/3 and the
+          singleton flake dropped from ~1-in-5 to ~1-in-8 — better, not fixed.
+          Publishing the marker BEFORE the test barrier (to close the remaining
+          mkdir->publish window) then made watcher-races ITSELF flaky, 2 of 3.
+          Reverted. The idea is still right; the placement needs a rested head.
      WHAT THE NEXT PASS SHOULD DO: stop reasoning from the lock's mtime. The
      winner should publish an explicit "spawning" marker with its own pid the
      moment it wins the mkdir, and sp_stop_watchers_for_pad should skip any
