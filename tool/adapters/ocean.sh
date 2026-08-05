@@ -48,15 +48,15 @@ fi
 # Pin the seat's model when the roster annotates one (name|adapter|MODEL|wake|target).
 # Without it the daemon's single current model answers for EVERY seat, so a pad of
 # differently-named agents is really one model wearing name tags.
-model_args=()
-[ -n "${SP_MODEL:-}" ] && [ "${SP_MODEL}" != "-" ] && model_args=(--model "$SP_MODEL")
-
-"$bin" wake \
-  --session-id "$session_id" \
-  "${model_args[@]}" \
+# Uses positional params instead of an array: bash 3.2 (macOS default) treats
+# empty-array [@] expansion as "unbound variable" under set -u.
+set -- --session-id "$session_id" \
   --cwd "$pad_dir" \
   --client-type "stitchpad" \
-  --timeout-seconds 600 \
+  --timeout-seconds 600
+[ -n "${SP_MODEL:-}" ] && [ "${SP_MODEL}" != "-" ] && set -- "$@" --model "$SP_MODEL"
+
+"$bin" wake "$@" \
   --prompt "You are @${name} on the stitchpad at ${pad}.
 
 THE MESSAGE ADDRESSED TO YOU:
