@@ -366,7 +366,8 @@ mod tests {
     #[test]
     fn override_roundtrip() {
         assert!(set_override("nord").is_ok());
-        assert_eq!(t(), palette("nord"));
+        let no_color = std::env::var_os("NO_COLOR").is_some_and(|v| !v.is_empty());
+        assert_eq!(t(), if no_color { TERMINAL } else { palette("nord") });
         assert!(set_override("definitely-fake").is_err());
         let _ = set_override("auto");
     }

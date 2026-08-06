@@ -7,6 +7,11 @@
 #   stitchpad set-wake <name> <push|pull> <target> [adapter]   update wake mode for an existing row
 #   stitchpad rename <old> <new>          rename a member everywhere local state knows them
 #   STITCHPAD_NAME=<you> stitchpad say [--image <path>] <text...>   post a message (auto-commits)
+#   STITCHPAD_NAME=<you> stitchpad say [--re <#m-id>] [--image <path>] <text...>   post a message (auto-commits; --re threads it)
+#   STITCHPAD_NAME=<you> stitchpad react <#m-id> <emoji>   react to a message (toggle; never wakes)
+#   STITCHPAD_NAME=<you> stitchpad amend <#m-id> <text|--file f>   rewrite YOUR message's body in place (live cards)
+#   STITCHPAD_NAME=<you> stitchpad run [--title t] <label>=<cmd>...   run steps as a live-amending ui timeline
+#   STITCHPAD_NAME=<you> stitchpad drop <file> [note]   share a doc: dropbox/ + relay mirror + one 📎 pad line
 #   stitchpad read [-n N]                 print the recent conversation (plain)
 #   stitchpad who / stitchpad roster      print parsed roster
 #   stitchpad whoami                      print your own resolved name for this terminal
@@ -2216,13 +2221,19 @@ PY
       _holder="$(sp_term_byname_check "$from")" || {
         echo "stitchpad: REFUSED — @$from is live-bound to ${_holder}, not $PAD_DIR (no terminal identity resolvable — env cleared?). cd there or 'stitchpad leave' first." >&2; exit 1; }
     fi
-    image_path=""
-    if [ "${1:-}" = "--image" ]; then
-      shift
-      image_path="${1:-}"
-      [ -n "$image_path" ] || { echo "usage: stitchpad say --image <path> [text...]" >&2; exit 1; }
-      shift
-    fi
+    image_path=""; reply_to=""
+    while :; do case "${1:-}" in
+      --image)
+        image_path="${2:-}"
+        [ -n "$image_path" ] || { echo "usage: stitchpad say [--re <#m-id>] [--image <path>] <text...>" >&2; exit 1; }
+        shift 2 ;;
+      --re)
+        reply_to="${2:-}"
+        [ -n "$reply_to" ] || { echo "usage: stitchpad say [--re <#m-id>] [--image <path>] <text...>" >&2; exit 1; }
+        reply_to="#${reply_to#\#}"   # normalize: accept "m-abc" or "#m-abc"
+        shift 2 ;;
+      *) break ;;
+    esac; done
     text="$*"
     [ -z "$text" ] && [ -z "$image_path" ] && { echo "usage: stitchpad say [--image <path>] <text...>  (you are @$from)" >&2; exit 1; }
 
@@ -2285,7 +2296,8 @@ PY
     # "-@name" exclusions in the message. So "@all -@ernie -@Jill hey" wakes
     # everyone except ernie and Jill. The -@name tokens are stripped from the
     # posted text. Expands to explicit @mentions so the normal wake gate just works.
-    if printf '%s' "$text" | grep -qiE '(^|[[:space:]])@all([^a-zA-Z0-9_-]|$)'; then
+    # "@flock" is the lore alias — same gang-prompt, pasture voice.
+    if printf '%s' "$text" | grep -qiE '(^|[[:space:]])@(all|flock)([^a-zA-Z0-9_-]|$)'; then
       # collect excluded names from -@name tokens
       excl=" $from "   # never wake yourself
       for tok in $text; do
@@ -2301,13 +2313,22 @@ PY
         [ "$rt" = "operator" ] || [ "$rt" = "human" ] && continue
         mentions="$mentions @$rn"
       done < <(sp_roster)
-      # strip the -@name exclusion tokens and the literal @all, prepend the expanded list
-      cleaned="$(printf '%s' "$text" | sed -E 's/(^|[[:space:]])-@[a-zA-Z0-9_-]+//g; s/(^|[[:space:]])@all([^a-zA-Z0-9_-]|$)/\2/Ig')"
+      # strip the -@name exclusion tokens and the literal @all/@flock, prepend the expanded list
+      cleaned="$(printf '%s' "$text" | sed -E 's/(^|[[:space:]])-@[a-zA-Z0-9_-]+//g; s/(^|[[:space:]])@(all|flock)([^a-zA-Z0-9_-]|$)/\3/Ig')"
       text="$(printf '%s' "${mentions# } $(printf '%s' "$cleaned" | sed -E 's/^[[:space:]]+//')")"
     fi
     # Derive the message timestamp from the captured epoch (same as the
     # date divider) so the divider, message HH:MM, and commit timestamp all
     # originate from the same wall-clock snapshot.
+    # From the live branch: a `--re` pointing at nothing renders as a broken
+    # thread on every surface. Checked BEFORE the journal opens, so the failure
+    # path has nothing to roll back.
+    if [ -n "$reply_to" ] && ! grep -q "· $reply_to" "$PAD_MD" 2>/dev/null; then
+      sp_unlock
+      _say_record failed
+      echo "stitchpad: reply target $reply_to not found in this pad" >&2
+      exit 1
+    fi
     ts="$(sp_date_divider_hhmm || date '+%I:%M %p')"
     # Journal the exact pre-operation bytes of the pad, the session registry,
     # and every lifecycle marker BEFORE any mutation. The registry and markers
@@ -2327,7 +2348,15 @@ PY
     # (last-divider-epoch) is inside the journal window: any later failure
     # restores it too, so a retry sees exactly the pre-say world.
     sp_date_divider_insert || true
-    printf '\n## %s · %s\n\n%s\n' "@$from" "$ts" "$text" >> "$PAD_MD"
+    # Header grammar v2 (live branch): "## @name · TIME · #m-ID [· re:#m-PARENT]".
+    # The id is the durable anchor reactions, threads and `amend` all hang off;
+    # readers that only want author/time ignore the extra " · " fields. The
+    # timestamp still comes from the captured epoch, so divider, header and
+    # commit stay on one wall clock.
+    mid="$(sp_msg_id)"
+    hdr="@$from · $ts · #$mid"
+    [ -n "$reply_to" ] && hdr="$hdr · re:$reply_to"
+    printf '\n## %s\n\n%s\n' "$hdr" "$text" >> "$PAD_MD"
     # Align the git commit timestamp with the same captured epoch ("@<epoch>"
     # is git's strict epoch form). Scoped to this one sp_commit call — bash
     # restores prefixed assignments after the function returns, so no ambient
@@ -2372,7 +2401,204 @@ PY
     rm -f "$PAD_STATE/pending.$from" "$PAD_STATE/delivered_no_reply.$from" 2>/dev/null
     sp_unlock
     _say_record posted
-    echo "✓ posted as @$from"
+    echo "✓ posted as @$from (#$mid)"
+    ;;
+
+  amend)
+    # Edit-in-place by message id: replace the BODY of one of YOUR messages
+    # (header, id, and thread linkage untouched). This is what makes live
+    # cards possible — a posted ui timeline amends as its run progresses, and
+    # every surface just re-parses. Append-only spirit survives: each amend is
+    # one git commit, so history holds every version.
+    #   stitchpad amend <#m-id> <text...>
+    #   stitchpad amend <#m-id> --file <path>
+    sp_init_paths || exit 1
+    from="$(sp_me)"
+    [ -z "$from" ] && { echo "stitchpad: no identity — join first (or set STITCHPAD_NAME)" >&2; exit 1; }
+    target="${1:?usage: stitchpad amend <#m-id> <text...|--file <path>>}"; shift
+    target="${target#\#}"
+    bodyf="$(mktemp)"
+    if [ "${1:-}" = "--file" ]; then
+      # -r not -f: process substitution (/dev/fd/N) is a legitimate source
+      [ -r "${2:-}" ] || { rm -f "$bodyf"; echo "stitchpad: --file needs a readable path" >&2; exit 1; }
+      cat "$2" > "$bodyf"
+    else
+      [ $# -gt 0 ] || { rm -f "$bodyf"; echo "usage: stitchpad amend <#m-id> <text...|--file <path>>" >&2; exit 1; }
+      printf '%s' "$*" > "$bodyf"
+    fi
+    sp_lock || { rm -f "$bodyf"; exit 1; }
+    python3 - "$PAD_MD" "$target" "$from" "$bodyf" <<'PY'
+import re, sys
+pad, mid, who, bodyf = sys.argv[1:5]
+lines = open(pad, encoding="utf-8", errors="replace").read().split("\n")
+hit = -1
+for i, ln in enumerate(lines):
+    if not ln.startswith("## @"):
+        continue
+    segs = [s.strip() for s in ln[3:].split(" · ")]
+    if f"#{mid}" in segs:
+        hit = i
+        author = segs[0].lstrip("@")
+        break
+if hit < 0:
+    sys.exit(2)          # id not found
+if author != who:
+    sys.exit(3)          # not your message
+end = len(lines)
+for j in range(hit + 1, len(lines)):
+    if lines[j].startswith("## @") or re.match(r"^\*@\S+ reacted ", lines[j]):
+        end = j
+        break
+body = open(bodyf, encoding="utf-8", errors="replace").read().rstrip("\n")
+new = lines[:hit + 1] + ["", body, ""] + lines[end:]
+open(pad, "w", encoding="utf-8").write("\n".join(new))
+PY
+    rc=$?
+    rm -f "$bodyf"
+    case "$rc" in
+      0) sp_commit "amend: $from #$target"; sp_unlock; echo "✓ amended #$target" ;;
+      2) sp_unlock; echo "stitchpad: message #$target not found" >&2; exit 1 ;;
+      3) sp_unlock; echo "stitchpad: #$target is not your message — only the author amends" >&2; exit 1 ;;
+      *) sp_unlock; echo "stitchpad: amend failed" >&2; exit 1 ;;
+    esac
+    ;;
+
+  run)
+    # Execution timeline: run labeled steps and narrate them as ONE live
+    # ui timeline message that amends in place as states flip — the agent's
+    # run becomes a living card in the room. Stops on first failure and
+    # threads the failing output under the timeline as a real artifact.
+    #   stitchpad run [--title <t>] <label>=<cmd> [<label>=<cmd> ...]
+    sp_init_paths || exit 1
+    from="$(sp_me)"
+    [ -z "$from" ] && { echo "stitchpad: no identity — join first (or set STITCHPAD_NAME)" >&2; exit 1; }
+    title="execution"
+    labels=(); cmds=()
+    while [ $# -gt 0 ]; do case "$1" in
+      --title) title="${2:-execution}"; shift 2 ;;
+      *=*) labels+=("${1%%=*}"); cmds+=("${1#*=}"); shift ;;
+      *) echo "usage: stitchpad run [--title <t>] <label>=<cmd> [...]" >&2; exit 1 ;;
+    esac; done
+    [ "${#labels[@]}" -gt 0 ] || { echo "usage: stitchpad run [--title <t>] <label>=<cmd> [...]" >&2; exit 1; }
+    n=${#labels[@]}
+    states=(); ats=(); notes=()
+    for _ in "${labels[@]}"; do states+=("todo"); ats+=(""); notes+=(""); done
+
+    _tl_body() { # $1 = alt line → prints full message body (alt + fence)
+      local ev='[]' i
+      for i in $(seq 0 $((n - 1))); do
+        ev="$(jq -c --arg l "${labels[$i]}" --arg s "${states[$i]}" --arg a "${ats[$i]}" --arg no "${notes[$i]}" \
+          '. + [{label:$l, state:$s} + (if $a != "" then {at:$a} else {} end) + (if $no != "" then {note:$no} else {} end)]' <<< "$ev")"
+      done
+      printf '%s\n\n```ui timeline\n%s\n```' "$1" \
+        "$(jq -nc --arg t "$title" --argjson e "$ev" '{title:$t, events:$e}')"
+    }
+
+    _amend_tl() { # $1 = alt line → amend the live timeline message
+      local f; f="$(mktemp)"
+      _tl_body "$1" > "$f"
+      STITCHPAD_NAME="$from" "$BIN_DIR/stitchpad" amend "$mid" --file "$f" >/dev/null
+      rm -f "$f"
+    }
+
+    states[0]="active"
+    out="$(STITCHPAD_NAME="$from" "$BIN_DIR/stitchpad" say "$(_tl_body "⏱ $title — running (${n} steps)")")" || exit 1
+    mid="$(printf '%s' "$out" | grep -o 'm-[a-z0-9]*' | head -1)"
+    [ -n "$mid" ] || { echo "stitchpad: could not capture timeline message id" >&2; exit 1; }
+
+    failed=""
+    total_t0=$SECONDS
+    for i in $(seq 0 $((n - 1))); do
+      states[$i]="active"
+      _amend_tl "⏱ $title — running: ${labels[$i]}"
+      t0=$SECONDS
+      step_out="$(bash -c "${cmds[$i]}" 2>&1)"
+      rc=$?
+      ats[$i]="$((SECONDS - t0))s"
+      if [ $rc -eq 0 ]; then
+        states[$i]="done"
+      else
+        states[$i]="failed"
+        notes[$i]="exit $rc"
+        failed="${labels[$i]}"
+        _amend_tl "⏱ $title — ✕ failed at ${labels[$i]}"
+        # the failing output is the artifact — thread it under the timeline
+        tail_out="$(printf '%s' "$step_out" | tail -c 2000)"
+        STITCHPAD_NAME="$from" "$BIN_DIR/stitchpad" say --re "$mid" "$(printf '%s failed (exit %s) — output tail:\n\n```\n%s\n```' "${labels[$i]}" "$rc" "$tail_out")" >/dev/null
+        break
+      fi
+      _amend_tl "⏱ $title — ${labels[$i]} done"
+    done
+    if [ -z "$failed" ]; then
+      _amend_tl "⏱ $title — ✓ all $n steps green ($((SECONDS - total_t0))s)"
+      echo "✓ run complete: $n steps green (#$mid)"
+    else
+      echo "✕ run failed at $failed (#$mid)"
+      exit 1
+    fi
+    ;;
+
+  drop)
+    # Shared files: copy a doc into the pad's dropbox/ (local truth every
+    # agent + the TUI shed tab can read), mirror it to the relay when creds
+    # exist (so the PWA can view it via /f/…), and post one pad line. The pad
+    # line IS the files feed — every surface derives its files view from it.
+    #   stitchpad drop <file> [note...]
+    sp_init_paths || exit 1
+    from="$(sp_me)"
+    [ -z "$from" ] && { echo "stitchpad: no identity — join first (or set STITCHPAD_NAME)" >&2; exit 1; }
+    src="${1:?usage: stitchpad drop <file> [note...]}"; shift || true
+    note="$*"
+    [ -f "$src" ] || { echo "stitchpad: file not found: $src" >&2; exit 1; }
+    fsize="$(stat -f %z "$src" 2>/dev/null || stat -c %s "$src" 2>/dev/null || echo 0)"
+    [ "$fsize" -le $((15 * 1024 * 1024)) ] || { echo "stitchpad: file too large (15MB cap)" >&2; exit 1; }
+    fname="$(basename "$src" | tr -d '[]()' | tr ' ' '_')"
+    mkdir -p "$PAD_DIR/dropbox"
+    cp "$src" "$PAD_DIR/dropbox/$fname"
+    # human-readable size
+    if [ "$fsize" -ge 1048576 ]; then hsize="$(( fsize / 1048576 ))MB"
+    elif [ "$fsize" -ge 1024 ]; then hsize="$(( fsize / 1024 ))KB"
+    else hsize="${fsize}B"; fi
+    link=""
+    relay="${PASTURE_RELAY:-${STITCHPAD_RELAY:-}}"; token="${PASTURE_TOKEN:-${STITCHPAD_TOKEN:-}}"
+    if [ -n "$relay" ] && [ -n "$token" ]; then
+      pad_name="$(basename "$(dirname "$PAD_DIR")")"
+      resp="$(curl -fsS -H "authorization: Bearer $token" -F "file=@$PAD_DIR/dropbox/$fname" "${relay%/}/upload-file?pad=$pad_name" 2>/dev/null || true)"
+      key="$(printf '%s' "$resp" | jq -r '.key // empty' 2>/dev/null || true)"
+      [ -n "$key" ] && link=" [view](/f/${key#files/})"
+    fi
+    line="📎 **$fname** · $hsize → dropbox/$fname$link"
+    [ -n "$note" ] && line="$line — $note"
+    STITCHPAD_NAME="$from" "$BIN_DIR/stitchpad" say "$line"
+    ;;
+
+  react)
+    # React to a message: an append-only system line other surfaces aggregate
+    # into chips under the target. Never wakes anyone (system lines don't trip
+    # mention detection) — a reaction is an ack, not a prompt.
+    #   stitchpad react <#m-id> <emoji-or-word>
+    sp_init_paths || exit 1
+    from="$(sp_me)"
+    [ -z "$from" ] && { echo "stitchpad: no identity — join first (or set STITCHPAD_NAME)" >&2; exit 1; }
+    target="${1:?usage: stitchpad react <#m-id> <emoji>}"
+    emoji="${2:?usage: stitchpad react <#m-id> <emoji>}"
+    target="#${target#\#}"
+    [ "$(printf '%s' "$emoji" | wc -c)" -le 24 ] || { echo "stitchpad: reaction too long" >&2; exit 1; }
+    sp_lock || exit 1
+    grep -q "· $target" "$PAD_MD" 2>/dev/null || { sp_unlock; echo "stitchpad: message $target not found" >&2; exit 1; }
+    # Toggle-off: reacting again with the same emoji removes the earlier line.
+    _rline="$(grep -nF "*@$from reacted $emoji to $target" "$PAD_MD" 2>/dev/null | head -1 | cut -d: -f1)"
+    if [ -n "$_rline" ]; then
+      sed -i '' "${_rline}d" "$PAD_MD" 2>/dev/null || sed -i "${_rline}d" "$PAD_MD"
+      sp_commit "react: $from -$emoji $target"
+      sp_unlock
+      echo "✓ un-reacted $emoji"
+    else
+      sp_system "@$from reacted $emoji to $target"
+      sp_commit "react: $from $emoji $target"
+      sp_unlock
+      echo "✓ reacted $emoji to $target"
+    fi
     ;;
 
   claim)
@@ -4554,6 +4780,11 @@ TASKSEOF
         sp_narrate "opened task $id: $title" 2>/dev/null || true
         sp_unlock
         echo "$id created"
+        # Wake assignee if set
+        if [ -n "$assignee" ] && sp_user_exists "$assignee"; then
+          printf '\n## @%s · %s · #%s\n\n**task %s assigned:** %s\n' "$assignee" "$(date -u '+%H:%M')" "$(sp_msg_id)" "$id" "$title" >> "$PAD_MD"
+          sp_commit "task $id assigned to @$assignee"
+        fi
         ;;
 
       list)

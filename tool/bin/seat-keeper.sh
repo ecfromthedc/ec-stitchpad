@@ -1,392 +1,297 @@
 #!/usr/bin/env bash
-# One-shot anti-starvation keeper for roster-bound Ocean seats.
+# seat-keeper v2 — anti-starvation watchdog for pasture/stitchpad Ocean seats.
 #
-# The delivery watcher/supervisor exclusively owns unread mentions and their
-# seen cursors. The keeper only asks the canonical task parser for current open
-# work. One seat gets at most one task wake per run.
+# WHY v1 EXISTED: wakes are mention-driven. A seat with no NEW @mentions but an
+# unfinished task queue idles forever (this killed deepseek overnight on
+# rust-parity, 2026-08-01).
+#
+# WHY v2 EXISTS: v1 read `count.<seat>` as a backlog depth. It is neither a
+# backlog nor maintained. It is the CUMULATIVE count of pad lines addressing
+# @seat or @all (lib.sh sp_count_to), written ONCE at watcher startup
+# (watch.sh:45) and never touched again by the react loop — vestigial. So
+# `gate > 0` means "has ever been mentioned", not "has unread mentions". On
+# rust-parity that misreading woke codex and glm every 10 minutes for two days
+# (~570 paid turns) against a pad that mentions neither, while deepseek — the
+# seat v1 was written to save — sat untouched because its counter read 0.
+#
+# v2 asks the oracle the WATCHER asks: `stitchpad wake <name> --peek-ordinal`,
+# an unanswered mention resolved against that seat's own seen.<name> cursor.
+#
+# Three properties are carried over from Daniel Coulbourne's crux (MIT), which
+# solves this same class of problem:
+#
+#   1. FAIL CLOSED WITH A VOICE (crux lib/failover.js). A probe has three
+#      outcomes, not two: up, down, and unknown. v1 collapsed unknown into
+#      "skip", so an unreachable or reshaped daemon silently stopped the entire
+#      watchdog with no log line at all. Here unknown never moves a seat AND
+#      never passes in silence.
+#
+#   2. A CURSOR BELONGS TO THE CONSUMER (crux lib/cursor.js). Position is read
+#      relative to what THIS seat has consumed, never as a shared level.
+#
+#   3. A SUPERVISOR THAT CANNOT SEE ITS WORKER SAYS SO (crux 0.5.1). A wake that
+#      leaves the SAME mention unanswered is recorded as a strike; MAX_STRIKES
+#      consecutive no-ops quarantine the seat and log loudly instead of retrying
+#      forever. v1 could not tell a working wake from a wasted one.
+#
+# Pads watched: one repo path per line in ~/.pasture/keeper.conf
+# Kill switch:  touch ~/.pasture/keeper.off
+# Log:          ~/.pasture/keeper.log
+# Un-quarantine: rm <repo>/.stitchpad/.state/keeper-strike.<seat>
+#
+# Flags: --dry-run  decide and log, wake nothing
+#        --report   dry-run plus a per-seat table (what `crux leads` is for)
 set -uo pipefail
 
-_src="${BASH_SOURCE[0]}"; while [ -h "$_src" ]; do
-  _dir="$(cd -P "$(dirname "$_src")" && pwd)"; _src="$(readlink "$_src")"
-  [ "${_src#/}" = "$_src" ] && _src="$_dir/$_src"
-done
-BIN_DIR="$(cd -P "$(dirname "$_src")" && pwd)"
-source "$BIN_DIR/lib.sh"
+# Overridable so the positive path can be exercised against a throwaway pad
+# without touching the live fleet's conf. A refusal you cannot test is a refusal
+# that rots (crux's phrasing, and it applies to the wake path just as much).
+CONF="${SEAT_KEEPER_CONF:-$HOME/.pasture/keeper.conf}"
+LOG="${SEAT_KEEPER_LOG:-$HOME/.pasture/keeper.log}"
+HB="$HOME/dev/ocean-os/target/release/ocean-heartbeat"
+SP="$HOME/.stitchpad/bin/stitchpad"   # the mention oracle {@see seat_pending}
+DAEMON="http://127.0.0.1:4780"
+DRAIN_MIN_S=600       # min seconds between keeper wakes per seat (drain)
+QUEUE_MIN_S=900       # min seconds between keeper wakes per seat (task-queue)
+MAX_STRIKES=3         # consecutive no-effect wakes before quarantine
+RELOG_S=3600          # re-log a quarantined/unknown seat at most this often
 
-SP="$BIN_DIR/stitchpad"
-HB="${OCEAN_HEARTBEAT_BIN:-$(command -v ocean-heartbeat 2>/dev/null || true)}"
-DAEMON="${OCEAN_DAEMON_URL:-http://127.0.0.1:4780}"
-MIN_SECONDS="${STITCHPAD_KEEPER_MIN_SECONDS:-600}"
-LOCK_STALE_SECONDS="${STITCHPAD_KEEPER_LOCK_STALE_SECONDS:-300}"
-CONFIG="${STITCHPAD_KEEPER_CONFIG:-}"
-repos=()
-
-usage() {
-  echo "usage: stitchpad keeper [--config <repos-file>] <repo> [...]" >&2
-}
-
-while [ $# -gt 0 ]; do
-  case "$1" in
-    --config)
-      [ $# -ge 2 ] || { usage; exit 2; }
-      CONFIG="$2"; shift 2
-      ;;
-    --) shift; while [ $# -gt 0 ]; do repos+=("$1"); shift; done ;;
-    -*) echo "seat-keeper: unknown option: $1" >&2; usage; exit 2 ;;
-    *) repos+=("$1"); shift ;;
+DRY=0; REPORT=0
+for a in "$@"; do
+  case "$a" in
+    --dry-run) DRY=1 ;;
+    --report)  DRY=1; REPORT=1 ;;
+    *) echo "seat-keeper: unknown flag $a" >&2; exit 2 ;;
   esac
 done
 
-case "$MIN_SECONDS" in *[!0-9]*|'') echo "seat-keeper: STITCHPAD_KEEPER_MIN_SECONDS must be a non-negative integer" >&2; exit 2;; esac
-case "$LOCK_STALE_SECONDS" in *[!0-9]*|'') echo "seat-keeper: STITCHPAD_KEEPER_LOCK_STALE_SECONDS must be a non-negative integer" >&2; exit 2;; esac
-[ -n "$HB" ] && [ -x "$HB" ] || { echo "seat-keeper: ocean-heartbeat not found (set OCEAN_HEARTBEAT_BIN)" >&2; exit 1; }
+[ -f "$HOME/.pasture/keeper.off" ] && exit 0
+[ -f "$CONF" ] || exit 0
+[ -x "$HB" ] || { echo "seat-keeper: no heartbeat binary at $HB" >&2; exit 0; }
 
-if [ -n "$CONFIG" ]; then
-  [ -f "$CONFIG" ] || { echo "seat-keeper: config not found: $CONFIG" >&2; exit 1; }
-  while IFS= read -r repo; do
-    [ -n "$repo" ] || continue
-    case "$repo" in \#*) continue;; esac
-    repos+=("$repo")
-  done < "$CONFIG"
-fi
-[ "${#repos[@]}" -gt 0 ] || { usage; exit 2; }
-
-failures=0
-KEEPER_LOCK_DIR=""
-KEEPER_LOCK_OWNER=""
-KEEPER_TMP=""
-
-process_start() {
-  ps -p "$1" -o lstart= 2>/dev/null | sed 's/^[[:space:]]*//;s/[[:space:]]*$//'
-}
-
-keeper_lock_release() {
-  if [ -n "$KEEPER_TMP" ]; then rm -f "$KEEPER_TMP" 2>/dev/null || true; fi
-  if [ -n "$KEEPER_LOCK_DIR" ] && [ -d "$KEEPER_LOCK_DIR" ] \
-    && [ "$(cat "$KEEPER_LOCK_DIR/owner" 2>/dev/null || true)" = "$KEEPER_LOCK_OWNER" ]; then
-    rm -f "$KEEPER_LOCK_DIR/owner" 2>/dev/null || true
-    rmdir "$KEEPER_LOCK_DIR" 2>/dev/null || true
-  fi
-  KEEPER_LOCK_DIR=""
-  KEEPER_LOCK_OWNER=""
-  KEEPER_TMP=""
-}
-
-keeper_lock_acquire() {
-  local state="$1" name="$2" lock owner pid started epoch now current_start mtime age self_pid self_start
-  lock="$state/keeper.$name.lock.d"
-  now="$(date +%s)"
-  self_pid="${BASHPID:-$$}"
-  self_start="$(process_start "$self_pid")"
-  if ! mkdir "$lock" 2>/dev/null; then
-    owner="$(cat "$lock/owner" 2>/dev/null || true)"
-    IFS='|' read -r pid started epoch <<<"$owner"
-    case "$pid" in ''|*[!0-9]*) pid="";; esac
-    if [ -n "$pid" ] && kill -0 "$pid" 2>/dev/null; then
-      current_start="$(process_start "$pid")"
-      # If either start identity is unavailable, fail closed: kill -0 still
-      # proves a live process and it is never safe to steal that reservation.
-      { [ -z "$started" ] || [ -z "$current_start" ] || [ "$current_start" = "$started" ]; } && return 1
-    fi
-    case "$epoch" in ''|*[!0-9]*)
-      mtime="$(stat -f %m "$lock" 2>/dev/null || stat -c %Y "$lock" 2>/dev/null || echo "$now")"
-      epoch="$mtime"
-      ;;
-    esac
-    age=$((now - epoch))
-    [ "$age" -ge "$LOCK_STALE_SECONDS" ] || return 1
-    # Re-read before removal so two stale cleaners cannot delete a newly
-    # acquired owner's lock. mkdir below decides the sole winner.
-    [ "$(cat "$lock/owner" 2>/dev/null || true)" = "$owner" ] || return 1
-    rm -f "$lock/owner" 2>/dev/null || return 1
-    rmdir "$lock" 2>/dev/null || return 1
-    mkdir "$lock" 2>/dev/null || return 1
-  fi
-  KEEPER_LOCK_DIR="$lock"
-  KEEPER_LOCK_OWNER="$self_pid|$self_start|$now"
-  if ! printf '%s' "$KEEPER_LOCK_OWNER" > "$lock/owner"; then
-    rmdir "$lock" 2>/dev/null || true
-    KEEPER_LOCK_DIR=""
-    KEEPER_LOCK_OWNER=""
-    return 1
-  fi
+log() {
+  printf '[%s] %s\n' "$(date '+%Y-%m-%d %H:%M:%S')" "$*" >> "$LOG"
+  [ "$REPORT" -eq 1 ] && printf '  %s\n' "$*"
   return 0
 }
 
-keeper_write_atomic() {
-  local target="$1" value="$2"
-  KEEPER_TMP="$target.tmp.${BASHPID:-$$}"
-  printf '%s' "$value" > "$KEEPER_TMP" || return 1
-  mv "$KEEPER_TMP" "$target" || return 1
-  KEEPER_TMP=""
+# Rate-limited log: writes only if the named stamp file is older than RELOG_S.
+log_rl() {
+  local stamp="$1"; shift
+  local now last
+  now=$(date +%s); last=$(cat "$stamp" 2>/dev/null || echo 0)
+  case "$last" in ''|*[!0-9]*) last=0 ;; esac
+  [ $(( now - last )) -lt "$RELOG_S" ] && return 0
+  echo "$now" > "$stamp" 2>/dev/null
+  log "$@"
 }
 
-valid_seat_name() {
-  # State filenames are derived from roster names. Validate before constructing
-  # any path so a damaged or hostile roster cannot escape .state.
-  [[ "$1" =~ ^[A-Za-z0-9][A-Za-z0-9_-]{0,63}$ ]]
-}
+# keep the log bounded
+if [ -f "$LOG" ] && [ "$(wc -l < "$LOG")" -gt 2000 ]; then
+  tail -n 500 "$LOG" > "$LOG.tmp" && mv "$LOG.tmp" "$LOG"
+fi
 
-keeper_reservation_reconcile() {
-  local state="$1" name="$2" reservation line ordinal message_id phase attempt_id extra pipe_chars
-  reservation="$state/delivery.$name.keeper-reservation"
-  [ -f "$reservation" ] || return 1
-  line="$(cat "$reservation" 2>/dev/null || true)"
-  IFS='|' read -r ordinal message_id phase attempt_id extra <<<"$line"
-  pipe_chars="${line//[^|]/}"
-  if [ "${#pipe_chars}" -ne 3 ] || [ -n "${extra:-}" ] \
-    || [ -z "$message_id" ] || [ -z "$attempt_id" ] \
-    || [ "${#message_id}" -gt 512 ] || [ "${#attempt_id}" -gt 512 ]; then
-    echo "seat-keeper: invalid durable reservation for @$name; refusing automatic retry" >&2
-    failures=$((failures + 1))
-    return 0
-  fi
-  case "$message_id$attempt_id" in
-    *[!A-Za-z0-9._:-]*) phase="invalid" ;;
-  esac
-  # Ordinal 0 is the explicit task-only sentinel. Positive ordinals are owned
-  # by the unread delivery supervisor and are never created by this keeper.
-  [ "$ordinal" = "0" ] || phase="invalid"
-  case "$phase" in
-    completed)
-      rm -f "$reservation" 2>/dev/null || {
-        echo "seat-keeper: could not clear completed reservation for @$name" >&2
-        failures=$((failures + 1))
-        return 0
-      }
-      return 1
-      ;;
-    accepted)
-      # No timestamp or cursor can prove which side effects followed remote
-      # acceptance. Only the original live process may complete and remove it.
-      echo "seat-keeper: accepted reservation for @$name needs manual reconciliation; not retrying" >&2
-      failures=$((failures + 1))
-      return 0
-      ;;
-    in_flight)
-      # A previous process disappeared with the call in flight. Because the
-      # client has no idempotency key, acceptance cannot be inferred safely.
-      keeper_write_atomic "$reservation" "$ordinal|$message_id|acceptance_unknown|$attempt_id" || true
-      echo "seat-keeper: uncertain prior acceptance for @$name; not retrying" >&2
-      failures=$((failures + 1))
-      return 0
-      ;;
-    acceptance_unknown)
-      echo "seat-keeper: uncertain prior acceptance for @$name; not retrying" >&2
-      failures=$((failures + 1))
-      return 0
-      ;;
-    *)
-      echo "seat-keeper: invalid durable reservation for @$name; refusing automatic retry" >&2
-      failures=$((failures + 1))
-      return 0
-      ;;
-  esac
-}
+# --- daemon reachability, answered ONCE per run -----------------------------
+# v1 probed per seat and, on failure, silently skipped every seat — a watchdog
+# that had stopped watching and said nothing about it. Being unable to reach the
+# daemon is the single most important thing this script can report.
+if ! curl -sf -m 3 "$DAEMON/health" >/dev/null 2>&1; then
+  log_rl "$HOME/.pasture/.keeper-daemon-unreachable" \
+    "DAEMON UNREACHABLE at $DAEMON — no seat can be woken. The fleet is unattended until this clears."
+  exit 0
+fi
 
-trap 'keeper_lock_release' EXIT
-trap 'keeper_lock_release; exit 130' HUP INT TERM
-
-delivery_owned() {
-  local state="$1" name="$2" lock pid phase
-  # Durable delivery supervision owns every accepted/recoverable generation,
-  # including error retry. The keeper must not create a parallel turn.
-  [ -f "$state/delivery.$name.pending" ] && return 0
-  lock="$state/delivery.$name.worker.lock.d"
-  [ -d "$lock" ] || return 1
-  pid="$(cat "$lock/pid" 2>/dev/null || true)"
-  [ -n "$pid" ] && kill -0 "$pid" 2>/dev/null || return 1
-  phase="$(awk -F= '$1=="state" {print $2; exit}' "$state/delivery.$name.state" 2>/dev/null || true)"
-  [ "$phase" = "started" ] || [ "$phase" = "busy" ]
-}
-
-process_seat() {
-  local repo="$1" pad="$2" state="$3" name="$4" sid="$5"
-  local binding session_json active now last open_tasks prompt model output rc
-  local reservation task_digest message_id attempt_id reservation_value
-  local -a args
-
-  valid_seat_name "$name" || return 0
-  binding="$state/sessions/$sid"
-  [ -f "$binding" ] && [ "$(cat "$binding" 2>/dev/null)" = "$name" ] || return 0
-  keeper_lock_acquire "$state" "$name" || return 0
-
-  # Everything that can make the seat ineligible is checked while holding the
-  # atomic reservation. A second keeper therefore cannot observe the same
-  # keeper-last value and race an identical external wake.
-  [ -f "$binding" ] && [ "$(cat "$binding" 2>/dev/null)" = "$name" ] \
-    || { keeper_lock_release; return 0; }
-  [ ! -f "$state/dnd.$name" ] || { keeper_lock_release; return 0; }
-  [ ! -f "$state/pending.$name" ] && [ ! -f "$state/delivered_no_reply.$name" ] \
-    || { keeper_lock_release; return 0; }
-  if delivery_owned "$state" "$name"; then keeper_lock_release; return 0; fi
-  if keeper_reservation_reconcile "$state" "$name"; then keeper_lock_release; return 0; fi
-
-  session_json="$(curl -sf -m 4 "$DAEMON/v1/agent/sessions/$sid" 2>/dev/null || true)"
-  active="$(printf '%s' "$session_json" | python3 -c '
+# --- probe one session: busy | idle | unknown:<reason> ----------------------
+probe_session() {
+  local sid="$1" body
+  body=$(curl -sf -m 4 "$DAEMON/v1/agent/sessions/$sid" 2>/dev/null) || { echo "unknown:http-fail"; return; }
+  [ -z "$body" ] && { echo "unknown:empty-body"; return; }
+  printf '%s' "$body" | python3 -c '
 import json, sys
 try:
-    value = json.load(sys.stdin).get("session", {}).get("active_turn")
-    print("busy" if value else "idle")
+    d = json.load(sys.stdin)
 except Exception:
-    print("unknown")
-' 2>/dev/null)"
-  [ "$active" = "idle" ] || { keeper_lock_release; return 0; }
+    print("unknown:unparseable"); raise SystemExit(0)
+s = d.get("session")
+if not isinstance(s, dict):
+    print("unknown:no-session-object"); raise SystemExit(0)
+print("busy" if s.get("active_turn") else "idle")
+' 2>/dev/null || echo "unknown:probe-crashed"
+}
 
-  now="$(date +%s)"
-  last="$(cat "$state/keeper-last.$name" 2>/dev/null || echo 0)"
-  case "$last" in *[!0-9]*|'') last=0;; esac
-  [ $((now - last)) -ge "$MIN_SECONDS" ] || { keeper_lock_release; return 0; }
+# --- pending mention for a seat: <ordinal> | "" | unknown:<reason> ----------
+# ASK THE SAME ORACLE THE WATCHER ASKS. watch.sh fires on
+# `stitchpad wake <name> --peek` — an UNANSWERED mention, i.e. an @name newer
+# than that seat's last @-reply, resolved against seen.<name>. That is the
+# fleet's real engagement gate.
+#
+# v1 instead read count.<seat>, which is written ONCE at watcher startup
+# (watch.sh:45) and never maintained in the react loop. It is vestigial. Keying
+# wake decisions off a field nothing maintains is how codex and glm came to be
+# woken every 10 minutes for two days over a counter frozen since Aug 3.
+#
+# `--peek-ordinal` is used rather than `--peek` because it is the STABLE IDENTITY
+# of the pending mention, which is what lets the effect check below distinguish
+# "the same mention is still unanswered" (a wasted wake) from "a new mention
+# arrived" (progress). Neither peek form advances any cursor — verified.
+seat_pending() {
+  local repo="$1" name="$2" out rc
 
-  # Canonical task parser reads tasks.md plus legacy inline cards. Only the
-  # current actionable states ride the task wake; done/canceled never do.
-  open_tasks="$(STITCHPAD_HEARTBEAT_AUTOSTART=0 STITCHPAD_PAD_DIR="$pad" "$SP" task list --mine "$name" 2>/dev/null \
-    | awk -F'|' '
-          $3=="in_progress" || $3=="todo" || $3=="in_review" {
-            if (n < 4) {
-              if (n) printf "; "
-              printf "%s[%s] %s", $1, $3, $2
-            }
-            n++
-          }
-          END { if (n > 4) printf "; +%d more", n-4 }
-      ')"
-  [ -n "$open_tasks" ] || { keeper_lock_release; return 0; }
-  prompt="stitchpad keeper: open work for @$name — $open_tasks. Continue the current task. The delivery supervisor exclusively owns unread mentions; do not consume or replay mentions as part of this keeper wake."
-
-  # Recheck cross-process delivery ownership and daemon activity immediately
-  # before the external side effect. Delivery workers do not take keeper locks,
-  # so their durable contract remains the final authority.
-  [ -f "$binding" ] && [ "$(cat "$binding" 2>/dev/null)" = "$name" ] \
-    || { keeper_lock_release; return 0; }
-  [ ! -f "$state/dnd.$name" ] || { keeper_lock_release; return 0; }
-  [ ! -f "$state/pending.$name" ] && [ ! -f "$state/delivered_no_reply.$name" ] \
-    || { keeper_lock_release; return 0; }
-  if delivery_owned "$state" "$name"; then keeper_lock_release; return 0; fi
-  if keeper_reservation_reconcile "$state" "$name"; then keeper_lock_release; return 0; fi
-  session_json="$(curl -sf -m 4 "$DAEMON/v1/agent/sessions/$sid" 2>/dev/null || true)"
-  active="$(printf '%s' "$session_json" | python3 -c '
-import json, sys
-try:
-    value = json.load(sys.stdin).get("session", {}).get("active_turn")
-    print("busy" if value else "idle")
-except Exception:
-    print("unknown")
-' 2>/dev/null)"
-  [ "$active" = "idle" ] || { keeper_lock_release; return 0; }
-
-  # TASK-1: never wake a seat that would silently inherit the daemon global
-  # default, and (policy=refuse) never wake into an active requested/resolved
-  # mismatch. Surface mode logs loudly and proceeds.
-  if ! sp_model_pin_preflight "$state" "$name"; then
-    echo "seat-keeper: model-pin preflight refused wake for @$name" >&2
-    failures=$((failures + 1))
-    keeper_lock_release
-    return 0
+  # A name that is not on the roster peeks EMPTY with rc=0 — the same answer as
+  # "nothing is pending". A seat bound to an Ocean session but missing from the
+  # roster would therefore read as permanently idle and never be woken again:
+  # silent starvation, the exact failure this watchdog exists to prevent, wearing
+  # the healthy answer's clothes. It is a bound seat, so its absence is a fault.
+  if ! (cd "$repo" 2>/dev/null && "$SP" roster 2>/dev/null) | cut -d'|' -f1 | grep -qxF "$name"; then
+    echo "unknown:not-in-roster"; return
   fi
 
-  args=(wake --session-id "$sid" --cwd "$repo" --client-type stitchpad --no-wait --prompt "$prompt")
-  # seat-model is operator-owned scheduling policy. model.<name> is merely
-  # runtime-reported metadata and may be overwritten by any rebound session.
-  model="$(cat "$state/seat-model.$name" 2>/dev/null || true)"
-  [ -z "$model" ] || args+=(--model "$model")
-
-  # Persist before the external side effect. A process death from here through
-  # accepted persistence leaves a record that a later keeper converts to
-  # acceptance_unknown and never retries automatically.
-  task_digest="$(printf '%s' "$open_tasks" | cksum | awk '{print $1 "-" $2}')"
-  message_id="keeper-task-$task_digest"
-  attempt_id="${BASHPID:-$$}-$now-${RANDOM:-0}"
-  reservation="$state/delivery.$name.keeper-reservation"
-  reservation_value="0|$message_id|in_flight|$attempt_id"
-  if ! keeper_write_atomic "$reservation" "$reservation_value"; then
-    echo "seat-keeper: could not persist pre-submit reservation for @$name" >&2
-    failures=$((failures + 1))
-    keeper_lock_release
-    return 0
-  fi
-  output="$("$HB" "${args[@]}" 2>&1)"; rc=$?
-  if [ "$rc" -eq 0 ] && printf '%s' "$output" | python3 -c '
-import json, sys
-try:
-    data = json.load(sys.stdin)
-except Exception:
-    raise SystemExit(1)
-raise SystemExit(0 if data.get("ok") is True else 1)
-'; then
-    # TASK-1: persist the daemon-resolved model for this seat from the
-    # session's own config readback, then re-check requested vs resolved.
-    # Best-effort: an unanswered RPC leaves prior resolved truth untouched.
-    cfg_json="$(curl -sf -m 4 "$DAEMON/v1/agent/sessions/$sid/config" 2>/dev/null || true)"
-    if [ -n "$cfg_json" ]; then
-      resolved_model="$(printf '%s' "$cfg_json" | python3 -c '
-import json, sys
-try:
-    print(json.load(sys.stdin).get("model") or "")
-except Exception:
-    print("")
-' 2>/dev/null)"
-      resolved_provider="$(printf '%s' "$cfg_json" | python3 -c '
-import json, sys
-try:
-    print(json.load(sys.stdin).get("provider") or "")
-except Exception:
-    print("")
-' 2>/dev/null)"
-      if [ -n "$resolved_model" ]; then
-        sp_model_pin_record_resolved "$state" "$name" "$resolved_model" \
-          "$resolved_provider" "keeper-wake-config-rpc" "$sid" || true
-        sp_model_pin_check "$state" "$name" || true
-      fi
-    fi
-    keeper_write_atomic "$reservation" "0|$message_id|accepted|$attempt_id" || {
-      echo "seat-keeper: could not persist accepted state for @$name; not retrying" >&2
-      failures=$((failures + 1))
-      keeper_lock_release
-      return 0
-    }
-    keeper_write_atomic "$state/keeper-last.$name" "$now" || {
-      echo "seat-keeper: could not persist accepted wake for @$name" >&2
-      failures=$((failures + 1))
-      keeper_lock_release
-      return 0
-    }
-    keeper_write_atomic "$reservation" "0|$message_id|completed|$attempt_id" \
-      && rm -f "$reservation" 2>/dev/null
-    if [ -f "$reservation" ]; then
-      echo "seat-keeper: could not complete reservation cleanup for @$name" >&2
-      failures=$((failures + 1))
-    else
-      echo "seat-keeper: woke @$name (open work: $open_tasks)"
-    fi
-  else
-    keeper_write_atomic "$reservation" "0|$message_id|acceptance_unknown|$attempt_id" || true
-    echo "seat-keeper: wake acceptance unknown for @$name: $(printf '%s\n' "$output" | tail -1)" >&2
-    failures=$((failures + 1))
-  fi
-  keeper_lock_release
+  out=$(cd "$repo" 2>/dev/null && "$SP" wake "$name" --peek-ordinal 2>/dev/null); rc=$?
+  [ "$rc" -ne 0 ] && { echo "unknown:peek-rc-$rc"; return; }
+  out="$(printf '%s' "$out" | head -1 | tr -cd '0-9')"
+  echo "$out"
 }
 
-for repo in "${repos[@]}"; do
-  pad="$(sp_find_pad "$repo" 2>/dev/null || true)"
-  [ -n "$pad" ] && [ -f "$pad/stitchpad.md" -o -f "$pad/pasture.md" ] || {
-    echo "seat-keeper: skip $repo (no pad)" >&2
-    continue
-  }
-  state="$pad/.state"
-  roster="$(STITCHPAD_HEARTBEAT_AUTOSTART=0 STITCHPAD_PAD_DIR="$pad" "$SP" roster 2>/dev/null || true)"
-  while IFS='|' read -r name adapter wake sid; do
-    [ -n "$name" ] || continue
-    valid_seat_name "$name" || {
-      echo "seat-keeper: skip invalid roster seat name" >&2
-      continue
-    }
-    # This keeper owns only explicit Ocean push seats. Pull hooks and other
-    # adapters remain authoritative for their own delivery surfaces.
-    [ "$adapter" = "ocean" ] && [ "$wake" = "push" ] || continue
-    case "$sid" in ''|-|*/*|*..*|*[!a-zA-Z0-9._-]*) continue;; esac
-    process_seat "$repo" "$pad" "$state" "$name" "$sid"
-  done <<< "$roster"
-done
+# --- open pad tasks assigned to a seat --------------------------------------
+seat_tasks() {
+  local pad="$1" who="$2"
+  [ -f "$pad" ] || { echo 0; return; }
+  awk -v who="$who" '
+    /^```task/ {in_t=1; st=""; as=""; next}
+    in_t && /^status:/   {st=$2}
+    in_t && /^assignee:/ {as=$2}
+    in_t && /^```/ {in_t=0; if ((st=="todo" || st=="in_progress") && as==who) n++}
+    END {print n+0}' "$pad" 2>/dev/null || echo 0
+}
 
-[ "$failures" -eq 0 ]
+[ "$REPORT" -eq 1 ] && printf '%-12s %-8s %-20s %-8s %s\n' SEAT STATE PENDING STRIKES DECISION
+
+while IFS= read -r repo; do
+  [ -z "$repo" ] && continue
+  case "$repo" in \#*) continue ;; esac
+  ST="$repo/.stitchpad/.state"
+  PADFILE="$repo/.stitchpad/stitchpad.md"
+  [ -d "$ST" ] || continue
+
+  for f in "$ST"/ocean-session.*; do
+    [ -f "$f" ] || continue
+    name="${f##*/ocean-session.}"
+    sid="$(cat "$f" 2>/dev/null)"
+    [ -z "$sid" ] && continue
+    model="$(cat "$ST/seat-model.$name" 2>/dev/null || echo '')"
+
+    STRIKE="$ST/keeper-strike.$name"
+    OBS="$ST/keeper-obs.$name"
+    LASTF="$ST/keeper-last.$name"
+
+    state="$(probe_session "$sid")"
+    pending="$(seat_pending "$repo" "$name")"
+    strikes="$(cat "$STRIKE" 2>/dev/null || echo 0)"
+    case "$strikes" in ''|*[!0-9]*) strikes=0 ;; esac
+
+    decision=""
+
+    case "$state" in
+      busy)
+        # Working. Never needs the keeper, and progress clears its record.
+        rm -f "$OBS" "$STRIKE" 2>/dev/null
+        strikes=0
+        decision="busy — no action"
+        ;;
+      unknown:*)
+        # crux's `unknown`: nothing moves, and it is said out loud.
+        log_rl "$ST/.keeper-unknown.$name" \
+          "UNKNOWN state for $name ($repo): ${state#unknown:} — cannot tell whether it is alive; not waking."
+        decision="unknown (${state#unknown:}) — not waking"
+        ;;
+      idle)
+        now=$(date +%s)
+        last=$(cat "$LASTF" 2>/dev/null || echo 0)
+        case "$last" in ''|*[!0-9]*) last=0 ;; esac
+        since=$(( now - last ))
+
+        # EFFECT CHECK — evaluated only when a repeat wake is actually DUE.
+        # Counting once per keeper pass instead counts COOLDOWN passes as
+        # failures: at a 2-minute cron against a 10-minute drain interval that
+        # quarantines a seat in ~6 minutes, before the first repeat wake has even
+        # been sent. A strike must mean "I woke it again about the SAME mention
+        # and nothing moved".
+        # Once QUARANTINED, stop counting. A quarantined seat is never woken, so it
+        # never refreshes keeper-last, so "since" stays over the threshold and every
+        # subsequent pass would increment again — reporting "23 repeat wakes" when
+        # there were 3 wakes and 20 idle passes. A number in an alert that is not the
+        # thing it names is worse than no number.
+        if [ "$since" -ge "$DRAIN_MIN_S" ] && [ "$strikes" -lt "$MAX_STRIKES" ]; then
+          if [ -f "$OBS" ] && [ -n "$pending" ] && [ "$(cat "$OBS" 2>/dev/null)" = "$pending" ]; then
+            strikes=$(( strikes + 1 )); echo "$strikes" > "$STRIKE" 2>/dev/null
+          elif [ -f "$OBS" ]; then
+            strikes=0; rm -f "$OBS" "$STRIKE" 2>/dev/null
+          fi
+        fi
+
+        if [ "$strikes" -ge "$MAX_STRIKES" ]; then
+          log_rl "$ST/.keeper-quarantine.$name" \
+            "QUARANTINED $name ($repo): $strikes repeat wakes left mention #$pending unanswered — the wake is not landing. Not waking again until someone looks. Clear with: rm $STRIKE"
+          decision="QUARANTINED after $strikes repeat wakes"
+        else
+
+          reason=""; prompt=""
+          case "$pending" in
+            unknown:not-in-roster)
+              # Bound to a session but absent from the roster: it can never be
+              # mentioned, so it can never be woken. Naming the remedy matters —
+              # this one is fixed on the pad, not in the daemon.
+              log_rl "$ST/.keeper-peek-unknown.$name" \
+                "SEAT NOT ON ROSTER: $name ($repo) is bound to an Ocean session but has no roster line, so no mention can ever reach it and it will never be woken. Add it to the pad's \`\`\`roster block (name | adapter | wake | target), or remove .state/ocean-session.$name if the seat is retired."
+              ;;
+            unknown:*)
+              # The oracle could not answer. Nothing moves, and it is said.
+              log_rl "$ST/.keeper-peek-unknown.$name" \
+                "MENTION ORACLE UNAVAILABLE for $name ($repo): ${pending#unknown:} — mention wakes are disabled for this seat until \`stitchpad wake $name --peek-ordinal\` answers again."
+              ;;
+            '') ;;   # nothing unanswered — the overwhelmingly common case
+            *)
+              if [ "$since" -ge "$DRAIN_MIN_S" ]; then
+                reason="unanswered mention #$pending"
+                prompt="stitchpad keeper: you have an unanswered @${name} mention. cd $repo && ~/.stitchpad/bin/pasture read -n 30, handle it per the loop prompt, then continue your task queue."
+              fi
+              ;;
+          esac
+
+          if [ -z "$reason" ] && [ "$since" -ge "$QUEUE_MIN_S" ]; then
+            open=$(seat_tasks "$PADFILE" "$name")
+            if [ "${open:-0}" -gt 0 ]; then
+              reason="idle with $open open pad task(s)"
+              prompt="stitchpad keeper: you are idle but have $open open task(s) assigned on the pad. cd $repo && ~/.stitchpad/bin/pasture read -n 30 to refresh context, then continue your task queue per the loop prompt. Post .status when resumed."
+            fi
+          fi
+
+          if [ -z "$reason" ]; then
+            decision="idle, nothing due"
+          elif [ "$DRY" -eq 1 ]; then
+            decision="WOULD WAKE — $reason"
+          else
+            out=$("$HB" wake --session-id "$sid" --cwd "$repo" --client-type stitchpad \
+              ${model:+--model "$model"} --no-wait --prompt "$prompt" 2>&1)
+            if echo "$out" | grep -q '"ok": *true'; then
+              date +%s > "$LASTF"
+              # Remember WHICH mention we woke it about, so the next pass can tell
+              # whether the wake accomplished anything.
+              echo "$pending" > "$OBS" 2>/dev/null
+              log "woke $name ($repo): $reason"
+              decision="woke — $reason"
+            else
+              log "WAKE FAILED for $name ($repo): $reason — $(echo "$out" | tail -1)"
+              decision="WAKE FAILED — $reason"
+            fi
+          fi
+        fi
+        ;;
+    esac
+
+    [ "$REPORT" -eq 1 ] && printf '%-12s %-8s %-20s %-8s %s\n' \
+      "$name" "${state%%:*}" "${pending:-none}" "$strikes" "$decision"
+  done
+done < "$CONF"
+
+exit 0

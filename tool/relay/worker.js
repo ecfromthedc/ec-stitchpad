@@ -196,6 +196,19 @@ export default {
     const url = new URL(req.url);
     if (req.method === "OPTIONS") return new Response(null, { headers: cors });
 
+    // Keep legacy API/WebSocket clients working on the old domains, but send
+    // browser visits to the Pasture-branded URL. A 308 preserves the path and
+    // query string without turning old POST endpoints into redirects.
+    const pastureHost = {
+      "stitchpad.agentsworld.org": "pasture.agentsworld.org",
+      "ec-stitchpad.agentsworld.org": "ec-pasture.agentsworld.org",
+    }[url.hostname];
+    const wantsHtml = (req.headers.get("accept") || "").includes("text/html");
+    if (pastureHost && (req.method === "GET" || req.method === "HEAD") && (url.pathname === "/" || wantsHtml)) {
+      url.hostname = pastureHost;
+      return Response.redirect(url.toString(), 308);
+    }
+
     // handle → personal token map; legacy shared token stays valid alongside it
     let TOKENS = {};
     try { TOKENS = JSON.parse((env.PASTURE_TOKENS || env.STITCHPAD_TOKENS) || "{}"); } catch {}
@@ -235,9 +248,29 @@ export default {
       return json({ token: tokenFor(inv.handle), pad: inv.pad, handle: inv.handle });
     }
 
+    // Media serving — BEFORE the token gate: <img>/<a> tags cannot send an
+    // Authorization header, so gating these returned 401s and every embedded
+    // image rendered broken. Keys are content-addressed (sha-256) capability
+    // URLs — unguessable, so unauthenticated GET is the correct trade.
+    if (url.pathname.startsWith("/img/") && req.method === "GET") {
+      const obj = await env.IMAGES.get("images/" + url.pathname.slice(5));
+      if (!obj) return json({ error: "not found" }, 404);
+      const headers = new Headers(cors);
+      headers.set("content-type", obj.httpMetadata?.contentType || "image/png");
+      headers.set("cache-control", "public, max-age=31536000, immutable"); // sha-keyed → immutable
+      return new Response(obj.body, { headers });
+    }
+    if (url.pathname.startsWith("/f/") && req.method === "GET") {
+      const obj = await env.IMAGES.get("files/" + url.pathname.slice(3));
+      if (!obj) return json({ error: "not found" }, 404);
+      const headers = new Headers(cors);
+      headers.set("content-type", obj.httpMetadata?.contentType || "application/octet-stream");
+      return new Response(obj.body, { headers });
+    }
+
     // Non-API paths → serve the PWA static assets (index.html, manifest).
     const API = ["/login", "/join-request", "/invite", "/pads", "/pad", "/pad.colors", "/push", "/say", "/outbox", "/dm", "/dmbox", "/dm-in", "/dm-status", "/dmlog", "/summarize", "/summary-in", "/summary", "/task", "/term", "/term-in", "/doctor", "/doctor-in", "/upload-image", "/upload-file", "/filebox", "/ws"];
-    if (!API.includes(url.pathname) && !url.pathname.startsWith("/img/") && !url.pathname.startsWith("/f/")) {
+    if (!API.includes(url.pathname)) {
       return env.ASSETS ? env.ASSETS.fetch(req) : json({ error: "no assets" }, 404);
     }
     // WS can't set headers from the browser — accept the bearer as ?token= there.
@@ -306,14 +339,7 @@ export default {
       } catch {}
       return json({ ok: true, forgotten: pad });
     }
-    // Serve attached files from R2 (token-gated; no ?pad needed — key is global)
-    if (url.pathname.startsWith("/f/") && req.method === "GET") {
-      const obj = await env.IMAGES.get("files/" + url.pathname.slice(3));
-      if (!obj) return json({ error: "not found" }, 404);
-      const headers = new Headers(cors);
-      headers.set("content-type", obj.httpMetadata?.contentType || "application/octet-stream");
-      return new Response(obj.body, { headers });
-    }
+    // (media routes /img/ and /f/ are served above the token gate)
     if (!pad) return json({ error: "missing ?pad=NAME" }, 400);
 
     // realtime hot path → the pad's Durable Object
@@ -377,11 +403,17 @@ export default {
     }
 
     if (url.pathname === "/say" && req.method === "POST") {
-      const { from, text } = await req.json();
-      if (!text) return json({ error: "empty" }, 400);
+      // `re` threads the message (#m-… parent id); `react` is {id, emoji} —
+      // both ride the same queue and the bridge picks the CLI verb.
+      const { from, text, re, react } = await req.json();
+      if (!text && !react) return json({ error: "empty" }, 400);
+      // Keep the authenticated-handle binding: a client may not post as someone
+      // else. Live's form trusted `from` verbatim, which would undo that.
       const boundSayFrom = bindFrom(from);
       if (boundSayFrom === null) return json({ error: "from does not match the authenticated handle" }, 403);
       const msg = { from: boundSayFrom || "smaths", text, at: Date.now() };
+      if (re) msg.re = String(re);
+      if (react && react.id && react.emoji) msg.react = { id: String(react.id), emoji: String(react.emoji) };
       if (await tryDeliver(env, pad, "say", msg)) return json({ ok: true, delivered: "ws" });
       const qk = `outbox:${pad}`;
       const q = JSON.parse((await env.STITCHPAD.get(qk)) || "[]");
@@ -453,10 +485,12 @@ export default {
         httpMetadata: { contentType: file.type },
         customMetadata: { originalName: file.name, uploadedAt: new Date().toISOString() }
       });
-      // Construct public URL served through our own domain via the /img proxy
-      // route below — NOT the r2.dev dev URL (rate-limited, not for prod) and no
-      // public-bucket exposure. r2Key is images/<sha>.<ext>; /img strips "images/".
-      const publicUrl = `https://stitchpad.agentsworld.org/img/${sha}.${ext}`;
+      // ROOT-RELATIVE URL through our own /img proxy route. Every viewer reads
+      // the pad through some relay origin (prod domains, wrangler --local),
+      // and relative resolves correctly on all of them. The old hardcoded prod
+      // domain — and even url.origin, which wrangler dev rewrites to the route
+      // pattern — made every local upload a broken image.
+      const publicUrl = `/img/${sha}.${ext}`;
       return json({ url: publicUrl, sha, mime: file.type, size: file.size });
     }
     // File attach: any type up to 15MB → R2 + queued in filebox:<pad> for the
@@ -494,16 +528,7 @@ export default {
       await env.STITCHPAD.put(qk, "[]");
       return json({ messages: q });
     }
-    // Serve images from R2
-    if (url.pathname.startsWith("/img/") && req.method === "GET") {
-      const key = "images/" + url.pathname.slice(5);
-      const obj = await env.IMAGES.get(key);
-      if (!obj) return json({ error: "not found" }, 404);
-      const headers = new Headers(cors);
-      headers.set("content-type", obj.httpMetadata?.contentType || "application/octet-stream");
-      headers.set("cache-control", "public, max-age=31536000");
-      return new Response(obj.body, { headers });
-    }
+    // (image serving moved above the token gate — <img> tags can't auth)
     return json({ error: "not found" }, 404);
   },
 };

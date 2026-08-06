@@ -8,12 +8,19 @@ use ratatui::{
 };
 use std::process::Command;
 
-/// One parsed pad message: a `## @author · time` header block + its body lines.
+/// One parsed pad message: a `## @author · time [· #m-id] [· re:#m-id]` header
+/// block + its body lines (grammar v2 — ids anchor reactions and threads).
 #[derive(Debug, Clone)]
 pub struct Message {
     pub author: String,
     pub time: String,
     pub body: Vec<String>,
+    /// `#m-…` message id when the header carries one (v2 messages).
+    pub id: Option<String>,
+    /// Parent `#m-…` id when this message is a threaded reply.
+    pub reply_to: Option<String>,
+    /// Aggregated reactions: (emoji, [who…]) — from `*@x reacted E to #id*` lines.
+    pub reactions: Vec<(String, Vec<String>)>,
     /// Absolute `## @` block ordinal from the start of the pad (1-based). This is the
     /// same unit `.state/seen.<name>` stores, so read-receipts compare against it.
     pub ordinal: usize,
@@ -98,24 +105,41 @@ impl MessageList {
 
         let mut messages: Vec<Message> = Vec::new();
         let mut cur: Option<Message> = None;
+        // id → [(emoji, who)] — reaction system lines aggregate into chips
+        let mut rx: std::collections::HashMap<String, Vec<(String, String)>> =
+            std::collections::HashMap::new();
 
         for line in output.lines() {
             if let Some(rest) = line.strip_prefix("## @") {
-                // header: "@author · HH:MM AM/PM"  (separator is " · ")
+                // header segments split on " · ": author, time, then optional
+                // "#m-…" id and "re:#m-…" parent (v2 grammar; extras ignored)
                 if let Some(prev) = cur.take() {
                     messages.push(prev);
                 }
-                let (author, time) = match rest.split_once(" · ") {
-                    Some((a, t)) => (a.trim().to_string(), t.trim().to_string()),
-                    None => (rest.trim().to_string(), String::new()),
-                };
+                let mut segs = rest.split(" · ").map(str::trim);
+                let author = segs.next().unwrap_or("").to_string();
+                let time = segs.next().unwrap_or("").to_string();
+                let (mut id, mut reply_to) = (None, None);
+                for s in segs {
+                    if let Some(i) = s.strip_prefix("#m-") {
+                        id = Some(format!("m-{}", i));
+                    } else if let Some(p) = s.strip_prefix("re:#") {
+                        reply_to = Some(p.to_string());
+                    }
+                }
                 cur = Some(Message {
                     author,
                     time,
                     body: Vec::new(),
+                    id,
+                    reply_to,
+                    reactions: Vec::new(),
                     ordinal: 0,
                     seen_by: Vec::new(),
                 });
+            } else if let Some((who, emoji, target)) = parse_reaction_line(line) {
+                // reactions collect into chips on their target — never body text
+                rx.entry(target).or_default().push((emoji, who));
             } else if let Some(msg) = cur.as_mut() {
                 // trim trailing blank lines lazily: skip leading blanks, keep inner
                 if !(msg.body.is_empty() && line.trim().is_empty()) {
@@ -125,6 +149,25 @@ impl MessageList {
         }
         if let Some(prev) = cur.take() {
             messages.push(prev);
+        }
+        // attach aggregated reactions to their targets
+        for m in messages.iter_mut() {
+            if let Some(id) = &m.id {
+                if let Some(pairs) = rx.remove(id) {
+                    let mut per: Vec<(String, Vec<String>)> = Vec::new();
+                    for (emoji, who) in pairs {
+                        match per.iter_mut().find(|(e, _)| *e == emoji) {
+                            Some((_, whos)) => {
+                                if !whos.contains(&who) {
+                                    whos.push(who);
+                                }
+                            }
+                            None => per.push((emoji, vec![who])),
+                        }
+                    }
+                    m.reactions = per;
+                }
+            }
         }
 
         // Absolute ordinals: `read -n` gives a tail, so number backwards from the pad's
@@ -191,6 +234,23 @@ impl MessageList {
     fn author_color(name: &str) -> Color {
         crate::color::color_for(name)
     }
+}
+
+/// Parse a reaction system line: `*@who reacted EMOJI to #m-id · TIME*`.
+/// Returns (who, emoji, id) or None.
+fn parse_reaction_line(line: &str) -> Option<(String, String, String)> {
+    let t = line.trim();
+    let inner = t.strip_prefix("*@")?.strip_suffix('*')?;
+    let (who, rest) = inner.split_once(" reacted ")?;
+    let (emoji, rest) = rest.split_once(" to #")?;
+    let id = rest.split(" · ").next()?.trim();
+    if !id.starts_with("m-") {
+        return None;
+    }
+    Some((who.to_string(), emoji.to_string(), id.to_string()))
+}
+
+impl MessageList {
 
     pub fn scroll_up(&mut self) {
         self.follow = false;
@@ -220,14 +280,25 @@ impl MessageList {
             let mut header = vec![
                 Span::styled(GUTTER, Style::default().fg(color)),
                 Span::raw(GAP),
-                Span::styled(
-                    format!("@{}", m.author),
-                    Style::default().fg(color).add_modifier(Modifier::BOLD),
-                ),
             ];
+            if m.reply_to.is_some() {
+                // threaded reply — quiet marker, body stays in the flow
+                header.push(Span::styled("↳ ", Style::default().fg(theme::t().faint)));
+            }
+            header.push(Span::styled(
+                format!("@{}", m.author),
+                Style::default().fg(color).add_modifier(Modifier::BOLD),
+            ));
             if !m.time.is_empty() {
                 header.push(Span::styled(
                     format!("  ·  {}", m.time),
+                    Style::default().fg(theme::t().faint),
+                ));
+            }
+            if let Some(id) = &m.id {
+                // the citable anchor — dim, but present so a human can thread
+                header.push(Span::styled(
+                    format!("  #{}", id),
                     Style::default().fg(theme::t().faint),
                 ));
             }
@@ -237,7 +308,32 @@ impl MessageList {
             // an `!img: <path>` line renders as a muted placeholder (inline image is a
             // later enhancement; the placeholder keeps it legible everywhere now).
             let avail = (width as usize).saturating_sub(BODY_PREFIX_WIDTH).max(8);
+            let mut in_ui = false;
             for raw in &m.body {
+                // ```ui <type> fences collapse to a one-line marker — the alt
+                // line above them is the human-readable content here; the JSON
+                // payload is for rich surfaces.
+                if in_ui {
+                    if raw.trim() == "```" {
+                        in_ui = false;
+                    }
+                    continue;
+                }
+                if let Some(t) = raw.trim().strip_prefix("```ui ") {
+                    in_ui = true;
+                    lines.push(Line::from(vec![
+                        Span::styled(GUTTER, Style::default().fg(color)),
+                        Span::raw(GAP),
+                        Span::raw(INDENT),
+                        Span::styled(
+                            format!("⟦ui {}⟧", t.trim()),
+                            Style::default()
+                                .fg(theme::t().special)
+                                .add_modifier(Modifier::ITALIC),
+                        ),
+                    ]));
+                    continue;
+                }
                 if raw.trim().is_empty() {
                     lines.push(Line::from(vec![
                         Span::styled(GUTTER, Style::default().fg(color)),
@@ -267,6 +363,26 @@ impl MessageList {
                     row.insert(0, Span::styled(GUTTER, Style::default().fg(color)));
                     lines.push(Line::from(row));
                 }
+            }
+            // reaction chips: one quiet line, emoji + who
+            if !m.reactions.is_empty() {
+                let mut spans = vec![
+                    Span::styled(GUTTER, Style::default().fg(color)),
+                    Span::raw(GAP),
+                    Span::raw(INDENT),
+                ];
+                for (emoji, who) in &m.reactions {
+                    spans.push(Span::styled(
+                        format!("{} ", emoji),
+                        Style::default().fg(theme::t().fg),
+                    ));
+                    spans.push(Span::styled(
+                        who.iter().map(|w| format!("@{} ", w)).collect::<String>(),
+                        Style::default().fg(theme::t().muted),
+                    ));
+                    spans.push(Span::raw(" "));
+                }
+                lines.push(Line::from(spans));
             }
             // read-receipt: quiet "seen by @x @y" under the message, only if anyone has.
             if !m.seen_by.is_empty() {
@@ -506,6 +622,9 @@ mod tests {
             author: "dale".into(),
             time: "09:30 PM".into(),
             body: vec!["hi".into()],
+            id: None,
+            reply_to: None,
+            reactions: Vec::new(),
             ordinal: 5,
             seen_by: vec!["mark".into()],
         };
@@ -516,12 +635,72 @@ mod tests {
     }
 
     #[test]
+    fn reaction_line_parses_and_v2_header_segments_split() {
+        // reaction system line → (who, emoji, target)
+        assert_eq!(
+            parse_reaction_line("*@dale reacted 👍 to #m-abc123 · 06:40 PM*"),
+            Some(("dale".into(), "👍".into(), "m-abc123".into()))
+        );
+        // ordinary system lines are not reactions
+        assert_eq!(parse_reaction_line("*@dale joined the stitchpad · 02:50 AM*"), None);
+
+        // v2 header segments: "@who · time · #m-id · re:#m-parent"
+        let rest = "dale · 06:38 PM · #m-8f3k2 · re:#m-aaa111";
+        let mut segs = rest.split(" · ").map(str::trim);
+        assert_eq!(segs.next(), Some("dale"));
+        assert_eq!(segs.next(), Some("06:38 PM"));
+        let extras: Vec<&str> = segs.collect();
+        assert!(extras.contains(&"#m-8f3k2"));
+        assert!(extras.contains(&"re:#m-aaa111"));
+    }
+
+    #[test]
+    fn ui_fence_collapses_to_marker_and_reactions_render_chips() {
+        let list = MessageList {
+            messages: vec![Message {
+                author: "dale".into(),
+                time: "09:30 PM".into(),
+                body: vec![
+                    "shipping plan below".into(),
+                    "```ui table".into(),
+                    "{\"columns\":[\"a\"],\"rows\":[[\"1\"]]}".into(),
+                    "```".into(),
+                ],
+                id: Some("m-abc".into()),
+                reply_to: Some("m-parent".into()),
+                reactions: vec![("👍".into(), vec!["ernie".into(), "smaths".into()])],
+                ordinal: 1,
+                seen_by: Vec::new(),
+            }],
+            scroll: 0,
+            follow: true,
+            selection: None,
+        };
+        let lines = list.rendered_lines(60);
+        let text: Vec<String> = lines
+            .iter()
+            .map(|l| l.spans.iter().map(|s| s.content.as_ref()).collect())
+            .collect();
+        // header: reply marker + citable id
+        assert!(text[0].contains("↳ @dale"));
+        assert!(text[0].contains("#m-abc"));
+        // json payload collapsed to one ⟦ui table⟧ marker, no raw JSON
+        assert!(text.iter().any(|l| l.contains("⟦ui table⟧")));
+        assert!(!text.iter().any(|l| l.contains("columns")));
+        // reaction chips line present
+        assert!(text.iter().any(|l| l.contains("👍 @ernie @smaths")));
+    }
+
+    #[test]
     fn rendered_lines_use_colored_gutter_but_keep_plain_body_text() {
         let list = MessageList {
             messages: vec![Message {
                 author: "dale".into(),
                 time: "09:30 PM".into(),
                 body: vec!["hello".into()],
+                id: None,
+                reply_to: None,
+                reactions: Vec::new(),
                 ordinal: 5,
                 seen_by: vec!["mark".into()],
             }],

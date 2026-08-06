@@ -76,9 +76,19 @@ function pushPad(p, why) {
 }
 
 async function onSay(p, msg) {
-  const { from, text } = msg;
+  const { from, text, re, react } = msg;
+  const env = { ...process.env, STITCHPAD_NAME: from || "smaths" };
+  if (react && react.id && react.emoji) {
+    await sh(SP, ["react", String(react.id), String(react.emoji)], { cwd: p.proj, env });
+    log(p.name, `← @${from} reacted ${react.emoji} to ${react.id}`);
+    pushPad(p, "say");
+    return;
+  }
   if (!text) return;
-  await sh(SP, ["say", text], { cwd: p.proj, env: { ...process.env, STITCHPAD_NAME: from || "smaths" } });
+  const args = ["say"];
+  if (re) args.push("--re", String(re));   // threaded reply
+  args.push(text);
+  await sh(SP, args, { cwd: p.proj, env });
   log(p.name, `← @${from}: ${text.slice(0, 50)}`);
   pushPad(p, "say"); // echo lands on phones immediately, not next sweep
 }
