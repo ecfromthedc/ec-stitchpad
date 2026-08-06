@@ -2514,6 +2514,12 @@ PY
     # printed a tick and the message sat there forever. Warn (never refuse —
     # prose legitimately contains @-shaped text) and suggest the nearest roster
     # name, because a typo is the overwhelmingly likely cause.
+    # ONLY when a human is watching. This warning goes to stderr, and suites
+    # (and adapters, and the relay bridge) capture and parse stderr — emitting it
+    # unconditionally turned six green suites red, including two that could no
+    # longer parse their own output. Same convention `task list` already uses:
+    # human rendering on a terminal, byte-stable machine output otherwise.
+    if [ -t 2 ]; then
     _say_roster="$(sp_roster 2>/dev/null | cut -d'|' -f1 | tr -d ' ' | tr 'A-Z' 'a-z')"
     printf '%s' "$text" | grep -oE '(^|[[:space:]])@[A-Za-z0-9_-]+' | tr -d ' @' | tr 'A-Z' 'a-z' | sort -u \
     | while IFS= read -r _mn; do
@@ -2529,6 +2535,7 @@ PY
           echo "  ⚠ @$_mn is not on the roster — nobody was woken. (stitchpad roster)" >&2
         fi
       done
+    fi
     ;;
 
   amend)
