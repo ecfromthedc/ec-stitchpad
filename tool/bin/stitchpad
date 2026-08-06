@@ -3605,8 +3605,17 @@ PY
     # Push delivery belongs to the watcher (mention → fire_adapter → adapter).
     # Refuse, name the fix, and DO NOT touch the cursor. Self-wake and every
     # --peek/--peek-ordinal inspection are unaffected.
-    if [ "$relay_mode" -eq 0 ] && [ "$peek" -eq 0 ]; then
+    # k3 F4 close-out: the guard was scoped to relay_mode -eq 0, so the RELAY
+    # path kept the whole defect — `wake <someone-else> --relay` renders their
+    # message to this terminal and burns seen.relay.<padkey>.<name>, exactly the
+    # loss the local path refuses. Relay wake legitimately runs on a coworker's
+    # machine with no local pad, where no caller identity resolves; that case is
+    # preserved by refusing only when a caller identity EXISTS and is someone
+    # else. Every in-repo relay call is `"$0" wake --relay` with no name, so the
+    # caller is the seat and nothing changes for it.
+    if [ "$peek" -eq 0 ]; then
       _caller="$(sp_me 2>/dev/null || true)"; [ -n "$_caller" ] || _caller="${STITCHPAD_NAME:-}"
+      if [ "$relay_mode" -eq 1 ] && [ -z "$_caller" ]; then _caller="$who"; fi
       # P43 originally scoped this to PUSH seats. That was half the bug: waking a
       # PULL seat as a third party is just as destructive, and k3 proved it —
       # @boss ran `wake dale`, the message rendered on BOSS's terminal, and

@@ -140,6 +140,78 @@ else
   fi
 fi
 
+# ── G8: the RELAY path had the same hole ────────────────────────────────────
+# k3 F4 close-out. The guard was written as `relay_mode -eq 0 && peek -eq 0`, so
+# `wake <someone-else> --relay` walked straight past it, rendered their message
+# to the caller's terminal and burned seen.relay.<padkey>.<name>. Relay wake also
+# legitimately runs on a coworker's machine where NO caller identity resolves, so
+# the rule there is: refuse only when a caller identity exists and is someone else.
+#
+# Scope of this probe, stated rather than implied: it proves the refusal happens
+# BEFORE any relay work, and G9's mutant proves the guard is what produces it. It
+# does not stand up a relay server, so the cursor burn itself is measured on the
+# local path (G2/G5b), which shares every line of this code after the guard.
+echo ""
+echo "  -- relay path --"
+RS="$TMP/relaystate"; mkdir -p "$RS"
+relay_wake() {  # $1=identity ("" for none) $2...=args
+  local id="$1"; shift
+  ( cd "$PJ" 2>/dev/null || cd "$TMP"
+    if [ -n "$id" ]; then
+      env -u HERDR_PANE_ID -u CLAUDE_CODE_SESSION_ID -u STITCHPAD_SESSION \
+        HOME="$TMP/home.$NS" STITCHPAD_HOME="$RT" STITCHPAD_NAME="$id" \
+        STITCHPAD_TERMINAL_NAMESPACE="$NS" STITCHPAD_HEARTBEAT_AUTOSTART=0 \
+        STITCHPAD_RELAY_STATE_DIR="$RS" STITCHPAD_RELAY=http://127.0.0.1:1 \
+        STITCHPAD_TOKEN=t STITCHPAD_PAD=padname "$RT/bin/stitchpad" wake "$@"
+    else
+      env -u HERDR_PANE_ID -u CLAUDE_CODE_SESSION_ID -u STITCHPAD_SESSION -u STITCHPAD_NAME \
+        HOME="$TMP/home.nobody" STITCHPAD_HOME="$RT" \
+        STITCHPAD_TERMINAL_NAMESPACE=nobody STITCHPAD_HEARTBEAT_AUTOSTART=0 \
+        STITCHPAD_RELAY_STATE_DIR="$RS" STITCHPAD_RELAY=http://127.0.0.1:1 \
+        STITCHPAD_TOKEN=t STITCHPAD_PAD=padname "$RT/bin/stitchpad" wake "$@"
+    fi ) 2>&1
+}
+setup "$ROOT/tool" "$TMP/proj" p43gate
+out="$(relay_wake boss puller --relay || true)"
+case "$out" in
+  *REFUSED*) ok "G8 a third party waking someone else over the RELAY is refused too" ;;
+  *) bad "G8 relay wake by a third party was allowed: [$out]" ;;
+esac
+out="$(relay_wake puller --relay; printf 'rc=%s' "$?")"
+case "$out" in
+  *REFUSED*) bad "G8b a seat's own relay wake was refused — relay delivery is now broken" ;;
+  *) ok "G8b a seat waking ITSELF over the relay is unaffected" ;;
+esac
+out="$(relay_wake '' puller --relay || true)"
+case "$out" in
+  *REFUSED*) bad "G8c relay wake from a machine with no identity was refused — the coworker path is broken" ;;
+  *) ok "G8c relay wake with no resolvable caller identity still runs (the coworker case)" ;;
+esac
+
+# ── G9: MUTANT — put the relay exemption back ──────────────────────────────
+echo "  -- mutant: relay exempted from the guard --"
+MUT2="$TMP/mutant2"; mkdir -p "$MUT2"; cp -R "$ROOT/tool/." "$MUT2/"
+python3 - "$MUT2/bin/stitchpad" <<'PY'
+import sys
+p=sys.argv[1]; s=open(p,encoding='utf-8').read()
+old='''    if [ "$peek" -eq 0 ]; then'''
+new='''    if [ "$relay_mode" -eq 0 ] && [ "$peek" -eq 0 ]; then'''
+if s.count(old)!=1:
+    sys.stderr.write("MUTANT DID NOT APPLY: anchor not found exactly once\n"); sys.exit(9)
+open(p,'w',encoding='utf-8').write(s.replace(old,new))
+PY
+if [ $? -eq 9 ]; then
+  bad "G9 MUTANT DID NOT APPLY -- INCONCLUSIVE, not a pass"
+else
+  setup "$MUT2" "$TMP/proj3" p43mut2
+  build_pad
+  out="$(relay_wake boss puller --relay || true)"
+  case "$out" in
+    *REFUSED*) bad "G9 mutant applied but the relay wake was still refused -- G8 may be testing nothing" ;;
+    *) ok "G9 with the relay exempted the third-party wake sails through -- G8 detects it" ;;
+  esac
+fi
+
 echo ""
 echo "  passed: $pass  failed: $fail"
 [ "$fail" -eq 0 ] || exit 1
