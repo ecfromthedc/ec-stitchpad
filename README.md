@@ -32,7 +32,7 @@ a team. Everything else in this repo is operations around that one idea.
 
 The thing it is really built to defeat is **silence**. An agent that has quietly
 died looks exactly like an agent that is thinking hard. Most of the machinery
-here — the liveness board, the artifact contracts, the 89 test suites — exists
+here — the liveness board, the artifact contracts, the 103 test suites — exists
 because that one failure mode costs more than every other bug combined.
 
 ## How the wake works
@@ -64,6 +64,13 @@ cd ec-stitchpad
 Requires `git`, `bash` and `awk` (macOS or Linux). `node` only if you want the
 MCP server. `fswatch` only if you want push seats.
 
+This repo (`ec-stitchpad`) is the working fork and the one to clone; upstream
+is [Risingtides-dev/pasture](https://github.com/Risingtides-dev/pasture) (the
+project's newer name — see the note at the bottom). PRs land here.
+
+New to the project? **[docs/ONBOARDING.md](docs/ONBOARDING.md)** is the guided
+tour: first pad in five minutes, then the fleet, then the gate.
+
 ## The six commands
 
 This is the whole day-to-day surface. Run them from inside your project.
@@ -84,9 +91,11 @@ repo, so pad history never mixes with your project's history.
 stitchpad join dale claude pull
 ```
 
-`join <name> <adapter> [wake] [target]`. This writes a row into the ` ```roster `
-block inside `stitchpad.md`. The roster living *inside* the file is the point —
-open the file and you know who is in the room.
+`join <name> <adapter> [wake] [target]`. Shipped adapters: `claude`, `codex`,
+`pi`, `ocean` (daemon sessions), `herdr` (terminal panes), plus `cli` for a
+human seat. This writes a row into the ` ```roster ` block inside
+`stitchpad.md`. The roster living *inside* the file is the point — open the
+file and you know who is in the room.
 
 **One terminal holds one identity.** Each agent runs `join` from its own session,
 which is what stops anyone from posting as someone else. If you run `join` twice
@@ -191,33 +200,44 @@ Read this part. It is the honest list.
   the only observable you have. (`spawn --artifact` + `supervise` exist because
   of this.)
 - **`lanes` and `health` are two different liveness oracles and they can
-  disagree.** The board is the optimistic one. A seat can read `WORKING` for
-  some minutes after it has actually stopped. Treat a green board as "no news",
-  not as proof.
+  disagree.** The board is the optimistic one; a dead seat can read `WORKING`
+  for a bounded window before the watchdog flips it. The window is much
+  smaller than it used to be (`watcher-live-lease-gate.sh` and
+  `lanes-quarantine-gate.sh` pin the current bound), but treat a green board
+  as "no news", not as proof.
 - **A mention of a name that is not on the roster posts happily and wakes
   nobody.** In a terminal you now get a warning; nothing rejects the message.
   Typos are silent failures.
 - **Push seats need `fswatch` and a live daemon.** Pull seats need neither. If
   you are not sure what you have, use pull.
-- **Concurrency is not fully hardened.** Simultaneous writers to the same pad —
-  several agents saying something in the same instant, or two `task new` calls
-  racing — have known open defects. Normal conversational pacing is fine; a
-  thundering herd is not yet.
+- **Concurrency is gated, not unlimited.** The known simultaneous-writer
+  defects are closed and pinned by suites (`concurrency-round5-regression.sh`,
+  `delivery-grace-spawn-gate.sh`, `watcher-live-lease-gate.sh` — the close-out
+  triage records zero deferred findings). What remains unproven is sustained
+  thundering-herd load: many agents hammering one pad for minutes has no gate
+  yet. Normal conversational pacing is well inside the tested envelope.
 - **The relay/PWA is a separate, optional surface** and is not required for any
   of the above.
 
-Everything in this list is tracked in `evidence/OPERATOR-PAIN-LEDGER.md` (P1–P49)
+Everything in this list is tracked in `evidence/OPERATOR-PAIN-LEDGER.md` (P1–P49;
+P24/P43/P44 were never assigned — the p43/p44 gates exist regardless)
 and `evidence/reviews/`, with reproductions.
 
 ## Where things are
 
 ```
-tool/          the product — CLI, adapters, MCP server, TUI, relay
-  bin/stitchpad      the CLI (every command above)
+tool/          the product
+  bin/stitchpad      the CLI (every command above); bin/pasture is an alias
   adapters/          one small script per runtime; this is the extension model
-test/          89 suites, all enforced by one gate
+  mcp/               the MCP server — 14 tools (talk, DMs, task board)
+  instructions/      the shared agent prompt (ponytail), pinned + gated
+  personas/          role packs: library/ generics first, named examples second
+  pwa/ + relay/      the phone-facing mirror (Cloudflare worker + PWA)
+  tui-rs/            the Rust TUI
+  hosts/             experimental: an autonomous pi host (not installed)
+test/          103 suites, all enforced by one gate
 evidence/      what was measured, what broke, and what is still open
-docs/          migration and public-facing notes
+docs/          ONBOARDING, push-reachability SOP, pasture migration notes
 ```
 
 To support a new runtime you drop an adapter in `tool/adapters/` and add a
@@ -250,4 +270,6 @@ The rules the project holds itself to, learned the expensive way:
 Upstream is [Risingtides-dev/pasture](https://github.com/Risingtides-dev/pasture);
 "pasture" is the newer name for the same tool and the migration is in progress,
 so both names appear in paths (`~/.pasture` and `~/.stitchpad` resolve to the
-same place).
+same place). A fresh `install.sh` puts `stitchpad`/`stitchpad-tui` on PATH;
+the `pasture` aliases exist inside `tool/bin/` and land on PATH at Stage 2 of
+the rename (`docs/PASTURE_MIGRATION.md` has the staging).
