@@ -1458,6 +1458,7 @@ exec 9<>"$WATCH_EVENT_FIFO"
 rm -f "$WATCH_EVENT_FIFO"
 
 _pad_dir_gone_ticks=0
+_fsw_restarts=0
 while true; do
   if IFS= read -r -d "" -t 5 _ev <&9; then
     _pad_dir_gone_ticks=0
@@ -1481,7 +1482,35 @@ while true; do
       break
     done
     if ! kill -0 "$FSWATCH_PID" 2>/dev/null; then
-      echo "[stitchpad] fswatch died on a live pad — exiting for supervisor restart" >&2
+      # k3 F1: this used to log "exiting for supervisor restart" and exit 1.
+      # There is no supervisor. Nothing was watching this process, so the pad
+      # simply went deaf until a human happened to run a stitchpad command
+      # (ensure_watcher on any subcommand is the only thing that ever revived
+      # it) — while the log line said recovery was on its way.
+      #
+      # Either build the restart or stop claiming it. This builds it: fswatch
+      # dying on a live pad is transient (OOM, a brew upgrade swapping the
+      # binary), the watcher still holds its lock and its loop, and it can put
+      # its own eyes back. The bound is what keeps that honest — a fswatch that
+      # will not stay up is a real failure, and the exit then says exactly what
+      # will and will not happen next.
+      _fsw_restarts=$(( _fsw_restarts + 1 ))
+      if [ "$_fsw_restarts" -le "${STITCHPAD_FSWATCH_MAX_RESTARTS:-5}" ]; then
+        wait "$FSWATCH_PID" 2>/dev/null || true
+        # Write straight into fd 9: the fifo was unlinked once both ends were
+        # open, so there is no path left to reopen.
+        fswatch -0 "$PAD_MD" >&9 &
+        FSWATCH_PID=$!
+        sleep 1
+        if kill -0 "$FSWATCH_PID" 2>/dev/null; then
+          echo "[stitchpad] fswatch died on a live pad — restarted it (pid $FSWATCH_PID, attempt $_fsw_restarts/${STITCHPAD_FSWATCH_MAX_RESTARTS:-5}); event delivery resumed" >&2
+          # Catch up on anything that changed while we had no eyes.
+          react </dev/null
+          continue
+        fi
+      fi
+      echo "[stitchpad] fswatch will not stay up (attempt $_fsw_restarts) — this watcher is exiting." >&2
+      echo "[stitchpad] NOTHING restarts it automatically. Push seats on this pad stay deaf until the next stitchpad command here spawns a new watcher, or you run: stitchpad watch start" >&2
       exit 1
     fi
   fi
