@@ -80,6 +80,16 @@ case "$combined" in
   *) bad "G4 unreachable daemon produced NO voice — the fleet would sit unattended silently" ;;
 esac
 
+# ── G4b: a test run must not write into the live install ────────────
+# The alert stamp used to be pinned to $HOME/.pasture/ regardless of where the
+# log was pointed, so running this very gate suppressed the real fleet's
+# daemon-unreachable alert for an hour.
+if [ -f "$TMP/.keeper-daemon-unreachable" ]; then
+  ok "G4b the alert stamp follows SEAT_KEEPER_LOG — the install is untouched"
+else
+  bad "G4b no stamp beside the test log; it is being written somewhere else (the install?)"
+fi
+
 # ── G5/G6: bounds and blast radius ──────────────────────────────────
 if grep -qE '^MAX_STRIKES=[0-9]+' "$KEEPER"; then ok "G5 quarantine bound present ($(grep -oE '^MAX_STRIKES=[0-9]+' "$KEEPER"))"
 else bad "G5 no MAX_STRIKES bound — a no-effect wake could repeat forever"; fi

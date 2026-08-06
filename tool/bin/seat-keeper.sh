@@ -114,7 +114,13 @@ fi
 # that had stopped watching and said nothing about it. Being unable to reach the
 # daemon is the single most important thing this script can report.
 if ! curl -sf -m 3 "$DAEMON/health" >/dev/null 2>&1; then
-  log_rl "$HOME/.pasture/.keeper-daemon-unreachable" \
+  # Stamp lives beside the LOG, not beside the script. It was pinned to
+  # $HOME/.pasture/, so a suite pointing SEAT_KEEPER_LOG at a throwaway dir still
+  # wrote into the live install — and thereby suppressed the real fleet's
+  # daemon-unreachable alert for an hour. Caught by this gate doing exactly that.
+  # Production is unchanged: LOG defaults to ~/.pasture/keeper.log, so the stamp
+  # still lands in ~/.pasture.
+  log_rl "$(dirname "$LOG")/.keeper-daemon-unreachable" \
     "DAEMON UNREACHABLE at $DAEMON — no seat can be woken. The fleet is unattended until this clears."
   exit 0
 fi
