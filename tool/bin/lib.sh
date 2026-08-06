@@ -3862,6 +3862,36 @@ sp_spawn_tree() {
 # Verdicts: WORKING (artifact present), FAILED (artifact missing after terminal),
 #           PENDING (active/idle, no artifact yet), UNKNOWN (no session data).
 # This is the board the operator uses to see every seat's real output.
+# Every lane the board knows about: session registry ∪ artifact claims ∪ roster.
+# Extracted so `lanes` and `lanes --json` cannot disagree about who exists —
+# --json used to list ONLY seats with an artifact claim, so a quarantined seat
+# without one was invisible to every dashboard and cron that reads it (k3 F0).
+sp_lanes_names() {
+  local proj names claim cn rn rest
+  proj="${1:-$(sp_session_registry_project 2>/dev/null || echo '[]')}"
+  names="$(echo "$proj" | python3 -c "
+import json, sys
+try:
+    data = json.load(sys.stdin)
+except Exception:
+    data = []
+for s in data:
+    n = s.get('name','')
+    if n: print(n)
+" 2>/dev/null)"
+  for claim in "$PAD_STATE"/artifact-expect.*; do
+    [ -f "$claim" ] || continue
+    cn="${claim##*/artifact-expect.}"
+    echo "$names" | grep -qxF "$cn" 2>/dev/null || names="$names"$'\n'"$cn"
+  done
+  while IFS='|' read -r rn rest; do
+    rn="$(printf '%s' "$rn" | tr -d '[:space:]')"
+    [ -n "$rn" ] || continue
+    echo "$names" | grep -qxF "$rn" 2>/dev/null || names="$names"$'\n'"$rn"
+  done <<< "$(sp_roster 2>/dev/null || true)"
+  echo "$names" | sort -u | sed '/^$/d'
+}
+
 sp_lanes_display() {
   local proj name status age_s claim claim_file present verdict art_display
   proj="$(sp_session_registry_project 2>/dev/null || echo '[]')"
@@ -3984,6 +4014,21 @@ print('?')
         elif [ "$present" = "YES" ]; then verdict="DONE"
         else verdict="UNKNOWN"; fi ;;
     esac
+    # k3 F0: the watchdog can GIVE UP on a seat — three consecutive wakes that
+    # left the same mention unanswered quarantines it and seat-keeper stops
+    # waking it "until someone looks". `lanes` is the board the operator looks
+    # AT, and it did not know this state existed: a quarantined seat with a live
+    # heartbeat rendered WORKING. The one surface that should have said "this
+    # seat has been abandoned" was the one saying everything was fine.
+    # A verdict is a claim about a seat; it cannot ignore the component whose
+    # entire job is deciding that seat is not answering.
+    _lane_strikes="$(cat "$PAD_STATE/keeper-strike.$name" 2>/dev/null || echo 0)"
+    case "$_lane_strikes" in ''|*[!0-9]*) _lane_strikes=0 ;; esac
+    if [ "$_lane_strikes" -ge "${SEAT_KEEPER_MAX_STRIKES:-3}" ]; then
+      verdict="QUARANTINED"
+    elif [ "$_lane_strikes" -gt 0 ]; then
+      verdict="$verdict!$_lane_strikes"      # strikes accruing, not yet given up on
+    fi
     printf '%-12s %-12s %6s %-20s %-12s %-16s\n' \
       "$name" "$status" "${age_s}s" "$art_display" "$present" "$verdict"
   done <<< "$names"

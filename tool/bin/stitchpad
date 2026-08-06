@@ -5568,9 +5568,14 @@ sys.exit(1)
       _proj="$(sp_session_registry_project 2>/dev/null || echo '[]')"
       echo '['
       _first=1
-      for _claim in "$PAD_STATE"/artifact-expect.*; do
-        [ -f "$_claim" ] || continue
-        _name="${_claim##*/artifact-expect.}"
+      # k3 F0: this iterated artifact-expect.* ONLY, so a seat with no artifact
+      # claim never appeared — including a seat the watchdog had quarantined,
+      # which is precisely the row a dashboard needs. Same lane set as the text
+      # board now (sp_lanes_names), so the two surfaces cannot disagree about
+      # who exists.
+      while IFS= read -r _name; do
+        [ -n "$_name" ] || continue
+        _claim="$PAD_STATE/artifact-expect.$_name"
         _status="$(echo "$_proj" | python3 -c "
 import json, sys
 data = json.load(sys.stdin)
@@ -5581,21 +5586,39 @@ for s in data:
 print('unknown')
 " 2>/dev/null)"
         [ -z "$_status" ] && _status="unknown"
-        _age="$(( _now - $(stat -f %m "$_claim" 2>/dev/null || echo "$_now") ))"
-        _art="$(head -1 "$_claim")"
-        if sp_artifact_verify "$_name" 2>/dev/null; then _present="yes"; else _present="no"; fi
+        if [ -f "$_claim" ]; then
+          _age="$(( _now - $(stat -f %m "$_claim" 2>/dev/null || echo "$_now") ))"
+          _art="$(head -1 "$_claim")"
+          if sp_artifact_verify "$_name" 2>/dev/null; then _present="yes"; else _present="no"; fi
+        else
+          # No artifact contract for this seat: say so, rather than inventing a
+          # verdict about an artifact nobody promised.
+          _age="$(( _now - $(stat -f %m "$PAD_STATE/alive.$_name" 2>/dev/null || echo "$_now") ))"
+          _art="-"; _present="-"
+        fi
         case "$_status" in
           terminal) [ "$_present" = "no" ] && _verdict="FAILED" || _verdict="COMPLETE" ;;
           stale) _verdict="STALE" ;;
           idle) _verdict="IDLE" ;;
           active) _verdict="WORKING" ;;
-          *) [ "$_present" = "no" ] && _verdict="FAILED" || _verdict="DONE" ;;
+          *) case "$_present" in
+               no) _verdict="FAILED" ;;
+               yes) _verdict="DONE" ;;
+               *) _verdict="UNKNOWN" ;;
+             esac ;;
         esac
+        # k3 F0: --json is what every dashboard and cron reads, so quarantine
+        # has to travel here too — as a first-class field, not only folded into
+        # the verdict, so a consumer can act on it without string-matching.
+        _strikes="$(cat "$PAD_STATE/keeper-strike.$_name" 2>/dev/null || echo 0)"
+        case "$_strikes" in ''|*[!0-9]*) _strikes=0 ;; esac
+        _quar=false
+        if [ "$_strikes" -ge "${SEAT_KEEPER_MAX_STRIKES:-3}" ]; then _quar=true; _verdict="QUARANTINED"; fi
         [ "$_first" -eq 1 ] || printf ',\n'
         _first=0
-        printf '  {"name":"%s","status":"%s","age_s":%s,"artifact_expected":"%s","artifact_present":"%s","verdict":"%s"}' \
-          "$_name" "$_status" "$_age" "$_art" "$_present" "$_verdict"
-      done
+        printf '  {"name":"%s","status":"%s","age_s":%s,"artifact_expected":"%s","artifact_present":"%s","verdict":"%s","keeper_strikes":%s,"quarantined":%s}' \
+          "$_name" "$_status" "$_age" "$_art" "$_present" "$_verdict" "$_strikes" "$_quar"
+      done <<< "$(sp_lanes_names "$_proj")"
       echo ''; echo ']'
     else
       sp_lanes_display

@@ -41,6 +41,7 @@ heartbeat-races.sh 0 0
 heartbeat.sh 0 0
 identity-survival-under-join.sh 11 0
 install-wiring-gate.sh 12 0
+lanes-quarantine-gate.sh 9 0
 model-pinning.sh 49 0
 multipad-isolation.sh 42 0
 ocean-idle-guard-gate.sh 7 0
