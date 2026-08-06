@@ -172,7 +172,11 @@ set -u
 if [ -n "${STITCHPAD_TEST_PID_REGISTRY:-}" ]; then
   start="$(ps -p "$$" -o lstart= 2>/dev/null | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')"
   command="$(ps -p "$$" -o command= 2>/dev/null || true)"
-  command_proof="$(test_command_proof "$command")"
+  # Inlined (NOT test_command_proof): this heredoc is single-quoted, so the
+  # generated adapter is a separate bash process that can never see the parent
+  # suite's functions — the old call errored 127 on every registry-enabled run
+  # and registered rows with an EMPTY proof.
+  command_proof="$(printf '%s' "$command" | (shasum -a 256 2>/dev/null || sha256sum 2>/dev/null || openssl dgst -sha256 2>/dev/null | sed 's/^.* //') | awk '{print $1}')"
   [ -n "$start" ] && printf '%s|%s|adapter|%s|%s\n' "$$" "$start" "$0" "$command_proof" \
     >> "$STITCHPAD_TEST_PID_REGISTRY"
 fi
@@ -247,15 +251,40 @@ wait_no_worker() {
   return 1
 }
 
+# The hold models what it always meant: a LIVE worker owns the singleton while
+# directives coalesce/supersede behind it. The old shape (bare token+born, no
+# owner, no process) is indistinguishable from a starter that died mid-spawn —
+# and delivery_start_worker now waits out and RECLAIMS exactly that (the
+# OPEN #3 fix: a dead starter must not strand a fresh generation), so the old
+# hold was reclaimed mid-scenario and an early worker wrecked the coalescing
+# assertions. A decoy process whose ps command carries the exact verification
+# substring is what a held singleton really looks like in production.
 hold_worker() {
-  local name="$1" lock
+  local name="$1" lock token pid start
   lock="$(delivery_worker_lock "$name")"
   mkdir -p "$lock"
-  printf 'test-hold' > "$lock/token"
+  token="test-hold"
+  printf '%s' "$token" > "$lock/token"
   date +%s > "$lock/born"
+  # Compound command ON PURPOSE: `bash -c 'sleep 60'` execs into plain
+  # `sleep 60`, which loses the decoy argv the owner verification greps for.
+  # The 60s cap self-reaps the decoy if a failing scenario skips release.
+  bash -c 'sleep 60; exit 0' sp-test-hold "--delivery-worker $name $token" &
+  pid=$!
+  start="$(delivery_process_start "$pid")"
+  printf '%s|%s|%s|%s|%s\n' "$pid" "$start" "$token" "$PAD_DIR" "$name" > "$lock/owner"
+  printf '%s' "$pid" > "$lock/pid"
+  printf '%s' "$pid" > "$PAD_STATE/hold.$name.pid"
 }
 
 release_worker() {
+  local pid
+  pid="$(cat "$PAD_STATE/hold.$1.pid" 2>/dev/null || true)"
+  if [ -n "$pid" ]; then
+    kill "$pid" 2>/dev/null || true
+    wait "$pid" 2>/dev/null || true
+    rm -f "$PAD_STATE/hold.$1.pid"
+  fi
   rm -rf "$(delivery_worker_lock "$1")"
 }
 
@@ -427,7 +456,9 @@ cat > "$ocean_bin/ocean-heartbeat" <<'HEARTBEAT'
 if [ -n "${STITCHPAD_TEST_PID_REGISTRY:-}" ]; then
   start="$(ps -p "$$" -o lstart= 2>/dev/null | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')"
   command="$(ps -p "$$" -o command= 2>/dev/null || true)"
-  command_proof="$(test_command_proof "$command")"
+  # Inlined (NOT test_command_proof) — same reason as mock.sh above: a
+  # single-quoted heredoc cannot carry the parent suite's functions.
+  command_proof="$(printf '%s' "$command" | (shasum -a 256 2>/dev/null || sha256sum 2>/dev/null || openssl dgst -sha256 2>/dev/null | sed 's/^.* //') | awk '{print $1}')"
   [ -n "$start" ] && printf '%s|%s|adapter|%s|%s\n' "$$" "$start" "$0" "$command_proof" \
     >> "$STITCHPAD_TEST_PID_REGISTRY"
 fi
