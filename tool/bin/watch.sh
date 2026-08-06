@@ -1169,7 +1169,13 @@ _busy_ack_stage() {
   local name="$1" ordinal="$2" message_id="$3" sender="${4:-}"
   local marker
   marker="$(_busy_ack_marker "$name" "$ordinal")"
-  [ -f "$marker" ] && return 0  # already staged
+  [ -f "$marker" ] && return 0  # already staged, not yet posted
+  # ...and a DURABLE record of one already posted. The staged marker cannot carry
+  # that guarantee, because posting DELETES it — so once the ack was posted
+  # immediately (P49) every subsequent retry of the same busy generation staged
+  # and posted again. Measured: 31 identical "mid-lane" blocks in the pad from a
+  # single mention, still climbing. Found by the deepseek attacker seat (F5).
+  [ -f "$PAD_STATE/.busy-acked.$name.$ordinal" ] && return 0  # already posted once
   local ts
   ts="$(date '+%I:%M %p')"
   local sender_label="operator"
@@ -1183,6 +1189,12 @@ _busy_ack_post_pending() {
   for marker in "$PAD_STATE"/.busy-ack.*; do
     [ -f "$marker" ] || continue
     cat "$marker" >> "$PAD_MD"
+    # Tombstone BEFORE removing the marker: if we die between the two, the worst
+    # case is a tombstone with no marker (no ack, no spam) rather than a marker
+    # with no tombstone (spam forever). `.busy-acked.` does not match the
+    # `.busy-ack.*` glob above, so tombstones are never re-posted.
+    _ba_key="${marker##*/.busy-ack.}"
+    : > "$PAD_STATE/.busy-acked.$_ba_key" 2>/dev/null || true
     rm -f "$marker"
   done
 }

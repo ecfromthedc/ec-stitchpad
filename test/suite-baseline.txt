@@ -96,4 +96,4 @@ p44-roster-live-role-key-gate.sh 7 0
 thread-react-ui.sh 0 0
 p46-supervise-gate.sh 12 0
 p48-watcher-pad-gone-gate.sh 6 0
-operator-conduct-gate.sh 8 0
+operator-conduct-gate.sh 9 0

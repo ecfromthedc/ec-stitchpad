@@ -139,6 +139,18 @@ fi
 
 if grep -qi 'queued' "$G1_PAD/.stitchpad/stitchpad.md" 2>/dev/null; then
   ok "G1c: ack says queued"
+
+# G1d: EXACTLY ONE ack per mention, even though the busy seat keeps retrying.
+# The "ack once per ordinal" guard used to test only the staged marker — and
+# posting DELETES that marker, so once the ack was posted immediately (P49) every
+# retry staged and posted again: 31 identical blocks from one mention, still
+# climbing. Found by the deepseek attacker seat. A durable tombstone now carries
+# the guarantee. Counted after the retry window so a regression cannot hide.
+sleep 12
+_ack_n="$(grep -c 'mid-lane' "$G1_PAD/.stitchpad/stitchpad.md" 2>/dev/null || echo 0)"
+[ "$_ack_n" -eq 1 ] \
+  && ok "G1d: exactly one ack despite repeated busy retries" \
+  || bad "G1d: ack posted $_ack_n times for one mention (spam loop)"
 else
   bad "G1c: ack missing 'queued'"
 fi
