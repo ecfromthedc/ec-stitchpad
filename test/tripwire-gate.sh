@@ -315,11 +315,20 @@ echo ""
 # watcher-races.sh does exactly this on every run and was scored CRASHED while
 # exiting 0 and printing "watcher races ok". The discriminator is a bare PID
 # immediately after "line N: ". Crash-shaped statuses are NOT stripped.
+# PID FIELD WIDTH — the fixtures below are written the way bash actually prints,
+# not the way it is convenient to type. bash RIGHT-ALIGNS the pid in a 5-character
+# field, so the run of spaces after "line N:" is a function of the pid's digit
+# count: one space at 5 digits, two at 4, three at 3. Every fixture here used to
+# hard-code a single space, so the 4- and 3-digit cases below asserted against
+# spacing bash never emits — and the real gate, which hard-coded a single space in
+# the same place, scored watcher-races.sh CRASHED on every run that happened to
+# draw a pid under 10000 (measured: 1 red in 5 standalone runs). The assertions
+# are unchanged in strength; only the simulation was corrected.
 crash_scan() {
   local out="$1" scan
   local hard
-  scan="$(printf '%s' "$out" | grep -vE ': line [0-9]+: [0-9]+ [A-Za-z]' || true)"
-  hard="$(printf '%s' "$out" | grep -E ': line [0-9]+: [0-9]+ .*(Segmentation fault|Bus error|Abort trap|Illegal instruction|Trace/BPT)' || true)"
+  scan="$(printf '%s' "$out" | grep -vE ': line [0-9]+:[[:space:]]+[0-9]+ [A-Za-z]' || true)"
+  hard="$(printf '%s' "$out" | grep -E ': line [0-9]+:[[:space:]]+[0-9]+ .*(Segmentation fault|Bus error|Abort trap|Illegal instruction|Trace/BPT)' || true)"
   [ -n "$hard" ] && return 0
   echo "$scan" | grep -qE ': line [0-9]+: |unbound variable|command not found|syntax error near|: cannot execute|Segmentation fault'
 }
@@ -337,12 +346,40 @@ crash_scan 'suite.sh: line 8: 1/0: division by 0' \
 crash_scan 'suite.sh: line 12: PROJ1: unbound variable' \
   && ok  "crash-scan: an unset-variable diagnostic is a crash" \
   || bad "crash-scan: an unset-variable diagnostic was MISSED"
-crash_scan 'suite.sh: line 77: 1234 Suspended (tty output)   ./thing' \
+crash_scan 'suite.sh: line 77:  1234 Suspended (tty output)   ./thing' \
   && bad "crash-scan: an UNENUMERATED job status was scored as a CRASH" \
   || ok  "crash-scan: an unenumerated job status is still not a crash"
-crash_scan 'suite.sh: line 4: 999 Segmentation fault: 11  ./thing' \
+crash_scan 'suite.sh: line 4:   999 Segmentation fault: 11  ./thing' \
   && ok  "crash-scan: a segfaulting child is still a crash" \
   || bad "crash-scan: segfault job status was wrongly stripped"
+# ── pid field width: the exact shape that made this gate green while the real
+# ── tripwire went red. Each width must behave identically; the pid the OS hands
+# ── out must never decide whether a suite is reported as having crashed.
+crash_scan 'test/watcher-races.sh: line 103:  8971 Killed: 9    fswatch -0 pad' \
+  && bad "crash-scan: a job kill with a 4-digit pid was scored as a CRASH" \
+  || ok  "crash-scan: a job kill with a 4-digit pid is NOT a crash"
+crash_scan 'test/watcher-races.sh: line 103:   897 Killed: 9    fswatch -0 pad' \
+  && bad "crash-scan: a job kill with a 3-digit pid was scored as a CRASH" \
+  || ok  "crash-scan: a job kill with a 3-digit pid is NOT a crash"
+crash_scan 'suite.sh: line 4:  8971 Bus error: 10          ./thing' \
+  && ok  "crash-scan: a child dying on a bus fault is still a crash at 4 digits" \
+  || bad "crash-scan: a bus-fault job status was wrongly stripped at 4 digits"
+# The real script and this helper must not drift: a gate that carries its own COPY
+# of the logic can go green while the shipped classifier is broken, which is how
+# the width bug survived. Assert the shipped regexes are width-tolerant too.
+# Resolve the SAME way every other assertion here does — repo-relative, never via
+# PATH: `command -v regression-tripwire` would find the LIVE INSTALL and grade a
+# script that is not the one under test.
+_tw_src="$HERE/../tool/bin/regression-tripwire"
+if [ -r "$_tw_src" ]; then
+  if grep -Fq ': line [0-9]+:[[:space:]]+[0-9]+ [A-Za-z]' "$_tw_src"; then
+    ok  "crash-scan: the shipped classifier tolerates any pid field width"
+  else
+    bad "crash-scan: the shipped classifier still hard-codes a single space"
+  fi
+else
+  bad "crash-scan: could not read the shipped tripwire to check for drift"
+fi
 crash_scan 'all good here, 30 passed, 0 failed' \
   && bad "crash-scan: clean output scored as a crash" \
   || ok  "crash-scan: clean output is clean"

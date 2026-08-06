@@ -159,8 +159,27 @@ run_suite() {
   # `set -e` that status propagates out of the assignment and kills this
   # classifier outright — which is how a first attempt at this filter turned 21
   # of the gate's own assertions red.
-  _scan="$(printf '%s' "$output" | grep -vE ': line [0-9]+: [0-9]+ [A-Za-z]' || true)"
-  _hardstat="$(printf '%s' "$output" | grep -E ': line [0-9]+: [0-9]+ .*(Segmentation fault|Bus error|Abort trap|Illegal instruction|Trace/BPT)' || true)"
+  # WIDTH BUG (found by measuring, not by reading): bash RIGHT-ALIGNS the pid in a
+  # 5-character field when it reports a job status, so the separator after
+  # "line N:" is ONE space for a 5-digit pid and TWO for a 4-digit one:
+  #     watcher-races.sh: line 103: 26495 Killed: 9   ...   <- stripped, GREEN
+  #     watcher-races.sh: line 103:  8971 Killed: 9   ...   <- NOT stripped, CRASHED
+  # Both regexes hard-coded a single space, so watcher-races.sh — which kills its
+  # own fswatch every run — was scored CRASHED whenever the OS happened to hand it
+  # a pid below 10000. Measured 1 red in 5 standalone runs plus the full-tripwire
+  # run; the discriminator is the pid's DIGIT COUNT, nothing about the suite.
+  # `[[:space:]]+` preserves the discriminator exactly (a bare pid immediately
+  # after "line N:", then a status word) and only stops caring how wide it is.
+  # _hardstat is widened the same way so the two regexes agree on what a job-status
+  # line looks like. Be precise about what that buys: a 4-digit-pid segfault was
+  # already reported CRASH before this change, but via the fallback alternation
+  # (which matches a bare "Segmentation fault") rather than via the hard-status
+  # check — the right verdict for the wrong reason. Now the hard-status path
+  # recognises it directly, which is what keeps Bus error / Abort trap /
+  # Illegal instruction / Trace-BPT — none of which appear in that fallback
+  # alternation — classified by the rule that was written for them.
+  _scan="$(printf '%s' "$output" | grep -vE ': line [0-9]+:[[:space:]]+[0-9]+ [A-Za-z]' || true)"
+  _hardstat="$(printf '%s' "$output" | grep -E ': line [0-9]+:[[:space:]]+[0-9]+ .*(Segmentation fault|Bus error|Abort trap|Illegal instruction|Trace/BPT)' || true)"
   if [ -n "$_hardstat" ] || echo "$_scan" | grep -qE ': line [0-9]+: |unbound variable|command not found|syntax error near|: cannot execute|Segmentation fault'; then
     echo "$suite|CRASH|0|$rc"
     return 0
