@@ -3318,6 +3318,16 @@ PY
     sub="${1:-status}"; shift || true
     case "$sub" in
       on)
+        # DND is per-agent and always applies to the CALLER. It used to ACCEPT and
+        # silently ignore a name: `dnd on bob` printed "✓ DND on for @ec" and
+        # silenced @ec. You believe you muted a teammate; you muted yourself, and
+        # it said ✓. Refuse instead — silently doing something other than what was
+        # asked is the worst available behaviour.
+        if [ -n "${1:-}" ]; then
+          echo "stitchpad: 'dnd on' takes no name — it always applies to YOU (@$(sp_me 2>/dev/null || echo '<no identity>'))." >&2
+          echo "  to silence @${1}, run 'stitchpad dnd on' as that seat." >&2
+          exit 2
+        fi
         who="$(sp_me)"
         [ -z "$who" ] && { echo "stitchpad: no identity — call the MCP join tool first (or set STITCHPAD_NAME for CLI/testing)" >&2; exit 1; }
         touch "$(sp_dnd_file "$who")"
@@ -4773,6 +4783,16 @@ PY
     case "$sub" in
       new)
         # stitchpad task new "title" [--priority high] [--to name] [--labels a,b] [--desc text] [--estimate 30m]
+        # An unknown flag used to be swallowed as the TITLE:
+        #   stitchpad task new --title "Real Title"   ->  card titled "--title"
+        # printed "TASK-N created", rc=0. Refuse a leading flag; the title is
+        # positional and naming the real form is more useful than a wrong card.
+        case "${1:-}" in
+          --help|-h) echo "usage: stitchpad task new \"<title>\" [--priority p] [--to name] [--labels a,b] [--desc text] [--estimate 30m]" >&2; exit 2 ;;
+          -*) echo "stitchpad: task new takes the title as the FIRST positional argument, not '${1}'." >&2
+              echo "  try:  stitchpad task new \"<title>\" [--priority p] [--to name] [--labels a,b] [--desc text] [--estimate 30m]" >&2
+              exit 2 ;;
+        esac
         title="${1:-Untitled}"; shift 2>/dev/null || true
         priority="none"; assignee=""; labels=""; desc=""; estimate=""
         while [ $# -gt 0 ]; do
@@ -4782,6 +4802,12 @@ PY
             --labels) labels="$2"; shift 2 ;;
             --desc) desc="$2"; shift 2 ;;
             --estimate) estimate="$2"; shift 2 ;;
+            # A silent `*) shift` here discarded any unknown option AFTER the
+            # title too, so a typo like --piority just vanished and the card was
+            # created with the wrong metadata and rc=0.
+            -*) echo "stitchpad: task new — unknown option '$1'" >&2
+                echo "  known: --priority --to/--assignee --labels --desc --estimate" >&2
+                exit 2 ;;
             *) shift ;;
           esac
         done
