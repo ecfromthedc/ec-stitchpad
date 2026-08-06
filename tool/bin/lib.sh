@@ -1601,11 +1601,16 @@ sp_commit() {
   fi
   # H5b: HEAD didn't move and our bytes are not in HEAD — real failure.
   return 1
-  # P19 auto-narration: every durable commit emits a pad line so the operator sees
-  # progress without an agent remembering to narrate. Best-effort and never
-  # self-committing (that doubled commit counts and broke heal-roster).
-  sp_narrate "commit: $1" 2>/dev/null || true
-
+  # DEAD CODE REMOVED (deepseek F4). A `sp_narrate "commit: $1"` used to sit here,
+  # below an unconditional `return 1`, under a comment claiming "every durable
+  # commit emits a pad line". It was unreachable on every path — the success
+  # branches all return earlier — so P19 auto-narration never once fired from
+  # sp_commit. Deleting it rather than moving it up: narration IS emitted, but by
+  # the explicit sp_narrate calls at the sites that want it (task new, and the
+  # other P19 call sites), and switching it on for EVERY commit here would change
+  # what lands on the pad and start doubling lines those sites already write.
+  # A comment describing behaviour the code does not have is worse than no
+  # comment; that is what made this look implemented for so long.
 }
 
 # ── Roster parsing (the magic: roster is IN the markdown) ────────────
