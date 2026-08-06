@@ -1286,6 +1286,9 @@ def main() -> int:
     parser.add_argument("--deep", action="store_true")
     parser.add_argument("--daemon-url", default=None,
                         help="Ocean daemon URL (default: $OCEAN_DAEMON_URL or http://127.0.0.1:4780)")
+    parser.add_argument("--strict", action="store_true",
+                        help="exit 1 when the summary is error, 2 when only warnings "
+                             "(default exits 0 regardless; see main())")
     parser.add_argument("-h", "--help", action="help")
     args = parser.parse_args()
     if args.watch_start_grace < 0:
@@ -1295,6 +1298,29 @@ def main() -> int:
         print(json.dumps(snapshot, sort_keys=True, separators=(",", ":"), allow_nan=False))
     else:
         print(human(snapshot))
+
+    # EXIT CODE (k3 F3). This printed "summary: error — 0 ok, 1 warning, 1 error"
+    # and returned 0, so `stitchpad health && echo healthy` said healthy and any
+    # orchestrator scripting `health || alert` never alerted. The severity
+    # roll-up was computed correctly and then thrown away at the exact boundary
+    # a caller consumes.
+    #
+    # The default is DELIBERATELY still 0, and this is a compromise, not an
+    # oversight. `health` is already called in places that capture its output
+    # under `set -euo pipefail` with no guard — test/test-health-readonly.sh:194
+    # does `local_json="$($SP health --json)"` — and an unannounced flip to
+    # non-zero would turn a reporting fix into a new outage, including on a live
+    # fleet whose callers are not all in this repo. So the exit code becomes
+    # meaningful only when asked for.
+    #
+    # Callers that want the roll-up enforced:  stitchpad health --strict || alert
+    # 1 = at least one error, 2 = warnings only, 0 = clean.
+    if args.strict:
+        summary = snapshot.get("summary", {})
+        if summary.get("errors") or summary.get("pad_status") == "error":
+            return 1
+        if summary.get("warnings"):
+            return 2
     return 0
 
 

@@ -22,7 +22,8 @@
 #   stitchpad wake [name] [--peek]        print new @name messages since last drain
 #   stitchpad watch                       run the daemon (foreground)
 #   stitchpad start|stop|status|restart   manage the daemon (background)
-#   stitchpad health [--json] [--deep]    non-mutating local health snapshot
+#   stitchpad health [--json] [--deep] [--strict]  non-mutating local health snapshot
+#                                         --strict: exit 1 on error, 2 on warnings
 #   stitchpad sessions [--json]           read-only session-registry projection
 #   stitchpad telemetry [--json] [--model M] [--days N] [--limit N]   per-model reliability + cost-value summary
 #   stitchpad invite [--name <handle>] [--ttl 1h|30m|7d|never]   make a remote-join invite
