@@ -126,7 +126,7 @@ _ord_after="$(cut -d'|' -f2 "$(delivery_pending_file stuck)" 2>/dev/null)"
 if [ "$_gen_before" = "$_gen_after" ] && [ "$_ord_before" = "$_ord_after" ]; then
   ok "G3b the give-up notice is not itself a mention — no new generation ($_gen_after|$_ord_after)"
 else
-  bad "G3b the notice re-mentioned the seat: generation $_gen_before→$_gen_after, ordinal $_ord_before→$_ord_after — the give-up re-arms the retry it announces"
+  bad "G3b the notice re-mentioned the seat: generation ${_gen_before}->${_gen_after}, ordinal ${_ord_before}->${_ord_after} — the give-up re-arms the retry it announces"
 fi
 
 # ── G5: a NEW mention must be delivered at full speed ─────────────────────
