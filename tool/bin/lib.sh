@@ -3683,10 +3683,29 @@ sp_artifact_clear() {
 sp_wake_mode_for() {
   local name="${1:-}" row
   [ -n "$name" ] || return 0
+  # deepseek F6: this took the FIRST matching row and stopped. The roster is
+  # hand-editable and bridge-writable, and nothing downstream rejects a repeated
+  # name, so a seat with rows `dale|cli|pull|-` and `dale|cli|push|sess-999`
+  # answered "pull" here while the watcher (which iterates ALL rows) dispatched
+  # the push one. Every consumer of this helper then reasoned about a seat that
+  # was not the one being delivered to.
+  # Fail CLOSED on the ambiguity: if ANY row for this name says push, the seat is
+  # push. Push is the answer with consequences — it is the mode whose delivery
+  # belongs to the watcher and must never be consumed by a caller's terminal.
   row="$(sp_roster 2>/dev/null | awk -F'|' -v n="$name" '
     { gsub(/^[ \t]+|[ \t]+$/, "", $1); gsub(/^[ \t]+|[ \t]+$/, "", $3)
-      if (tolower($1) == tolower(n)) { print $3; exit } }')"
+      if (tolower($1) == tolower(n)) { if ($3 == "push") { print "push"; hit=1; exit } if (first == "") first = $3 } }
+    END { if (!hit && first != "") print first }')"
   printf '%s' "$row"
+}
+
+# deepseek F6: names carrying more than one roster row. A duplicate is never
+# legitimate — `join` refuses one (case-insensitively, and rejects the unicode
+# homoglyphs that used to slip past) — so any duplicate arrived by hand edit,
+# bridge write or merge, and every consumer that disagrees about which row is
+# real is a delivery bug waiting to happen. Prints the lowercased names.
+sp_roster_dupes() {
+  sp_roster 2>/dev/null | cut -d'|' -f1 | tr 'A-Z' 'a-z' | sort | uniq -d
 }
 
 # ── P46 Contract supervision ─────────────────────────────────────────────

@@ -517,6 +517,70 @@ EOF
     if [ -f "$PAD_MD" ] && grep -q '^```roster[[:space:]]*$' "$PAD_MD" 2>/dev/null; then
       _count="$(sp_roster_members_count "$PAD_MD")"
       if [ "$_count" -gt 0 ]; then
+        # deepseek F6: a populated roster is not necessarily a HEALTHY one. A
+        # repeated name is never legitimate — join refuses one — so it arrived by
+        # hand edit, bridge write or merge, and it makes every consumer disagree
+        # about the seat: sp_wake_mode_for read one row, the watcher dispatched
+        # another. This command is the natural home for the repair, and until now
+        # it answered "nothing to heal" on exactly the roster that needed it.
+        _dupes="$(sp_roster_dupes)"
+        if [ -n "$_dupes" ]; then
+          sp_lock || exit 1
+          _tmp="$(sp_stage "$PAD_MD")"
+          # Keep ONE row per name: the push row when the name has one (the mode
+          # with delivery consequences), else the first. Order of first
+          # appearance is preserved so the board does not reshuffle.
+          python3 - "$PAD_MD" > "$_tmp" <<'PY' || { rm -f "$_tmp"; sp_unlock; echo "stitchpad: heal-roster could not rewrite the roster — nothing changed" >&2; exit 1; }
+import re, sys
+lines = open(sys.argv[1], encoding='utf-8').read().split('\n')
+out, inblk, rows, order = [], False, {}, []
+def key(l):
+    return re.split(r'\s*\|\s*', l.strip())[0].lower()
+def wake_of(l):
+    f = re.split(r'\s*\|\s*', l.strip())
+    if len(f) >= 5 and f[2] not in ('push', 'pull'):
+        return f[3]
+    return f[2] if len(f) >= 3 else 'pull'
+for l in lines:
+    if not inblk and re.match(r'^```roster\s*$', l):
+        inblk = True; out.append(l); continue
+    if inblk and re.match(r'^```\s*$', l):
+        for k in order:
+            out.append(rows[k])
+        out.append(l); inblk = False; continue
+    if inblk:
+        s = l.strip()
+        if s == '' or s.startswith('#') or '|' not in s:
+            out.append(l); continue
+        k = key(l)
+        if k not in rows:
+            rows[k] = l; order.append(k)
+        elif wake_of(l) == 'push' and wake_of(rows[k]) != 'push':
+            rows[k] = l           # the push row wins
+        continue
+    out.append(l)
+sys.stdout.write('\n'.join(out))
+PY
+          _wr=0; sp_write_inplace "$_tmp" "$PAD_MD" || _wr=$?
+          if [ "$_wr" -ne 0 ]; then
+            sp_unlock
+            echo "stitchpad: heal-roster could not write the repaired roster (rc=$_wr) — nothing changed" >&2
+            exit 1
+          fi
+          _pre_dup="$(sp_commit_count)"
+          sp_commit_or_fail "repair: heal-roster collapsed duplicate roster rows ($(printf '%s' "$_dupes" | tr '\n' ' '))" || {
+            sp_unlock
+            echo "stitchpad: heal-roster dedupe NOT recorded — the commit did not land" >&2
+            exit 1; }
+          sp_unlock
+          _left="$(sp_roster_dupes)"
+          if [ -n "$_left" ]; then
+            echo "stitchpad: heal-roster ran but these names still have duplicate rows: $(printf '%s' "$_left" | tr '\n' ' ')" >&2
+            exit 1
+          fi
+          echo "✓ roster repaired: collapsed duplicate rows for $(printf '%s' "$_dupes" | tr '\n' ' ')(kept the push row where one existed)"
+          exit 0
+        fi
         echo "stitchpad: roster already present with $_count members — nothing to heal" >&2
         exit 0
       fi
@@ -3629,6 +3693,9 @@ PY
         if [ "$_wmode" = "push" ]; then
           echo "  to actually reach @$who:  stitchpad say \"@$who <your message>\"   (the watcher dispatches it)" >&2
           echo "  no watcher running?       stitchpad watch start" >&2
+        elif [ -z "$_wmode" ]; then
+          echo "  @$who is not on this pad's roster — check the name with: stitchpad roster" >&2
+          echo "  posting anyway?           stitchpad say \"@$who <your message>\"" >&2
         else
           echo "  @$who is a PULL seat — it collects its own messages. Post it:" >&2
           echo "                            stitchpad say \"@$who <your message>\"" >&2

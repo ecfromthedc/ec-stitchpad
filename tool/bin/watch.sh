@@ -1360,9 +1360,29 @@ react() {
   local rline
   while IFS= read -r rline; do members+=("$rline"); done < <(sp_roster)
   local m name adapter wake target
+  # deepseek F6 reported that a duplicated roster row makes this loop — which
+  # iterates ROWS — double-dispatch, because every other consumer keys on the
+  # NAME. Measured: it does NOT. delivery_enqueue is already idempotent per
+  # (ordinal, message_id), so the second row's enqueue is a no-op, and a `pull`
+  # row is skipped below anyway. What is real is that nobody ever TELLS the
+  # operator the roster is corrupt, and a duplicate silently decides which
+  # target a seat gets delivered on. The watcher sees the whole roster every
+  # cycle, so it is the right place to say so — rate-limited to once an hour per
+  # name, because a watcher speaks constantly.
+  local _lname _dupes _rl_dupe
+  _dupes=" $(sp_roster_dupes 2>/dev/null | tr '\n' ' ')"
   for m in "${members[@]}"; do
     IFS='|' read -r name adapter wake target <<< "$m"
     [ -n "$name" ] || continue
+    _lname="$(printf '%s' "$name" | tr 'A-Z' 'a-z')"
+    case "$_dupes" in
+      *" $_lname "*)
+        _rl_dupe="$PAD_STATE/.roster-dupe.$_lname"
+        if [ ! -f "$_rl_dupe" ] || [ -n "$(find "$_rl_dupe" -mmin +60 2>/dev/null)" ]; then
+          : > "$_rl_dupe" 2>/dev/null || true
+          echo "[stitchpad] @$name has MORE THAN ONE roster row — delivery follows one of them. Repair with: stitchpad heal-roster" >&2
+        fi ;;
+    esac
     # `pull` means the runtime's real lifecycle hook owns delivery. Never spawn
     # an external adapter for it: that creates a hidden second agent lane and
     # makes the operator's visible terminal cease to be the source of truth.

@@ -63,6 +63,7 @@ recovery-hardening3-regression.sh 67 0
 recovery-round7-regression.sh 27 0
 rename-state-carry-gate.sh 15 0
 reset-recovery.sh 0 0
+roster-duplicate-gate.sh 14 0
 rp2-directory-pathspec-gate.sh 10 0
 roster-recovery-guard-regression.sh 21 0
 roster-validation-gate.sh 12 0
