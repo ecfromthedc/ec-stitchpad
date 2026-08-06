@@ -71,6 +71,9 @@ sp_watch_owner_claim "$WATCH_LOCK" "$WATCH_GENERATION" "$$" || exit 1
 printf '%s' "$$" > "$WATCH_LOCK/pid" || exit 1
 printf '%s' "$(date -u +%Y-%m-%dT%H:%M:%SZ)" > "$WATCH_LOCK/ts" || exit 1
 watcher_cleanup() {
+  # Our own fswatch child must never outlive us: with the pad gone it has no
+  # reader and no further events, so an orphan would leak exactly like P48.
+  [ -n "${FSWATCH_PID:-}" ] && kill "$FSWATCH_PID" 2>/dev/null || true
   if sp_watch_owner_matches "$WATCH_LOCK" "$WATCH_GENERATION" "$$" 2>/dev/null; then
     if [ "$WATCH_LAUNCHED" -eq 1 ]; then
       # The daemon supervisor retains generation+launcher across a child crash
@@ -1262,4 +1265,45 @@ done
 # Re-prove ownership immediately before spawning fswatch; the signal traps above
 # exit rather than merely cleaning and continuing.
 sp_watch_owner_matches "$WATCH_LOCK" "$WATCH_GENERATION" "$$" || exit 1
-fswatch -0 "$PAD_MD" | while read -r -d "" _ev; do react </dev/null; done
+
+# P48: the event loop needs a TICK. `fswatch | while read ...` blocks in read
+# forever once the pad directory is deleted (fswatch can never deliver another
+# event), and the loop body on the right of a pipe is a subshell whose `exit`
+# would strand the real watcher, its EXIT trap and its lock. Instead fswatch
+# writes to a private FIFO held on fd 9 and the loop runs in the MAIN shell
+# with a timed read, so every idle tick re-proves the pad directory exists.
+# A missing pad FILE is tolerated (an outer `git stash -u` removes it briefly);
+# only a missing pad DIRECTORY on consecutive ticks is terminal. `exit` here is
+# a real main-shell exit: watcher_cleanup runs, the lock is released, and the
+# daemon supervisor sees its lock dir gone and stands down on its own instead
+# of respawning the worker.
+WATCH_EVENT_FIFO="$PAD_STATE/.watch-events.$$"
+rm -f "$WATCH_EVENT_FIFO"
+mkfifo "$WATCH_EVENT_FIFO" || { echo "[stitchpad] could not create event fifo" >&2; exit 1; }
+fswatch -0 "$PAD_MD" > "$WATCH_EVENT_FIFO" &
+FSWATCH_PID=$!
+# Open RDWR so the open never blocks waiting for a writer and the fd never
+# reports EOF if fswatch dies; the fifo name is unlinked once both ends are up.
+exec 9<>"$WATCH_EVENT_FIFO"
+rm -f "$WATCH_EVENT_FIFO"
+
+_pad_dir_gone_ticks=0
+while true; do
+  if IFS= read -r -d "" -t 5 _ev <&9; then
+    _pad_dir_gone_ticks=0
+    react </dev/null
+  elif [ ! -d "$PAD_DIR" ]; then
+    _pad_dir_gone_ticks=$((_pad_dir_gone_ticks + 1))
+    if [ "$_pad_dir_gone_ticks" -ge 3 ]; then
+      echo "[stitchpad] pad directory $PAD_DIR is gone — watcher exiting" >&2
+      kill "$FSWATCH_PID" 2>/dev/null || true
+      exit 0
+    fi
+  else
+    _pad_dir_gone_ticks=0
+    if ! kill -0 "$FSWATCH_PID" 2>/dev/null; then
+      echo "[stitchpad] fswatch died on a live pad — exiting for supervisor restart" >&2
+      exit 1
+    fi
+  fi
+done

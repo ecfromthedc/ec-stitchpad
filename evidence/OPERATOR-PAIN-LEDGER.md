@@ -773,7 +773,7 @@ by the new suite. Write the v2-shaped fixture and restore the five.
 
 ---
 
-## P48 — watchers outlive their pads, and the launcher respawns them (ROOT-CAUSED, NOT FIXED)
+## P48 — watchers outlive their pads (FIXED by k3; gated)
 
 **This is what made `operator-conduct-gate.sh` flake, and it leaks processes on the
 operator's laptop.** Root-caused; two attempted fixes were REVERTED because both
@@ -831,3 +831,37 @@ not hung; it is waiting correctly for an event that cannot arrive.
 
 Until then: `stitchpad watch stop` before deleting a pad, and expect suites that
 create throwaway pads to leak watchers.
+
+### RESOLVED — and one claim above is CORRECTED
+
+Fixed by **k3 (Kimi)**, dispatched under supervision: the same Ocean session every
+round, with a continuation that said "continue from where you stopped, do not
+start over". That is the P46 loop applied to the agent that kept falling off the
+task *because* dispatch was one-shot. It produced a working patch on the first
+turn.
+
+The insight both of my attempts missed:
+
+    exec 9<>"$WATCH_EVENT_FIFO"
+
+Opening the FIFO **read-write** means the open never blocks waiting for a writer
+and the fd never reports EOF if fswatch dies. My version used `exec 3<`, hit EOF
+immediately, and the watcher exited on startup. With fd 9 held open, a timed read
+(`read -t 5 <&9`) gives the loop a tick, the loop stays in the MAIN shell so
+`exit` runs `watcher_cleanup` and releases the lock, and the launcher then sees
+its lock directory gone and stands down **on its own — no signals**, which is
+what defeated my sentinel.
+
+Verified by execution: watcher exits within 30s of the pad directory being
+deleted, no orphan fswatch, a transiently missing pad FILE is still tolerated,
+and watcher-singleton / containment / ordering stay green.
+`test/p48-watcher-pad-gone-gate.sh` — 5 assertions, mutant-proved (restoring the
+tickless pipeline leaves the watcher alive).
+
+**CORRECTION to the analysis above.** I wrote that the failure rate of
+`operator-conduct-gate.sh` "tracks that count", which implied the leak caused the
+flake. With the leak fixed and watchers holding flat at 4-5 instead of growing
+~10 per run, that suite still fails: **2 green / 4 red over six runs.** The leak
+was real, severe (219 processes) and is now fixed; it was NOT the cause of the
+flake. Correlation, and I stated it too strongly. The flake needs its own
+investigation and the suite stays quarantined until it has one.
