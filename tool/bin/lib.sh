@@ -3678,6 +3678,19 @@ for s in data:
 print('unknown')
 " 2>/dev/null)"
     [ -z "$status" ] && status="unknown"
+    # A seat with no OCEAN SESSION is not necessarily absent. `lanes` derived
+    # status purely from the session registry, so a freshly joined cli/pull seat
+    # — heartbeating, on the roster, demonstrably alive — read "unknown/UNKNOWN"
+    # on the board. That is the first thing a new operator sees after `join`, and
+    # it flatly contradicts `roster` and the watcher, both of which consider that
+    # seat alive. Fall back to the SAME liveness rule the rest of the tool uses
+    # (sp_any_alive, watch.sh react): a heartbeat file whose mtime is under 90s
+    # counts as alive, whether or not it carries a pid.
+    if [ "$status" = "unknown" ] && [ -f "$PAD_STATE/alive.$name" ]; then
+      _lane_hb="$(stat -f %m "$PAD_STATE/alive.$name" 2>/dev/null || stat -c %Y "$PAD_STATE/alive.$name" 2>/dev/null || echo 0)"
+      _lane_age=$(( $(date +%s) - _lane_hb ))
+      [ "$_lane_age" -lt 90 ] && status="alive"
+    fi
     # Age since last activity
     age_s="$(echo "$proj" | python3 -c "
 import json, sys
@@ -3694,6 +3707,12 @@ for s in data:
 print('?')
 " 2>/dev/null)"
     [ -z "$age_s" ] && age_s="?"
+    # Age from the heartbeat when the session registry has none. Must run AFTER
+    # age_s is computed above, or it is simply overwritten.
+    if [ "$age_s" = "?" ] && [ "$status" = "alive" ] && [ -f "$PAD_STATE/alive.$name" ]; then
+      _lane_hb2="$(stat -f %m "$PAD_STATE/alive.$name" 2>/dev/null || stat -c %Y "$PAD_STATE/alive.$name" 2>/dev/null || echo 0)"
+      age_s=$(( $(date +%s) - _lane_hb2 ))
+    fi
     # Artifact check
     art_display=""
     if [ -f "$PAD_STATE/artifact-expect.$name" ]; then
@@ -3721,6 +3740,12 @@ print('?')
       stale)  verdict="STALE" ;;
       idle)   verdict="IDLE" ;;
       active) verdict="WORKING" ;;
+      alive)
+        # Heartbeating, but no Ocean session — a cli/pull seat. Its artifact
+        # contract still decides the verdict; absent one it is simply WORKING.
+        if [ "$present" = "NO" ]; then verdict="FAILED"
+        elif [ "$present" = "YES" ]; then verdict="DONE"
+        else verdict="WORKING"; fi ;;
       unknown)
         if [ "$present" = "NO" ]; then verdict="FAILED"
         elif [ "$present" = "YES" ]; then verdict="DONE"
