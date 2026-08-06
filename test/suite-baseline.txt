@@ -39,8 +39,9 @@ heal-roster-regression.sh 19 0
 health-strict-exit-gate.sh 7 0
 heartbeat-races.sh 0 0
 heartbeat.sh 0 0
+herdr-nudge-sanitize-gate.sh 6 0
 identity-survival-under-join.sh 11 0
-install-wiring-gate.sh 12 0
+install-wiring-gate.sh 13 0
 lanes-quarantine-gate.sh 9 0
 model-pinning.sh 49 0
 multipad-isolation.sh 42 0

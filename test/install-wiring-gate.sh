@@ -17,8 +17,9 @@
 #       user's real config to make our own step succeed)
 #   G4  ... and the refusal names the file and the reason
 #   G5  a valid settings.json still wires: rc=0 and the banner prints
-#   G6  ... with the Stop hook, the PreToolUse claim hook and the MCP server
-#       actually present in the JSON (the banner is checked against the file)
+#   G6  ... with the Stop hook and claim hook really in settings.json and the
+#       MCP server really in ~/.claude.json — the file Claude actually reads
+#       (k3 F17). The banner is checked against the files, never trusted.
 #   G7  ... and pre-existing user keys survive the merge
 #   G8  a second run is idempotent: rc=0, still exactly one Stop entry
 #   G9  no python3 at all → non-zero, and the ledger says why
@@ -102,7 +103,11 @@ case "$out" in
   *) bad "G5b the success banner is missing on a fully wired install" ;;
 esac
 
-python3 - "$S" <<'PY' >"$TMP/g6" 2>/dev/null
+# The MCP server belongs in ~/.claude.json, NOT settings.json: proven with two
+# isolated HOMEs and `claude mcp list` — an entry in settings.json is invisible
+# to Claude, an entry in ~/.claude.json is listed (k3 F17). So this checks the
+# hooks in settings.json and the MCP registration in ~/.claude.json.
+python3 - "$S" "$GOOD_HOME/.claude.json" <<'PY' >"$TMP/g6" 2>/dev/null
 import json,sys
 d=json.load(open(sys.argv[1]))
 h=d.get("hooks",{})
@@ -110,13 +115,22 @@ def has(sec,frag):
     return any(frag in (x.get("command") or "") for blk in h.get(sec,[]) for x in blk.get("hooks",[]))
 print("stop"  if has("Stop","stop-hook.sh") else "-")
 print("claim" if has("PreToolUse","claim-hook.sh") else "-")
-print("mcp"   if "stitchpad" in d.get("mcpServers",{}) else "-")
+try:
+    j=json.load(open(sys.argv[2]))
+except Exception:
+    j={}
+print("mcp"   if "stitchpad" in j.get("mcpServers",{}) else "-")
 print("keep"  if d.get("env",{}).get("KEEP")=="me" and d.get("model")=="opus" else "-")
+print("nodead" if "stitchpad" not in d.get("mcpServers",{}) else "-")
 PY
 _g6="$(tr '\n' ' ' < "$TMP/g6" 2>/dev/null)"
 case "$_g6" in
-  "stop claim mcp keep "*) ok "G6 Stop hook, claim hook and MCP server are all really in the file" ;;
-  *) bad "G6 the banner claimed more than the file contains: [$_g6]" ;;
+  "stop claim mcp keep nodead "*) ok "G6 hooks in settings.json, MCP in ~/.claude.json — all really present" ;;
+  *) bad "G6 the banner claimed more than the files contain: [$_g6]" ;;
+esac
+case "$_g6" in
+  *"nodead "*) ok "G6b nothing was written to settings.json's mcpServers, which Claude never reads" ;;
+  *) bad "G6b the MCP server went back into settings.json, where Claude cannot see it" ;;
 esac
 case "$_g6" in
   *"keep "*) ok "G7 pre-existing user keys survived the merge" ;;

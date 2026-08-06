@@ -160,21 +160,50 @@ echo
 # registered, adds if missing. No duplicate errors, no interactive prompts.
 MCP_SERVER="$HOME_DIR/mcp/server.mjs"
 
-# Claude: ~/.claude/settings.json  mcpServers.stitchpad
+# Claude: ~/.claude.json  mcpServers.stitchpad
+#
+# k3 F17, PROVEN: Claude Code does NOT read mcpServers from
+# ~/.claude/settings.json, which is where this installer used to write it. Two
+# isolated HOMEs, identical server definition, `claude mcp list`:
+#   entry in ~/.claude/settings.json → "No MCP servers configured"
+#   entry in ~/.claude.json          → "probe: node … ✘ Failed to connect"
+# i.e. only the second file is read. Every Claude seat this installer ever
+# touched was left WITHOUT the stitchpad MCP tools, while the run printed
+# "✓ Claude MCP stitchpad registered". The file's own comment named the right
+# path all along; the code did not follow it.
+CLAUDE_JSON="$HOME/.claude.json"
 if command -v python3 >/dev/null 2>&1; then
-  if [ "$CLAUDE_JSON_OK" != 1 ]; then
-    _wire_fail "Claude MCP server registration — $CLAUDE_SETTINGS is unparseable"
-  elif python3 - "$CLAUDE_SETTINGS" "$MCP_SERVER" <<'PY'
+  [ -f "$CLAUDE_JSON" ] || echo '{}' > "$CLAUDE_JSON"
+  if ! _json_ok "$CLAUDE_JSON"; then
+    echo "✗ $CLAUDE_JSON is not valid JSON — REFUSING to edit it."
+    echo "    $(_json_err "$CLAUDE_JSON")"
+    _wire_fail "Claude MCP server registration — $CLAUDE_JSON is unparseable"
+  elif python3 - "$CLAUDE_JSON" "$MCP_SERVER" "$CLAUDE_SETTINGS" <<'PY'
 import json,sys
-p,sp=sys.argv[1],sys.argv[2]
+p,sp,old=sys.argv[1],sys.argv[2],sys.argv[3]
 d=json.load(open(p))
 srv=d.setdefault("mcpServers",{})
+changed=False
 if "stitchpad" not in srv:
     srv["stitchpad"]={"type":"stdio","command":"node","args":[sp],"env":{}}
+    changed=True
+if changed:
     json.dump(d,open(p,"w"),indent=2)
+# Clear the dead registration this installer used to write into settings.json.
+# Only OUR entry, only when it is the whole of mcpServers, and only if the file
+# parses — a user's other config is never touched.
+try:
+    s=json.load(open(old))
+    m=s.get("mcpServers")
+    if isinstance(m,dict) and set(m)=={"stitchpad"}:
+        del s["mcpServers"]
+        json.dump(s,open(old,"w"),indent=2)
+        print("  (removed the dead mcpServers entry from settings.json)")
+except Exception:
+    pass
 PY
-  then echo "✓ Claude MCP stitchpad registered ($CLAUDE_SETTINGS)"
-  else _wire_fail "Claude MCP server registration — the merge into $CLAUDE_SETTINGS failed"
+  then echo "✓ Claude MCP stitchpad registered ($CLAUDE_JSON)"
+  else _wire_fail "Claude MCP server registration — the merge into $CLAUDE_JSON failed"
   fi
 
   # Codex: ~/.codex/config.toml  [mcp_servers.stitchpad]
