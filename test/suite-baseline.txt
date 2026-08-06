@@ -15,7 +15,7 @@ authority-redesign-regression.sh 29 0
 bridge-heartbeat-interval.sh 3 0
 clear-regression.sh 9 0
 color-bash32.sh 0 0
-command-dispatch-gate.sh 90 0
+command-dispatch-gate.sh 91 0
 commit-fail-postcondition-gate.sh 6 0
 concurrency-round5-regression.sh 8 0
 coordination-lifecycle-slice-a.sh 7 0

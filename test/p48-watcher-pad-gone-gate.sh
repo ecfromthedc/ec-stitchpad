@@ -70,9 +70,18 @@ echo ""
 
 RT="$ROOT/tool"
 PAD="$(make_pad "$RT" a)"
+PRE_PIDS="$(pids_for "$RT")"     # whatever was already running, not ours
 start_watch "$RT" a "$PAD"
 napp 4
-MINE="$(pids_for "$RT")"; STARTED_PIDS="$MINE"
+# Take the DELTA, not every watcher under the tool root: other suites (and the
+# release gate running them in sequence) leave watchers of their own around, and
+# counting those made this gate fail on unrelated activity — a gate lying about
+# the code under test, for the second time in this file.
+MINE=""
+for _p in $(pids_for "$RT"); do
+  case " $PRE_PIDS " in *" $_p "*) ;; *) MINE="$MINE $_p" ;; esac
+done
+STARTED_PIDS="$MINE"
 n="$(count_mine "$MINE")"
 [ "$n" -gt 0 ] && ok "G1 a watcher started on a healthy pad (n=$n)" || bad "G1 no watcher started"
 
@@ -90,7 +99,12 @@ fsw_after="$(pgrep -f 'fswatch -0' 2>/dev/null | wc -l | tr -d ' ')"
 PAD2="$(make_pad "$RT" b)"
 start_watch "$RT" b "$PAD2"
 napp 4
-MINE2="$(pids_for "$RT")"; STARTED_PIDS="$STARTED_PIDS $MINE2"
+PRE2="$PRE_PIDS $MINE"
+MINE2=""
+for _p in $(pids_for "$RT"); do
+  case " $PRE2 " in *" $_p "*) ;; *) MINE2="$MINE2 $_p" ;; esac
+done
+STARTED_PIDS="$STARTED_PIDS $MINE2"
 mv "$PAD2/stitchpad.md" "$TMP/stashed.md" 2>/dev/null || true
 napp 20
 n="$(count_mine "$MINE2")"

@@ -230,7 +230,10 @@ d = json.load(sys.stdin)
 print(sum(m.get("wake_runs", 0) for m in d.get("models", [])))' 2>/dev/null)"
 check 'F5 summary wake_runs unaffected by polls' '0' "$wake_runs"
 # a REAL wake still records a wake event (guard against over-correction)
-out="$(cd "$tmp/f5" && STITCHPAD_MODEL=k3 "$SP" wake victim 2>/dev/null)"
+# Named seat: P43 refuses a CONSUMING wake issued by anyone but the seat (it
+# renders to the caller and burns the cursor), so a bare third-party wake now
+# records push_misdirect rather than delivered. Real callers name the seat.
+out="$(cd "$tmp/f5" && STITCHPAD_MODEL=k3 STITCHPAD_NAME=victim "$SP" wake victim 2>/dev/null)"
 real="$(find "$STATE5/telemetry" -name '*.jsonl' -exec cat {} + 2>/dev/null | python3 -c '
 import json, sys
 for line in sys.stdin:
