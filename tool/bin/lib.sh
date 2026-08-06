@@ -777,6 +777,26 @@ except Exception:
 PY
 }
 
+# Is somebody mid-publication inside this lock right now?
+# The claim marker is written with a builtin redirect the instant mkdir wins, so
+# a lock is "ownerless but claimed" only while its winner is still spawning the
+# processes sp_lock_owner_write needs. Read with `read <`, not `cat`, so probing
+# stays fork-free too.
+sp_lock_claimer_is_live() {
+  local claim=""
+  [ -f "$1/claiming" ] || return 1
+  # NO `|| return 1` on the read. `read` returns NON-ZERO when it hits EOF
+  # without a delimiter — which is exactly what happens on a file written by a
+  # bare `printf '%s'` — while still having assigned the variable. Treating that
+  # status as failure made this function answer "not live" every single time, so
+  # the guard was present, passed review, and protected nothing. The marker is
+  # now written with a trailing newline as well; both halves are belt and braces
+  # because a lock guard that silently never fires is the worst kind.
+  read -r claim < "$1/claiming" 2>/dev/null
+  case "$claim" in ''|*[!0-9]*) return 1 ;; esac
+  kill -0 "$claim" 2>/dev/null
+}
+
 sp_lock() {
   local lock="$PAD_STATE/.lock" age now mtime observed pid_capture _jitter
   local _start _elapsed
@@ -804,17 +824,36 @@ sp_lock() {
           [ -d "$lock" ] || continue
         fi
       elif [ ! -f "$lock/owner" ] && [ "$age" -ge "$SP_LOCK_EMPTY_RECLAIM" ]; then
-        # E1: empty (ownerless) lock reclaim. The owner file is written within
-        # ~ms of mkdir, so a lock that is still empty after a short bounded
-        # wait means the creator was SIGKILLed in the mkdir→owner-write window.
-        # Without this, the next writer hits "pad busy (lock timeout)" at 5 s
-        # and every retry fails until the 30 s SP_LOCK_STALE age-based path.
-        rmdir "$lock" 2>/dev/null || true
-        [ -d "$lock" ] || continue
+        # E1: empty (ownerless) lock reclaim. The premise WAS "the owner file is
+        # written within ~ms of mkdir, so a still-empty lock means the creator
+        # was SIGKILLed in the mkdir→owner-write window". That premise was false.
+        # sp_lock_owner_write cannot publish until it has spawned /bin/sh (for
+        # PPID), ps twice, and a python3 interpreter — comfortably longer than
+        # SP_LOCK_EMPTY_RECLAIM (1s) on a loaded machine. So this branch was
+        # stealing the lock from writers that were alive and mid-publication:
+        # two writers then believed they held the same critical section, the
+        # robbed one failed with "could not publish pad-lock ownership", and its
+        # journal rollback could rewind work the thief had already committed.
+        # Reproduced deterministically via STITCHPAD_LOCK_TEST_BEFORE_OWNER_BARRIER.
+        # Only ever reclaim from a claimant that is provably GONE.
+        if ! sp_lock_claimer_is_live "$lock"; then
+          rm -f "$lock/claiming" 2>/dev/null || true
+          rmdir "$lock" 2>/dev/null || true
+          [ -d "$lock" ] || continue
+        fi
       elif [ "$age" -ge "$SP_LOCK_STALE" ]; then
         # Fallback: age-based stale-break for pre-generation or empty locks.
         # Non-empty unknown locks fail closed because their contents are not
         # ownership proof.
+        # DELIBERATELY NOT liveness-gated, unlike E1 above. The claim marker
+        # holds a pid, and pids get REUSED — if an unrelated process inherits
+        # the number, `kill -0` says "live" forever and a liveness-only rule
+        # would wedge the pad permanently with no way out. Publishing ownership
+        # takes well under a second; a lock still unowned after SP_LOCK_STALE
+        # (30s) is not a slow writer under any plausible load, so age remains
+        # the ultimate escape hatch. E1 fixes the 1-second steal; this bounds
+        # the blast radius of the fix.
+        rm -f "$lock/claiming" 2>/dev/null || true
         rmdir "$lock" 2>/dev/null || true
         [ -d "$lock" ] || continue
       fi
@@ -831,6 +870,13 @@ sp_lock() {
     _jitter=$(( (RANDOM % 10) + 1 ))   # 1-10 centiseconds (0.01-0.10s)
     sleep 0.${_jitter}
   done
+  # CLAIM THE LOCK IMMEDIATELY — builtin redirect, ZERO forks, so this runs in
+  # microseconds. Everything below (the /bin/sh PPID capture, then ps/ps/python3
+  # inside sp_lock_owner_write) takes orders of magnitude longer, and until it
+  # finishes the lock has no `owner` file. That gap is what E1 above used to
+  # reclaim out from under a live writer. Nothing between mkdir and this line
+  # may fork, or the gap reopens.
+  printf '%s\n' "$$" > "$lock/claiming" 2>/dev/null || true
   _SP_LOCK_DIR="$lock"
   # `$$` does not change in a Bash 3.2 subshell. Ask a direct child for its
   # parent PID so the lock records the shell that actually owns this execution
@@ -857,11 +903,16 @@ sp_lock() {
   _SP_LOCK_SUBSHELL="${BASH_SUBSHELL:-0}"
   _SP_LOCK_GENERATION="$(date +%s).${_SP_LOCK_PID}.${RANDOM:-0}"
   if ! sp_lock_owner_write "$lock" "$_SP_LOCK_GENERATION" "$_SP_LOCK_PID"; then
+    rm -f "$lock/claiming" 2>/dev/null || true
     rmdir "$lock" 2>/dev/null || true
     _SP_LOCK_DIR=""; _SP_LOCK_GENERATION=""; _SP_LOCK_PID=""; _SP_LOCK_SUBSHELL=""
     echo "stitchpad: could not publish pad-lock ownership" >&2
     return 1
   fi
+  # Ownership is published; the claim marker has done its job. Removing it keeps
+  # the lock directory to exactly the one file every other path expects, so a
+  # later rmdir cannot fail on unexpected contents.
+  rm -f "$lock/claiming" 2>/dev/null || true
   # Signals exit first; the EXIT trap then releases only this exact generation.
   # An INT/TERM handler that merely unlocked and returned could let mutation
   # continue after forfeiting ownership.
@@ -891,6 +942,10 @@ sp_unlock() {
     && [ -n "$_SP_LOCK_DIR" ] && [ -n "$_SP_LOCK_GENERATION" ] && [ -n "$_SP_LOCK_PID" ] \
     && sp_lock_owner_matches "$_SP_LOCK_DIR" "$_SP_LOCK_GENERATION" "$_SP_LOCK_PID"; then
     rm -f "$_SP_LOCK_DIR/owner" 2>/dev/null || true
+    # Defensive: a claim marker should already be gone by the time ownership was
+    # published, but an rmdir that fails on leftover contents wedges the pad for
+    # every future writer, so never let one survive our own release.
+    rm -f "$_SP_LOCK_DIR/claiming" 2>/dev/null || true
     rmdir "$_SP_LOCK_DIR" 2>/dev/null || true
   fi
   _SP_LOCK_DIR=""; _SP_LOCK_GENERATION=""; _SP_LOCK_PID=""; _SP_LOCK_SUBSHELL=""

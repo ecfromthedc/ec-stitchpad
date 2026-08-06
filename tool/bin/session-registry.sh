@@ -1288,8 +1288,39 @@ sp_session_registry_journal_rollback() {
       return 1
     fi
   done < "$_paths_source"
+  # ── HEAD-ADVANCED GUARD (deepseek F1, second half) ───────────────────────
+  # This journal snapshots $PAD_MD, so a rollback rewrites the pad file back to
+  # its pre-operation bytes. That is correct when this writer is the only one who
+  # touched it — and destructive when it is not. If another writer committed in
+  # between, restoring our snapshot silently DELETES their message from the
+  # working pad, and the next successful commit records the wiped state as HEAD:
+  # a message that was acknowledged with "✓ posted" and really was committed
+  # simply ceases to exist.
+  # The orphan-recovery path already refuses exactly this (it compares HEAD
+  # against the stamped .base-sha before restoring). The live path did not, even
+  # though journal_begin stamps .base-sha for both. Same evidence, same rule.
+  # Registry/marker files are still restored — they are per-session and ours.
+  # Only the shared pad file is held back, and the journal is preserved so the
+  # snapshot can be recovered by hand.
+  local _rb_skip_pad=0 _rb_base="" _rb_head=""
+  if [ -f "$jdir/.base-sha" ] && [ -n "${PAD_GIT:-}" ] && [ -d "$PAD_GIT" ]; then
+    _rb_base="$(cat "$jdir/.base-sha" 2>/dev/null || true)"
+    _rb_head="$(git --git-dir="$PAD_GIT" --work-tree="$PAD_DIR" rev-parse HEAD 2>/dev/null || true)"
+    if [ -n "$_rb_base" ] && [ "$_rb_base" != "unborn" ] \
+       && [ -n "$_rb_head" ] && [ "$_rb_base" != "$_rb_head" ]; then
+      _rb_skip_pad=1
+      _rollback_partial=1
+      echo "stitchpad: pad history advanced during this operation (journalled base $_rb_base, HEAD now $_rb_head) — NOT restoring the pad file, because another writer's committed message would be erased. Registry state rolled back; journal preserved at $jdir" >&2
+    fi
+  fi
+
   while IFS= read -r f; do
     [ -n "$f" ] || continue
+
+    if [ "$_rb_skip_pad" = "1" ] && [ -n "${PAD_MD:-}" ] && [ "$f" = "$PAD_MD" ]; then
+      i=$(( i + 1 ))
+      continue
+    fi
 
     existed="$(sed -n "$(( i + 1 ))p" "$jdir/manifest" 2>/dev/null)"
     if [ "$existed" = "1" ]; then
