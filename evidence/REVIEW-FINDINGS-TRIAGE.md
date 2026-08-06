@@ -112,6 +112,44 @@ much as its right half:
   the pid is *not* our writer and reclaiming is correct. Treating EPERM as
   "alive" would reintroduce a permanent wedge. Behaviour kept deliberately.
 
+## Open for the next session — found here, not fixed here
+
+Three things this close-out established but did not fix. Each is written up so
+the next session starts from evidence rather than rediscovery.
+
+1. **`watcher-races.sh` is load-sensitive, and the fragility is in the product,
+   not the suite.** It passes 5/5 standalone and fails inside a full tripwire
+   run and under synthetic CPU load, at
+   `fail "ensure-watcher cancelled or replaced the live supervisor gap"`.
+   Measured on the PRISTINE pre-session tree (b8509a4) under the same load: it
+   fails identically. So a concurrent `stitchpad` command can cancel a live
+   supervisor's generation during the daemon's 2-second restart gap when the
+   machine is busy — the liveness evidence stops being readable fast enough and
+   a live supervisor reads as dead. Do NOT widen the suite's budget to hide it;
+   the assertion is correct and the race is real.
+
+2. **`set-wake` prints "failed to bind" after successfully binding.** Observed
+   live re-pointing @glm: `set-wake glm push <sid>` printed
+   `stitchpad: failed to bind Ocean session ... to @glm`, and an immediate
+   `bind-session` answered `already bound (no-op)` — the bind HAD happened. A
+   false FAILURE report, the mirror image of the false-success class this build
+   has been closing, and it makes an operator retry an operation that already
+   worked.
+
+3. **`delivery_start_worker` has a 5s ownerless-lock grace that returns WITHOUT
+   spawning.** A brand-new delivery generation landing in that window waits for
+   the next enqueue. In production the watcher enqueues on every pad event so it
+   recovers; with no further pad writes the mention sits. Surfaced by the
+   busy-retry fixture (the give-up path reaches this window more often), and the
+   fixture now models production rather than relying on one lucky call.
+
+Also unproven and NOT claimed: on `#campaign-hub-rust-rebuild`, three of four
+`say` attempts under contention with the live watcher printed a rollback-shaped
+warning AND the message landed anyway, leaving four copies of one ping. Only the
+first line of each run was captured, so whether rc was non-zero is unknown —
+and that is the difference between a wording problem and a false-failure
+report. Establish the exit code FIRST.
+
 ## Method
 
 Every FIXED entry was reproduced on a throwaway pad with an isolated `HOME`
