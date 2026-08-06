@@ -170,6 +170,81 @@ fi
 # /Users/ecfromthedc/dev/agents/stitchpad-wt/evidence/live-checkout-escapes.log).
 # W1-W4 already prove the singleton holds.
 
+# ── W6/W7: a dead watcher must not wedge the pad forever ─────────────────
+# FOUND LIVE ON THE OPERATOR'S FLEET, not by reading code. A watcher lock holding
+# `pid` and `ts` but no `generation` made sp_watch_empty_lock_reclaim return 1
+# unconditionally — its emptiness test ran first, so age and pid-liveness were
+# never consulted. Measured on a real pad: pid 14088 dead, lock 39136s (nearly 11
+# hours) old, every push seat deaf the whole time while `lanes` said WORKING.
+# Nothing self-healed it; the only cure was deleting the directory by hand.
+# This is the silence class at its most expensive: the fleet looks fine and
+# receives nothing.
+W6="$WORK/w6"; mkdir -p "$W6/home" "$W6/proj"
+(
+  cd "$W6/proj" || exit 1
+  export HOME="$W6/home" STITCHPAD_HOME="$TOOL" STITCHPAD_TERMINAL_NAMESPACE=w6
+  "$SP" init >/dev/null 2>&1
+  "$SP" join dale cli pull - >/dev/null 2>&1
+)
+W6L="$W6/proj/.stitchpad/.state/watch.lock.d"
+rm -rf "$W6L"; mkdir -p "$W6L"
+printf '999999\n' > "$W6L/pid"          # a pid that cannot be running
+printf '2026-08-06T03:07:14Z\n' > "$W6L/ts"
+touch -t 202608050307 "$W6L"            # older than any start grace
+
+# A watcher only runs when a seat is alive, and this suite disables heartbeat
+# autostart globally (line 39). Without a fresh alive marker `watch start`
+# refuses for THAT reason and the lock is never even examined — the probe would
+# then "fail" while proving nothing. Stamp liveness directly.
+printf '{"name":"dale"}\n' > "$W6/proj/.stitchpad/.state/alive.dale"
+
+if kill -0 999999 2>/dev/null; then
+  bad "W6 INVALID PROBE: pid 999999 is actually alive on this machine"
+else
+  w6_rc=0; w6_out=""
+  w6_out="$( cd "$W6/proj" && HOME="$W6/home" STITCHPAD_HOME="$TOOL" STITCHPAD_TERMINAL_NAMESPACE=w6 \
+      "$SP" watch start 2>&1 )" || w6_rc=$?
+  # Distinguish "no live seat" (a broken probe) from "the lock blocked it" (the
+  # bug). Both surface the same sentence, so key on whether OUR planted pid is
+  # still sitting in the lock: if it is, the lock is what stopped the watcher.
+  case "$w6_out" in
+    *"is any agent alive"*)
+      if ! grep -q '^999999$' "$W6L/pid" 2>/dev/null; then
+        bad "W6 INVALID PROBE: refused for lack of a live seat, not because of the lock"
+      fi ;;
+  esac
+  if [ "$w6_rc" -eq 0 ]; then
+    ok "W6: a dead-pid ownerless watcher lock is reclaimed, not left to wedge the pad"
+  else
+    bad "W6: dead-pid watcher lock wedged the pad (watch start rc=$w6_rc) — push seats go permanently deaf"
+  fi
+  # The reclaimed lock must be re-acquired with real ownership, not just deleted.
+  if [ -f "$W6L/generation" ]; then
+    ok "W7: the replacement watcher owns its lock (generation present)"
+  else
+    bad "W7: lock has no generation after restart — ownership was not established"
+  fi
+  ( cd "$W6/proj" && HOME="$W6/home" STITCHPAD_HOME="$TOOL" STITCHPAD_TERMINAL_NAMESPACE=w6 \
+      "$SP" watch stop >/dev/null 2>&1 ) || true
+fi
+
+# W8: a lock whose pid is STILL ALIVE must never be reclaimed — that would kill a
+# working watcher, which is the opposite failure and how W1-W4's churn started.
+W8L="$W6/proj/.stitchpad/.state/watch.lock.d"
+rm -rf "$W8L"; mkdir -p "$W8L"
+sleep 600 &
+w8_pid=$!
+printf '%s\n' "$w8_pid" > "$W8L/pid"; printf 'x\n' > "$W8L/ts"
+touch -t 202608050307 "$W8L"
+if sp_watch_reclaim_probe=1 true && ! ( cd "$W6/proj" && HOME="$W6/home" STITCHPAD_HOME="$TOOL" \
+     STITCHPAD_TERMINAL_NAMESPACE=w6 "$SP" watch start >/dev/null 2>&1 ); then
+  ok "W8: a lock held by a LIVE pid is refused, not stolen"
+else
+  bad "W8: reclaimed a watcher lock whose pid is still alive — a working watcher would be displaced"
+fi
+kill -TERM "$w8_pid" 2>/dev/null || true
+wait "$w8_pid" 2>/dev/null || true
+
 # ── Verdict ───────────────────────────────────────────────────────────────
 echo ""
 if [ "$fail" -gt 0 ]; then

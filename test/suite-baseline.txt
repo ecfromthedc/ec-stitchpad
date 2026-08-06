@@ -79,7 +79,7 @@ wake-regression.sh 0 0
 watcher-containment-gate.sh 10 0
 watcher-ordering-gate.sh 3 0
 watcher-races.sh 0 0
-watcher-singleton-gate.sh 6 0
+watcher-singleton-gate.sh 9 0
 oversight-gate.sh 14 0
 
 websec-regression.sh 8 0

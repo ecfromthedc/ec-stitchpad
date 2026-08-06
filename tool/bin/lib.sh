@@ -2998,13 +2998,43 @@ sp_watch_test_barrier_wait() {
 }
 
 sp_watch_empty_lock_reclaim() {
-  local lock="$1" now mtime age
+  local lock="$1" now mtime age entries lock_pid
   [ -d "$lock" ] || return 1
-  [ -z "$(find "$lock" -mindepth 1 -maxdepth 1 -print -quit 2>/dev/null)" ] || return 1
   now="$(date +%s)"
   mtime="$(stat -f %m "$lock" 2>/dev/null || stat -c %Y "$lock" 2>/dev/null || echo "$now")"
   age=$((now - mtime))
   [ "$age" -ge "$STITCHPAD_WATCH_START_GRACE" ] || return 1
+
+  # Case 1: a genuinely empty lock directory.
+  if [ -z "$(find "$lock" -mindepth 1 -maxdepth 1 -print -quit 2>/dev/null)" ]; then
+    rmdir "$lock" 2>/dev/null
+    return $?
+  fi
+
+  # Case 2: THE WEDGE. Found live on the operator's fleet: a watcher lock holding
+  # `pid` and `ts` but no `generation`. The emptiness test above ran FIRST, so a
+  # non-empty lock returned 1 no matter how old it was or whether its pid was
+  # dead — and `watch start` then refused with "fresh or unknown ownerless
+  # watcher lock left untouched" forever. Measured on a real pad: pid 14088 dead,
+  # lock 39136 seconds (nearly 11 hours) old, every push seat on that pad deaf
+  # the entire time while `lanes` reported them WORKING. Nothing self-heals it;
+  # the only cure was deleting the directory by hand, which no operator knows to
+  # do because the message calls an 11-hour-old lock "fresh".
+  # Reclaim ONLY this exact known shape, and only when the recorded pid is gone.
+  # An unrecognised lock layout still fails closed — its contents are not
+  # ownership proof and guessing is how a live watcher gets killed.
+  entries="$(find "$lock" -mindepth 1 -maxdepth 1 -exec basename {} \; 2>/dev/null | sort | tr '\n' ' ')"
+  case "$entries" in
+    'pid '|'pid ts ') ;;
+    *) return 1 ;;
+  esac
+  lock_pid=""
+  read -r lock_pid < "$lock/pid" 2>/dev/null
+  case "$lock_pid" in ''|*[!0-9]*) return 1 ;; esac
+  # Still running -> never reclaim. (A pid we cannot signal is not ours, so it is
+  # not our watcher either; same reasoning as the pad lock's claim marker.)
+  kill -0 "$lock_pid" 2>/dev/null && return 1
+  rm -f "$lock/pid" "$lock/ts" 2>/dev/null || true
   rmdir "$lock" 2>/dev/null
 }
 
@@ -3240,7 +3270,13 @@ sp_stop_watchers_for_pad() {
   generation="$(cat "$watch_lock/generation" 2>/dev/null || true)"
   if [ -d "$watch_lock" ] && [ -z "$generation" ]; then
     sp_watch_empty_lock_reclaim "$watch_lock" 2>/dev/null && return 0
-    echo "stitchpad: fresh or unknown ownerless watcher lock left untouched for $PAD_MD" >&2
+    # Say WHICH it is and how old, and name the cure. "fresh or unknown" on an
+    # 11-hour-old lock sent the operator looking for a live watcher that had been
+    # dead all night.
+    _wl_age="unknown"
+    _wl_mt="$(stat -f %m "$watch_lock" 2>/dev/null || stat -c %Y "$watch_lock" 2>/dev/null || true)"
+    [ -n "$_wl_mt" ] && _wl_age="$(( $(date +%s) - _wl_mt ))s"
+    echo "stitchpad: watcher lock for $PAD_MD is ${_wl_age} old, carries no ownership generation, and its contents are not a shape this version can verify — left untouched. Push seats on this pad receive NOTHING until it is resolved. Inspect: ls -la $watch_lock" >&2
     return 1
   fi
   if [ -d "$watch_lock" ] && ! sp_watch_launcher_is_valid "$watch_lock" "$generation"; then
