@@ -69,7 +69,10 @@ SK_BIN_DIR="$(cd -P "$(dirname "$_sk_src")" && pwd)"
 DRAIN_MIN_S="${SEAT_KEEPER_DRAIN_MIN_S:-${STITCHPAD_KEEPER_MIN_SECONDS:-600}}"
 QUEUE_MIN_S="${SEAT_KEEPER_QUEUE_MIN_S:-${STITCHPAD_KEEPER_MIN_SECONDS:-900}}"
 MAX_STRIKES=3         # consecutive no-effect wakes before quarantine
-RELOG_S=3600          # re-log a quarantined/unknown seat at most this often
+# Overridable like the rest: the rate limit is right in production (do not spam
+# the log every 2 minutes) and is precisely what stops a suite from ever
+# observing the alert, since the stamp file outlives the run.
+RELOG_S="${SEAT_KEEPER_RELOG_S:-3600}"   # re-log a quarantined/unknown seat at most this often
 
 DRY=0; REPORT=0
 for a in "$@"; do

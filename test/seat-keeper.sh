@@ -67,8 +67,13 @@ if [ "$before" = "$after" ]; then ok "G3 a keeper run left every seen cursor unt
 else bad "G3 the keeper MOVED a cursor: $before -> $after"; fi
 
 # ── G4: fail closed, with a voice ───────────────────────────────────
+# SEAT_KEEPER_RELOG_S=0 defeats the alert rate limiter. That limiter is correct in
+# production — the keeper runs every 120s and must not spam — but its stamp file
+# outlives a test run, so without this the alert is emitted once and every later
+# run of this gate sees silence and calls it a regression. (It did exactly that.)
 out="$( cd "$TMP" && SEAT_KEEPER_CONF="$TMP/keeper.conf" SEAT_KEEPER_LOG="$TMP/k2.log" \
-        OCEAN_DAEMON_URL="http://127.0.0.1:59999" /bin/bash "$KEEPER" 2>&1 )"
+        SEAT_KEEPER_RELOG_S=0 OCEAN_DAEMON_URL="http://127.0.0.1:59999" \
+        /bin/bash "$KEEPER" 2>&1 )"
 combined="$out$(cat "$TMP/k2.log" 2>/dev/null || true)"
 case "$combined" in
   *DAEMON*|*daemon*|*unreachable*) ok "G4 an unreachable daemon is reported, not passed over in silence" ;;
