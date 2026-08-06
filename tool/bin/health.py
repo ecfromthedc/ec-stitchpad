@@ -39,8 +39,12 @@ DELIVERY_STATES = {
     "accepted", "started", "busy", "error", "in_flight", "cancel_pending",
     "deferred_dnd", "acceptance_unknown", "completed", "tombstoned",
     "errored", "cancelled",
+    # ds F5 / k3 F14: the busy-retry bound's terminal state. The mention is not
+    # lost — it waits for the seat's own Stop hook — but nothing will retry it,
+    # so it is an ATTENTION state, not an error.
+    "deferred_permanent",
 }
-DELIVERY_ATTENTION_STATES = {"cancel_pending", "deferred_dnd"}
+DELIVERY_ATTENTION_STATES = {"cancel_pending", "deferred_dnd", "deferred_permanent"}
 DELIVERY_ERROR_STATES = {"error", "errored", "cancelled", "acceptance_unknown"}
 DELIVERY_TIMESTAMP_KEYS = {"accepted_at", "started_at", "completed_at", "error_at"}
 KEEPER_STATES = {"accepted", "in_flight", "completed", "acceptance_unknown"}

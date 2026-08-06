@@ -154,7 +154,7 @@ fire_adapter() {
   # seat's retry can be reasoned about, and the ack file is what lets a delivery be
   # confirmed rather than assumed. Both are kept — they are orthogonal.
   SP_WAKE="$wake" SP_TARGET="$target" SP_MODEL="$model" SP_PAD_DIR="$PAD_DIR" SP_PAD_MD="$PAD_MD" \
-    SP_DELIVERY_ACK_FILE="$ack_file" STITCHPAD_FORCE_WAKE="$force" \
+    SP_DELIVERY_ACK_FILE="$ack_file" STITCHPAD_FORCE_WAKE="$force" SP_ORDINAL="$ordinal" \
     bash "$script" mention "$name" "$PAD_MD" "$taskfile" </dev/null &
   DELIVERY_ADAPTER_PID=$!
   wait "$DELIVERY_ADAPTER_PID" || rc=$?
@@ -264,6 +264,94 @@ _sp_delivery_cancel_bound_reset() {
   local name="$1" turn_id="$2" reason="$3"
   type sp_recovery_reset >/dev/null 2>&1 && \
     sp_recovery_reset "$PAD_STATE" "cancel:$name:$turn_id:$reason" || true
+}
+
+# ── BUSY-RETRY BOUND (deepseek F5 / k3 F14) ────────────────────────────────
+# The busy path read adapter rc=3 as "transient — try again in 2s" and looped
+# with no attempt count, no backoff and no terminal state. For a claude TUI seat
+# the condition is not transient: claude.sh can NEVER inject into a live TUI, so
+# it returns 3 every time and only the seat's own Stop hook can consume the
+# mention. One @mention to an idle claude seat therefore produced a desktop
+# notification WITH SOUND every ~2.5s forever, a delivery-log line per retry
+# (~34k/day/seat), and a delivery that never reached any terminal state.
+#
+# The obvious fix — give up sooner — is the dangerous one: a seat that goes
+# quiet is worse than a seat that is noisy. So this does three things, and the
+# third is what keeps the seat alive:
+#   1. exponential backoff with a ceiling, so the notification rate collapses
+#   2. an attempt bound landing in `deferred_permanent`, ANNOUNCED on the pad,
+#      after which the Stop hook owns delivery (which is the claude contract)
+#   3. the sleep wakes EARLY whenever new work arrives, so backing off never
+#      delays a fresh mention
+# The counter is keyed by generation+ordinal, so a newer mention always starts
+# from zero attempts and full responsiveness.
+_busy_retry_file() { echo "$PAD_STATE/delivery.$1.busyretry"; }
+_busy_retry_read() {   # $1=name $2=generation $3=ordinal → attempts so far for THIS work
+  local f pg po n=0
+  f="$(_busy_retry_file "$1")"
+  if [ -f "$f" ]; then
+    IFS='|' read -r pg po n < "$f" 2>/dev/null || true
+    case "${n:-}" in ''|*[!0-9]*) n=0 ;; esac
+    [ "${pg:-}" = "$2" ] && [ "${po:-}" = "$3" ] || n=0
+  fi
+  printf '%s' "$n"
+}
+_busy_retry_bump() {   # $1=name $2=generation $3=ordinal → the new attempt count
+  local n
+  n="$(_busy_retry_read "$1" "$2" "$3")"
+  n=$(( n + 1 ))
+  printf '%s|%s|%s\n' "$2" "$3" "$n" > "$(_busy_retry_file "$1")" 2>/dev/null || true
+  printf '%s' "$n"
+}
+_busy_retry_clear() { rm -f "$(_busy_retry_file "$1")" 2>/dev/null || true; }
+# SP_DELIVERY_RETRY_SECONDS is FRACTIONAL in the test harness (0.05). Doing
+# shell arithmetic on that raises "syntax error" on every retry — which the
+# tripwire correctly scores as a CRASH. A sub-second base keeps its own value
+# and simply gets no backoff; the attempt bound still applies, which is the part
+# that matters.
+_busy_is_int() { case "${1:-}" in ''|*[!0-9]*) return 1 ;; *) return 0 ;; esac; }
+_busy_backoff_seconds() {  # $1=attempt $2=base $3=cap
+  local a="$1" s="$2" cap="$3" i=1
+  _busy_is_int "$s" && _busy_is_int "$cap" || { printf '%s' "$s"; return 0; }
+  while [ "$i" -lt "$a" ] && [ "$s" -lt "$cap" ]; do s=$(( s * 2 )); i=$(( i + 1 )); done
+  [ "$s" -gt "$cap" ] && s="$cap"
+  printf '%s' "$s"
+}
+# Sleep in 1s steps, returning the moment the work this worker is backing off
+# from stops being the current work. Without this, a 60s backoff would sit on a
+# brand-new mention for a minute — trading a noisy seat for a slow one.
+_busy_sleep() {   # $1=seconds $2=name $3=generation
+  local left="$1" name="$2" gen="$3" pend cur
+  pend="$(delivery_pending_file "$name")"
+  _busy_is_int "$left" || { sleep "$left" 2>/dev/null || true; return 0; }
+  while [ "$left" -gt 0 ]; do
+    sleep 1
+    left=$(( left - 1 ))
+    [ -f "$pend" ] || return 0
+    IFS='|' read -r cur _ < "$pend" 2>/dev/null || return 0
+    [ "${cur:-}" = "$gen" ] || return 0
+    [ -f "$(delivery_successor_file "$name")" ] && return 0
+    [ -f "$(delivery_worker_lock "$name")/stop-requested" ] && return 0
+  done
+  return 0
+}
+# The give-up notice rides the existing busy-ack marker machinery, so it is
+# posted under the pad lock by _busy_ack_post_pending and tombstoned after one
+# posting. A different key than the ack's, so the two never collide.
+_busy_giveup_stage() {   # $1=name $2=ordinal $3=sender $4=attempts $5=window-seconds
+  local name="$1" ordinal="$2" sender="${3:-}" attempts="$4" window="$5" marker ts label
+  marker="$PAD_STATE/.busy-ack.$name.$ordinal.giveup"
+  [ -f "$marker" ] && return 0
+  [ -f "$PAD_STATE/.busy-acked.$name.$ordinal.giveup" ] && return 0
+  ts="$(date '+%I:%M %p')"; label="operator"; [ -n "$sender" ] && label="$sender"
+  # The seat's handle appears ONCE, in the leading `_@name` form. A mention is
+  # `(^|[ \t])@name([^a-z0-9_-]|$)` — so a SPACE-preceded @name anywhere in this
+  # notice would post a fresh mention of the very seat we are giving up on,
+  # minting a new delivery generation and restarting the storm with a pad write
+  # per round. Measured while building this: ordinal 1 → 3 and the retry
+  # re-armed. Never name the seat with a leading space here.
+  printf '%s\n## %s · %s\n\n_@%s could not be woken after %s attempts over ~%ss — that runtime has no external injection channel, so this message now waits for that seat to reach a turn boundary and collect it itself. Retrying stopped; the message is NOT lost._\n\n' \
+    "" "@$label" "$ts" "$name" "$attempts" "$window" > "$marker"
 }
 
 delivery_cancel_ocean_turn() {
@@ -572,6 +660,12 @@ except Exception: print("")' "$(delivery_ack_file "$DELIVERY_WORKER_NAME" "$DELI
 delivery_worker() {
   local name="$1" token="$2" lock pending generation ordinal message_id task_id accepted_at adapter wake target
   local started rc retry_seconds="${SP_DELIVERY_RETRY_SECONDS:-2}"
+  # ds F5 / k3 F14. Defaults: 2,4,8,16,32,60,60,60,60 → give up after 9 attempts
+  # spanning ~5 minutes. Both are env-tunable for tests and for an operator who
+  # wants a longer leash.
+  local busy_max_attempts="${SP_DELIVERY_BUSY_MAX_ATTEMPTS:-9}"
+  local busy_retry_cap="${SP_DELIVERY_BUSY_RETRY_CAP:-60}"
+  local _busy_n _busy_wait _busy_elapsed=0
   local turn_id turn_status meta current_ordinal current_sender current_id current_task ack_file tmp_turn
   local attempt_at reconcile acked_turn owner_tmp process_start
   lock="$(delivery_worker_lock "$name")"
@@ -595,6 +689,12 @@ delivery_worker() {
   while :; do
     pending="$(delivery_pending_file "$name")"; [ -f "$pending" ] || break
     IFS='|' read -r generation ordinal message_id task_id accepted_at adapter wake target < "$pending"
+    # ds F5 / k3 F14: a worker respawns on every pad write, so the bound has to
+    # hold ACROSS workers too. Without this check the storm would simply resume
+    # one adapter call — and one notification — per pad event, forever.
+    if [ "$(_busy_retry_read "$name" "$generation" "$ordinal")" -ge "$busy_max_attempts" ]; then
+      break
+    fi
     turn_id="$(cat "$(delivery_turn_file "$name" "$generation")" 2>/dev/null || true)"
     DELIVERY_ACTIVE_ADAPTER="$adapter"; DELIVERY_ACTIVE_TURN="$turn_id"
     DELIVERY_ACTIVE_GENERATION="$generation"
@@ -853,6 +953,7 @@ delivery_worker() {
       delivery_advance_seen "$name" "$ordinal"
       if delivery_pending_matches "$name" "$generation" "$ordinal" "$message_id"; then
         rm -f "$pending"
+        _busy_retry_clear "$name"
         delivery_write_state "$name" completed "$generation" "$ordinal" "$message_id" "$task_id" \
           "$accepted_at" "$started" "$(delivery_now)"
         if [ -f "$(delivery_successor_file "$name")" ]; then
@@ -889,7 +990,20 @@ delivery_worker() {
       # A courtesy must never break delivery: every failure here is swallowed.
       ( sp_lock 2>/dev/null && _busy_ack_post_pending \
           && sp_commit "busy-ack @$name" >/dev/null 2>&1; sp_unlock 2>/dev/null ) || true
-      sleep "$retry_seconds"
+      # ds F5 / k3 F14: bound this. See _busy_retry_* above.
+      _busy_n="$(_busy_retry_bump "$name" "$generation" "$ordinal")"
+      if [ "$_busy_n" -ge "$busy_max_attempts" ]; then
+        delivery_write_state "$name" deferred_permanent "$generation" "$ordinal" "$message_id" "$task_id" \
+          "$accepted_at" "$started" "" "$(delivery_now)" busy_retry_exhausted
+        _busy_giveup_stage "$name" "$ordinal" "${current_sender:-}" "$_busy_n" "$_busy_elapsed"
+        ( sp_lock 2>/dev/null && _busy_ack_post_pending \
+            && sp_commit "busy-giveup @$name" >/dev/null 2>&1; sp_unlock 2>/dev/null ) || true
+        echo "[stitchpad] @$name still busy after $_busy_n attempts (~${_busy_elapsed}s) — retries stopped for ordinal $ordinal; its own Stop hook owns delivery from here"
+        break
+      fi
+      _busy_wait="$(_busy_backoff_seconds "$_busy_n" "$retry_seconds" "$busy_retry_cap")"
+      _busy_is_int "$_busy_wait" && _busy_elapsed=$(( _busy_elapsed + _busy_wait )) || true
+      _busy_sleep "$_busy_wait" "$name" "$generation"
       continue
     fi
     if [ "$adapter" = ocean ] && [ -f "$(delivery_submit_file "$name" "$generation")" ]; then

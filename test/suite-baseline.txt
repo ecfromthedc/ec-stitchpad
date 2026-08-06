@@ -13,6 +13,7 @@ artifact-contract-gate.sh 21 0
 authority-hardfix-regression.sh 24 0
 authority-redesign-regression.sh 29 0
 bridge-heartbeat-interval.sh 3 0
+busy-retry-bound-gate.sh 14 0
 clear-regression.sh 9 0
 color-bash32.sh 0 0
 command-dispatch-gate.sh 91 0
