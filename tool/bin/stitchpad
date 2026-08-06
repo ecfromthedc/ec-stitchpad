@@ -2585,7 +2585,19 @@ PY
     _say_roster_count="$(sp_roster_members_count "$PAD_MD")"
     if [ "$_say_roster_count" -eq 0 ]; then
       sp_unlock
-      echo "stitchpad: pad roster is EMPTY — refusing to post; run 'stitchpad heal-roster' to recover the roster from pad history" >&2
+      # deepseek F7: this always said "run heal-roster", which on a FRESH pad
+      # cannot work — there is no historic roster with members to recover, so
+      # heal-roster exits 1 with "cannot heal" and the operator's very first
+      # command has sent them to a dead end. Empty-because-nobody-joined and
+      # empty-because-lost are different faults with different fixes; the
+      # commit count tells them apart (a fresh pad has only its bootstrap).
+      if [ "$(sp_commit_count)" -le 1 ]; then
+        echo "stitchpad: pad roster is EMPTY — nobody has joined yet. Take a seat first:" >&2
+        echo "    stitchpad join <your-name> <cli|claude|codex|ocean|pi>" >&2
+        echo "  (heal-roster cannot help here: a fresh pad has no history to recover from.)" >&2
+      else
+        echo "stitchpad: pad roster is EMPTY — refusing to post; run 'stitchpad heal-roster' to recover the roster from pad history" >&2
+      fi
       exit 1
     fi
 

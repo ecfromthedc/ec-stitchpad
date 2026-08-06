@@ -170,6 +170,67 @@ else
   bad "R7c: hook log grew to $_r7_lines lines over 2 calls — unbounded on every turn end"
 fi
 
+# ── R8: deepseek F7 — the first command a new operator runs must not dead-end ─
+# `say` on a fresh pad refused with "run 'stitchpad heal-roster'". heal-roster
+# cannot repair a fresh pad — there is no historic roster with members — so it
+# exits 1 with "cannot heal". The very first command sent the operator to a
+# command that cannot succeed. Empty-because-nobody-joined and
+# empty-because-lost are different faults; the commit count tells them apart.
+P8="$(newpad p8 r8)" || bad "R8 setup"
+_r8_out="$( cd "$P8" && STITCHPAD_TERMINAL_NAMESPACE=r8 STITCHPAD_NAME=bob "$SP" say "first words" 2>&1 )"
+case "$_r8_out" in
+  *"nobody has joined yet"*)
+    ok "R8: a fresh pad tells the operator to join, not to heal" ;;
+  *heal-roster*)
+    bad "R8: a fresh pad still points at heal-roster, which cannot repair it" ;;
+  *) bad "R8: unexpected refusal on a fresh pad: $(printf '%s' "$_r8_out" | head -1)" ;;
+esac
+case "$_r8_out" in
+  *"stitchpad join"*) ok "R8b: the message names the command that actually works" ;;
+  *) bad "R8b: the refusal does not name `join`" ;;
+esac
+# and it must still be true: the advice works
+if ( cd "$P8" && STITCHPAD_TERMINAL_NAMESPACE=r8 STITCHPAD_NAME=bob "$SP" join bob cli pull - >/dev/null 2>&1 ) \
+   && ( cd "$P8" && STITCHPAD_TERMINAL_NAMESPACE=r8 STITCHPAD_NAME=bob "$SP" say "first words" >/dev/null 2>&1 ); then
+  ok "R8c: following that advice actually lets the first message post"
+else
+  bad "R8c: the advice does not work — join then say still fails"
+fi
+# a pad WITH history and a lost roster still gets the heal-roster advice
+python3 - "$P8/.stitchpad/stitchpad.md" <<'PY'
+import re, sys
+p = sys.argv[1]; s = open(p, encoding='utf-8').read()
+s = re.sub(r"(?ms)(^```roster\n)(.*?)(^```$)", r"\1# name | adapter | wake | target\n\3", s, count=1)
+open(p, 'w', encoding='utf-8').write(s)
+PY
+_r8b_out="$( cd "$P8" && STITCHPAD_TERMINAL_NAMESPACE=r8 STITCHPAD_NAME=bob "$SP" say "second words" 2>&1 )"
+case "$_r8b_out" in
+  *heal-roster*) ok "R8d: a pad that HAS history still gets the heal-roster advice" ;;
+  *) bad "R8d: the lost-roster case lost its recovery advice: $(printf '%s' "$_r8b_out" | head -1)" ;;
+esac
+# MUTANT: collapse the two cases back into one
+_r8_mut="$TMP/mut-f7"; mkdir -p "$_r8_mut"; cp -R "$TOP/tool/." "$_r8_mut/"
+python3 - "$_r8_mut/bin/stitchpad" <<'PY'
+import sys
+p = sys.argv[1]; s = open(p, encoding='utf-8').read()
+old = '      if [ "$(sp_commit_count)" -le 1 ]; then'
+new = '      if false; then'
+if s.count(old) != 1:
+    sys.stderr.write("MUTANT DID NOT APPLY\n"); sys.exit(9)
+open(p, 'w', encoding='utf-8').write(s.replace(old, new))
+PY
+if [ $? -eq 9 ]; then
+  bad "R8e MUTANT DID NOT APPLY — INCONCLUSIVE, not a pass"
+else
+  P8M="$TMP/p8m"; mkdir -p "$P8M"
+  ( cd "$P8M" && STITCHPAD_TERMINAL_NAMESPACE=r8m "$_r8_mut/bin/stitchpad" init >/dev/null 2>&1 )
+  _m_out="$( cd "$P8M" && STITCHPAD_TERMINAL_NAMESPACE=r8m STITCHPAD_NAME=bob "$_r8_mut/bin/stitchpad" say "first words" 2>&1 )"
+  case "$_m_out" in
+    *heal-roster*) ok "R8e: without the split a fresh pad gets the dead-end advice again — R8 detects it" ;;
+    *) bad "R8e: mutant applied but the advice did not change — R8 may be testing nothing" ;;
+  esac
+fi
+
 echo ""
 echo "=== RESULTS: $pass PASS, $fail FAIL ==="
 [ "$fail" -eq 0 ] || exit 1
