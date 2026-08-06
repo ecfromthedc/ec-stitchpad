@@ -777,6 +777,20 @@ except Exception:
 PY
 }
 
+# Roster handle length cap, enforced at every PRODUCER (join, rename, spawn).
+# 64 is well inside the 255-byte single-component filesystem limit once the
+# longest state prefix is added ("delivered_no_reply.<name>", "scope-violation.<name>"),
+# and no real handle needs more. Refusing here is what stops the downstream
+# workarounds: E-17 had to hash the identity to keep the read cursor writable
+# precisely because an unbounded handle was allowed in at join time.
+SP_NAME_MAX="${SP_NAME_MAX:-64}"
+sp_assert_name_length() {
+  local n="$1"
+  [ "${#n}" -le "$SP_NAME_MAX" ] && return 0
+  echo "stitchpad: name too long (${#n} chars, max $SP_NAME_MAX) — per-agent state files are '<prefix>.<name>' and a filesystem caps one path component at 255 bytes" >&2
+  return 1
+}
+
 # Is somebody mid-publication inside this lock right now?
 # The claim marker is written with a builtin redirect the instant mkdir wins, so
 # a lock is "ownerless but claimed" only while its winner is still spawning the
@@ -3227,6 +3241,19 @@ sp_delivery_ocean_unresolved_after_stop() {
   local name="$1" state pending_adapter submit generation turn_file turn_id result
   state="$(sed -n 's/^state=//p' "$PAD_STATE/delivery.$name.state" 2>/dev/null | tail -1)"
   case "$state" in acceptance_unknown|cancel_pending) return 0;; esac
+  # A delivery whose OWN state file already records a terminal outcome is
+  # resolved, full stop. Without this, the loop below demanded a
+  # `delivery.<name>.cancel.<turn_id>/result` file — which only ever exists when
+  # somebody issued a CANCEL. A turn that simply ERRORED never produces one, so
+  # `result` came back empty, the loop returned "unresolved", and `leave` and
+  # `rename` refused that seat FOREVER:
+  #     stitchpad: refusing to remove @codex — Ocean acceptance/cancellation
+  #     outcome is unresolved
+  # Hit live on the operator's fleet with delivery.codex.state already saying
+  # state=errored / turn_status=errored. A seat whose session is broken is
+  # exactly the seat you most need to be able to remove, and it was the one seat
+  # you could not. Terminal is terminal, however it was reached.
+  case "$state" in errored|completed|canceled|cancelled|delivered) return 1;; esac
   pending_adapter="$(cut -d'|' -f6 "$PAD_STATE/delivery.$name.pending" 2>/dev/null || true)"
   [ "$pending_adapter" = ocean ] || return 1
   for submit in "$PAD_STATE"/delivery."$name".submit.*; do

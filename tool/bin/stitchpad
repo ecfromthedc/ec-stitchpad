@@ -388,7 +388,21 @@ EOF
         else
           printf '%-5s %-30s %s\n' '[ch]'  "#$_pn" "$(dirname "$_pd")"
         fi
-      done < <(find "$_r" -maxdepth 4 -type d \( -name .stitchpad -o -name .pasture \) 2>/dev/null | grep -v '/\.stitchpad/\.stitchpad' | sort -u)
+      # DEPTH (k3 F12). This was a bare `-maxdepth 4`, so a pad any deeper than
+      # four levels under the search root was invisible — including, on a real
+      # layout, the pad the operator was standing in. A missing pad renders
+      # identically to "no pads", which is the same silhouette as P5's destroyed
+      # pad, so the listing built for P18/P26 was incomplete by construction and
+      # said nothing about it.
+      # Depth is raised and made overridable. The cost of going deeper is walking
+      # big trees, so the known-heavy directories are PRUNED rather than the depth
+      # being kept artificially short: pruning .git/node_modules/target keeps this
+      # fast on exactly the repos that made a shallow limit tempting.
+      done < <(find "$_r" -maxdepth "${STITCHPAD_PADS_MAXDEPTH:-8}" \
+                 \( -name .git -o -name node_modules -o -name target \
+                    -o -name Library -o -name .Trash -o -name .cache \) -prune -o \
+                 -type d \( -name .stitchpad -o -name .pasture \) -print 2>/dev/null \
+               | grep -v '/\.stitchpad/\.stitchpad' | sort -u)
     done
     if [ "$_pads_prune" -eq 1 ]; then
       echo "✓ pruned $_pads_found scratch pad(s)"
@@ -813,6 +827,14 @@ You may spawn your own sub-agents (stitchpad spawn <name> --brief ... --artifact
     # That is how @dave, @davé and @dáve ended up as three roster rows the
     # operator cannot tell apart. Enumeration has no collation semantics.
     case "$who" in *[!abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789_-]*) echo "stitchpad: bad name '$who' (allowed: a-z 0-9 _ -)" >&2; exit 1;; esac
+    # LENGTH CAP (k3 F19). join validated the CHARACTER SET and never the length,
+    # so a 241-character handle was accepted here and then had to be worked around
+    # everywhere downstream: per-agent state files are "<prefix>.<name>" and a
+    # filesystem caps one path component at 255 bytes, so a long handle pushed
+    # those names past the limit. E-17 already had to hash the identity just to
+    # keep the read cursor writable. Cap it at the PRODUCER — the one place that
+    # can actually refuse — instead of adding another downstream workaround.
+    sp_assert_name_length "$who" || exit 1
     # F3: Case-ambiguous duplicate: sp_user_exists uses tolower, so 'Dave'
     # matches 'dave' — re-joining the same seat is idempotent (exit 0).
     # ORDER MATTERS. The duplicate-name check used to run FIRST and exit 0, which
@@ -1005,6 +1027,7 @@ You may spawn your own sub-agents (stitchpad spawn <name> --brief ... --artifact
     old="${1:?usage: stitchpad rename <old> <new>}"
     new="${2:?usage: stitchpad rename <old> <new>}"
     case "$new" in *[!abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789_-]*) echo "stitchpad: bad name '$new' (allowed: a-z 0-9 _ -)" >&2; exit 1;; esac
+    sp_assert_name_length "$new" || exit 1
     sp_user_exists "$old" || { echo "stitchpad: @$old not in roster" >&2; exit 1; }
     sp_user_exists "$new" && { echo "stitchpad: @$new already in roster" >&2; exit 1; }
     # Every simple name-keyed state file this arm knows how to carry across.
@@ -5009,8 +5032,15 @@ TASKSEOF
             } >> "$_e13_pad_tmp"
           fi
         fi
+        # The ONE assignment notice. It carries a message id so the block can be
+        # threaded and reacted to like any other message — that id is the only
+        # thing the second, post-unlock copy of this block below ever added, and
+        # that copy is why every `task new --to` posted the notice TWICE (once
+        # here inside the lock, once again after sp_unlock through an unchecked
+        # sp_commit, outside the atomic dual-write). Written here and only here.
         if [ -n "$assignee" ] && sp_user_exists "$assignee"; then
-          printf '\n## @%s · %s\n\n**task %s assigned:** %s\n' "$assignee" "$(date -u '+%H:%M')" "$id" "$title" >> "$_e13_pad_tmp"
+          printf '\n## @%s · %s · #%s\n\n**task %s assigned:** %s\n' \
+            "$assignee" "$(date -u '+%H:%M')" "$(sp_msg_id)" "$id" "$title" >> "$_e13_pad_tmp"
         fi
 
         # Move both temp copies into place.  The window between the two mv
@@ -5045,11 +5075,13 @@ TASKSEOF
         sp_narrate "opened task $id: $title" 2>/dev/null || true
         sp_unlock
         echo "$id created"
-        # Wake assignee if set
-        if [ -n "$assignee" ] && sp_user_exists "$assignee"; then
-          printf '\n## @%s · %s · #%s\n\n**task %s assigned:** %s\n' "$assignee" "$(date -u '+%H:%M')" "$(sp_msg_id)" "$id" "$title" >> "$PAD_MD"
-          sp_commit "task $id assigned to @$assignee"
-        fi
+        # The assignee's notice is written ABOVE, inside the lock, as part of the
+        # atomic dual-write. It used to be appended a SECOND time right here —
+        # after sp_unlock, straight into $PAD_MD, with an unchecked sp_commit.
+        # That gave every `task new --to` two identical notice blocks, and the
+        # duplicate landed outside the lock with its commit result discarded, so
+        # a failed commit left the pad file ahead of its own history in silence.
+        # Deleted deliberately: one notice, written once, under the lock.
         ;;
 
       list)
@@ -5397,6 +5429,15 @@ sys.exit(1)
     # A seat that produces nothing shows FAILED, not idle.  Missing artifacts
     # after a terminal session are the loudest signal in the fleet.
     sp_init_paths_readonly || exit 1
+    # P5 (deepseek F2): `roster` and `whoami` refuse loudly when the pad's git dir
+    # is gone, but the operator's PRIMARY status board did not — it rendered a
+    # table and exited 0 on a pad whose durability layer no longer exists. The
+    # next write then silently re-initialises an EMPTY history, so every prior
+    # commit (read cursors, heal-roster history, the compaction audit trail) is
+    # destroyed without a word. The board must not be the one surface that says
+    # nothing is wrong; a lane table is a claim about a fleet, and it cannot be
+    # made against a pad that can no longer record anything.
+    sp_assert_pad_git_usable || exit 1
     if [ "${1:-}" = "--json" ]; then
       # NO `local` HERE. This is the top level of a case arm, not a function
       # body, and bash rejects `local` outside a function — it printed
