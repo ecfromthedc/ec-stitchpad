@@ -94,3 +94,4 @@ p25-sidebar-organisation-gate.sh 7 0
 p42-subagent-spawn-gate.sh 12 0
 p43-wake-push-misdirect-gate.sh 7 0
 p44-roster-live-role-key-gate.sh 7 0
+thread-react-ui.sh 0 0
