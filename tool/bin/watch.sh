@@ -1036,9 +1036,9 @@ delivery_worker() {
 }
 
 delivery_start_worker() {
-  local name="$1" lock pid token age now born command process_start owner_tmp owner owner_start owner_token owner_pad owner_name
+  local name="$1" lock pid token age now born command process_start owner_tmp owner owner_start owner_token owner_pad owner_name _grace_tries=0
   lock="$(delivery_worker_lock "$name")"
-  if [ -d "$lock" ]; then
+  while [ -d "$lock" ]; do
     token="$(cat "$lock/token" 2>/dev/null || true)"
     owner="$(cat "$lock/owner" 2>/dev/null || true)"
     IFS='|' read -r pid owner_start owner_token owner_pad owner_name <<< "$owner"
@@ -1054,9 +1054,26 @@ delivery_start_worker() {
        && [[ "$command" == *"--delivery-worker $name $token"* ]]; then return 0; fi
     born="$(cat "$lock/born" 2>/dev/null || stat -f %m "$lock" 2>/dev/null || stat -c %Y "$lock" 2>/dev/null || date +%s)"
     now="$(date +%s)"; age=$((now-born))
-    [ -z "$pid" ] && [ "$age" -lt 5 ] && return 0
+    if [ -z "$pid" ] && [ "$age" -lt 5 ]; then
+      # OPEN #3: an ownerless lock younger than 5s means a concurrent starter
+      # may be mid-spawn between its mkdir and publishing the owner. The old
+      # code RETURNED 0 here — success with no worker — so a brand-new
+      # generation landing in this window had nobody supervising it and sat
+      # until the next enqueue; with no further pad writes, the mention sat
+      # forever. Wait the window out instead: either the starter publishes a
+      # verifiable owner (the return 0 above fires on the next pass) or the
+      # grace expires and the dead starter's lock is reclaimed below.
+      # Bounded: born is fixed per lock, so age crosses the grace; the try
+      # cap covers pathological lock churn, where a young lock keeps being
+      # replaced — that means a LIVE starter is making progress, so it wins.
+      _grace_tries=$((_grace_tries + 1))
+      [ "$_grace_tries" -le 50 ] || return 0
+      sleep 0.2
+      continue
+    fi
     rm -rf "$lock" 2>/dev/null || true
-  fi
+    break
+  done
   mkdir "$lock" 2>/dev/null || return 0
   token="$(date +%s)-$$-$RANDOM-$RANDOM"
   printf '%s' "$token" > "$lock/token"; date +%s > "$lock/born"

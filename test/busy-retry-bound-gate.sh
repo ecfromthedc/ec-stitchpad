@@ -156,11 +156,12 @@ fi
 printf idle-now > "$PAD_STATE/busy.stuck.mode"
 append_message operator '@stuck second, different question'
 # Enqueue the way production does — the watcher calls delivery_enqueue on EVERY
-# pad event, not once. That matters here: delivery_start_worker has a 5s
-# ownerless-lock grace that returns WITHOUT spawning, so a brand-new generation
-# landing inside that window waits for the next enqueue. Pre-existing behaviour
-# (this suite does not own it), but the give-up path reaches it more often, so
-# it is written down here rather than hidden behind a single lucky call.
+# pad event, not once. Historical note: delivery_start_worker's 5s
+# ownerless-lock grace used to return WITHOUT spawning, so a generation landing
+# inside that window waited for the next enqueue; the give-up path reached it
+# more often. That hole is now fixed (the grace waits out the window and
+# reclaims) and owned by delivery-grace-spawn-gate.sh; the double enqueue here
+# stays because it models production, not because it papers over the grace.
 delivery_enqueue stuck busy push t
 wait_state stuck completed || { delivery_enqueue stuck busy push t; wait_state stuck completed || true; }
 if [ "$(state_value stuck state)" = "completed" ]; then
