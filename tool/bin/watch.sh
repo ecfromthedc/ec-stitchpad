@@ -1277,6 +1277,19 @@ sp_watch_owner_matches "$WATCH_LOCK" "$WATCH_GENERATION" "$$" || exit 1
 # a real main-shell exit: watcher_cleanup runs, the lock is released, and the
 # daemon supervisor sees its lock dir gone and stands down on its own instead
 # of respawning the worker.
+# fswatch is the watcher's only source of events. Without it the watcher starts,
+# takes its lock, logs `fswatch: command not found`, and then BOTH
+# `stitchpad watch start` and `stitchpad watch status` report success — while no
+# mention is ever delivered. Found by k3 reviewing its own P48 fix; the earlier
+# wording promised a "supervisor restart" that never comes. Fail loudly, before
+# the lock is used for anything, with the command that fixes it.
+if ! command -v fswatch >/dev/null 2>&1; then
+  echo "[stitchpad] fswatch is not installed (or not on PATH) — the watcher cannot receive events." >&2
+  echo "[stitchpad] install it:  brew install fswatch" >&2
+  echo "[stitchpad] until then, push seats will NOT be woken; pull seats are unaffected." >&2
+  exit 1
+fi
+
 WATCH_EVENT_FIFO="$PAD_STATE/.watch-events.$$"
 rm -f "$WATCH_EVENT_FIFO"
 mkfifo "$WATCH_EVENT_FIFO" || { echo "[stitchpad] could not create event fifo" >&2; exit 1; }

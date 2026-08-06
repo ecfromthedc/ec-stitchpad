@@ -3818,6 +3818,14 @@ except: print("")' 2>/dev/null)"
         ;;
       start)
         sp_init_paths || exit 1
+        # Surface the missing dependency HERE, where the operator is looking,
+        # instead of only in .state/watch.log which nobody is told about.
+        if ! command -v fswatch >/dev/null 2>&1; then
+          echo "stitchpad: fswatch is not installed (or not on PATH) — a watcher cannot receive events." >&2
+          echo "  install it:  brew install fswatch" >&2
+          echo "  pull seats work without it; push seats will not be woken." >&2
+          exit 1
+        fi
         if sp_watcher_alive; then
           echo "✓ watcher already running for $(basename "$(dirname "$PAD_DIR")")"
           exit 0
