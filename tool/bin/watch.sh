@@ -660,10 +660,13 @@ except Exception: print("")' "$(delivery_ack_file "$DELIVERY_WORKER_NAME" "$DELI
 delivery_worker() {
   local name="$1" token="$2" lock pending generation ordinal message_id task_id accepted_at adapter wake target
   local started rc retry_seconds="${SP_DELIVERY_RETRY_SECONDS:-2}"
-  # ds F5 / k3 F14. Defaults: 2,4,8,16,32,60,60,60,60 → give up after 9 attempts
-  # spanning ~5 minutes. Both are env-tunable for tests and for an operator who
-  # wants a longer leash.
-  local busy_max_attempts="${SP_DELIVERY_BUSY_MAX_ATTEMPTS:-9}"
+  # ds F5 / k3 F14. Defaults: 2,4,8,16,32,then 60s → 15 attempts spanning ~11
+  # minutes. The bound has to CLEAR the longest legitimate busy window or it
+  # turns a normal long turn into a give-up notice on the pad: ocean.sh submits
+  # wakes with --timeout-seconds 600, so a ten-minute turn is expected
+  # behaviour, not a stuck seat. Anything past that is genuinely not landing.
+  # Both are env-tunable for tests and for an operator who wants a longer leash.
+  local busy_max_attempts="${SP_DELIVERY_BUSY_MAX_ATTEMPTS:-15}"
   local busy_retry_cap="${SP_DELIVERY_BUSY_RETRY_CAP:-60}"
   local _busy_n _busy_wait _busy_elapsed=0
   local turn_id turn_status meta current_ordinal current_sender current_id current_task ack_file tmp_turn
