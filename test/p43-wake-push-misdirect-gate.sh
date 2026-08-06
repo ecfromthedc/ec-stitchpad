@@ -89,12 +89,20 @@ esac
 cur=0; [ -f "$STATE/seen.pusher" ] && cur="$(cat "$STATE/seen.pusher" 2>/dev/null || echo 0)"
 [ "$cur" = "0" ] || bad "G4b --peek advanced the cursor to $cur (it must not)"
 
-# ── G5: pull seats unaffected ───────────────────────────────────────
-out="$(sp boss wake puller || true)"
+# ── G5: PULL seats are protected too ────────────────────────────────
+# This originally asserted the opposite — that a third party waking a pull seat
+# "still renders", which was the half-fixed design. k3 proved the other half:
+# @boss ran `wake dale` on a PULL seat, the message rendered on BOSS's terminal
+# and seen.dale advanced 0 -> 1, so dale could never see it. The seat's wake mode
+# is irrelevant; what matters is that the caller is not the seat.
+out="$(sp boss wake puller 2>&1 || true)"
 case "$out" in
-  *'audit the adapters'*) ok "G5 a PULL seat still renders -- behaviour unchanged" ;;
-  *) bad "G5 pull-seat wake regressed: $out" ;;
+  *REFUSED*) ok "G5 a third party waking a PULL seat is refused too" ;;
+  *) bad "G5 pull-seat wake by a third party was allowed: $out" ;;
 esac
+cur=0; [ -f "$STATE/seen.puller" ] && cur="$(cat "$STATE/seen.puller" 2>/dev/null || echo 0)"
+[ "$cur" = "0" ] && ok "G5b the pull seat's cursor did not move either" \
+                 || bad "G5b seen.puller advanced to $cur -- message LOST"
 
 # ── G6: self-wake unaffected ────────────────────────────────────────
 sp boss say "@pusher second message" >/dev/null 2>&1 || true
@@ -111,7 +119,7 @@ MUT="$TMP/mutant"; mkdir -p "$MUT"; cp -R "$ROOT/tool/." "$MUT/"
 python3 - "$MUT/bin/stitchpad" <<'PY'
 import sys
 p=sys.argv[1]; s=open(p,encoding='utf-8').read()
-old='''      if [ "$_caller" != "$who" ] && [ "$(sp_wake_mode_for "$who")" = "push" ]; then'''
+old='''      if [ "$_caller" != "$who" ]; then'''
 new='''      if false; then'''
 if s.count(old)!=1:
     sys.stderr.write("MUTANT DID NOT APPLY: anchor not found exactly once\n"); sys.exit(9)

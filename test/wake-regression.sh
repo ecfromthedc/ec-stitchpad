@@ -234,7 +234,7 @@ cd "$case1"
 stop_watcher "$case1"
 STITCHPAD_NAME=tester "$SP" say '@dale first ping' >/dev/null
 STITCHPAD_NAME=larry "$SP" say 'unrelated after first ping' >/dev/null
-out="$("$SP" wake dale)"
+out="$(STITCHPAD_NAME=dale "$SP" wake dale)"
 contains "$out" '@dale first ping' || fail 'wake did not include addressed message'
 if contains "$out" 'unrelated after first ping'; then
   fail 'wake included a later unrelated block'
@@ -255,7 +255,7 @@ STITCHPAD_NAME=larry "$SP" say 'unrelated status update' >/dev/null
 second="$("$SP" wake dale --peek)"
 contains "$second" '@dale one-shot ping' || fail 'unrelated commit incorrectly cleared unanswered mention'
 STITCHPAD_NAME=dale "$SP" say '@tester addressed reply clears ping' >/dev/null
-third="$("$SP" wake dale)"
+third="$(STITCHPAD_NAME=dale "$SP" wake dale)"
 if [ -n "$third" ]; then
   printf '%s\n' "$third" >&2
   fail 'addressed reply did not clear unanswered mention'
@@ -326,7 +326,7 @@ fi
 	peek1="$("$SP" wake agent --peek)"
 	contains "$peek1" '@agent oldest-first ping' || fail 'FIFO: oldest mention not returned first'
 	# Consume it (non-peek advances seen cursor)
-	"$SP" wake agent >/dev/null
+	STITCHPAD_NAME=agent "$SP" wake agent >/dev/null
 	# Now the next oldest (other's ping) should surface
 	peek2="$("$SP" wake agent --peek)"
 	contains "$peek2" '@agent second burst ping' || fail 'FIFO: second mention not returned after consuming first'
@@ -349,14 +349,14 @@ fi
 	p1="$("$SP" wake agent --peek)"
 	contains "$p1" 'alpha mentions agent' || fail 'same-sender: alpha mention not found'
 	# Consume alpha's mention
-	"$SP" wake agent >/dev/null
+	STITCHPAD_NAME=agent "$SP" wake agent >/dev/null
 	# Agent replies to alpha — should clear alpha's mention gate
 	STITCHPAD_NAME=agent "$SP" say '@alpha thanks for the ping' >/dev/null
 	# Beta's mention should STILL be awake (not swallowed by replying to alpha)
 	p2="$("$SP" wake agent --peek)"
 	contains "$p2" 'beta also mentions agent' || fail 'same-sender: replying to alpha swallowed beta mention'
 	# Consume beta's mention
-	"$SP" wake agent >/dev/null
+	STITCHPAD_NAME=agent "$SP" wake agent >/dev/null
 	# Now agent replies to beta
 	STITCHPAD_NAME=agent "$SP" say '@beta acknowledged' >/dev/null
 	# Both gates should be clear
@@ -381,7 +381,7 @@ fi
 	wake1="$("$SP" wake agent --peek)"
 	contains "$wake1" 'peek-ordinal test' || fail '--peek-ordinal consumed the gate (must be read-only)'
 	# Consume, then --peek-ordinal should be empty (no open mention)
-	"$SP" wake agent >/dev/null
+	STITCHPAD_NAME=agent "$SP" wake agent >/dev/null
 	ord2="$("$SP" wake agent --peek-ordinal)"
 	[ -z "$ord2" ] && ord2=0
 	[ "$ord2" -eq 0 ] || fail '--peek-ordinal returned non-zero after all mentions consumed'
@@ -406,7 +406,7 @@ fi
 	STITCHPAD_NAME=smaths "$SP" say '@agent second mention - CRITICAL' >/dev/null
 
 	# Consume first (ordinal 1, seen → 1)
-	"$SP" wake agent >/dev/null
+	STITCHPAD_NAME=agent "$SP" wake agent >/dev/null
 	[ "$(cat "$case9/.stitchpad/.state/seen.agent")" -eq 1 ] || fail 'invariant5: seen != 1 after first consume'
 
 	# Stamp pending with ordinal 2 (watcher stamps BEFORE consuming second)
@@ -415,7 +415,7 @@ fi
 	printf '%s' "$po" > "$case9/.stitchpad/.state/pending.agent"
 
 	# Consume second (ordinal 2, seen → 2)
-	"$SP" wake agent >/dev/null
+	STITCHPAD_NAME=agent "$SP" wake agent >/dev/null
 	[ "$(cat "$case9/.stitchpad/.state/seen.agent")" -eq 2 ] || fail 'invariant5: seen != 2 after second consume'
 
 	# Turn crashed — normal wake sees nothing (seen advanced past both)
@@ -536,7 +536,7 @@ fi
 	# Consume one mention (seen=1), stamp pending=1, turn crashes.
 	STITCHPAD_NAME=fable "$SP" say '@agent critical message' >/dev/null
 	printf '1' > "$case11/.stitchpad/.state/pending.agent"
-	"$SP" wake agent >/dev/null                                      # seen=1
+	STITCHPAD_NAME=agent "$SP" wake agent >/dev/null                                      # seen=1
 
 	# Enable DND for agent (wake --force exits 0 silently).
 	touch "$case11/.stitchpad/.state/dnd.agent"
@@ -689,7 +689,7 @@ EOF
 	stop_watcher "$case14"
 	STITCHPAD_NAME=alice "$SP" say '@agent question from alice' >/dev/null
 	STITCHPAD_NAME=agent "$SP" say 'sure thing @alice' >/dev/null   # @alice is token 4, not token 2
-	out14="$("$SP" wake agent)"
+	out14="$(STITCHPAD_NAME=agent "$SP" wake agent)"
 	[ -z "$out14" ] || {
 	  printf '%s\n' "$out14" >&2
 	  fail 'reply-target: @target past token 2 did not clear the same-sender gate'
@@ -712,7 +712,7 @@ EOF
 	STITCHPAD_NAME=alice "$SP" say '@agent question from alice' >/dev/null      # ord 1
 	STITCHPAD_NAME=agent "$SP" say '@alice answered' >/dev/null                 # ord 2 — clears alice's mention
 	STITCHPAD_NAME=charlie "$SP" say '@agent question from charlie' >/dev/null  # ord 3 — must still deliver
-	out15="$("$SP" wake agent)"
+	out15="$(STITCHPAD_NAME=agent "$SP" wake agent)"
 	contains "$out15" 'question from charlie' \
 	  || fail 'reply-clears-gate starved a later mention from another sender'
 	if contains "$out15" 'question from alice'; then
@@ -724,7 +724,7 @@ EOF
 	[ "$_seen15" -eq 3 ] \
 	  || fail "reply-clears-gate advanced seen to wrong ordinal: $_seen15 (want 3)"
 	# Everything drained → the next wake is silent
-	second15="$("$SP" wake agent)"
+	second15="$(STITCHPAD_NAME=agent "$SP" wake agent)"
 	[ -z "$second15" ] || fail 'reply-clears-gate left an extra mention queued'
 
 	stop_all_fixture_runtime

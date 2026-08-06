@@ -3433,10 +3433,24 @@ PY
     # --peek/--peek-ordinal inspection are unaffected.
     if [ "$relay_mode" -eq 0 ] && [ "$peek" -eq 0 ]; then
       _caller="$(sp_me 2>/dev/null || true)"; [ -n "$_caller" ] || _caller="${STITCHPAD_NAME:-}"
-      if [ "$_caller" != "$who" ] && [ "$(sp_wake_mode_for "$who")" = "push" ]; then
-        echo "stitchpad: REFUSED — @$who is a PUSH seat; \`wake\` would print its message here and burn its cursor without delivering anything." >&2
-        echo "  to actually reach @$who:  stitchpad say \"@$who <your message>\"   (the watcher dispatches it)" >&2
-        echo "  no watcher running?       stitchpad watch start" >&2
+      # P43 originally scoped this to PUSH seats. That was half the bug: waking a
+      # PULL seat as a third party is just as destructive, and k3 proved it —
+      # @boss ran `wake dale`, the message rendered on BOSS's terminal, and
+      # seen.dale advanced 0 -> 1, so dale could never see it. The seat is
+      # irrelevant; what matters is that the CALLER IS NOT THE SEAT. `wake`
+      # renders to this process's stdout and then consumes, so anyone else
+      # running it destroys the message no matter how that seat is woken.
+      if [ "$_caller" != "$who" ]; then
+        _wmode="$(sp_wake_mode_for "$who")"
+        echo "stitchpad: REFUSED — \`wake\` renders to THIS terminal and then advances @$who's cursor, so running it for someone else destroys the message." >&2
+        if [ "$_wmode" = "push" ]; then
+          echo "  to actually reach @$who:  stitchpad say \"@$who <your message>\"   (the watcher dispatches it)" >&2
+          echo "  no watcher running?       stitchpad watch start" >&2
+        else
+          echo "  @$who is a PULL seat — it collects its own messages. Post it:" >&2
+          echo "                            stitchpad say \"@$who <your message>\"" >&2
+          echo "  draining @$who yourself?  run it AS that seat: STITCHPAD_NAME=$who stitchpad wake $who" >&2
+        fi
         echo "  just want to look?        stitchpad wake $who --peek   (non-consuming)" >&2
         _wake_record push_misdirect 1
       fi

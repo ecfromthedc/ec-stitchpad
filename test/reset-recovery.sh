@@ -43,8 +43,8 @@ cd "$tmp"
 
 STITCHPAD_NAME=alpha "$SP" say '@agent first historical delivery' >/dev/null
 STITCHPAD_NAME=beta "$SP" say '@agent second exact recovery target' >/dev/null
-"$SP" wake agent >/dev/null
-"$SP" wake agent >/dev/null
+STITCHPAD_NAME=agent "$SP" wake agent >/dev/null
+STITCHPAD_NAME=agent "$SP" wake agent >/dev/null
 
 state="$tmp/.stitchpad/.state"
 pad_canon="$(cd -P "$tmp/.stitchpad" && pwd)"
@@ -190,7 +190,7 @@ heal_hook="$(printf '{"cwd":"%s","session_id":"heal-session","stop_hook_active":
 STITCHPAD_PAD_DIR="$tmp" "$SP" bind-session legacy-session legacy >/dev/null
 STITCHPAD_NAME=alpha "$SP" say '@legacy preserve unrelated recovery' >/dev/null
 legacy_ord="$("$SP" wake legacy --peek-ordinal)"
-"$SP" wake legacy >/dev/null
+STITCHPAD_NAME=legacy "$SP" wake legacy >/dev/null
 printf '%s' "$legacy_ord" > "$state/pending.legacy"
 printf '%s' 'malformed-reset-provenance' > "$state/pending.legacy.reset"
 legacy_hook="$(printf '{"cwd":"%s","session_id":"legacy-session","stop_hook_active":false}' "$tmp" | "$SP" hook)"
