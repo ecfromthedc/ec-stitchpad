@@ -3475,6 +3475,41 @@ sp_wake_mode_for() {
   printf '%s' "$row"
 }
 
+# ── P46 Contract supervision ─────────────────────────────────────────────
+# A dispatched turn does the first concrete thing it is told and stops. Measured
+# five times across k3 and deepseek-v4-flash: every seat returned rc=0 having
+# written only its stub header, and one given four SPECIFIC claims to verify
+# still produced a scaffold. So the limit is not prompt breadth — a wake turn
+# executes a short explicit sequence and does not sustain open-ended work.
+#
+# What is ours to fix is that dispatch is ONE SHOT WITH NO FEEDBACK LOOP: the
+# turn ends, nobody checks the contract, and nobody tells the agent it is not
+# finished. Under P45 the orchestrator cannot even read what the agent said, so
+# the silence is total.
+#
+# Supervision closes that loop with the pieces that already exist:
+# sp_artifact_produced answers "did anything actually get made", and the pad's
+# mention path is the delivery mechanism that provably works. Deliberately NOT
+# in the watcher: that is live delivery machinery, and this is an additive
+# bookkeeping layer that must not be able to destabilise it.
+
+sp_supervise_strikes() {   # $1=name -> current strike count (0 if none)
+  local name="${1:?}" f
+  [ -n "${PAD_STATE:-}" ] || { printf '0'; return 0; }
+  f="$PAD_STATE/supervise-strikes.$name"
+  if [ -f "$f" ]; then printf '%s' "$(cat "$f" 2>/dev/null || echo 0)"; else printf '0'; fi
+}
+sp_supervise_strike_add() {
+  local name="${1:?}" n
+  n=$(( $(sp_supervise_strikes "$name") + 1 ))
+  printf '%s' "$n" > "$PAD_STATE/supervise-strikes.$name" || return 1
+  printf '%s' "$n"
+}
+sp_supervise_clear() {
+  local name="${1:?}"
+  rm -f "$PAD_STATE/supervise-strikes.$name" 2>/dev/null || true
+}
+
 # ── P42 Delegation Contract — sub-agent spawning ─────────────────────────
 # EC: "they also need the ability to spawn their own sub-agents if they need to,
 # all within this context ... and it should always be following the orchestrator's

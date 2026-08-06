@@ -770,3 +770,64 @@ comment in place, not deleted quietly.
 So: the telemetry ships and is used; it is not currently proven by a gate. The
 model-pin core remains fully gated (49 assertions), and keeper behaviour is gated
 by the new suite. Write the v2-shaped fixture and restore the five.
+
+---
+
+## P48 — watchers outlive their pads, and the launcher respawns them (ROOT-CAUSED, NOT FIXED)
+
+**This is what made `operator-conduct-gate.sh` flake, and it leaks processes on the
+operator's laptop.** Root-caused; two attempted fixes were REVERTED because both
+made things worse. Written down in full so the next attempt starts here.
+
+### The measurement
+`operator-conduct-gate.sh` fails roughly half the time — including at `1b59398`,
+before any of this session's work, so it is NOT a regression from the merge. I
+twice built a "regression" story on five green runs and was twice wrong; the base
+rate is what settled it.
+
+The failure rate tracks a process count:
+
+```
+run 1: passed=5   watch.sh processes: 132
+run 2: passed=8   ... 146      run 4: passed=5   ... 164
+after clearing to 0:  6 runs -> green=3 red=3, count climbing ~9-12 per run
+at 219 processes:     6 runs -> green=0 red=6
+```
+
+Every one of those 219 processes belonged to a pad that **no longer existed**. The
+suite creates three pads per run, deletes its temp dir at exit, and leaves the
+watchers running for the rest of the session. They keep `fswatch`-ing a path that
+will never come back.
+
+### Why they never exit
+`watch.sh` ends in `fswatch -0 "$PAD_MD" | while read -r -d "" _ev; do react; done`.
+That has **no tick**. Once the pad is deleted there are no further events, so
+`react()` — which holds every liveness check — never runs again. The watcher is
+not hung; it is waiting correctly for an event that cannot arrive.
+
+### Why the two obvious fixes are wrong
+1. **A pad-gone check inside `react()`** does nothing, for the reason above: on a
+   deleted pad `react()` is never called.
+2. **A background sentinel that signals the watcher** made it WORSE. `watch.sh` is
+   its own supervisor — a LAUNCHER parent (ppid 1) plus a worker child — and the
+   launcher respawns a worker whenever one dies. Signalling the worker produced
+   churn; signalling the parent chain produced an entirely NEW watcher tree:
+   ```
+   BEFORE 51404  1      watch.sh        AFTER 51404  1     watch.sh   (survived)
+   BEFORE 51809  51404  watch.sh        AFTER 67423  1     watch.sh   (NEW tree)
+   ```
+   Also note the loop body on the right of a pipe is a SUBSHELL, so an `exit`
+   there kills only the subshell and leaves the watcher, its EXIT trap and its
+   lock behind. Both attempts were reverted; `tool/bin/watch.sh` is unchanged.
+
+### What a correct fix has to satisfy
+- Give the loop a tick without breaking the proven fswatch path (a timed read on a
+  fd, so the loop stays in the MAIN shell and `exit` runs `watcher_cleanup`).
+- Stop the LAUNCHER as well, or the worker is simply respawned.
+- Tolerate a missing pad FILE (an outer `git stash -u` removes it briefly) while
+  treating a missing pad DIRECTORY, seen repeatedly, as terminal.
+- Be proven by a gate that starts a watcher, deletes the pad, and asserts the
+  process count returns to zero — plus a mutant.
+
+Until then: `stitchpad watch stop` before deleting a pad, and expect suites that
+create throwaway pads to leak watchers.

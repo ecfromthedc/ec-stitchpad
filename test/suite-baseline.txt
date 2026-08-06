@@ -15,7 +15,7 @@ authority-redesign-regression.sh 29 0
 bridge-heartbeat-interval.sh 3 0
 clear-regression.sh 9 0
 color-bash32.sh 0 0
-command-dispatch-gate.sh 88 0
+command-dispatch-gate.sh 90 0
 commit-fail-postcondition-gate.sh 6 0
 concurrency-round5-regression.sh 8 0
 coordination-lifecycle-slice-a.sh 7 0
@@ -89,9 +89,10 @@ pad-narration-gate.sh 8 0
 p38-task-list-readable-gate.sh 5 0
 operator-conduct-gate.sh 8 0
 terminal-isolation-gate.sh 7 0
-help-discoverability-gate.sh 99 0
+help-discoverability-gate.sh 101 0
 p25-sidebar-organisation-gate.sh 7 0
 p42-subagent-spawn-gate.sh 12 0
 p43-wake-push-misdirect-gate.sh 7 0
 p44-roster-live-role-key-gate.sh 7 0
 thread-react-ui.sh 0 0
+p46-supervise-gate.sh 12 0

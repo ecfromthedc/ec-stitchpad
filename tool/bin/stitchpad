@@ -53,6 +53,8 @@
 #   stitchpad evidence list|verify        list sealed artifacts / verify their sha256 sidecars
 #   stitchpad spawn <name> --brief <t> --artifact <p>   delegate to a sub-agent under contract
 #   stitchpad spawn --tree                show the delegation lineage and each seat's contract
+#   stitchpad supervise <name>|--all [--max N]   re-prompt a seat whose artifact is
+#                                         still missing; FAILED after N tries
 #   stitchpad directive [text]            set/print the orchestrator standing order that
 #                                         every spawned sub-agent inherits verbatim
 #
@@ -590,6 +592,81 @@ EOF
       if [ -n "$_d" ]; then printf '%s\n' "$_d"
       else echo "stitchpad: no orchestrator directive set (stitchpad directive \"<text>\")" >&2; exit 1; fi
     fi
+    ;;
+
+  supervise)
+    # stitchpad supervise <name> [--max N]   |   stitchpad supervise --all [--max N]
+    #
+    # Closes the loop a one-shot dispatch leaves open. For each supervised seat:
+    #   artifact produced        -> DONE, contract and strikes cleared
+    #   artifact missing/empty   -> post a CONTINUATION mention and record a strike
+    #   strikes exhausted        -> FAILED, said out loud on the pad, no more wakes
+    #
+    # The continuation deliberately says "continue, do not start over": a re-woken
+    # agent that restarts rewrites its stub every round and the loop never
+    # converges. Delivery goes through the ordinary mention path — the one proven
+    # to reach a push seat — never through `wake`, which would print here and burn
+    # the seat's cursor without delivering (P43).
+    sp_init_paths || exit 1
+    _sv_max=3; _sv_all=0; _sv_name=""
+    while [ $# -gt 0 ]; do
+      case "$1" in
+        --all) _sv_all=1; shift ;;
+        --max) _sv_max="${2:-3}"; shift 2 ;;
+        -*) echo "stitchpad: unknown option '$1' for supervise" >&2; exit 2 ;;
+        *) [ -z "$_sv_name" ] && _sv_name="$1"; shift ;;
+      esac
+    done
+    case "$_sv_max" in ''|*[!0-9]*) echo "stitchpad: --max must be a non-negative integer" >&2; exit 2 ;; esac
+    _sv_me="$(sp_me 2>/dev/null || true)"; [ -n "$_sv_me" ] || _sv_me="${STITCHPAD_NAME:-supervisor}"
+
+    _sv_targets=""
+    if [ "$_sv_all" -eq 1 ]; then
+      for _f in "$PAD_STATE"/artifact-expect.*; do
+        [ -f "$_f" ] || continue
+        _n="${_f##*/artifact-expect.}"; _sv_targets="$_sv_targets$_n
+"
+      done
+    else
+      [ -n "$_sv_name" ] || { echo "stitchpad: usage: stitchpad supervise <name> [--max N]  |  stitchpad supervise --all" >&2; exit 2; }
+      _sv_targets="$_sv_name
+"
+    fi
+    [ -n "$_sv_targets" ] || { echo "no seats under contract"; exit 0; }
+
+    _sv_rc=0
+    printf '%s' "$_sv_targets" | while IFS= read -r _seat; do
+      [ -n "$_seat" ] || continue
+      if [ ! -f "$PAD_STATE/artifact-expect.$_seat" ]; then
+        echo "@$_seat: no artifact contract — nothing to supervise"
+        continue
+      fi
+      if sp_artifact_verify "$_seat" 2>/dev/null; then
+        echo "✓ @$_seat DONE — $(sp_artifact_expected "$_seat" | tr '\n' ' ')"
+        sp_supervise_clear "$_seat"
+        sp_artifact_clear "$_seat"
+        continue
+      fi
+      _n="$(sp_supervise_strikes "$_seat")"
+      if [ "$_n" -ge "$_sv_max" ]; then
+        echo "✗ @$_seat FAILED — $_n continuations, artifact still not produced" >&2
+        STITCHPAD_NAME="$_sv_me" "$BIN_DIR/stitchpad" say \
+          "@$_seat is FAILED after $_n continuations — still nothing at: $(sp_artifact_expected "$_seat" | tr '\n' ' ')" \
+          >/dev/null 2>&1 || true
+        continue
+      fi
+      _n="$(sp_supervise_strike_add "$_seat")"
+      STITCHPAD_NAME="$_sv_me" "$BIN_DIR/stitchpad" say "@$_seat your turn ended but your artifact is still missing or empty:
+$(sp_artifact_expected "$_seat" | sed 's/^/  · /')
+
+CONTINUE from where you stopped — do NOT start over and do NOT rewrite the file
+from scratch. Append what you have completed so far, then keep going. If you
+genuinely cannot produce it, say so on the pad and say WHY; silence is scored
+FAILED. (continuation $_n of $_sv_max)" >/dev/null 2>&1 \
+        || { echo "stitchpad: could not post continuation for @$_seat" >&2; }
+      echo "→ @$_seat continued ($_n/$_sv_max) — artifact still missing"
+    done
+    exit "$_sv_rc"
     ;;
 
   spawn)
