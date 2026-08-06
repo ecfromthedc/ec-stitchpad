@@ -55,7 +55,7 @@ hours.
 | k3 F13 | `ocean.sh` idle-guard failed OPEN on an unanswerable probe | unparseable body → rc=0 wake FIRED; dead daemon → rc=0 wake FIRED | `943dd06` · `ocean-idle-guard-gate.sh` (new, 7) |
 | ds F6 | duplicate roster row — consumers disagreed about one seat; no repair path existed | `sp_wake_mode_for` answered "pull" for a seat delivered over push; `heal-roster` said "nothing to heal" | `67c7c7b` · `roster-duplicate-gate.sh` (new, 14) |
 | k3 F0 | a keeper-quarantined seat read WORKING on `lanes`; `lanes --json` hid it entirely | 3 strikes + live heartbeat → `WORKING`; the seat absent from `--json` | `4b97717` · `lanes-quarantine-gate.sh` (new, 9) |
-| k3 F1 | the watcher logged "exiting for supervisor restart"; there is no supervisor | killing fswatch killed the watcher; the pad went deaf until someone ran a command | `9eafe26` · `watcher-fswatch-restart-gate.sh` (new, 7) |
+| k3 F1 | the watcher logged "exiting for supervisor restart" unconditionally — true under `daemon start`, a lie under `ensure_watcher` | killing fswatch killed the watcher; with no supervisor the pad went deaf until someone ran a command | `9eafe26` + `13ce124` · `watcher-fswatch-restart-gate.sh` (new, 8) |
 | ds F7 | a fresh pad's `say` sent the operator to `heal-roster`, which cannot repair a fresh pad | both commands rc=1; the actual fix (`join`) was never named | `6fd9c3d` · `finish-round-gate.sh` (14→19) |
 | k3 F17 | the Claude MCP server was registered into a file Claude does not read | two isolated HOMEs: entry in `settings.json` → "No MCP servers configured"; entry in `~/.claude.json` → listed | `27edcc1` · `install-wiring-gate.sh` G6/G6b |
 | k3 F15 | untrusted pad text with live shell metacharacters typed into a raw pty | `$(id)`, backtick, `;`, `|`, `&&`, `>` all survived the sanitizer; a shell ran the second command | `27edcc1` · `herdr-nudge-sanitize-gate.sh` (new, 6) |
@@ -76,6 +76,12 @@ much as its right half:
 - **k3 F15** — its second precondition (the pane is a shell, not an agent TUI)
   was never demonstrated and still has not been. The fix removes the dependency
   on it instead of arguing about it.
+- **k3 F1** — "there is no supervisor" is FALSE for a watcher started by
+  `stitchpad daemon start`: `tool/bin/daemon.sh` respawns watch.sh 2s after any
+  exit, and `watcher-races.sh` pins that with an ownerless-restart-gap probe.
+  I repeated the finding's claim in code and in this document before the
+  full-tree gate caught it. The message was true in that mode and false in the
+  `ensure_watcher` mode, and the fix is now conditional on which one is running.
 
 ## ALREADY-FIXED on master before this work (4)
 
@@ -129,3 +135,12 @@ shipped, and which are the reason the mutant discipline exists:
    under test: the length cap truncated inside an unbalanced backquote, so the
    shell refused to parse the line. A mutant that passes for an unintended
    reason is the same false-success class as the bugs being fixed.
+
+And three more that only the FULL-TREE run could find, all in my own work
+(`13ce124`): a wrong premise about the supervisor (above); a constant changed
+without updating the suite that is its contract; and a fixture running two
+delivery workers, which overshoots a bound that a single worker respects
+because the adapter fires before the attempt is counted. The last one also
+surfaced a pre-existing hole worth its own session: delivery_start_worker has a
+5s ownerless-lock grace that returns WITHOUT spawning, so a brand-new generation
+landing in that window waits for the next enqueue.
