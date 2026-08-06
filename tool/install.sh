@@ -38,6 +38,31 @@ case ":$PATH:" in
      echo "    export PATH=\"$DEST:\$PATH\""; echo;;
 esac
 
+# ─── WIRING LEDGER ───────────────────────────────────────────────────────────
+# k3 F16: this installer used to print "✓ stitchpad installed — multi-agent
+# collaboration is wired." unconditionally, rc=0, even when every hook-wiring
+# step had raised a traceback and NOTHING was wired. On a fresh machine with a
+# trailing comma in ~/.claude/settings.json — the commonest JSON wound — that
+# produced a fleet that can never be woken, wearing a success banner.
+#
+# Every wiring step now records its own outcome here. The closing banner is
+# chosen from this ledger and the installer exits non-zero when it is non-empty.
+# Nothing prints ✓ unless the thing it names actually happened.
+WIRE_FAILED=""
+_wire_fail() {
+  WIRE_FAILED="${WIRE_FAILED}${WIRE_FAILED:+
+}    • $1"
+}
+
+# A config we are about to merge into must PARSE first. Missing or empty is
+# fine — we create those. Anything else that python3 cannot load, we refuse to
+# touch: rewriting a user's settings.json would silently discard their model,
+# permissions and MCP config, which is a worse outcome than a loud refusal.
+_json_ok() { [ -s "$1" ] || return 0; python3 -c 'import json,sys; json.load(open(sys.argv[1]))' "$1" >/dev/null 2>&1; }
+_json_err() { python3 -c 'import json,sys
+try: json.load(open(sys.argv[1]))
+except Exception as e: print(e)' "$1" 2>/dev/null; }
+
 # ─── WIRE THE WAKE HOOKS AUTOMATICALLY ───────────────────────────────────────
 # The plugin must ship working hooks, not instructions to hand-edit configs.
 # Each runtime's Stop hook runs the same stable shim (adapters/stop-hook.sh →
@@ -46,10 +71,24 @@ SHIM="$STD_HOME/adapters/stop-hook.sh"
 
 # Claude Code: ~/.claude/settings.json  hooks.Stop[]
 CLAUDE_SETTINGS="$HOME/.claude/settings.json"
+CLAUDE_JSON_OK=0
 if command -v python3 >/dev/null 2>&1; then
   mkdir -p "$HOME/.claude"
   [ -f "$CLAUDE_SETTINGS" ] || echo '{}' > "$CLAUDE_SETTINGS"
-  python3 - "$CLAUDE_SETTINGS" "$SHIM" <<'PY' && echo "✓ Claude Stop hook wired ($CLAUDE_SETTINGS)"
+  if _json_ok "$CLAUDE_SETTINGS"; then
+    CLAUDE_JSON_OK=1
+  else
+    echo "✗ $CLAUDE_SETTINGS is not valid JSON — REFUSING to edit it."
+    echo "    $(_json_err "$CLAUDE_SETTINGS")"
+    echo "    A trailing comma is the usual cause. Fix that file and re-run this"
+    echo "    installer. Nothing was wired for Claude, and nothing was overwritten."
+    _wire_fail "Claude Stop wake hook — $CLAUDE_SETTINGS is unparseable"
+    _wire_fail "Claude PreToolUse claim hook — same file"
+  fi
+fi
+
+if [ "$CLAUDE_JSON_OK" = 1 ]; then
+  if python3 - "$CLAUDE_SETTINGS" "$SHIM" <<'PY'
 import json,sys
 p,shim=sys.argv[1],sys.argv[2]
 d=json.load(open(p))
@@ -59,10 +98,13 @@ if not wired(stop):
     stop.append({"hooks":[{"type":"command","command":shim,"timeout":15}]})
     json.dump(d,open(p,"w"),indent=2)
 PY
+  then echo "✓ Claude Stop hook wired ($CLAUDE_SETTINGS)"
+  else _wire_fail "Claude Stop wake hook — the merge into $CLAUDE_SETTINGS failed"
+  fi
 
   # Claude PreToolUse claim hook (hard-deny on Write/Edit for claimed files)
   CLAIM_SHIM="$STD_HOME/adapters/claim-hook.sh"
-  python3 - "$CLAUDE_SETTINGS" "$CLAIM_SHIM" <<'PY' && echo "✓ Claude PreToolUse claim hook wired"
+  if python3 - "$CLAUDE_SETTINGS" "$CLAIM_SHIM" <<'PY'
 import json,sys
 p,shim=sys.argv[1],sys.argv[2]
 d=json.load(open(p)); hooks=d.setdefault("hooks",{}); pre=hooks.setdefault("PreToolUse",[])
@@ -71,12 +113,21 @@ if not wired(pre):
     pre.append({"matcher":"Write|Edit|MultiEdit","hooks":[{"type":"command","command":shim,"timeout":10}]})
     json.dump(d,open(p,"w"),indent=2)
 PY
+  then echo "✓ Claude PreToolUse claim hook wired"
+  else _wire_fail "Claude PreToolUse claim hook — the merge into $CLAUDE_SETTINGS failed"
+  fi
+fi
 
-  # Codex: ~/.codex/hooks.json  hooks.Stop[]
+# Codex: ~/.codex/hooks.json  hooks.Stop[]
+if command -v python3 >/dev/null 2>&1; then
   CODEX_HOOKS="$HOME/.codex/hooks.json"
   if [ -d "$HOME/.codex" ] || [ -f "$CODEX_HOOKS" ]; then
     [ -f "$CODEX_HOOKS" ] || { mkdir -p "$HOME/.codex"; echo '{}' > "$CODEX_HOOKS"; }
-    python3 - "$CODEX_HOOKS" "$SHIM" <<'PY' && echo "✓ Codex Stop hook wired ($CODEX_HOOKS)"
+    if ! _json_ok "$CODEX_HOOKS"; then
+      echo "✗ $CODEX_HOOKS is not valid JSON — REFUSING to edit it."
+      echo "    $(_json_err "$CODEX_HOOKS")"
+      _wire_fail "Codex Stop wake hook — $CODEX_HOOKS is unparseable"
+    elif python3 - "$CODEX_HOOKS" "$SHIM" <<'PY'
 import json,sys
 p,shim=sys.argv[1],sys.argv[2]
 d=json.load(open(p))
@@ -86,9 +137,13 @@ if not wired(stop):
     stop.append({"hooks":[{"type":"command","command":shim,"timeout":15}]})
     json.dump(d,open(p,"w"),indent=2)
 PY
+    then echo "✓ Codex Stop hook wired ($CODEX_HOOKS)"
+    else _wire_fail "Codex Stop wake hook — the merge into $CODEX_HOOKS failed"
+    fi
   fi
 else
   echo "⚠  python3 not found — cannot auto-wire hooks. Wire manually (see adapters/)."
+  _wire_fail "every wake hook — python3 is not installed"
 fi
 
 # MCP server deps — install so `node mcp/server.mjs` doesn't crash (-32000).
@@ -105,9 +160,11 @@ echo
 # registered, adds if missing. No duplicate errors, no interactive prompts.
 MCP_SERVER="$HOME_DIR/mcp/server.mjs"
 
-# Claude: ~/.claude.json  mcpServers.stitchpad
+# Claude: ~/.claude/settings.json  mcpServers.stitchpad
 if command -v python3 >/dev/null 2>&1; then
-  python3 - "$CLAUDE_SETTINGS" "$MCP_SERVER" <<'PY' && echo "✓ Claude MCP stitchpad registered ($CLAUDE_SETTINGS)"
+  if [ "$CLAUDE_JSON_OK" != 1 ]; then
+    _wire_fail "Claude MCP server registration — $CLAUDE_SETTINGS is unparseable"
+  elif python3 - "$CLAUDE_SETTINGS" "$MCP_SERVER" <<'PY'
 import json,sys
 p,sp=sys.argv[1],sys.argv[2]
 d=json.load(open(p))
@@ -116,6 +173,9 @@ if "stitchpad" not in srv:
     srv["stitchpad"]={"type":"stdio","command":"node","args":[sp],"env":{}}
     json.dump(d,open(p,"w"),indent=2)
 PY
+  then echo "✓ Claude MCP stitchpad registered ($CLAUDE_SETTINGS)"
+  else _wire_fail "Claude MCP server registration — the merge into $CLAUDE_SETTINGS failed"
+  fi
 
   # Codex: ~/.codex/config.toml  [mcp_servers.stitchpad]
   CODEX_CONFIG="$HOME/.codex/config.toml"
@@ -135,16 +195,26 @@ fi
 
 echo
 echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
-echo "  ✓ stitchpad installed — multi-agent collaboration is wired."
-echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
-# Echo back what actually got wired this run (detected, not assumed) so the user
-# sees a real system, not a TODO list. Each runtime line only prints if present.
-echo "  Wired on this machine:"
-command -v claude >/dev/null 2>&1 && echo "    • Claude   — Stop wake + PreToolUse claim hook + MCP"
-command -v codex  >/dev/null 2>&1 && echo "    • Codex    — Stop wake hook + MCP"
-command -v pi     >/dev/null 2>&1 && echo "    • pi       — wake extension + MCP"
-command -v claude >/dev/null 2>&1 || command -v codex >/dev/null 2>&1 || command -v pi >/dev/null 2>&1 || \
-  echo "    • (no claude/codex/pi runtime detected — install one, then re-run this)"
+if [ -n "$WIRE_FAILED" ]; then
+  echo "  ✗ stitchpad installed, but the wake wiring did NOT complete."
+  echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+  echo "  These steps did not happen:"
+  printf '%s\n' "$WIRE_FAILED"
+  echo
+  echo "  The CLI is linked and pads will work, but @mentions will NOT wake"
+  echo "  anyone until the above is fixed. Fix it and re-run this installer."
+else
+  echo "  ✓ stitchpad installed — multi-agent collaboration is wired."
+  echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+  # Echo back what actually got wired this run (detected, not assumed) so the
+  # user sees a real system, not a TODO list. Each line only prints if present.
+  echo "  Wired on this machine:"
+  command -v claude >/dev/null 2>&1 && echo "    • Claude   — Stop wake + PreToolUse claim hook + MCP"
+  command -v codex  >/dev/null 2>&1 && echo "    • Codex    — Stop wake hook + MCP"
+  command -v pi     >/dev/null 2>&1 && echo "    • pi       — wake extension + MCP"
+  command -v claude >/dev/null 2>&1 || command -v codex >/dev/null 2>&1 || command -v pi >/dev/null 2>&1 || \
+    echo "    • (no claude/codex/pi runtime detected — install one, then re-run this)"
+fi
 echo
 echo "  Start a room (in any project):"
 echo "    stitchpad init                     # create the pad + start its watcher"
@@ -158,3 +228,7 @@ echo "    STITCHPAD_RELAY=<url> STITCHPAD_TOKEN=<tok> stitchpad bridge install"
 echo
 echo "  Verify any time:  stitchpad doctor"
 echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+
+# rc follows the ledger, not the last echo. An unattended installer that cannot
+# wire the wake path must fail loudly enough for a script to notice.
+[ -z "$WIRE_FAILED" ] || exit 1

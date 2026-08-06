@@ -39,6 +39,7 @@ health-strict-exit-gate.sh 7 0
 heartbeat-races.sh 0 0
 heartbeat.sh 0 0
 identity-survival-under-join.sh 11 0
+install-wiring-gate.sh 12 0
 model-pinning.sh 49 0
 multipad-isolation.sh 42 0
 p18-scratch-pad-gate.sh 12 0
