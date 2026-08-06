@@ -3042,6 +3042,17 @@ sp_watch_empty_lock_reclaim() {
   # Reclaim ONLY this exact known shape, and only when the recorded pid is gone.
   # An unrecognised lock layout still fails closed — its contents are not
   # ownership proof and guessing is how a live watcher gets killed.
+  # ABSOLUTE FLOOR, and it is load-bearing. The empty-lock case above is gated on
+  # STITCHPAD_WATCH_START_GRACE, which suites routinely set to 0 for speed — and
+  # `pid` + `ts` with no `generation` is ALSO the shape a watcher has for the
+  # instant between claiming its lock and publishing ownership. With grace at 0
+  # this branch would reclaim a watcher that was legitimately starting, which is
+  # precisely the churn W1-W4 exist to prevent. It turned watcher-races.sh red
+  # intermittently the first time I wrote it, and standalone runs looked clean.
+  # A real wedged lock in production is HOURS old (measured: 39136s and 40357s),
+  # so refusing to touch anything younger than a minute costs nothing and closes
+  # the startup window. Overridable only so a gate can exercise the path.
+  [ "$age" -ge "${STITCHPAD_WATCH_STALE_MIN:-60}" ] || return 1
   entries="$(find "$lock" -mindepth 1 -maxdepth 1 -exec basename {} \; 2>/dev/null | sort | tr '\n' ' ')"
   case "$entries" in
     'pid '|'pid ts ') ;;

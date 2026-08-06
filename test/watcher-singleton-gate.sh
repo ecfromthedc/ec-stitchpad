@@ -245,6 +245,34 @@ fi
 kill -TERM "$w8_pid" 2>/dev/null || true
 wait "$w8_pid" 2>/dev/null || true
 
+# W9: THE STARTUP WINDOW. `pid` + `ts` with no `generation` is not only the shape
+# of a wedged lock — it is also, for an instant, the shape of a watcher that is
+# starting. Suites set STITCHPAD_WATCH_START_GRACE=0 for speed, so gating the
+# dead-pid reclaim on that alone let it fire on a STARTING watcher and turned
+# watcher-races.sh red intermittently under full-run load, while five standalone
+# runs looked perfectly clean. A real wedged lock is hours old (measured 39136s
+# and 40357s on live pads), so an absolute floor costs nothing and closes the
+# window. This asserts the floor exists — not merely that today's default is 60.
+W9L="$W6/proj/.stitchpad/.state/watch.lock.d"
+rm -rf "$W9L"; mkdir -p "$W9L"
+printf '999999\n' > "$W9L/pid"; printf 'x\n' > "$W9L/ts"   # dead pid, but BRAND NEW lock
+# The discriminator is whether OUR planted marker survived. Checking merely that
+# a pid file exists is useless: when the lock IS wrongly reclaimed, the
+# replacement watcher immediately writes its own pid back, so the file is present
+# either way. That mistake made the first version of this assertion pass under
+# its own mutant — green while testing nothing.
+( cd "$W6/proj" && HOME="$W6/home" STITCHPAD_HOME="$TOOL" \
+    STITCHPAD_TERMINAL_NAMESPACE=w6 STITCHPAD_WATCH_START_GRACE=0 \
+    "$SP" watch start >/dev/null 2>&1 ) || true
+if grep -q '^999999$' "$W9L/pid" 2>/dev/null; then
+  ok "W9: a fresh ownerless lock is left alone regardless of start grace"
+else
+  bad "W9: a SECONDS-OLD ownerless lock was reclaimed — a starting watcher can be displaced"
+fi
+( cd "$W6/proj" && HOME="$W6/home" STITCHPAD_HOME="$TOOL" STITCHPAD_TERMINAL_NAMESPACE=w6 \
+    "$SP" watch stop >/dev/null 2>&1 ) || true
+rm -rf "$W9L"
+
 # ── Verdict ───────────────────────────────────────────────────────────────
 echo ""
 if [ "$fail" -gt 0 ]; then
