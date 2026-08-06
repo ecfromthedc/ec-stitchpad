@@ -122,6 +122,50 @@ else
   fi
 fi
 
+# ── G8  the task counter must read where `task new` actually WRITES ──────────
+# `stitchpad task new` writes cards to .stitchpad/tasks.md; the pad file keeps
+# only a pointer block carrying no status:/assignee:. seat_tasks was handed
+# stitchpad.md alone, so it counted 0 for every card created since the tasks.md
+# split and the "idle with open tasks" wake could never fire — the watchdog's
+# primary job, off in silence. Producer/consumer mismatch, same shape as the
+# count.* bug v2 was written to replace.
+# The function is extracted rather than sourced: the keeper RUNS on source.
+G8DIR="$TMP/g8"; mkdir -p "$G8DIR"
+sed -n '/^seat_tasks() {/,/^}/p' "$KEEPER" > "$G8DIR/fn.sh"
+if [ ! -s "$G8DIR/fn.sh" ]; then
+  bad "G8 could not extract seat_tasks from the keeper"
+else
+  # A card exactly as `task new --to dale` lands it in tasks.md ...
+  cat > "$G8DIR/tasks.md" <<'G8EOF'
+```task TASK-1
+status: todo
+assignee: dale
+G8EOF
+  printf '```\n' >> "$G8DIR/tasks.md"
+  # ... and the pointer block the pad file gets instead: no status, no assignee.
+  printf '```task\nsee tasks.md\n```\n' > "$G8DIR/stitchpad.md"
+
+  # shellcheck disable=SC1090
+  . "$G8DIR/fn.sh"
+  _g8_both="$(seat_tasks dale "$G8DIR/tasks.md" "$G8DIR/stitchpad.md")"
+  _g8_padonly="$(seat_tasks dale "$G8DIR/stitchpad.md")"
+  _g8_missing="$(seat_tasks dale "$G8DIR/nope.md")"
+
+  [ "$_g8_both" = "1" ] \
+    && ok "G8 an open card in tasks.md is counted for its assignee" \
+    || bad "G8 open card in tasks.md counted as '$_g8_both', expected 1"
+
+  # This is the mutant, and it must APPLY: reading only the pad file — the exact
+  # pre-fix call — has to return 0, or G8 is asserting nothing.
+  [ "$_g8_padonly" = "0" ] \
+    && ok "G8b MUTANT: reading only the pad file counts 0 — the bug is reproducible" \
+    || bad "G8b mutant did not apply: pad-only read returned '$_g8_padonly', expected 0"
+
+  [ "$_g8_missing" = "0" ] \
+    && ok "G8c a missing task file counts 0, not empty or an error" \
+    || bad "G8c missing task file returned '$_g8_missing', expected 0"
+fi
+
 echo ""
 echo "  passed: $pass  failed: $fail"
 [ "$fail" -eq 0 ] || exit 1

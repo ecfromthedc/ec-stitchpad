@@ -177,15 +177,33 @@ seat_pending() {
 }
 
 # --- open pad tasks assigned to a seat --------------------------------------
+# Counts open cards for a seat across EVERY file a card can live in.
+# It used to take a single file and the caller passed stitchpad.md — the legacy
+# inline location. `stitchpad task new` writes .stitchpad/tasks.md (PAD_TASKS);
+# the pad file keeps only a pointer block, which carries no status:/assignee:
+# and so counts as zero. The result: "idle with N open pad task(s)" could not
+# fire for any card created since the tasks.md split, and the anti-starvation
+# watchdog silently stopped doing its primary job — a seat with open work idles
+# forever and the keeper logs nothing at all. Producer/consumer mismatch, the
+# same shape as the count.* bug v2 was written to fix.
+# Both locations are summed rather than one being chosen: `task migrate` moves
+# legacy inline blocks into tasks.md, so a pad can be mid-migration, and a card
+# exists in exactly one of the two — summing cannot double-count it.
 seat_tasks() {
-  local pad="$1" who="$2"
-  [ -f "$pad" ] || { echo 0; return; }
-  awk -v who="$who" '
-    /^```task/ {in_t=1; st=""; as=""; next}
-    in_t && /^status:/   {st=$2}
-    in_t && /^assignee:/ {as=$2}
-    in_t && /^```/ {in_t=0; if ((st=="todo" || st=="in_progress") && as==who) n++}
-    END {print n+0}' "$pad" 2>/dev/null || echo 0
+  local who="$1"; shift
+  local f total=0 n
+  for f in "$@"; do
+    [ -f "$f" ] || continue
+    n="$(awk -v who="$who" '
+      /^```task/ {in_t=1; st=""; as=""; next}
+      in_t && /^status:/   {st=$2}
+      in_t && /^assignee:/ {as=$2}
+      in_t && /^```/ {in_t=0; if ((st=="todo" || st=="in_progress") && as==who) n++}
+      END {print n+0}' "$f" 2>/dev/null || echo 0)"
+    case "$n" in ''|*[!0-9]*) n=0 ;; esac
+    total=$(( total + n ))
+  done
+  echo "$total"
 }
 
 [ "$REPORT" -eq 1 ] && printf '%-12s %-8s %-20s %-8s %s\n' SEAT STATE PENDING STRIKES DECISION
@@ -195,6 +213,7 @@ while IFS= read -r repo; do
   case "$repo" in \#*) continue ;; esac
   ST="$repo/.stitchpad/.state"
   PADFILE="$repo/.stitchpad/stitchpad.md"
+  TASKFILE="$repo/.stitchpad/tasks.md"     # where `task new` actually writes
   [ -d "$ST" ] || continue
 
   for f in "$ST"/ocean-session.*; do
@@ -283,7 +302,7 @@ while IFS= read -r repo; do
           esac
 
           if [ -z "$reason" ] && [ "$since" -ge "$QUEUE_MIN_S" ]; then
-            open=$(seat_tasks "$PADFILE" "$name")
+            open=$(seat_tasks "$name" "$TASKFILE" "$PADFILE")
             if [ "${open:-0}" -gt 0 ]; then
               reason="idle with $open open pad task(s)"
               prompt="stitchpad keeper: you are idle but have $open open task(s) assigned on the pad. cd $repo && ~/.stitchpad/bin/pasture read -n 30 to refresh context, then continue your task queue per the loop prompt. Post .status when resumed."
