@@ -2445,10 +2445,17 @@ PY
     # Push-target capture is owned by MCP/pi Herdr join and SessionStart repair.
     # Honor the same explicit autostart opt-out as join; tests and maintenance
     # can bind identity without silently creating a ticker/watcher generation.
+    # The heartbeat is best-effort HERE: this arm's exit status is the BINDING's
+    # status. The old `start && echo` tail made a heartbeat failure the arm's
+    # exit code, so callers (set-wake, join) printed "failed to bind" after a
+    # bind that LANDED — a false-failure report, observed live re-pointing @glm.
     if [ "${STITCHPAD_HEARTBEAT_AUTOSTART:-1}" != "0" ]; then
-      STITCHPAD_NAME="$nm" STITCHPAD_HEARTBEAT_PARENT_PID="${STITCHPAD_HEARTBEAT_PARENT_PID:-$PPID}" \
-        "$BIN_DIR/stitchpad" heartbeat start "$nm" >/dev/null 2>&1 \
-        && echo "✓ heartbeat for @$nm"
+      if STITCHPAD_NAME="$nm" STITCHPAD_HEARTBEAT_PARENT_PID="${STITCHPAD_HEARTBEAT_PARENT_PID:-$PPID}" \
+        "$BIN_DIR/stitchpad" heartbeat start "$nm" >/dev/null 2>&1; then
+        echo "✓ heartbeat for @$nm"
+      else
+        echo "stitchpad: heartbeat did not start for @$nm — the session binding itself landed" >&2
+      fi
     fi
     ;;
 
