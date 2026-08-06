@@ -87,7 +87,6 @@ p32-multibyte-variable-gate.sh 4 0
 p33-terminal-refusal-message-gate.sh 4 0
 pad-narration-gate.sh 8 0
 p38-task-list-readable-gate.sh 5 0
-operator-conduct-gate.sh 8 0
 terminal-isolation-gate.sh 7 0
 help-discoverability-gate.sh 101 0
 p25-sidebar-organisation-gate.sh 7 0
