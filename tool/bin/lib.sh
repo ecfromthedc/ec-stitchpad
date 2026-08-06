@@ -1321,6 +1321,86 @@ sp_commit_or_fail() {
   sp_verify_commit_landed "$pre_count"
 }
 
+# ── ALL-OR-NOTHING for pad-REWRITING operations (compact / archive) ─────────
+# deepseek F13: both commands rewrote the pad in place and deleted every
+# seen.<name> cursor BEFORE checking that the commit landed, then printed
+#   "stitchpad: compact NOT recorded — pad unchanged, cursors untouched"
+# with BOTH halves of that sentence false. Measured on a throwaway pad with the
+# repo's own STITCHPAD_TEST_COMMIT_FAIL seam: seen.bob went 15 → gone, the pad
+# sha changed, and the NEXT successful `say` committed the rewritten pad — a
+# FAILED operation became durable truth, and every agent's cursor with it.
+#
+# sp_commit_or_fail already tells the truth about the COMMIT; these three give
+# the same all-or-nothing shape to the FILES the operation touched first.
+#
+#   sp_rewrite_begin [extra file ...]  → snapshot dir on stdout
+#   sp_rewrite_rollback <dir>          → 0 restored · 2 pad held back · 1 partial
+#   sp_rewrite_commit <dir>            → success: drop the snapshot
+#
+# The pad is only restored when HEAD is still where it was at begin. That is the
+# same evidence rule the registry journal's rollback uses (faa3229): if another
+# writer's commit landed in between, rewinding the working tree would erase
+# THEIR message, so we hold the pad back and say so rather than trade one lost
+# message for another.
+sp_rewrite_begin() {   # [extra file ...] → prints the snapshot dir
+  local d f i=0
+  [ -n "${PAD_STATE:-}" ] && [ -d "$PAD_STATE" ] && [ ! -L "$PAD_STATE" ] || return 1
+  [ -f "$PAD_MD" ] && [ ! -L "$PAD_MD" ] || return 1
+  d="$(mktemp -d "$PAD_STATE/.rewrite-journal.XXXXXX")" || return 1
+  cp "$PAD_MD" "$d/pad" || { rm -rf "$d"; return 1; }
+  mkdir -p "$d/cursors" || { rm -rf "$d"; return 1; }
+  for f in "$PAD_STATE"/seen.*; do
+    [ -f "$f" ] && [ ! -L "$f" ] || continue
+    cp "$f" "$d/cursors/${f##*/}" || { rm -rf "$d"; return 1; }
+  done
+  : > "$d/extra-paths" || { rm -rf "$d"; return 1; }
+  for f in "$@"; do
+    [ -n "$f" ] || continue
+    [ -L "$f" ] && { rm -rf "$d"; return 1; }
+    printf '%s\n' "$f" >> "$d/extra-paths"
+    if [ -f "$f" ]; then cp "$f" "$d/extra.$i" || { rm -rf "$d"; return 1; }; fi
+    i=$(( i + 1 ))
+  done
+  sgit rev-parse HEAD > "$d/base-sha" 2>/dev/null || printf 'unborn' > "$d/base-sha"
+  [ -s "$d/base-sha" ] || printf 'unborn' > "$d/base-sha"
+  printf '%s' "$d"
+}
+
+sp_rewrite_rollback() {   # $1 = snapshot dir
+  local d="${1:-}" base now rc=0 f n i=0
+  [ -n "$d" ] && [ -d "$d" ] || return 1
+  base="$(cat "$d/base-sha" 2>/dev/null || echo unborn)"
+  now="$(sgit rev-parse HEAD 2>/dev/null || echo unborn)"
+  [ -n "$now" ] || now="unborn"
+  if [ "$now" = "$base" ]; then
+    cat "$d/pad" > "$PAD_MD" || rc=1
+  else
+    echo "stitchpad: HEAD moved during this operation ($base → $now) — the pad was NOT restored, because that would erase the commit that landed in between. Pre-operation copy kept at $d/pad" >&2
+    rc=2
+  fi
+  # Cursors are restored either way: they are per-seat delivery state, not
+  # shared pad content, so putting them back cannot clobber another writer.
+  for f in "$d"/cursors/*; do
+    [ -f "$f" ] || continue
+    n="${f##*/}"
+    case "$n" in seen.*) ;; *) continue ;; esac
+    cat "$f" > "$PAD_STATE/$n" || rc=1
+  done
+  while IFS= read -r f; do
+    [ -n "$f" ] || continue
+    if [ -f "$d/extra.$i" ]; then
+      cat "$d/extra.$i" > "$f" || rc=1
+    else
+      rm -f "$f" 2>/dev/null || true   # the operation created it; unmake it
+    fi
+    i=$(( i + 1 ))
+  done < "$d/extra-paths"
+  [ "$rc" -eq 0 ] && rm -rf "$d"
+  return "$rc"
+}
+
+sp_rewrite_commit() { [ -n "${1:-}" ] && [ -d "${1:-}" ] && rm -rf "$1"; return 0; }
+
 # Append a small italic system/presence line to the pad (join/leave, etc.).
 # Not a message — no @sender — so it never trips mention detection or the gate.
 sp_system() {

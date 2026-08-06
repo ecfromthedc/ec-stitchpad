@@ -1682,6 +1682,13 @@ PY
       _auth="$(awk '/^## @/{a=$2; sub(/^@/,"",a); print a}' "$span_file" | sort | uniq -c | sort -rn | head -6 | awk '{printf "%s×%s ", $2, $1}')"
       sum="(no LLM summary) archived $arch_count messages through $now_label — top authors: ${_auth:-n/a}"
     fi
+    # ds F13: snapshot the pad and every cursor BEFORE the first destructive
+    # byte, so the failure path can make its own message true. A compact that
+    # cannot be undone must not start.
+    _rw="$(sp_rewrite_begin)" || {
+      sp_unlock; rm -f "$span_file" "$carried"
+      echo "stitchpad: cannot snapshot the pad before compacting — refusing, nothing changed" >&2
+      exit 1; }
     tmp="$(sp_stage "$PAD_MD")"
     {
       sed -n "1,${head_end}p" "$PAD_MD"
@@ -1692,16 +1699,33 @@ PY
       if [ -s "$carried" ]; then printf '\n*open tasks carried through compaction:*\n\n'; cat "$carried"; fi
       printf '\n'
       sed -n "${cut_line},\$p" "$PAD_MD"
-    } > "$tmp" && sp_write_inplace "$tmp" "$PAD_MD"
+    } > "$tmp"
+    _wr=0; sp_write_inplace "$tmp" "$PAD_MD" || _wr=$?
+    if [ "$_wr" -ne 0 ]; then
+      sp_rewrite_rollback "$_rw" >/dev/null 2>&1 || true
+      sp_unlock; rm -f "$span_file" "$carried"
+      echo "stitchpad: compact could not rewrite the pad (write rc=$_wr) — nothing changed" >&2
+      exit 1
+    fi
     rm -f "$PAD_STATE"/seen.* 2>/dev/null
     # S1: the commit return was ignored, and the readref stamping below then
     # anchored EVERY agent's cursor to `rev-parse HEAD` — which, on a failed
     # commit, is the PRE-compact commit. False success compounded into cursor
     # corruption. Verify the commit landed BEFORE touching any cursor.
+    # ds F13: and when it did not land, put the pad and the cursors BACK. The
+    # old message claimed both were untouched while the pad had already been
+    # rewritten on disk and every seen.* deleted — so the next successful `say`
+    # committed the failed compact and made it permanent.
     sp_commit_or_fail "compact: gen $gen — $arch_count msgs → archive (keep $keep)" || {
+      _rwrc=0; sp_rewrite_rollback "$_rw" || _rwrc=$?
       sp_unlock
-      echo "stitchpad: compact NOT recorded — pad unchanged, cursors untouched" >&2
+      if [ "$_rwrc" -eq 0 ]; then
+        echo "stitchpad: compact NOT recorded — the pad and every cursor were restored to their pre-compact state" >&2
+      else
+        echo "stitchpad: compact NOT recorded, and the rollback was INCOMPLETE (rc=$_rwrc) — see the line above; the pre-compact pad is preserved in .stitchpad/.state" >&2
+      fi
       exit 1; }
+    sp_rewrite_commit "$_rw"
     _h="$(sgit rev-parse HEAD 2>/dev/null || true)"
     if [ -n "$_h" ]; then for _f in "$PAD_STATE"/readref.*; do [ -f "$_f" ] && printf '%s' "$_h" > "$_f"; done; fi
     sp_unlock
@@ -1760,6 +1784,13 @@ PY
       /^\*carried through archiving:\*$/               { next }
       { print }
     ' "$span" > "$body"
+    # ds F13: snapshot the pad, every cursor AND the transcript file before the
+    # first destructive byte. The transcript is an APPEND, so without this a
+    # failed archive left a duplicate block in it that the retry appended again.
+    _rw="$(sp_rewrite_begin "$arch_file")" || {
+      sp_unlock; rm -f "$span" "$carried" "$body"
+      echo "stitchpad: cannot snapshot the pad before archiving — refusing, nothing changed" >&2
+      exit 1; }
     if [ ! -f "$arch_file" ]; then
       {
         printf '# 🗄 archived conversation — %s\n\n' "$day"
@@ -1787,17 +1818,27 @@ PY
         "$arch_count" "$arch_rel" "$(date '+%Y-%m-%d %H:%M')"
       sed -n "${cut_line},\$p" "$PAD_MD"
     } > "$tmp"
-    sp_write_inplace "$tmp" "$PAD_MD" || { sp_unlock; rm -f "$span" "$carried" "$body"; exit 1; }
+    sp_write_inplace "$tmp" "$PAD_MD" || {
+      sp_rewrite_rollback "$_rw" >/dev/null 2>&1 || true
+      sp_unlock; rm -f "$span" "$carried" "$body"; exit 1; }
     # Message ordinals shrink, so wake cursors must reset — same contract as
     # compact. A still-unanswered mention in the kept tail may re-fire once,
     # which is correct: it IS unanswered.
     rm -f "$PAD_STATE"/seen.* 2>/dev/null
     # S2: same compound defect as compact — unchecked commit, then cursors
     # stamped onto a possibly-stale HEAD. Verify before stamping.
+    # ds F13: "cursors untouched" was false — they were already deleted, along
+    # with a rewritten pad and an appended transcript file. Restore all three.
     sp_commit_or_fail "archive: $arch_count msgs → $arch_rel (keep $keep)" "$(basename "$PAD_MD")" archive || {
+      _rwrc=0; sp_rewrite_rollback "$_rw" || _rwrc=$?
       sp_unlock
-      echo "stitchpad: archive NOT recorded — cursors untouched" >&2
+      if [ "$_rwrc" -eq 0 ]; then
+        echo "stitchpad: archive NOT recorded — the pad, the transcript file and every cursor were restored to their pre-archive state" >&2
+      else
+        echo "stitchpad: archive NOT recorded, and the rollback was INCOMPLETE (rc=$_rwrc) — see the line above; the pre-archive pad is preserved in .stitchpad/.state" >&2
+      fi
       exit 1; }
+    sp_rewrite_commit "$_rw"
     _h="$(sgit rev-parse HEAD 2>/dev/null || true)"
     if [ -n "$_h" ]; then for _f in "$PAD_STATE"/readref.*; do [ -f "$_f" ] && printf '%s' "$_h" > "$_f"; done; fi
     sp_unlock
