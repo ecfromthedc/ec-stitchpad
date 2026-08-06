@@ -206,3 +206,82 @@ not a produced artifact. Before this session it would have read present/DONE and
 been indistinguishable from `worker2`. That difference is the entire point of the
 work: an orchestrator can now see which seats actually delivered without reading
 any agent's mind, which is the one thing the daemon cannot tell them (P45).
+
+---
+
+## PART 3 — the merge, P46, P48, and the overnight fleet
+
+**Everything below is on fork `ecfromthedc/pasture`, both `master` and
+`fix/macos-arena`, and on the live install at `~/.pasture` → this tree.**
+
+### The merge that had to happen first
+Pointing the install at the hardening branch would have DELETED 16 commits of
+live work (the shed, the ui timeline + `stitchpad run`, message ids with threads
+and reactions, PWA media, per-seat model, a bash-3.2 `start` fix). So it became a
+merge: 17 conflict blocks across 7 files, each decided by checking a fact rather
+than picking a side. The decisive one: production runs the keeper **bare** through
+launchd every 120s, and the hardening branch's keeper answers a bare invocation
+with usage + exit 2 — shipping it would have switched the fleet's watchdog off
+silently. So the live keeper (v2, mention-oracle) ships; its telemetry was ported
+and it finally has a gate.
+
+### P46 — a dispatch is no longer one-shot
+`stitchpad supervise <name>|--all [--max N]`. Produced → DONE. Missing or empty →
+a continuation is posted and a strike recorded. Strikes exhausted → FAILED, said
+out loud, never woken again. The continuation says "CONTINUE from where you
+stopped, do NOT start over" — without that a re-woken agent rewrites its stub
+every round and the loop never converges. 12 assertions, mutant-proved.
+
+### P48 — watchers outliving their pads: FIXED BY k3
+219 live watchers, every one on a pad that no longer existed, ~10 leaked per test
+run. The loop `fswatch | while read` has no tick, so a deleted pad means no more
+events and `react()` — which holds every liveness check — never runs again.
+
+**I failed this twice** (a check in `react()` is a no-op; a sentinel just gets the
+worker respawned by watch.sh's own launcher, and one attempt spawned a whole new
+watcher tree). k3 fixed it on the first turn when dispatched **under supervision**
+— same session each round, "continue, don't start over". The insight I missed:
+
+    exec 9<>"$WATCH_EVENT_FIFO"     # read-WRITE
+
+Opening the FIFO RDWR means the open never blocks and the fd never reports EOF if
+fswatch dies; my `exec 3<` hit EOF instantly and killed the watcher at startup.
+With the fd held open a timed read gives the loop a tick, the loop stays in the
+MAIN shell so `exit` runs `watcher_cleanup`, and the launcher then stands down on
+its own when it sees the lock gone — no signals. Machine went 219 watchers → 0.
+
+Then k3 reviewed its OWN fix and found the next bug: without fswatch on PATH the
+watcher started, took its lock, and both `watch start` and `watch status`
+reported success while nothing was ever delivered. Preflight added in both places.
+
+### Corrections I had to make to my own claims
+- I wrote that the operator-conduct failure rate "tracks" the watcher count,
+  implying causation. With the leak fixed and watchers flat it STILL fails 4-of-6.
+  Correlation. That suite is quarantined with cause UNKNOWN — the only quarantined
+  suite, printed loudly in every tripwire report.
+- I twice built a "regression" story on five green runs of a suite that is a coin
+  flip. The base rate is what settled it, three times in one session.
+- My first supervision loop treated `wake` rc=3 ("turn still running") as
+  "stopped" and fired three continuations that the daemon rejected 409 — I
+  interrupted Kimi mid-work. Fixed: it waits while a turn is in flight.
+
+### `lanes` no longer lies about a fresh seat
+A joined, heartbeating cli/pull seat read `unknown / UNKNOWN` because `lanes` used
+only the Ocean session registry. Same producer/consumer-disagree shape as P44 and
+the help truncation. Now falls back to the 90s heartbeat rule the rest of the tool
+uses: reads `alive / 3s / WORKING`.
+
+### Overnight fleet (running as of this entry)
+Three supervised seats on durable keepers (`/tmp/blindspot/keep-cooking.sh`),
+each relaunched when its loop ends, bounded at 6 cycles so it cannot spin:
+  · `kimi-review`  (k3)                — end-to-end adversarial, outside-eye lens
+  · `ds-review`    (deepseek-v4-flash) — attacker lens
+  · `flake2`       (deepseek-v4-pro)   — the operator-conduct flake, cause unknown
+Artifacts: `/tmp/blindspot/REVIEW-kimi.md`, `REVIEW-ds.md`, `FLAKE2.md`.
+The review prompt they share is `/tmp/blindspot/REVIEW-PROMPT.md`.
+
+### NOT done, deliberately
+EC asked to strip the tests and leave a tool-only repo once everything is green.
+Not done yet, and when it is it should be a SEPARATE tool-only branch with the
+full tree kept intact — "super clean" must not also mean "no safety net". The
+28k lines of tests are what make the silence class detectable at all.
