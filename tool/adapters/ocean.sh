@@ -60,18 +60,53 @@ EOF
 # stale pending input (the parked-message bug smaths hit). Defer instead — the
 # watcher keeps the gate and retries, and the Stop hook covers turn-end
 # delivery for a session that is already running.
+#
+# k3 F13: this guard USED TO FAIL OPEN. `active` was computed as busy|idle|
+# unknown but only "busy" deferred, so a 3s timeout, a dead daemon or an
+# unparseable body all fell through to "idle" and the wake fired — precisely
+# when the daemon is too sick to answer quickly but still accepting turns
+# (overloaded, GC-paused, mid-restart with a half-up listener), which is exactly
+# when a session is most likely to be mid-turn. Measured with a mock daemon and
+# a stub ocean-heartbeat: unparseable body → rc=0, wake FIRED; daemon gone →
+# rc=0, wake FIRED.
+#
+# The fail direction was backwards. A deferred mention is retried by the watcher
+# — that is what the whole delivery-supervision machinery is for — while a wake
+# posted into a mid-turn session is the corruption this guard exists to prevent.
+# seat-keeper.sh already encodes the right policy in its own probe: "a probe has
+# three outcomes, not two: up, down, and unknown — unknown never moves a seat."
+# Same three states here, same reason strings, and unknown NEVER wakes.
+# (The retry it defers into is itself bounded now — ds F5 / k3 F14 — so a daemon
+# that stays unreachable ends in an announced terminal state instead of a spin.)
 daemon_url="${OCEAN_DAEMON_URL:-http://127.0.0.1:4780}"
-active="$(curl -sf --max-time 3 "$daemon_url/v1/agent/sessions/$session_id" 2>/dev/null \
-  | python3 -c 'import json,sys
+probe_session_state() {
+  local body
+  body="$(curl -sf --max-time 3 "$daemon_url/v1/agent/sessions/$session_id" 2>/dev/null)" \
+    || { printf 'unknown:http-fail'; return; }
+  [ -z "$body" ] && { printf 'unknown:empty-body'; return; }
+  printf '%s' "$body" | python3 -c '
+import json, sys
 try:
-    s=json.load(sys.stdin).get("session",{})
-    print("busy" if s.get("active_turn") else "idle")
+    d = json.load(sys.stdin)
 except Exception:
-    print("unknown")' 2>/dev/null)"
-if [ "$active" = "busy" ]; then
-  echo "[ocean.sh] session $session_id mid-turn — deferring wake for @$name" >&2
-  exit 3
-fi
+    print("unknown:unparseable"); raise SystemExit(0)
+s = d.get("session")
+if not isinstance(s, dict):
+    print("unknown:no-session-object"); raise SystemExit(0)
+print("busy" if s.get("active_turn") else "idle")
+' 2>/dev/null || printf 'unknown:probe-crashed'
+}
+active="$(probe_session_state)"
+[ -n "$active" ] || active="unknown:empty-probe"
+case "$active" in
+  busy)
+    echo "[ocean.sh] session $session_id mid-turn — deferring wake for @$name" >&2
+    exit 3 ;;
+  idle) ;;
+  *)
+    echo "[ocean.sh] session $session_id state UNKNOWN (${active#unknown:}) — cannot tell whether it is mid-turn; NOT waking @$name. The watcher keeps the mention and retries." >&2
+    exit 3 ;;
+esac
 
 seat_model="$(sp_model_pin_requested "$state_dir" "$name")"
 # master annotates the model on the roster row and exports SP_MODEL. Keep that as

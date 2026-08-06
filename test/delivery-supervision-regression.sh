@@ -455,6 +455,23 @@ cat > "$ocean_bin/curl" <<'CURL'
 #!/usr/bin/env bash
 state="$STITCHPAD_PAD_DIR/.state"
 url="${!#}"
+# GET /v1/agent/sessions/<id> — ocean.sh's idle-guard probe. This mock used to
+# answer EVERY url with the /v1/requests list shape, which the real daemon never
+# returns for this route, and the old fail-open guard read that as "idle". With
+# the guard failing closed (k3 F13) the fixture had to stop lying. Shape taken
+# from ocean-agent-sdk's AgentSessionResponse and confirmed against a live
+# daemon: {ok, session{...}, turns[]}, where `active_turn` is OMITTED when the
+# session is idle (serde skip_serializing_if) and carries the in-flight turn id
+# when the daemon's request registry has a non-terminal request for it.
+if [[ "$url" == */v1/agent/sessions/ocean-session ]]; then
+  active="$(cat "$state/ocean.active" 2>/dev/null || true)"
+  if [ -n "$active" ]; then
+    printf '{"ok":true,"session":{"id":"ocean-session","title":"t","cwd":"/","created_at":"2099-01-01T00:00:00Z","updated_at":"2099-01-01T00:00:00Z","active_turn":"%s","client_type":"stitchpad"},"turns":[]}\n' "$active"
+  else
+    printf '{"ok":true,"session":{"id":"ocean-session","title":"t","cwd":"/","created_at":"2099-01-01T00:00:00Z","updated_at":"2099-01-01T00:00:00Z","client_type":"stitchpad"},"turns":[]}\n'
+  fi
+  exit 0
+fi
 if [[ "$url" == */cancel ]]; then
   turn="${url%/cancel}"; turn="${turn##*/}"
   printf '%s\n' "$turn" >> "$state/ocean.cancels"
