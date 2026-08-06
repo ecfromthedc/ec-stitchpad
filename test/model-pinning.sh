@@ -187,37 +187,22 @@ check 'telemetry mismatch marker' 'gpt-5.6-sol|claude-fable-5' \
   "$(cut -d'|' -f1,2 "$STATE/model-mismatch.telemis")"
 case "$(cat "$tmp/telemis.err")" in *'MISMATCH @telemis'*) ok 'telemetry mismatch surfaced loudly' ;; *) bad 'telemetry mismatch surfaced loudly' 'loud line' "$(cat "$tmp/telemis.err")" ;; esac
 
-printf '\n--- keeper recovery path ---\n'
-STITCHPAD_PAD_DIR="$tmp/.stitchpad" "$SP" join keeperseat ocean push sid-keeper >/dev/null 2>&1
-STITCHPAD_NAME=operator STITCHPAD_PAD_DIR="$tmp/.stitchpad" "$SP" task new 'keeper model pin task' --to keeperseat >/dev/null
-STITCHPAD_NAME=operator STITCHPAD_PAD_DIR="$tmp/.stitchpad" "$SP" say '@keeperseat keeper telemetry probe' >/dev/null
-printf 'gpt-5.6-sol' > "$STATE/seat-model.keeperseat"
-kcalls="$tmp/keeper.calls"
-cat > "$mockbin/ocean-heartbeat" <<'EOF'
-#!/usr/bin/env bash
-printf '%s\n' "$*" >> "$KEEPER_CALLS"
-printf '{"ok": true}\n'
-EOF
-chmod +x "$mockbin/ocean-heartbeat"
-out="$(cd "$tmp" && PATH="$mockbin:$PATH" KEEPER_CALLS="$kcalls" \
-  OCEAN_HEARTBEAT_BIN="$mockbin/ocean-heartbeat" \
-  STITCHPAD_KEEPER_MIN_SECONDS=0 MOCK_CONFIG_MODEL='claude-fable-5' \
-  "$SP" keeper "$tmp" 2>"$tmp/keeper.err")"
-[ -f "$kcalls" ] && ok 'keeper woke eligible seat' || bad 'keeper woke eligible seat' 'wake call' "$(cat "$tmp/keeper.err")"
-check 'keeper resolved recorded from daemon config' 'claude-fable-5' "$(cat "$STATE/resolved-model.keeperseat")"
-check 'keeper meta source' 'keeper-wake-config-rpc' "$(cut -d'|' -f1 "$STATE/resolved-model-meta.keeperseat")"
-check 'keeper mismatch marker' 'gpt-5.6-sol|claude-fable-5' \
-  "$(cut -d'|' -f1,2 "$STATE/model-mismatch.keeperseat")"
-# Refuse policy with the now-active mismatch: keeper must not wake again.
-rm -f "$kcalls"
-out="$(cd "$tmp" && PATH="$mockbin:$PATH" KEEPER_CALLS="$kcalls" \
-  OCEAN_HEARTBEAT_BIN="$mockbin/ocean-heartbeat" \
-  STITCHPAD_KEEPER_MIN_SECONDS=0 STITCHPAD_MODEL_PIN_POLICY=refuse \
-  MOCK_CONFIG_MODEL='claude-fable-5' \
-  "$SP" keeper "$tmp" 2>"$tmp/keeper2.err")"
-[ ! -f "$kcalls" ] && ok 'keeper refuse policy: no wake into active mismatch' \
-  || bad 'keeper refuse policy: no wake into active mismatch' 'no wake' "$(cat "$kcalls")"
-case "$(cat "$tmp/keeper2.err")" in *'model-pin preflight refused'*) ok 'keeper refusal logged loudly' ;; *) bad 'keeper refusal logged loudly' 'log line' "$(cat "$tmp/keeper2.err")" ;; esac
+printf '\n--- keeper recovery path: REMOVED, see ledger P47 ---\n'
+# These assertions drove the task-parser keeper, which no longer ships: production
+# invokes the keeper bare through launchd every two minutes, and that keeper
+# answers a bare invocation with usage + exit 2, so keeping it would have switched
+# the fleet's watchdog off silently. The mention-oracle keeper (v2) ships instead.
+#
+# The model-pin CORE above is untouched and still fully gated (50 assertions). The
+# resolved-model telemetry these five checked HAS been ported into v2 — it records
+# `keeper-wake-config-rpc` after an accepted wake exactly as before — but v2 also
+# probes daemon health and session state, so exercising it needs a fixture shaped
+# around that control flow rather than this one. That fixture is owed, and is
+# filed as P47 rather than left as a silent hole.
+#
+# Keeper behaviour is NOT uncovered in the meantime: test/seat-keeper.sh gates v2
+# directly, including the invariant this file never checked — that a keeper run
+# does not advance any seen.<name> cursor.
 
 printf '\n========== RESULTS ==========\n'
 printf 'Passed:  %d\nFailed:  %d\n' "$PASSED" "$FAILED"

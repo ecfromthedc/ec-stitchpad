@@ -48,11 +48,26 @@ set -uo pipefail
 # that rots (crux's phrasing, and it applies to the wake path just as much).
 CONF="${SEAT_KEEPER_CONF:-$HOME/.pasture/keeper.conf}"
 LOG="${SEAT_KEEPER_LOG:-$HOME/.pasture/keeper.log}"
-HB="$HOME/dev/ocean-os/target/release/ocean-heartbeat"
-SP="$HOME/.stitchpad/bin/stitchpad"   # the mention oracle {@see seat_pending}
-DAEMON="http://127.0.0.1:4780"
-DRAIN_MIN_S=600       # min seconds between keeper wakes per seat (drain)
-QUEUE_MIN_S=900       # min seconds between keeper wakes per seat (task-queue)
+# HB/SP/DAEMON were hardcoded to the INSTALL, which is right in production and
+# is also why this keeper had no gate: a suite cannot point it at a throwaway
+# tree. Same treatment as CONF/LOG above — overridable, identical defaults.
+HB="${OCEAN_HEARTBEAT_BIN:-$HOME/dev/ocean-os/target/release/ocean-heartbeat}"
+SP="${SEAT_KEEPER_SP:-$HOME/.stitchpad/bin/stitchpad}"   # the mention oracle {@see seat_pending}
+DAEMON="${OCEAN_DAEMON_URL:-http://127.0.0.1:4780}"
+
+# Model-pin telemetry helpers live in lib.sh. Resolved the same way every other
+# bin/ script does, through the symlink, so the keeper records which model a wake
+# ACTUALLY resolved to rather than only which one was requested.
+_sk_src="${BASH_SOURCE[0]}"; while [ -h "$_sk_src" ]; do
+  _sk_dir="$(cd -P "$(dirname "$_sk_src")" && pwd)"; _sk_src="$(readlink "$_sk_src")"
+  [ "${_sk_src#/}" = "$_sk_src" ] && _sk_src="$_sk_dir/$_sk_src"
+done
+SK_BIN_DIR="$(cd -P "$(dirname "$_sk_src")" && pwd)"
+[ -f "$SK_BIN_DIR/lib.sh" ] && . "$SK_BIN_DIR/lib.sh" 2>/dev/null || true
+# Overridable for the same reason CONF/LOG/HB are: a rate limit you cannot lower
+# is a rate limit no suite can exercise. Defaults unchanged.
+DRAIN_MIN_S="${SEAT_KEEPER_DRAIN_MIN_S:-${STITCHPAD_KEEPER_MIN_SECONDS:-600}}"
+QUEUE_MIN_S="${SEAT_KEEPER_QUEUE_MIN_S:-${STITCHPAD_KEEPER_MIN_SECONDS:-900}}"
 MAX_STRIKES=3         # consecutive no-effect wakes before quarantine
 RELOG_S=3600          # re-log a quarantined/unknown seat at most this often
 
@@ -274,6 +289,28 @@ while IFS= read -r repo; do
             out=$("$HB" wake --session-id "$sid" --cwd "$repo" --client-type stitchpad \
               ${model:+--model "$model"} --no-wait --prompt "$prompt" 2>&1)
             if echo "$out" | grep -q '"ok": *true'; then
+              # RESOLVED-MODEL TELEMETRY (ported from the task-parser keeper this
+              # replaced): ask the daemon what the session actually resolved to and
+              # record it against the requested pin, so a silent provider swap is
+              # visible instead of being discovered days later. Best-effort — an
+              # unreachable daemon leaves the previous resolved record untouched,
+              # and nothing here can change the wake outcome.
+              if command -v sp_model_pin_record_resolved >/dev/null 2>&1; then
+                _cfg="$(curl -sf -m 3 "$DAEMON/v1/agent/sessions/$sid/config" 2>/dev/null || true)"
+                if [ -n "$_cfg" ]; then
+                  _rm="$(printf '%s' "$_cfg" | python3 -c 'import json,sys
+try: print(json.load(sys.stdin).get("model") or "")
+except Exception: print("")' 2>/dev/null)"
+                  _rp="$(printf '%s' "$_cfg" | python3 -c 'import json,sys
+try: print(json.load(sys.stdin).get("provider") or "")
+except Exception: print("")' 2>/dev/null)"
+                  if [ -n "$_rm" ]; then
+                    sp_model_pin_record_resolved "$ST" "$name" "$_rm" "$_rp" \
+                      "keeper-wake-config-rpc" "$sid" || true
+                    sp_model_pin_check "$ST" "$name" || true
+                  fi
+                fi
+              fi
               date +%s > "$LASTF"
               # Remember WHICH mention we woke it about, so the next pass can tell
               # whether the wake accomplished anything.

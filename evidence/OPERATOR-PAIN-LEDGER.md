@@ -736,3 +736,37 @@ This belongs in `stitchpad spawn` (and any dispatch path), not in a per-pad scri
 it is exactly the generic pasture capability the fleet keeps needing. Sizing note:
 the per-round delta must be small and must forbid restarting, or a re-woken agent
 rewrites its stub every round and the loop makes no progress.
+
+---
+
+## P47 — the keeper's model-pin telemetry is shipped but not gated (OWED)
+
+Two keeper designs existed in parallel: a task-parser one on the hardening branch
+and the mention-oracle one (v2) on the live branch. **v2 ships**, for one decisive
+reason found by reading the launchd job rather than the code: production runs
+`/bin/bash ~/.pasture/bin/seat-keeper.sh` with **no arguments** every two minutes,
+and the task-parser keeper answers a bare invocation with a usage message and
+exit 2. Shipping it would have switched the fleet's watchdog off silently — the
+exact failure class this build exists to eliminate.
+
+v2 arrived with **no test coverage at all** (the live branch carries one suite in
+total). That has been fixed: `test/seat-keeper.sh` now gates v2 directly — the bare
+production invocation, conf handling, fail-closed-with-a-voice on an unreachable
+daemon, the quarantine bound, blast radius, and **the invariant the old suite only
+proxied**: a keeper run must not advance any `seen.<name>` cursor. The old suite
+asserted that by grepping the keeper's source for the word `wake`, which forbade
+even a non-consuming `--peek-ordinal` read; the cursor invariant is both weaker in
+what it forbids and stronger in what it proves, and it is mutant-proved.
+
+**What is owed.** The resolved-model telemetry HAS been ported into v2 — after an
+accepted wake it reads the session config back and records
+`keeper-wake-config-rpc` exactly as before — but the five assertions in
+`model-pinning.sh` that used to exercise it drove the task-parser keeper's control
+flow. v2 additionally probes daemon health and session state, so proving that path
+needs a fixture shaped around v2 (a mock daemon answering `/health` and
+`/v1/agent/sessions/<sid>`), not the old one. Those five were removed with a
+comment in place, not deleted quietly.
+
+So: the telemetry ships and is used; it is not currently proven by a gate. The
+model-pin core remains fully gated (49 assertions), and keeper behaviour is gated
+by the new suite. Write the v2-shaped fixture and restore the five.

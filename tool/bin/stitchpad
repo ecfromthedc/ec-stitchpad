@@ -1411,7 +1411,37 @@ PY
     ;;
 
   keeper)
-    exec "$BIN_DIR/seat-keeper.sh" "$@"
+    # Documented CLI: `stitchpad keeper [--config <repos-file>] <repo> ...`.
+    # The keeper itself is conf-driven (SEAT_KEEPER_CONF, default
+    # ~/.pasture/keeper.conf) because production invokes it bare through launchd
+    # every two minutes — that bare path MUST keep working, so with no arguments
+    # this still execs straight through and the keeper resolves its own conf.
+    # With arguments, the positional repos are materialised into a temp conf so
+    # the published CLI keeps its contract without the keeper growing a second
+    # source of truth for which pads it watches.
+    if [ $# -eq 0 ]; then exec "$BIN_DIR/seat-keeper.sh"; fi
+    _kp_conf=""; _kp_repos=""
+    while [ $# -gt 0 ]; do
+      case "$1" in
+        --config) [ $# -ge 2 ] || { echo "usage: stitchpad keeper [--config <repos-file>] <repo> ..." >&2; exit 2; }
+                  _kp_conf="$2"; shift 2 ;;
+        --)       shift; while [ $# -gt 0 ]; do _kp_repos="$_kp_repos$1
+"; shift; done ;;
+        -*)       echo "stitchpad keeper: unknown option: $1" >&2; exit 2 ;;
+        *)        _kp_repos="$_kp_repos$1
+"; shift ;;
+      esac
+    done
+    if [ -n "$_kp_repos" ]; then
+      _kp_tmp="$(mktemp)" || exit 1
+      [ -n "$_kp_conf" ] && [ -f "$_kp_conf" ] && cat "$_kp_conf" >> "$_kp_tmp"
+      printf '%s' "$_kp_repos" >> "$_kp_tmp"
+      SEAT_KEEPER_CONF="$_kp_tmp" "$BIN_DIR/seat-keeper.sh"; _kp_rc=$?
+      rm -f "$_kp_tmp"
+      exit "$_kp_rc"
+    fi
+    [ -n "$_kp_conf" ] || { echo "usage: stitchpad keeper [--config <repos-file>] <repo> ..." >&2; exit 2; }
+    exec env SEAT_KEEPER_CONF="$_kp_conf" "$BIN_DIR/seat-keeper.sh"
     ;;
 
   compact)

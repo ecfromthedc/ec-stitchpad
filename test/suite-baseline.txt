@@ -15,7 +15,7 @@ authority-redesign-regression.sh 29 0
 bridge-heartbeat-interval.sh 3 0
 clear-regression.sh 9 0
 color-bash32.sh 0 0
-command-dispatch-gate.sh 79 0
+command-dispatch-gate.sh 87 0
 commit-fail-postcondition-gate.sh 6 0
 concurrency-round5-regression.sh 8 0
 coordination-lifecycle-slice-a.sh 7 0
@@ -37,7 +37,7 @@ heal-roster-regression.sh 19 0
 heartbeat-races.sh 0 0
 heartbeat.sh 0 0
 identity-survival-under-join.sh 11 0
-model-pinning.sh 55 0
+model-pinning.sh 49 0
 multipad-isolation.sh 42 0
 p18-scratch-pad-gate.sh 12 0
 p26-relay-channel-gate.sh 9 0
@@ -61,9 +61,9 @@ rp2-directory-pathspec-gate.sh 10 0
 roster-recovery-guard-regression.sh 21 0
 roster-validation-gate.sh 12 0
 say-image.sh 0 0
-seat-keeper.sh 0 0
+seat-keeper.sh 7 0
 task-dual-source-regression.sh 20 0
-task26-mutant.sh 23 0
+task26-mutant.sh 25 0
 task4-bounded-recovery-regression.sh 28 0
 task5-scope-authority-regression.sh 36 0
 telemetry-regression.sh 17 0
@@ -89,7 +89,7 @@ pad-narration-gate.sh 8 0
 p38-task-list-readable-gate.sh 5 0
 operator-conduct-gate.sh 8 0
 terminal-isolation-gate.sh 7 0
-help-discoverability-gate.sh 91 0
+help-discoverability-gate.sh 99 0
 p25-sidebar-organisation-gate.sh 7 0
 p42-subagent-spawn-gate.sh 12 0
 p43-wake-push-misdirect-gate.sh 7 0
