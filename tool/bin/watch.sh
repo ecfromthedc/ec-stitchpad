@@ -1485,18 +1485,27 @@ while true; do
       break
     done
     if ! kill -0 "$FSWATCH_PID" 2>/dev/null; then
-      # k3 F1: this used to log "exiting for supervisor restart" and exit 1.
-      # There is no supervisor. Nothing was watching this process, so the pad
-      # simply went deaf until a human happened to run a stitchpad command
-      # (ensure_watcher on any subcommand is the only thing that ever revived
-      # it) — while the log line said recovery was on its way.
+      # k3 F1: this used to log "exiting for supervisor restart" and exit 1
+      # UNCONDITIONALLY. The finding said there is no supervisor. That is half
+      # right, and the half matters:
       #
-      # Either build the restart or stop claiming it. This builds it: fswatch
-      # dying on a live pad is transient (OOM, a brew upgrade swapping the
-      # binary), the watcher still holds its lock and its loop, and it can put
-      # its own eyes back. The bound is what keeps that honest — a fswatch that
-      # will not stay up is a real failure, and the exit then says exactly what
-      # will and will not happen next.
+      #   · started by `stitchpad daemon start` → bin/daemon.sh IS a supervisor.
+      #     It runs watch.sh in a loop and respawns it 2s after any exit. The
+      #     old message was TRUE here, and exiting is the correct behaviour —
+      #     recovering in place would rob the supervisor of its restart and
+      #     break the ownerless-restart gap watcher-races.sh pins.
+      #   · started by lib.sh's ensure_watcher (any stitchpad subcommand) →
+      #     nothing supervises it. The message was a lie, and the pad went deaf
+      #     until a human happened to run another command.
+      #
+      # Both spawn paths export STITCHPAD_WATCH_GENERATION, so that cannot tell
+      # them apart; daemon.sh now also exports STITCHPAD_WATCH_SUPERVISED.
+      # Supervised: exit and say so truthfully. Unsupervised: put our own eyes
+      # back, bounded, because nobody else will.
+      if [ -n "${STITCHPAD_WATCH_SUPERVISED:-}" ]; then
+        echo "[stitchpad] fswatch died on a live pad — exiting; the daemon supervisor will restart this watcher" >&2
+        exit 1
+      fi
       _fsw_restarts=$(( _fsw_restarts + 1 ))
       if [ "$_fsw_restarts" -le "${STITCHPAD_FSWATCH_MAX_RESTARTS:-5}" ]; then
         wait "$FSWATCH_PID" 2>/dev/null || true

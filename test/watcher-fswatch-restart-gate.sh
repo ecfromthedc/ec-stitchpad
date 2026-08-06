@@ -16,7 +16,8 @@
 #   G2  ... with a new fswatch child actually running
 #   G3  ... and the log says what happened, without promising a supervisor
 #   G4  events flow again: a pad write after the death is still auto-committed
-#   G5  no file in the tree still promises a "supervisor restart"
+#   G5  a SUPERVISED watcher still exits, so bin/daemon.sh can restart it
+#       (the half of F1 that was wrong: that supervisor really does exist)
 #   G6  MUTANT: remove the restart → the watcher dies again
 set -uo pipefail
 
@@ -126,16 +127,33 @@ else
   kill "$WPID" 2>/dev/null || true; wait "$WPID" 2>/dev/null || true
 fi
 
-# G5 — the claim must be gone from the tree, not just from this path. Comments
-# that DOCUMENT the old wording are exactly what a future reader needs, so only
-# lines the tool can actually PRINT count (a comment line cannot reach a log).
-_g5="$(grep -rn 'supervisor restart' "$TOP/tool" 2>/dev/null \
-        | grep -v '^Binary' \
-        | awk -F: '{ line=$0; sub(/^[^:]*:[^:]*:/, "", line); sub(/^[ \t]+/, "", line); if (substr(line,1,1) != "#") print }' || true)"
-if [ -n "$_g5" ]; then
-  bad "G5 a live code path still promises a supervisor restart: $(printf '%s' "$_g5" | head -1)"
+# G5 — a SUPERVISED watcher must still exit and let bin/daemon.sh restart it.
+# This is the half of k3 F1 that was wrong: `stitchpad daemon start` really does
+# run a supervisor loop, so exiting there is correct and recovering in place
+# would rob it of the restart (and break watcher-races.sh's ownerless gap).
+P5="$(build "$TOP/tool" 5)"
+LOG5="$TMP/w5.log"
+( cd "$P5" && STITCHPAD_NAME=larry STITCHPAD_WATCH_SUPERVISED=1 \
+    exec /bin/bash "$TOP/tool/bin/watch.sh" > "$LOG5" 2>&1 ) &
+WPID=$!; WPIDS="$WPIDS $WPID"
+SFSW="$(wait_fswatch "$WPID" || true)"
+if [ -z "${SFSW:-}" ]; then
+  bad "G5 INVALID PROBE — the supervised watcher never spawned fswatch"
 else
-  ok "G5 no code path in tool/ promises a supervisor restart any more"
+  FPIDS="$FPIDS $SFSW"
+  kill "$SFSW" 2>/dev/null || true
+  naptime 8
+  if kill -0 "$WPID" 2>/dev/null; then
+    bad "G5 a SUPERVISED watcher stayed alive — it stole the restart from bin/daemon.sh"
+    kill "$WPID" 2>/dev/null || true
+  else
+    ok "G5 a supervised watcher exits and leaves the restart to bin/daemon.sh"
+  fi
+  if grep -q 'supervisor will restart' "$LOG5" 2>/dev/null; then
+    ok "G5b ... and says so, which is TRUE in that mode"
+  else
+    bad "G5b the supervised exit did not explain itself: $(tail -2 "$LOG5" | tr '\n' ' ')"
+  fi
 fi
 
 # ── G6 MUTANT: take the restart away ──────────────────────────────────────

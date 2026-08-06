@@ -458,10 +458,20 @@ states = {
     "accepted", "started", "busy", "error", "in_flight", "cancel_pending",
     "deferred_dnd", "acceptance_unknown", "completed", "tombstoned",
     "errored", "cancelled",
+    # ds F5 / k3 F14: the busy-retry bound's terminal state. Declared here
+    # DELIBERATELY — this block is the contract for that constant, and it is
+    # what caught the state being added to health.py without a decision about
+    # how health should classify it.
+    "deferred_permanent",
 }
 assert module["DELIVERY_STATES"] == states
+# NOT recoverable: nothing will retry a deferred_permanent delivery — that is
+# the whole point of the bound. The seat's own Stop hook owns it from there,
+# and a new mention mints a new generation.
 recoverable = {"accepted", "busy", "error", "cancel_pending", "deferred_dnd"}
-attention = {"cancel_pending", "deferred_dnd"}
+# ATTENTION, not error: the mention is not lost, but a human should know that
+# automatic delivery has stopped for it.
+attention = {"cancel_pending", "deferred_dnd", "deferred_permanent"}
 errors = {"error", "errored", "cancelled", "acceptance_unknown"}
 with tempfile.TemporaryDirectory() as root:
     state = Path(root)

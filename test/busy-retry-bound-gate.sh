@@ -68,6 +68,22 @@ new_case() {  # $1=label $2=roster row
 }
 append_message() { printf '\n## @%s · 00:00\n\n%s\n' "$1" "$2" >> "$PAD_MD"; }
 state_value() { sed -n "s/^${2}=//p" "$(delivery_state_file "$1")" 2>/dev/null | tail -1; }
+# Let the SINGLE worker that delivery_enqueue spawns do the work and wait for
+# it, instead of also running one in the foreground. Two workers race: the
+# adapter fires BEFORE the attempt is counted, so N concurrent workers overshoot
+# the bound by N-1 — which is what this suite kept measuring (5 calls against a
+# bound of 4, 2 runs in 3). Production cannot hit that: delivery_worker_lock is
+# a singleton. The fixture was the thing with two workers.
+wait_state() {  # $1=name $2..=acceptable states; bounded
+  local name="$1"; shift
+  local tries=200 st
+  while [ "$tries" -gt 0 ]; do
+    st="$(state_value "$name" state)"
+    for want in "$@"; do [ "$st" = "$want" ] && return 0; done
+    tries=$(( tries - 1 )); sleep 0.1
+  done
+  return 1
+}
 calls() { wc -l < "$PAD_STATE/busy.$1.calls" 2>/dev/null | tr -d ' ' || echo 0; }
 
 new_case bootstrap 'bootstrap | busy | push | t'
@@ -84,7 +100,14 @@ new_case bound 'stuck | busy | push | t'
 append_message operator '@stuck please look at the tripwire'
 _t0="$(date +%s)"
 delivery_enqueue stuck busy push t
-( delivery_worker stuck "$(cat "$(delivery_worker_lock stuck)/token" 2>/dev/null)" ) >/dev/null 2>&1 || true
+wait_state stuck deferred_permanent || true
+# The terminal STATE is written before the pad notice is posted (two steps:
+# delivery_write_state, then stage + lock + commit). Wait for the artifact this
+# block actually asserts on, or G3 races the write it is measuring.
+_w=0; while [ "$_w" -lt 100 ]; do
+  grep -q 'could not be woken after' "$PAD_MD" 2>/dev/null && break
+  sleep 0.1; _w=$(( _w + 1 ))
+done
 _t1="$(date +%s)"
 _n="$(calls stuck)"
 if [ "${_n:-0}" -ge 1 ] && [ "${_n:-0}" -le "$SP_DELIVERY_BUSY_MAX_ATTEMPTS" ]; then
@@ -132,8 +155,14 @@ fi
 # ── G5: a NEW mention must be delivered at full speed ─────────────────────
 printf idle-now > "$PAD_STATE/busy.stuck.mode"
 append_message operator '@stuck second, different question'
+# Enqueue the way production does — the watcher calls delivery_enqueue on EVERY
+# pad event, not once. That matters here: delivery_start_worker has a 5s
+# ownerless-lock grace that returns WITHOUT spawning, so a brand-new generation
+# landing inside that window waits for the next enqueue. Pre-existing behaviour
+# (this suite does not own it), but the give-up path reaches it more often, so
+# it is written down here rather than hidden behind a single lucky call.
 delivery_enqueue stuck busy push t
-( delivery_worker stuck "$(cat "$(delivery_worker_lock stuck)/token" 2>/dev/null)" ) >/dev/null 2>&1 || true
+wait_state stuck completed || { delivery_enqueue stuck busy push t; wait_state stuck completed || true; }
 if [ "$(state_value stuck state)" = "completed" ]; then
   ok "G5 a NEW mention resets the bound and is delivered — giving up once does not deafen the seat"
 else
@@ -145,7 +174,7 @@ new_case recover 'flaky | busy | push | t'
 printf idle-now > "$PAD_STATE/busy.flaky.mode"
 append_message operator '@flaky are you free'
 delivery_enqueue flaky busy push t
-( delivery_worker flaky "$(cat "$(delivery_worker_lock flaky)/token" 2>/dev/null)" ) >/dev/null 2>&1 || true
+wait_state flaky completed || true
 [ "$(state_value flaky state)" = "completed" ] \
   && ok "G6 an adapter that succeeds still completes normally" \
   || bad "G6 normal delivery regressed (state=$(state_value flaky state))"
@@ -200,11 +229,12 @@ _stamps="$(ls "$CASE_PAD/.state"/notified.frank.* 2>/dev/null | wc -l | tr -d ' 
 new_case respawn 'again | busy | push | t'
 append_message operator '@again a question'
 delivery_enqueue again busy push t
-( delivery_worker again "$(cat "$(delivery_worker_lock again)/token" 2>/dev/null)" ) >/dev/null 2>&1 || true
+wait_state again deferred_permanent || true
 _c1="$(calls again)"
 for _r in 1 2 3; do
   delivery_enqueue again busy push t
-  ( delivery_worker again "$(cat "$(delivery_worker_lock again)/token" 2>/dev/null)" ) >/dev/null 2>&1 || true
+  wait_state again deferred_permanent || true
+  sleep 1
 done
 _c2="$(calls again)"
 if [ "${_c1:-0}" -gt 0 ] && [ "${_c2:-0}" = "${_c1:-0}" ]; then

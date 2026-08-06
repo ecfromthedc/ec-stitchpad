@@ -75,7 +75,14 @@ case "${1:-status}" in
         supervisor_owns_generation || exit 0
         date +%s > "$LOCKDIR/heartbeat"
         supervisor_owns_generation || exit 0
+        # STITCHPAD_WATCH_SUPERVISED tells the watcher that THIS loop exists.
+        # Both this supervisor and lib.sh's ensure_watcher export
+        # STITCHPAD_WATCH_GENERATION, so that variable cannot distinguish them —
+        # and the difference matters: a watcher started here should DIE on a
+        # fatal event and let this loop restart it, while a watcher spawned by
+        # ensure_watcher has nobody to do that and must recover in place (k3 F1).
         STITCHPAD_PAD_DIR="$PAD_DIR" STITCHPAD_WATCH_GENERATION="$watch_generation" \
+          STITCHPAD_WATCH_SUPERVISED=1 \
           bash "$STITCHPAD_HOME/bin/watch.sh" >>"$LOG" 2>&1
         watcher_rc=$?
         supervisor_owns_generation || exit 0
