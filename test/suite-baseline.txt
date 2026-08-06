@@ -66,6 +66,7 @@ roster-recovery-guard-regression.sh 21 0
 roster-validation-gate.sh 12 0
 say-image.sh 0 0
 seat-keeper.sh 11 0
+session-start-identity-claim-gate.sh 7 0
 task-dual-source-regression.sh 20 0
 task26-mutant.sh 25 0
 task4-bounded-recovery-regression.sh 28 0

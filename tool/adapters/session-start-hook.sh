@@ -57,6 +57,59 @@ if [ "${HERDR_ENV:-}" = "1" ] && [ -n "${HERDR_PANE_ID:-}" ]; then
   fi
 fi
 
+# ── IDENTITY CLAIM (k3 F18) ─────────────────────────────────────────────────
+# Every rule below is check-then-act, and rule (3) in particular decides "nobody
+# is @name" from a heartbeat file that the winner does not refresh until AFTER
+# its ticker forks. Two session starts in the same window therefore both saw a
+# stale heartbeat, both adopted, and both bound their session id — two live
+# agents answering to one handle, with seen.<name> making mention delivery a
+# first-hook-wins race. That is the 02:53 fable incident, re-opened by
+# concurrency. Measured before this claim, 5 rounds of paired concurrent starts:
+# 5/5 rounds ended with 2 bindings and 2 hooks printing "you are @fable".
+#
+# mkdir is the atomic primitive used for every other singleton in this codebase.
+# Ownership is published with a BUILTIN redirect the instant mkdir returns —
+# before anything forks — so a contender never sees an ownerless claim.
+#
+# A contender WAITS for the claim rather than skipping outright: after the
+# winner publishes a live heartbeat, re-running the rules gives the right answer
+# for everyone. A genuine resume (rule 1) still adopts; only the orphan rescue,
+# whose premise "nobody is the name" has just become false, correctly stands
+# down. A claim whose owner is dead is reclaimed, so a crashed hook cannot wedge
+# auto-rejoin forever — the failure mode this file exists to avoid.
+_claim="$pad/.state/identity-claim.$name.d"
+_claim_held=0
+_claim_waited=0
+_claim_try() { mkdir "$_claim" 2>/dev/null && printf '%s\n' "$$" > "$_claim/owner" 2>/dev/null; }
+_claim_owner_dead() {
+  local _p
+  _p="$(cat "$_claim/owner" 2>/dev/null | tr -d '[:space:]')"
+  [ -n "$_p" ] || return 1              # no owner yet: the winner is mid-publish
+  kill -0 "$_p" 2>/dev/null && return 1
+  return 0
+}
+mkdir -p "$pad/.state" 2>/dev/null || true
+if _claim_try; then
+  _claim_held=1
+else
+  _claim_waited=1
+  _w=0
+  while [ "$_w" -lt 60 ]; do            # bounded: ~3s of 50ms steps
+    sleep 0.05
+    if _claim_try; then _claim_held=1; break; fi
+    _w=$(( _w + 1 ))
+  done
+  if [ "$_claim_held" -eq 0 ] && _claim_owner_dead; then
+    rmdir "$_claim" 2>/dev/null || rm -rf "$_claim" 2>/dev/null || true
+    _claim_try && _claim_held=1
+  fi
+fi
+if [ "$_claim_held" -eq 0 ]; then
+  echo "stitchpad: session-start auto-rejoin SKIPPED — another session is claiming @$name right now" >&2
+  exit 0
+fi
+trap 'rm -rf "$_claim" 2>/dev/null || true' EXIT
+
 adopt=0
 # (1) true resume: this session id already bound to this name
 if [ -n "$sid" ] && [ -f "$pad/.state/sessions/$sid" ]; then
@@ -84,12 +137,37 @@ if [ "$adopt" -eq 0 ]; then
   fi
   [ "$orphan" -eq 1 ] && adopt=1
 fi
-[ "$adopt" -eq 1 ] || exit 0
+if [ "$adopt" -eq 0 ]; then
+  # Not adopting is the normal, silent outcome for a helper session sharing a
+  # pad. But a session that WAITED on the identity claim and then found the
+  # handle taken is the F18 loser — it must not just vanish, or the operator
+  # sees one of two panes mysteriously nameless with nothing said about it.
+  [ "$_claim_waited" -eq 1 ] && \
+    echo "stitchpad: session-start auto-rejoin SKIPPED — @$name was claimed by a session that started at the same moment; this session stays unnamed (run \`stitchpad join\` if you need your own handle)" >&2
+  exit 0
+fi
 
 # Re-bind THIS session id, restart the heartbeat under the live claude pid.
 [ -n "$sid" ] && "$bin" bind-session "$sid" "$name" >/dev/null 2>&1 || true
 STITCHPAD_NAME="$name" STITCHPAD_HEARTBEAT_PARENT_PID="$PPID" \
   "$bin" heartbeat start "$name" >/dev/null 2>&1 || true
+
+# k3 F18: the ticker writes alive.<name> from a FORKED child, so `heartbeat
+# start` returning proves nothing about the file the next session start will
+# read. Hold the claim until the identity is actually published — otherwise the
+# contender we serialized against wakes into the same stale-heartbeat window we
+# just closed. Bounded (~2s); if the heartbeat never comes up we release anyway
+# rather than block a session start on it.
+_hbf="$pad/.state/alive.$name"; _now="$(date +%s)"
+_hbw=0
+while [ "$_hbw" -lt 40 ]; do
+  if [ -f "$_hbf" ]; then
+    _hbts="$(stat -f %m "$_hbf" 2>/dev/null || stat -c %Y "$_hbf" 2>/dev/null || echo 0)"
+    [ "$_hbts" -ge "$_now" ] && break
+  fi
+  sleep 0.05
+  _hbw=$(( _hbw + 1 ))
+done
 
 # Re-pin the push wake target to this terminal (stable across pane moves).
 [ -n "$myterm" ] && "$bin" set-wake "$name" push "$myterm" herdr >/dev/null 2>&1 || true
