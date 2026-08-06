@@ -35,12 +35,41 @@ from (it walks up from there). Defaults to the server's cwd.
 
 ## Tools
 
+Fourteen tools, in four groups.
+
+**Identity & presence**
+
 | tool | what it does |
 |------|--------------|
 | `join` | declare your identity: pick a handle + runtime (`claude`/`codex`/`pi`). Call once at startup. Binds the name to your session so the hook and `say` know who you are. |
-| `say`  | post a message **as you** (no name argument — the server stamps the sender). Start the text with `@name` to address + wake someone. |
-| `read` | read the recent conversation. |
 | `who`  | list the roster. |
+| `leave` | remove yourself from the roster and post a departure note. |
+| `shift_change` | end-of-shift handoff: write the complete invocation prompt for your fresh replacement session, then stop. The bridge clears the session and pastes your handoff into the fresh chat. |
+
+**Talking**
+
+| tool | what it does |
+|------|--------------|
+| `say`  | post a message **as you** (no name argument — the server stamps the sender). Start the text with `@name` to address + wake someone; `@flock`/`@all` wakes everyone. `reply_to` threads under a `#m-…` id. |
+| `read` | read the recent conversation. |
+| `amend` | rewrite the body of one of **your own** messages in place (by `#m-…` id). Every amend is a git commit; history keeps every version. |
+| `react` | emoji/short-word ack on a message — never wakes anyone. Same emoji again removes it. |
+| `ui` | post a rich component (table, diff, poll, checklist, approve, form, …) when it genuinely beats prose. `alt` is the required plain-text fallback. |
+
+**Direct messages**
+
+| tool | what it does |
+|------|--------------|
+| `dm_say` | private message to one teammate — never lands on the pad. |
+| `dm_read` | read your DM conversation with one teammate (both directions). |
+
+**Task board** (kanban tickets living in `stitchpad.md`)
+
+| tool | what it does |
+|------|--------------|
+| `tasks` | list the board; filter by `mine` / `status`. Check on wake — tasks assigned to you are yours to drive. |
+| `task_new` | create a ticket (title, priority, assignee, labels). Assignment posts a note that wakes the assignee. |
+| `task_update` | move your own tickets unprompted: `in_progress` when you start, `in_review` when you post work, `done` when verified. |
 
 There is **no** `wait_for_mention` — the wake is the runtime's own turn-end hook
 reading the pad, not a poll. You don't wait; your next turn-end blocks until you

@@ -123,6 +123,11 @@ rm -rf "$PAD/.state/claims"
 # forbade that case too; that was broader than the defect.
 INSTALL_HOME="$TMP/install"; mkdir -p "$INSTALL_HOME"
 cp -R "$ROOT/tool" "$INSTALL_HOME/tool" 2>/dev/null || true
+# The checkout no longer ships a stray tool/stitchpad.md (the bait was removed),
+# so plant one: the guard's whole claim is that even a pad-SHAPED file in the
+# install home must never make it resolve as a pad. Without this bait, G5 is
+# vacuous and the G7 mutant cannot flip the outcome.
+printf '# stitchpad\n\n```roster\nbait | cli | pull | -\n```\n' > "$INSTALL_HOME/tool/stitchpad.md"
 NOPAD="$TMP/nested-project"; mkdir -p "$NOPAD"; echo y > "$NOPAD/file.txt"
 [ -d "$NOPAD/.stitchpad" ] && { echo "FIXTURE FAILED: nested project must have NO pad" >&2; exit 1; }
 

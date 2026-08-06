@@ -1,8 +1,11 @@
 # r1-watcher-churn — P13 root cause, fix, gate
 
-**Evidence of storm:** `/Users/ecfromthedc/dev/agents/stitchpad-wt/evidence/live-checkout-escapes.log`,
-110 lines spanning 01:38:10–01:39:17. 41 `ensure-watcher` + 34 `watch.sh` spawns in 67 seconds.
-Not steady state — a respawn storm.
+**Evidence of storm:** a machine-local log (`live-checkout-escapes.log`, on the
+operator's machine outside this repo — not preserved in-tree), 110 lines
+spanning 01:38:10–01:39:17. 41 `ensure-watcher` + 34 `watch.sh` spawns in 67
+seconds. Not steady state — a respawn storm. The reproducible half of the
+evidence is `test/watcher-singleton-gate.sh`, which re-creates the storm shape
+without the log.
 
 ## Root cause (two bugs)
 

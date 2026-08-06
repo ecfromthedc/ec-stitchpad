@@ -22,6 +22,14 @@ tool/mcp/package-lock.json
 
 tool/relay/.wrangler/
 
+# machine-local — the "never git add -A" rule, now enforced instead of remembered:
+# keeper runtime config, bridge runtime state, and per-operator wrangler configs
+# (some carry credential-shaped lines). The generic tool/relay/wrangler.toml
+# template stays tracked; the glob below does not match it.
+tool/keeper.conf
+tool/relay/state/
+tool/relay/wrangler.*.toml
+
 tool/stitchpad-git/
 
 # stitchpad runtime (isolated history)

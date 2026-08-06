@@ -101,10 +101,13 @@ sp_prompt_with_ponytail() {
 # ── Pad resolution ──────────────────────────────────────────────────
 # Find the pad dir: explicit $PAD_DIR, else nearest .stitchpad up the tree.
 # The install home is ~/.stitchpad -> <checkout>/tool, which matches the very
-# marker name this walk-up looks for — and the checkout ships tool/stitchpad.md,
-# so it reads as a fully valid pad. Without this guard every directory under
-# $HOME resolves to it: writes land in the tracked repo file, and the claim hook
-# denies Write/Edit machine-wide. Never treat the install home as a pad.
+# marker name this walk-up looks for. The checkout used to ship a stray
+# tool/stitchpad.md (removed — it was a real pad's debris), which made the
+# install home read as a fully valid pad: every directory under $HOME resolved
+# to it, writes landed in the tracked repo file, and the claim hook denied
+# Write/Edit machine-wide. The guard stays as defense-in-depth — any
+# pad-shaped file that lands in the install home must never make it a pad
+# (p29-p30-claim-hook-gate plants exactly that bait to prove it).
 sp_is_install_home() {
   local cand="$1" home
   home="$(cd "${STITCHPAD_HOME:-$HOME/.stitchpad}" 2>/dev/null && pwd -P)" || return 1

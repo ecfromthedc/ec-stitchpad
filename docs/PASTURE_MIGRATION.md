@@ -1,5 +1,16 @@
 # Pasture migration — the full rename, staged so nothing breaks mid-shift
 
+> **Current stage (2026-08-06): Stage 1 landed; Stage 2 complete on the main
+> Mac.** The compat layer is live (`sp_find_pad` resolves `.pasture/` first,
+> then `.stitchpad/`; `PASTURE_*` env wins with `STITCHPAD_*` fallback), the
+> launchd bridge runs as `org.pasture.bridge`, and `~/.stitchpad` and
+> `~/.pasture` resolve to the same place. Stages 3–4 (per-pad flip, residue
+> sweep) are NOT started — which is why `stitchpad` is still the name you see
+> in most paths, the CLI, and the env. Both names work everywhere. Note: the
+> in-repo `stitchpad bridge install` still writes the legacy
+> `org.stitchpad.bridge` label — a fresh machine gets that label until its own
+> Stage 2; the main Mac's pasture-labeled plists were the Stage-2 migration.
+
 Goal: zero "stitchpad" anywhere — repo, code, dirs, env, plugins, launchd, app — without
 dropping a single wake, DM, or task while three live crews keep working.
 
@@ -27,7 +38,9 @@ AND on a legacy-named one, same binary.
 ## Stage 2 — repo + install rename (one machine at a time, any time after Stage 1)
 - `~/stitchpad` → `~/pasture` with symlink `~/stitchpad → ~/pasture` (hooks in
   ~/.claude/settings.json and ~/stitchpad-md checkouts keep working via symlink)
-- `tool/bin/stitchpad` → `tool/bin/pasture` (+ back-compat symlink), same for tui
+- `tool/bin/pasture` + `tool/bin/pasture-tui` exist as symlinks to the
+  `stitchpad` binaries (the tree kept `stitchpad` as the real file and made
+  `pasture` the alias — the reverse of the original plan, same effect)
 - `~/.stitchpad` install → `~/.pasture` + symlink
 - launchd: install org.pasture.bridge plist, bootout org.stitchpad.bridge (same binary path
   via new names)
@@ -47,13 +60,11 @@ then gutenburg (Eric coordinated), then ocean-os, then ocean-surface.
 - Update AGENTS/handoff docs, personas, memory notes; retire the old repo name on GitHub
 
 ## Machines checklist
-- [ ] this Mac (Stage 1+2 by claude/surface)
-- [ ] johns-macbook-air (SSH ready; ~/stitchpad-md checkout + ~/.stitchpad install)
-- [ ] erics-mac-mini (BLOCKED: needs Remote Login + key; or Eric runs the script himself)
-- [ ] Eric's worker env duplicates (via CF API, same account)
+- [x] main Mac (Stage 1+2 complete — see the stage marker at the top)
+- [ ] each remaining machine runs Stage 2 when its operator has a window
+      (per-operator details live in evidence/, not here)
 
 ## Human calls needed
 1. Channel noun confirmed: "Pastures" (alternative if preferred: "Paddocks" — herding-true
    for per-project rooms; one-line change)
 2. The Stage-3 window per active pad (agents idle ~2 min each)
-3. Eric: SSH access or self-serve script run

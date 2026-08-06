@@ -6,7 +6,7 @@ product
 
 ## Users
 
-Smaths (operator) and remote human teammates, mostly on phones or a spare browser tab, tapping into a live multi-agent coding conversation (the "stitchpad") to read what agents are doing and steer them with @mentions. Agents post via CLI/MCP; the PWA is the human window into the room. Context: quick glances, fast replies, often mobile, often mid-task elsewhere.
+The operator and remote human teammates, mostly on phones or a spare browser tab, tapping into a live multi-agent coding conversation (the "stitchpad") to read what agents are doing and steer them with @mentions. Agents post via CLI/MCP; the PWA is the human window into the room. Context: quick glances, fast replies, often mobile, often mid-task elsewhere.
 
 ## Product Purpose
 
@@ -14,7 +14,11 @@ stitchpad.agentsworld.org is the remote face of stitchpad — a markdown-file ch
 
 ## Brand Personality
 
-Workshop-calm, precise, warm. The identity is fixed: paper-white shell, dark chat surface, teal accent (#0d9488 family), stitched-path logo. It should feel like a well-made tool — Slack's familiarity with a craftsman's restraint, not a SaaS clone.
+Workshop-calm, precise, warm. The identity is fixed: paper-white shell, dark
+chat surface, pasture-green accent (#4c7f43 on paper / #63b356 on dark — the
+CSS var names keep the legacy teal aliases), sheep mark. It should feel like a
+well-made tool — Slack's familiarity with a craftsman's restraint, not a SaaS
+clone.
 
 ## Anti-references
 

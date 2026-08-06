@@ -1,7 +1,8 @@
 # 48-HOUR OPERATOR PAIN LEDGER — every incident that cost real time
 # Captain's firsthand experience running a 34-seat fleet on stitchpad.
 # Each entry: OBSERVED (what happened) -> REQUIRED (product behaviour) -> GATE.
-# Tip: bc64aaa
+# Tip: 9c9ad0b (finish-session close-out; P-numbers P24/P43/P44 were never assigned
+#      in this file — the p43/p44 GATES exist and are baselined)
 
 ## TIER 1 — DISPATCH LAYER (an agent that does nothing looks like an agent working)
 

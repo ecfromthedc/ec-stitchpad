@@ -1,8 +1,0 @@
-name = "ec-stitchpad-redirect"
-main = "legacy-redirect.js"
-account_id = "d5fbf64067844a591842c14f1b53bd79"
-compatibility_date = "2026-06-01"
-
-routes = [
-  { pattern = "ec-stitchpad.agentsworld.org", custom_domain = true }
-]
