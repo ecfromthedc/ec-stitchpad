@@ -60,6 +60,20 @@ echo "--- durable commands under forced commit failure ---"
 probe "set-wake"     set-wake alice push -
 probe "rename"       rename bob bobby
 probe "task migrate" task migrate
+# amend and react were the two survivors of the family this gate was written for:
+# both called a bare sp_commit and then printed "✓" unconditionally, so a failed
+# commit left the rewritten body / the reaction line in the WORKING pad, absent
+# from history, with rc=0 telling the author it landed. The next successful write
+# then commits that state as though it had always been there. Not covered here
+# before, which is exactly how they survived the audit that fixed the other five.
+_cfp_mid="$(grep -oE '#m-[0-9a-f]+' "$WORK/.stitchpad/stitchpad.md" 2>/dev/null | head -1 | tr -d '#')"
+if [ -n "$_cfp_mid" ]; then
+  probe "amend" amend "$_cfp_mid" "amended under forced commit failure"
+  probe "react" react "$_cfp_mid" "👍"
+else
+  bad "amend/react: INVALID PROBE (no message id found in the pad to target)"
+  bad "react: INVALID PROBE (no message id found in the pad to target)"
+fi
 # compact and archive both CONSUME messages, so each needs its own fresh supply —
 # otherwise whichever runs second is a no-op and proves nothing.
 probe "compact"      compact --keep 2

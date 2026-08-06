@@ -255,8 +255,21 @@ else:
     server.handle_request()
 PY
   SERVER_PID=$!
-  for _ in $(seq 1 100); do [ -s "$_port_file" ] && return; sleep 0.02; done
-  fail "HTTP fixture did not start"
+  # STARTUP BUDGET. This was 100 x 0.02s = 2 seconds, which is fine for a suite
+  # run on its own and NOT fine inside the full release gate: booting a fresh
+  # python3 and binding a socket on a machine already running 90 suites (and a
+  # live fleet's launchd keeper every 120s) routinely takes longer than that.
+  # When it did, `fail` fired before the suite printed its RESULTS line, so the
+  # tripwire saw no parseable output AND a non-zero exit and scored the suite
+  # PARSE_ERR / CRASHED — a red release gate caused entirely by how busy the
+  # machine was, on a suite that passes 5 out of 5 standalone.
+  # The assertions this fixture supports are about how `health` classifies
+  # malformed and spoofed URLs; how fast python starts is not one of them, so
+  # the budget is raised rather than any check being softened. It still FAILS
+  # LOUDLY on a genuine no-start — the message just says how long it waited.
+  _fixture_wait_iters=750       # 750 x 0.02s = 15s
+  for _ in $(seq 1 $_fixture_wait_iters); do [ -s "$_port_file" ] && return; sleep 0.02; done
+  fail "HTTP fixture ($_mode) did not start within $((_fixture_wait_iters / 50))s"
 }
 
 # Pin malformed and spoofed URL classification independently of urllib.parse

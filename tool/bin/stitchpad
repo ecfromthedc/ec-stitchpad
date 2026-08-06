@@ -2652,7 +2652,16 @@ PY
     rc=$?
     rm -f "$bodyf"
     case "$rc" in
-      0) sp_commit "amend: $from #$target"; sp_unlock; echo "✓ amended #$target" ;;
+      0) # Checked commit: an unchecked sp_commit here printed "✓ amended" rc=0
+         # even when the commit failed, leaving the rewritten body in the working
+         # pad but not in history — and the NEXT successful write then commits it
+         # as if it had always been there.
+         if ! sp_commit_or_fail "amend: $from #$target"; then
+           sp_unlock
+           echo "stitchpad: amend NOT recorded — #$target was rewritten in the working pad but the commit did not land" >&2
+           exit 1
+         fi
+         sp_unlock; echo "✓ amended #$target" ;;
       2) sp_unlock; echo "stitchpad: message #$target not found" >&2; exit 1 ;;
       3) sp_unlock; echo "stitchpad: #$target is not your message — only the author amends" >&2; exit 1 ;;
       *) sp_unlock; echo "stitchpad: amend failed" >&2; exit 1 ;;
@@ -2786,12 +2795,24 @@ PY
     _rline="$(grep -nF "*@$from reacted $emoji to $target" "$PAD_MD" 2>/dev/null | head -1 | cut -d: -f1)"
     if [ -n "$_rline" ]; then
       sed -i '' "${_rline}d" "$PAD_MD" 2>/dev/null || sed -i "${_rline}d" "$PAD_MD"
-      sp_commit "react: $from -$emoji $target"
+      # sp_commit, not sp_commit_or_fail, meant a failed commit still printed ✓
+      # and exited 0 — the working pad silently diverging from its own history
+      # while the author is told it landed. say/rename/restore-roster all use the
+      # checked form; react and amend were the two that did not.
+      if ! sp_commit_or_fail "react: $from -$emoji $target"; then
+        sp_unlock
+        echo "stitchpad: reaction NOT recorded — the pad file changed but the commit did not land" >&2
+        exit 1
+      fi
       sp_unlock
       echo "✓ un-reacted $emoji"
     else
       sp_system "@$from reacted $emoji to $target"
-      sp_commit "react: $from $emoji $target"
+      if ! sp_commit_or_fail "react: $from $emoji $target"; then
+        sp_unlock
+        echo "stitchpad: reaction NOT recorded — the pad file changed but the commit did not land" >&2
+        exit 1
+      fi
       sp_unlock
       echo "✓ reacted $emoji to $target"
     fi
@@ -5377,11 +5398,18 @@ sys.exit(1)
     # after a terminal session are the loudest signal in the fleet.
     sp_init_paths_readonly || exit 1
     if [ "${1:-}" = "--json" ]; then
-      local _names _proj _now _name _status _age _art _present _verdict
+      # NO `local` HERE. This is the top level of a case arm, not a function
+      # body, and bash rejects `local` outside a function — it printed
+      #   stitchpad: line NNNN: local: can only be used in a function
+      # to stderr TWICE on every single `lanes --json`, healthy pad or not. The
+      # command still worked (the names silently became globals and stdout still
+      # parsed), which is exactly why it survived: only stderr was wrong, so
+      # every cron, CI job and daemon capturing it logged two garbage lines per
+      # call while the "--json is clean" contract quietly did not hold.
       _now="$(date +%s)"
       _proj="$(sp_session_registry_project 2>/dev/null || echo '[]')"
       echo '['
-      local _first=1
+      _first=1
       for _claim in "$PAD_STATE"/artifact-expect.*; do
         [ -f "$_claim" ] || continue
         _name="${_claim##*/artifact-expect.}"

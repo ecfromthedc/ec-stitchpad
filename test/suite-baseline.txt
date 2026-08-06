@@ -9,14 +9,14 @@
 # suite-baseline.txt — recorded pass/fail counts for every test suite.
 absorb-completeness-gate.sh 21 0
 agent-visibility-gate.sh 25 0
-artifact-contract-gate.sh 18 0
+artifact-contract-gate.sh 21 0
 authority-hardfix-regression.sh 24 0
 authority-redesign-regression.sh 29 0
 bridge-heartbeat-interval.sh 3 0
 clear-regression.sh 9 0
 color-bash32.sh 0 0
 command-dispatch-gate.sh 91 0
-commit-fail-postcondition-gate.sh 6 0
+commit-fail-postcondition-gate.sh 8 0
 concurrency-round5-regression.sh 8 0
 coordination-lifecycle-slice-a.sh 7 0
 coordination-lifecycle-sliceB.sh 30 0

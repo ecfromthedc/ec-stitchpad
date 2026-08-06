@@ -230,6 +230,39 @@ fi
 # =========================================================================
 # VERDICT
 # =========================================================================
+# G6: `lanes --json` is MACHINE output — stderr must be empty
+# The json branch declared `local _names …` and `local _first=1` at the top level
+# of the case arm, which is not a function body, so bash rejected each one and
+# printed "local: can only be used in a function" to stderr TWICE per call. The
+# command still worked (the names became globals, stdout still parsed), so it was
+# invisible from the terminal — while every cron, CI job and daemon capturing
+# stderr logged two garbage lines on every single invocation.
+# =========================================================================
+echo ""
+echo "--- G6: lanes --json emits nothing on stderr ---"
+_LJ_ERR="$(mktemp "${TMPDIR:-/tmp}/lanes-json-err.XXXXXX")"
+"$STITCHPAD_HOME/bin/stitchpad" lanes --json >/dev/null 2>"$_LJ_ERR" || true
+if [ -s "$_LJ_ERR" ]; then
+  bad "G6: lanes --json wrote to stderr: $(head -2 "$_LJ_ERR" | tr '\n' ' ')"
+else
+  ok "G6: lanes --json leaves stderr empty"
+fi
+# The shape assertion, so this cannot regress into a different top-level `local`:
+if grep -qE "can only be used in a function" "$_LJ_ERR" 2>/dev/null; then
+  bad "G6b: a 'local' outside a function is still being executed in the lanes arm"
+else
+  ok "G6b: no out-of-function variable declaration is reached by lanes --json"
+fi
+# stdout must remain parseable JSON — the point is to silence stderr, not to
+# change what the board emits.
+if "$STITCHPAD_HOME/bin/stitchpad" lanes --json 2>/dev/null | python3 -c 'import json,sys; json.load(sys.stdin)' 2>/dev/null; then
+  ok "G6c: lanes --json still emits valid JSON on stdout"
+else
+  bad "G6c: lanes --json stdout is not valid JSON"
+fi
+rm -f "$_LJ_ERR"
+
+# =========================================================================
 echo ""
 echo "=== RESULTS ==="
 echo "Passed:  $PASSED"
