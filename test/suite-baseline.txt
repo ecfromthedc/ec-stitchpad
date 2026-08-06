@@ -56,6 +56,7 @@ rc1-c11-c13-regression.sh 13 0
 recover-migrated-pad.sh 40 0
 recovery-hardening3-regression.sh 67 0
 recovery-round7-regression.sh 27 0
+rename-state-carry-gate.sh 15 0
 reset-recovery.sh 0 0
 rp2-directory-pathspec-gate.sh 10 0
 roster-recovery-guard-regression.sh 21 0

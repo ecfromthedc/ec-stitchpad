@@ -1006,6 +1006,39 @@ You may spawn your own sub-agents (stitchpad spawn <name> --brief ... --artifact
     case "$new" in *[!abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789_-]*) echo "stitchpad: bad name '$new' (allowed: a-z 0-9 _ -)" >&2; exit 1;; esac
     sp_user_exists "$old" || { echo "stitchpad: @$old not in roster" >&2; exit 1; }
     sp_user_exists "$new" && { echo "stitchpad: @$new already in roster" >&2; exit 1; }
+    # Every simple name-keyed state file this arm knows how to carry across.
+    # Declared ONCE and used twice — the pre-flight refusal below and the move
+    # loop further down — so the two can never disagree about what is handled.
+    _rename_prefixes="seen seen.relay count alive role level runtime forcewake dnd
+      delivered_no_reply ocean-session seat-model resolved-model model
+      keeper-strike keeper-obs keeper-last supervise-strikes
+      artifact-expect authority scope scope-cleared scope-violation
+      operator-grant pending"
+    # PRE-FLIGHT. The old list stopped at delivered_no_reply, so .state/ocean-session.<old>
+    # survived a rename: seat-keeper iterates ocean-session.* and logged
+    # "SEAT NOT ON ROSTER" forever for a name that no longer existed, while the
+    # renamed seat had no binding file and was never considered — the
+    # anti-starvation watchdog silently stopped covering the one seat it was
+    # watching. An allow-list rots; the point of this check is that the NEXT
+    # omission is loud instead.
+    # It runs BEFORE any mutation on purpose. Checking after the roster rewrite
+    # would refuse with the pad file already renamed and the commit not taken —
+    # trading a silent state leak for a working pad that disagrees with its own
+    # history, which is strictly worse.
+    _unknown_state=""
+    for _f in "$PAD_STATE"/*."$old"; do
+      [ -e "$_f" ] || continue
+      _bn="$(basename "$_f")"; _pfx="${_bn%".$old"}"; _known=0
+      for _k in $_rename_prefixes; do [ "$_pfx" = "$_k" ] && { _known=1; break; }; done
+      [ "$_known" -eq 1 ] || _unknown_state="${_unknown_state:+$_unknown_state }$_bn"
+    done
+    if [ -n "$_unknown_state" ]; then
+      echo "stitchpad: refusing to rename @$old — unrecognised state file(s): $_unknown_state" >&2
+      echo "  rename does not know how to carry these to @$new, and leaving them behind is how" >&2
+      echo "  a renamed push seat goes invisible to seat-keeper. Add the prefix to" >&2
+      echo "  _rename_prefixes in the rename arm of $0." >&2
+      exit 1
+    fi
     sp_stop_delivery_worker "$old"
     if sp_delivery_ocean_unresolved_after_stop "$old"; then
       echo "stitchpad: refusing to rename @$old — Ocean acceptance/cancellation outcome is unresolved" >&2
@@ -1041,7 +1074,14 @@ You may spawn your own sub-agents (stitchpad spawn <name> --brief ... --artifact
     perl -pe 's/\@\Q'"$old"'\E(?![A-Za-z0-9_-])/\@'"$new"'/g' "$PAD_MD" > "$tmp" \
       && sp_write_inplace "$tmp" "$PAD_MD"
     # per-agent state files keyed by name
-    for _pfx in seen seen.relay count alive role level runtime forcewake dnd delivered_no_reply; do
+    # This list used to stop at delivered_no_reply, and the omission was not
+    # cosmetic: .state/ocean-session.<old> stayed put, so seat-keeper — which
+    # iterates ocean-session.* — kept logging "SEAT NOT ON ROSTER" for a name
+    # that no longer exists while the renamed seat, having no binding file, was
+    # never considered at all. The anti-starvation watchdog silently stopped
+    # covering the seat, which is the exact failure it exists to prevent. Model
+    # pins and keeper counters were stranded the same way.
+    for _pfx in $_rename_prefixes; do
       [ -f "$PAD_STATE/$_pfx.$old" ] && mv "$PAD_STATE/$_pfx.$old" "$PAD_STATE/$_pfx.$new" 2>/dev/null
     done
     # The worker is stopped above, so all remaining delivery artifacts are
@@ -1066,6 +1106,27 @@ You may spawn your own sub-agents (stitchpad spawn <name> --brief ... --artifact
       IFS='|' read -r _lp _ln _lt < "$_f"
       [ "$_lp" = "$PAD_DIR" ] && [ "$_ln" = "$old" ] && printf '%s|%s|%s' "$PAD_DIR" "$new" "$_lt" > "$_f"
     done
+    # POST-CONDITION: prove the claim before printing it.
+    # An allow-list of prefixes is guaranteed to rot — it already did, silently,
+    # and the only symptom was a watchdog that stopped watching. So rather than
+    # trust the list, look for what it was supposed to eliminate: any remaining
+    # simple name-keyed file for the OLD name. Compound keys are deliberately not
+    # matched here — heartbeat.<name>.lock is a directory the ticker restart owns,
+    # and delivery.<name>.<suffix> is moved by its own loop above.
+    # This does not mv anything on its own: a new state file added later must be
+    # added to the list ABOVE. It just makes the omission loud instead of silent.
+    _stale_state=""
+    for _f in "$PAD_STATE"/*."$old"; do
+      [ -e "$_f" ] || continue
+      _stale_state="${_stale_state:+$_stale_state }$(basename "$_f")"
+    done
+    if [ -n "$_stale_state" ]; then
+      sp_unlock
+      echo "stitchpad: rename INCOMPLETE — these state files still key on @$old: $_stale_state" >&2
+      echo "  the roster row moved but this state did not; a push seat renamed in this condition" >&2
+      echo "  goes invisible to seat-keeper. Add the prefix to the rename list in this arm." >&2
+      exit 1
+    fi
     sp_system "@$old is now @$new"
     # S3: rename rewrites roster bytes, per-agent state, delivery artifacts,
     # session bindings and terminal locks on disk. An unrecorded rename leaves
