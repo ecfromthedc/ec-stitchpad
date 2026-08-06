@@ -3083,6 +3083,44 @@ sp_watch_launcher_lease_is_fresh() {
   [ "$age" -ge 0 ] && [ "$age" -lt "${STITCHPAD_WATCH_RESTART_GRACE:-5}" ]
 }
 
+# OPEN #1 (watcher-races under load): a LIVE supervisor must never be scored
+# dead on ONE stale wall-clock observation. In the daemon's ownerless restart
+# gap the supervisor stamps $lock/heartbeat, sleeps 2s, and re-proves its own
+# ownership three times (each check forks python3) before stamping again — on
+# a busy machine that stretches past the restart grace while the process is
+# alive and merely descheduled, and the cost of the wrong verdict is a
+# CANCELLED LIVE GENERATION. Process-liveness (exact manifest + kill -0) is
+# load-robust and decides WHO holds the lock; the lease decides only whether
+# it is MAKING PROGRESS — and "no progress" needs two observations a full
+# grace apart with the SAME heartbeat stamp before it means dead. A single
+# slow moment can no longer cancel a live supervisor; a genuinely wedged one
+# is still reclaimed, one grace later than before.
+# Returns 0: treat the live launcher as ALIVE (first stale observation, or the
+#            stamp advanced since the last one — it is making progress).
+# Returns 1: launcher not live, or provably not progressing across a grace.
+sp_watch_live_launcher_stale_verdict() {
+  local lock="$1" generation="$2" strike="$PAD_STATE/.watch-stale-strike"
+  local stamp now prev prev_gen prev_rest prev_stamp prev_seen
+  sp_watch_launcher_is_live "$lock" || return 1
+  stamp="$(cat "$lock/heartbeat" 2>/dev/null || true)"
+  now="$(date +%s)"
+  prev="$(cat "$strike" 2>/dev/null || true)"
+  prev_gen="${prev%%|*}"; prev_rest="${prev#*|}"
+  prev_stamp="${prev_rest%%|*}"; prev_seen="${prev_rest#*|}"
+  if [ -n "$prev" ] && [ "$prev_gen" = "$generation" ] && [ "$prev_stamp" = "$stamp" ]; then
+    case "$prev_seen" in ''|*[!0-9]*) prev_seen="$now" ;; esac
+    if [ $((now - prev_seen)) -ge "${STITCHPAD_WATCH_RESTART_GRACE:-5}" ]; then
+      rm -f "$strike" 2>/dev/null || true
+      return 1
+    fi
+    return 0
+  fi
+  printf '%s|%s|%s' "$generation" "$stamp" "$now" > "$strike.tmp.$$" 2>/dev/null \
+    && mv "$strike.tmp.$$" "$strike" 2>/dev/null \
+    || rm -f "$strike.tmp.$$" 2>/dev/null || true
+  return 0
+}
+
 sp_watch_test_barrier_wait() {
   local barrier="$1" label="$2" i=0 limit="${STITCHPAD_WATCH_TEST_BARRIER_TICKS:-500}"
   case "$limit" in ''|*[!0-9]*) limit=500 ;; esac
@@ -3206,6 +3244,12 @@ sp_watcher_alive() {
         && rm -f "$watch_lock/owner" "$watch_lock/pid" "$watch_lock/ts" 2>/dev/null || true
       return 0
     fi
+    # Stale lease but the launcher itself is verifiably LIVE: defer the death
+    # verdict until no-progress is proven across a full grace (OPEN #1). No
+    # mutation here — fresh evidence or a matured strike decides the next call.
+    if sp_watch_live_launcher_stale_verdict "$watch_lock" "$generation"; then
+      return 0
+    fi
     sp_watch_lock_remove_generation "$watch_lock" "$generation" 2>/dev/null || true
     return 1
   fi
@@ -3213,9 +3257,13 @@ sp_watcher_alive() {
   if sp_watch_launcher_lease_is_fresh "$watch_lock" "$generation"; then return 0; fi
   if ! sp_watch_launcher_is_live "$watch_lock"; then
     sp_watch_lock_remove_generation "$watch_lock" "$generation" 2>/dev/null || true
-  else
-    echo "stitchpad: live launcher has not published a watcher owner" >&2
+    return 1
   fi
+  # Live launcher, stale lease: one slow moment is not death (OPEN #1).
+  if sp_watch_live_launcher_stale_verdict "$watch_lock" "$generation"; then
+    return 0
+  fi
+  echo "stitchpad: live launcher has not published a watcher owner" >&2
   return 1
 }
 
@@ -3538,6 +3586,11 @@ sp_reap_duplicate_watchers_for_pad() {
   # No fswatch during the bounded startup/restart phase is healthy when the
   # exact supervisor lease is fresh; do not cancel it based on a missing pid.
   [ "$count" -eq 0 ] && sp_watch_launcher_lease_is_fresh "$watch_lock" "$generation" && return 0
+  # Same judgment under load (OPEN #1): a stale lease on a verifiably LIVE
+  # launcher is not death until no-progress is proven across a full grace —
+  # this reap runs right after sp_watcher_alive said yes, and cancelling here
+  # would undo that verdict on the same slow moment.
+  [ "$count" -eq 0 ] && sp_watch_live_launcher_stale_verdict "$watch_lock" "$generation" && return 0
 
   sp_stop_watchers_for_pad
   return 1

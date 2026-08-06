@@ -88,6 +88,7 @@ tripwire-gate.sh 38 0
 wake-regression.sh 0 0
 watcher-containment-gate.sh 10 0
 watcher-fswatch-restart-gate.sh 8 0
+watcher-live-lease-gate.sh 9 0
 watcher-ordering-gate.sh 3 0
 watcher-races.sh 0 0
 watcher-singleton-gate.sh 10 0
