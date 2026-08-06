@@ -31,7 +31,7 @@ empty-lock-reclaim-gate.sh 17 0
 evidence-labeling.sh 0 0
 evidence-verify-gate.sh 8 0
 false-success-gate.sh 2 0
-finish-round-gate.sh 9 0
+finish-round-gate.sh 14 0
 fixture-bleed-gate.sh 5 0
 fixture-reap-gate.sh 9 0
 heal-roster-regression.sh 19 0

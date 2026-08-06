@@ -121,6 +121,55 @@ else
   ok "R5b: a genuinely in-flight delivery still blocks removal"
 fi
 
+# ── R6 (k3 F8): the keeper must not switch itself off in silence ───────────
+# The missing-heartbeat-binary check sat ABOVE log(), so all it could do was
+# echo to stderr and exit 0. Under launchd stderr goes nowhere a person reads,
+# so the fleet's watchdog turned itself off and reported success with keeper.log
+# — the one file an operator opens — completely empty.
+R6D="$TMP/r6"; mkdir -p "$R6D"
+printf '/tmp\n' > "$R6D/keeper.conf"
+_r6_rc=0
+OCEAN_HEARTBEAT_BIN="$R6D/not-a-real-binary" \
+  SEAT_KEEPER_CONF="$R6D/keeper.conf" SEAT_KEEPER_LOG="$R6D/keeper.log" \
+  /bin/bash "$TOP/tool/bin/seat-keeper.sh" >/dev/null 2>&1 || _r6_rc=$?
+if [ "$_r6_rc" -ne 0 ]; then
+  ok "R6: a keeper that cannot wake anything exits non-zero"
+else
+  bad "R6: keeper exited 0 while doing nothing — it reported success for an off watchdog"
+fi
+if [ -s "$R6D/keeper.log" ] && grep -q 'FLEET UNATTENDED' "$R6D/keeper.log"; then
+  ok "R6b: the reason is written to keeper.log, where an operator will find it"
+else
+  bad "R6b: keeper.log is empty — the failure is invisible in the one place people look"
+fi
+
+# ── R7 (k3 F10): the wake hook fails open, but never without a trace ───────
+# A Stop hook that errors can wedge the runtime, so exit 0 is correct. Exit 0
+# with NO record is not: every claude/codex seat goes deaf at once while the
+# heartbeat keeps them looking alive.
+R7D="$TMP/r7"; mkdir -p "$R7D"
+_r7_rc=0
+env -i HOME="$R7D" PATH=/usr/bin:/bin STITCHPAD_HOOK_LOG="$R7D/hook.log" \
+  /bin/bash "$TOP/tool/adapters/stop-hook.sh" </dev/null >/dev/null 2>&1 || _r7_rc=$?
+if [ "$_r7_rc" -eq 0 ]; then
+  ok "R7: the hook still fails OPEN when the CLI is missing (exit 0)"
+else
+  bad "R7: hook exited $_r7_rc — a failing Stop hook can wedge the runtime"
+fi
+if [ -s "$R7D/hook.log" ]; then
+  ok "R7b: a breadcrumb records why the seat went deaf"
+else
+  bad "R7b: the seat goes deaf with no trace anywhere"
+fi
+env -i HOME="$R7D" PATH=/usr/bin:/bin STITCHPAD_HOOK_LOG="$R7D/hook.log" \
+  /bin/bash "$TOP/tool/adapters/stop-hook.sh" </dev/null >/dev/null 2>&1 || true
+_r7_lines="$(wc -l < "$R7D/hook.log" 2>/dev/null | tr -d ' ')"
+if [ "${_r7_lines:-0}" = "1" ]; then
+  ok "R7c: the breadcrumb is rate-limited (2 calls, 1 line) — a hook runs constantly"
+else
+  bad "R7c: hook log grew to $_r7_lines lines over 2 calls — unbounded on every turn end"
+fi
+
 echo ""
 echo "=== RESULTS: $pass PASS, $fail FAIL ==="
 [ "$fail" -eq 0 ] || exit 1

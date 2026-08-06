@@ -85,8 +85,6 @@ done
 
 [ -f "$HOME/.pasture/keeper.off" ] && exit 0
 [ -f "$CONF" ] || exit 0
-[ -x "$HB" ] || { echo "seat-keeper: no heartbeat binary at $HB" >&2; exit 0; }
-
 log() {
   printf '[%s] %s\n' "$(date '+%Y-%m-%d %H:%M:%S')" "$*" >> "$LOG"
   [ "$REPORT" -eq 1 ] && printf '  %s\n' "$*"
@@ -103,6 +101,19 @@ log_rl() {
   echo "$now" > "$stamp" 2>/dev/null
   log "$@"
 }
+
+# MISSING HEARTBEAT BINARY (k3 F8). This check used to sit ABOVE log(), so all it
+# could do was `echo ... >&2; exit 0` — and under launchd stderr goes nowhere a
+# person looks. The watchdog for the entire fleet therefore switched itself off
+# and reported success, with keeper.log — the one file an operator opens —
+# completely empty. Moved below the log helpers so the failure lands where it
+# will be READ, and the exit code now says what happened. Rate-limited, because
+# this runs every 120 seconds and an unbounded log is its own outage.
+if [ ! -x "$HB" ]; then
+  log_rl "$(dirname "$LOG")/.keeper-no-hb" \
+    "FLEET UNATTENDED: no heartbeat binary at $HB — seat-keeper cannot wake any seat and is doing nothing. Set OCEAN_HEARTBEAT_BIN or build ocean-heartbeat."
+  exit 1
+fi
 
 # keep the log bounded
 if [ -f "$LOG" ] && [ "$(wc -l < "$LOG")" -gt 2000 ]; then
