@@ -865,3 +865,52 @@ flake. With the leak fixed and watchers holding flat at 4-5 instead of growing
 was real, severe (219 processes) and is now fixed; it was NOT the cause of the
 flake. Correlation, and I stated it too strongly. The flake needs its own
 investigation and the suite stays quarantined until it has one.
+
+---
+
+## P49 — the busy-ack was never actually posted; the operator waited in silence (FIXED)
+
+**This was the ~50% `operator-conduct-gate` flake, and it was a PRODUCT bug the
+whole time — not a test problem.** Fixed and stable: 8 green runs out of 8, where
+the suite previously failed about half the time going back to `1b59398`.
+
+### The mechanism
+When a mention arrives for a seat that is mid-turn, the delivery worker defers and
+posts an acknowledgement so the operator knows the question was queued rather than
+dropped. The code says exactly that:
+
+```
+# P22 OPERATOR-CONDUCT: a mention arriving while the agent is mid-turn
+# gets an IMMEDIATE ack posted to the pad. The operator never waits
+# in silence wondering whether the question was queued or dropped.
+```
+
+The code did not do that. `_busy_ack_stage` writes a **marker file** and the pad
+line is only appended later by `_busy_ack_post_pending`, which runs inside
+`react()` — and `react()` only runs on an fswatch event. After a busy defer,
+**nothing writes the pad**: the adapter writes to `.state`. So no event arrived,
+`react()` never ran again, and the ack sat staged forever.
+
+That is why every failing run had `.state/.busy-ack.pro5.1` present and no
+`mid-lane` line in the pad. It passed roughly half the time only when some
+unrelated write happened to fire another event first. The comment promising the
+operator "never waits in silence" described the exact opposite of the behaviour.
+
+### The fix
+Post the ack where it is staged, which is what the comment always claimed:
+staging first (so it stays idempotent per ordinal), then an immediate
+lock-and-post; a lock we cannot take right now simply leaves the marker. Plus a
+belt-and-braces flush on the watcher's idle tick for anything still staged.
+A courtesy must never break delivery, so every failure in that path is swallowed.
+
+### The suite's own mutant had to be rewritten too
+G4 proved causality by RACING the mechanism — a background loop deleting
+`.busy-ack.*` every 0.3s. That only ever won because posting was deferred by
+seconds. With the ack posted immediately the deleter cannot win, and the mutant
+stopped proving anything. It now disables the MECHANISM instead of out-running it
+(`_busy_ack_stage` stubbed to a no-op in a copied tool tree), which is both
+robust and a stronger claim: with staging disabled, no ack may appear by any path.
+It also carries an explicit MUTANT-DID-NOT-APPLY branch.
+
+`operator-conduct-gate.sh` is **out of quarantine** and back under enforcement at
+8 assertions. There are now no quarantined suites.

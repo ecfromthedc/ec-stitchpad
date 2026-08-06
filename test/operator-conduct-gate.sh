@@ -236,60 +236,59 @@ _cleanup_pids
 sleep 1
 
 # ===========================================================================
-# G4: MUTANT — delete ack markers → no ack
+# G4: MUTANT — disable the ack MECHANISM -> no ack
 # ===========================================================================
+# This used to race the mechanism: a background loop deleted .busy-ack.* every
+# 0.3s and the test asserted no ack appeared. That only ever won because posting
+# was DEFERRED to the next react() cycle, seconds later. Now the ack is posted
+# immediately at stage time (that deferral WAS the ~50% flake — the marker was
+# written and the pad line never landed), so a deleter can no longer win the race
+# and the mutant stopped proving anything.
+# A mutant must disable the MECHANISM, not out-run it: _busy_ack_stage is
+# stubbed to a no-op in a copied tool tree. The assertion is unchanged and
+# stronger — with staging disabled, no ack may appear by any path.
 echo ""
-echo "--- G4: mutant — no ack when markers deleted ---"
+echo "--- G4: mutant — no ack when staging is disabled ---"
 
 G4_HOME="$TMP/g4-home"
 G4_PAD="$TMP/g4-pad"
-mkdir -p "$G4_HOME" "$G4_PAD"
-G4_STATE="$G4_PAD/.stitchpad/.state"
-NS4="conduct-g4-$$"
+MUT4="$TMP/g4-tool"
+mkdir -p "$G4_HOME" "$G4_PAD" "$MUT4"
+cp -R "$ROOT/tool/." "$MUT4/"
+if python3 - "$MUT4/bin/watch.sh" <<'MUTPY'
+import sys
+p = sys.argv[1]; s = open(p, encoding='utf-8').read()
+old = "_busy_ack_stage() {"
+if s.count(old) != 1:
+    sys.stderr.write("MUTANT DID NOT APPLY\n"); sys.exit(9)
+open(p, 'w', encoding='utf-8').write(s.replace(old, "_busy_ack_stage() { return 0; #", 1))
+MUTPY
+then
+  G4_STATE="$G4_PAD/.stitchpad/.state"
+  NS4="conduct-g4-$$"
+  SP4="$MUT4/bin/stitchpad"
+  M4() { env HOME="$G4_HOME" STITCHPAD_HOME="$MUT4" STITCHPAD_TERMINAL_NAMESPACE="$NS4" \
+             STITCHPAD_HEARTBEAT_AUTOSTART=0 "$@"; }
 
-HOME="$G4_HOME" STITCHPAD_TERMINAL_NAMESPACE="$NS4" STITCHPAD_HEARTBEAT_AUTOSTART=0 \
-  "$SP" init "$G4_PAD" --force --name conduct-g4 >/dev/null 2>&1
-mkdir -p "$G4_STATE"
-echo "busy" > "$G4_STATE/.test-busy.control"
+  M4 "$SP4" init "$G4_PAD" --force --name conduct-g4 >/dev/null 2>&1
+  mkdir -p "$G4_STATE"
+  echo "busy" > "$G4_STATE/.test-busy.control"
+  M4 env STITCHPAD_NAME=operator STITCHPAD_PAD_DIR="$G4_PAD/.stitchpad" "$SP4" join operator codex pull - >/dev/null 2>&1
+  M4 env STITCHPAD_NAME=pro5 STITCHPAD_PAD_DIR="$G4_PAD/.stitchpad" "$SP4" join pro5 test-busy push term-pro5 >/dev/null 2>&1
+  _write_alive "$G4_STATE" operator
+  _write_alive "$G4_STATE" pro5
+  M4 env STITCHPAD_PAD_DIR="$G4_PAD/.stitchpad" "$SP4" watch start >/dev/null 2>&1
+  wait_watcher "$G4_PAD/.stitchpad" "$G4_HOME" "$NS4" || echo "  WARNING: mutant watcher did not report running"
 
-HOME="$G4_HOME" STITCHPAD_TERMINAL_NAMESPACE="$NS4" STITCHPAD_HEARTBEAT_AUTOSTART=0 \
-  STITCHPAD_NAME=operator STITCHPAD_PAD_DIR="$G4_PAD/.stitchpad" \
-  "$SP" join operator codex pull - >/dev/null 2>&1
+  M4 env STITCHPAD_NAME=operator STITCHPAD_PAD_DIR="$G4_PAD/.stitchpad" "$SP4" say "@pro5 status?" >/dev/null 2>&1 || true
+  sleep 12
 
-HOME="$G4_HOME" STITCHPAD_TERMINAL_NAMESPACE="$NS4" STITCHPAD_HEARTBEAT_AUTOSTART=0 \
-  STITCHPAD_NAME=pro5 STITCHPAD_PAD_DIR="$G4_PAD/.stitchpad" \
-  "$SP" join pro5 test-busy push term-pro5 >/dev/null 2>&1
-
-_write_alive "$G4_STATE" operator
-_write_alive "$G4_STATE" pro5
-
-HOME="$G4_HOME" STITCHPAD_TERMINAL_NAMESPACE="$NS4" STITCHPAD_HEARTBEAT_AUTOSTART=0 \
-  STITCHPAD_PAD_DIR="$G4_PAD/.stitchpad" \
-  "$SP" watch start >/dev/null 2>&1
-
-wait_watcher "$G4_PAD/.stitchpad" "$G4_HOME" "$NS" || echo "  WARNING: watcher did not report running"
-
-# Continuous marker deletion
-(
-  for _i in $(seq 1 30); do
-    rm -f "$G4_STATE"/.busy-ack.* 2>/dev/null || true
-    sleep 0.3
-  done
-) &
-_cleaner=$!
-_record_pid "$_cleaner"
-
-HOME="$G4_HOME" STITCHPAD_TERMINAL_NAMESPACE="$NS4" STITCHPAD_HEARTBEAT_AUTOSTART=0 \
-  STITCHPAD_NAME=operator STITCHPAD_PAD_DIR="$G4_PAD/.stitchpad" \
-  "$SP" say "@pro5 status?" >/dev/null 2>&1 || true
-
-sleep 8
-kill "$_cleaner" 2>/dev/null || true
-wait "$_cleaner" 2>/dev/null || true
-
-grep -qi 'mid-lane' "$G4_PAD/.stitchpad/stitchpad.md" 2>/dev/null \
-  && bad "G4a: ack appeared despite mutant" \
-  || ok "G4a: no ack with markers deleted (mutant)"
+  grep -qi 'mid-lane' "$G4_PAD/.stitchpad/stitchpad.md" 2>/dev/null \
+    && bad "G4a: ack appeared despite mutant" \
+    || ok "G4a: no ack when staging is disabled (mutant)"
+else
+  bad "G4a: MUTANT DID NOT APPLY -- INCONCLUSIVE, not a pass"
+fi
 
 _kill_path "$G4_PAD"
 _cleanup_pids

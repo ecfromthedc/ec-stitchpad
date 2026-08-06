@@ -5,4 +5,3 @@
 # a free pass — it documents a measurement gap that must be justified.
 # Additions to this file require a commit message explaining WHY the suite
 # cannot be reliably measured.
-operator-conduct-gate.sh ~50% flake, cause UNKNOWN (pre-existing at 1b59398). P48 was suspected and is now FIXED, but the suite still fails 4-of-6 with watchers flat — so the leak was correlation, not cause. A green run here is luck and must not count as enforcement.

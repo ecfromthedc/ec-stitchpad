@@ -878,6 +878,17 @@ delivery_worker() {
       # If staging fails for any reason the retry loop must still run to completion
       # (delivery-supervision: "busy seat did not retry to completion").
       _busy_ack_stage "$name" "$ordinal" "$message_id" "${sender:-}" || true
+      # ...and POST it now. The comment above has always said "IMMEDIATE", but the
+      # code only staged a marker and left the posting to react(), which runs on
+      # fswatch events only. Nothing writes the pad after a busy defer — the
+      # adapter writes to .state — so no event ever came, react() never ran again,
+      # and the ack sat staged forever. That is the ~50% operator-conduct flake:
+      # the marker file exists on every failing run and the pad line never lands.
+      # Still staged first, so this stays idempotent per ordinal and a lock we
+      # cannot take right now simply leaves the marker for the tick below.
+      # A courtesy must never break delivery: every failure here is swallowed.
+      ( sp_lock 2>/dev/null && _busy_ack_post_pending \
+          && sp_commit "busy-ack @$name" >/dev/null 2>&1; sp_unlock 2>/dev/null ) || true
       sleep "$retry_seconds"
       continue
     fi
@@ -1314,6 +1325,15 @@ while true; do
     fi
   else
     _pad_dir_gone_ticks=0
+    # Idle tick: flush any busy-ack a delivery worker staged but could not post
+    # (it holds no lock guarantee). Cheap — the glob is empty in the common case,
+    # so a healthy pad does no work here.
+    for _ba in "$PAD_STATE"/.busy-ack.*; do
+      [ -f "$_ba" ] || continue
+      ( sp_lock 2>/dev/null && _busy_ack_post_pending \
+          && sp_commit "busy-ack flush" >/dev/null 2>&1; sp_unlock 2>/dev/null ) || true
+      break
+    done
     if ! kill -0 "$FSWATCH_PID" 2>/dev/null; then
       echo "[stitchpad] fswatch died on a live pad — exiting for supervisor restart" >&2
       exit 1
