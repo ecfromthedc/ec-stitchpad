@@ -11,6 +11,24 @@
 #
 # The watcher starts via 'stitchpad watch start' after alive files are written.
 set -uo pipefail
+# Wait for the watcher to actually be RUNNING instead of assuming it comes up
+# inside a fixed 2s. That assumption is why this suite flaked roughly one run in
+# three: `watch start` returns before the watcher has taken its singleton lock,
+# so a mention posted immediately after could land with "watchers: 0" and no ack
+# ever arrived. Polling the same status the operator would read makes the wait a
+# fact rather than a guess; the assertions below are unchanged.
+wait_watcher() { # $1=pad dir, $2=home, $3=namespace
+  local i
+  for i in $(seq 1 60); do
+    if HOME="$2" STITCHPAD_TERMINAL_NAMESPACE="$3" STITCHPAD_HEARTBEAT_AUTOSTART=0 \
+       STITCHPAD_PAD_DIR="$1" "$SP" watch status 2>/dev/null | grep -q 'running'; then
+      return 0
+    fi
+    sleep 0.25
+  done
+  return 1
+}
+
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 SP="$ROOT/tool/bin/stitchpad"
@@ -80,7 +98,7 @@ HOME="$G1_HOME" STITCHPAD_TERMINAL_NAMESPACE="$NS" STITCHPAD_HEARTBEAT_AUTOSTART
   STITCHPAD_PAD_DIR="$G1_PAD/.stitchpad" \
   "$SP" watch start >/dev/null 2>&1
 
-sleep 2
+wait_watcher "$G1_PAD/.stitchpad" "$G1_HOME" "$NS" || echo "  WARNING: watcher did not report running"
 echo "  pad ready, watcher started, pro5 is busy"
 
 # Send mention as operator
@@ -193,7 +211,7 @@ HOME="$G3_HOME" STITCHPAD_TERMINAL_NAMESPACE="$NS3" STITCHPAD_HEARTBEAT_AUTOSTAR
   STITCHPAD_PAD_DIR="$G3_PAD/.stitchpad" \
   "$SP" watch start >/dev/null 2>&1
 
-sleep 2
+wait_watcher "$G3_PAD/.stitchpad" "$G3_HOME" "$NS" || echo "  WARNING: watcher did not report running"
 echo "  agent echo joined (free), watcher started"
 
 HOME="$G3_HOME" STITCHPAD_TERMINAL_NAMESPACE="$NS3" STITCHPAD_HEARTBEAT_AUTOSTART=0 \
@@ -249,7 +267,7 @@ HOME="$G4_HOME" STITCHPAD_TERMINAL_NAMESPACE="$NS4" STITCHPAD_HEARTBEAT_AUTOSTAR
   STITCHPAD_PAD_DIR="$G4_PAD/.stitchpad" \
   "$SP" watch start >/dev/null 2>&1
 
-sleep 2
+wait_watcher "$G4_PAD/.stitchpad" "$G4_HOME" "$NS" || echo "  WARNING: watcher did not report running"
 
 # Continuous marker deletion
 (
