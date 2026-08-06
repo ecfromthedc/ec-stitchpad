@@ -143,12 +143,33 @@ the next session starts from evidence rather than rediscovery.
    busy-retry fixture (the give-up path reaches this window more often), and the
    fixture now models production rather than relying on one lucky call.
 
-Also unproven and NOT claimed: on `#campaign-hub-rust-rebuild`, three of four
-`say` attempts under contention with the live watcher printed a rollback-shaped
-warning AND the message landed anyway, leaving four copies of one ping. Only the
-first line of each run was captured, so whether rc was non-zero is unknown —
-and that is the difference between a wording problem and a false-failure
-report. Establish the exit code FIRST.
+RESOLVED BY EVIDENCE (was: unproven `say` rollback warning under contention).
+The exit code is established: **rc=0 — a wording-class problem, not a
+false-failure report.** Three independent lines of evidence, all from the live
+record of the 02:18 PM incident on `#campaign-hub-rust-rebuild`:
+
+1. **Pad-git forensics.** The four copies of the ping are four separate `say`
+   runs (each run appends exactly once — the operator retried). Copies 1–2
+   were swept into the watcher's `update` auto-commits (14:18:24, 14:18:33,
+   authored as kimi) — the documented JH4 benign race, where `say`'s own
+   commit then finds its bytes already in HEAD and sp_commit returns 0.
+   Copies 3–4 committed normally as captain (14:18:37, 14:18:42).
+2. **Say telemetry.** The runs in the window recorded `outcome=posted` — that
+   record is written only on the success path, immediately before the
+   `✓ posted` line, so those runs exited 0. There are ZERO `outcome=failed`
+   records in the window; the failure paths (`_say_record failed`) all record
+   before their `exit 1`, and the one genuine failure that day (deepseek,
+   14:56Z) proves the failed path does record.
+3. **Synthetic contention.** 20 contended attempts (watcher-shaped sp_lock'd
+   committer at 50ms cadence + a second seat racing every post;
+   `../repro/say-contention-rc.sh`): 20 clean, 0 false failures, 0 warnings,
+   0 duplicates.
+
+So the message landed and `say` reported success every time; the duplicates
+were the operator's retries, each of which also landed and said so. The exact
+warning text remains unidentified (only first lines were captured live) — if
+it recurs, capture full stderr AND `$?` before acting on it; the repro script
+above is the harness for that.
 
 ## Method
 
