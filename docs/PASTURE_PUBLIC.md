@@ -31,9 +31,9 @@ No Cloudflare account required to start — localhost + a tunnel.
 
 ## Repo strategy (decision needed: smaths)
 - Private ops repo: github.com/Risingtides-dev/pasture (renamed today; contains
-  our events.md history + crew personas)
+  our evidence/events.md history + crew personas)
 - Public repo: FRESH-HISTORY clone (single initial commit — our history has
-  operational detail; never publish it). Scrub: events.md, personas/ (ship
+  operational detail; never publish it). Scrub: evidence/events.md, personas/ (ship
   neutral samples), any tokens/hosts, .claude wiring. Name: `pasture`
   (public) vs keeping ops private under `pasture-ops` — smaths picks.
 
