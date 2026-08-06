@@ -2509,6 +2509,26 @@ PY
     sp_unlock
     _say_record posted
     echo "✓ posted as @$from (#$mid)"
+    # A mention aimed at a name that is not on the roster wakes NOBODY, and used
+    # to say nothing about it: `say "@carlo ..."` when the seat is @carlos
+    # printed a tick and the message sat there forever. Warn (never refuse —
+    # prose legitimately contains @-shaped text) and suggest the nearest roster
+    # name, because a typo is the overwhelmingly likely cause.
+    _say_roster="$(sp_roster 2>/dev/null | cut -d'|' -f1 | tr -d ' ' | tr 'A-Z' 'a-z')"
+    printf '%s' "$text" | grep -oE '(^|[[:space:]])@[A-Za-z0-9_-]+' | tr -d ' @' | tr 'A-Z' 'a-z' | sort -u \
+    | while IFS= read -r _mn; do
+        [ -n "$_mn" ] || continue
+        [ "$_mn" = "all" ] && continue
+        printf '%s\n' "$_say_roster" | grep -qx "$_mn" && continue
+        _near="$(printf '%s\n' "$_say_roster" | awk -v n="$_mn" '
+          { a=$0; if (length(a)==0) next
+            if (index(a,substr(n,1,3))==1 || index(n,substr(a,1,3))==1) { print a; exit } }')"
+        if [ -n "$_near" ]; then
+          echo "  ⚠ @$_mn is not on the roster — nobody was woken. Did you mean @$_near?" >&2
+        else
+          echo "  ⚠ @$_mn is not on the roster — nobody was woken. (stitchpad roster)" >&2
+        fi
+      done
     ;;
 
   amend)
