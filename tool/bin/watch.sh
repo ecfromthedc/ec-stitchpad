@@ -20,6 +20,14 @@ _src="${BASH_SOURCE[0]}"; while [ -h "$_src" ]; do
 done
 BIN_DIR="$(cd -P "$(dirname "$_src")" && pwd)"
 source "$BIN_DIR/lib.sh"
+# The E7/ds-F5 retry bounds call sp_recovery_* behind `type` guards, so a
+# worker that never loads recovery-policy.sh silently degrades to UNBOUNDED
+# retry — the exact forever-loop the bounds exist to prevent (found live
+# 2026-08-07: a cancel of a turn the restarted daemon had never heard of
+# retried every 10s for half an hour with recovery-attempts/ empty). Load the
+# policy here so the guards guard; keep the same tolerant form as
+# session-registry.sh for stripped installs.
+[ -f "$BIN_DIR/recovery-policy.sh" ] && source "$BIN_DIR/recovery-policy.sh" || true
 sp_init_paths || { echo "no stitchpad"; exit 1; }
 
 WATCH_LIBRARY_MODE="${STITCHPAD_WATCH_LIB_ONLY:-0}"
@@ -467,10 +475,26 @@ except Exception: print("invalid")' "$response" 2>/dev/null)"
   poll_attempts="${SP_DELIVERY_CANCEL_POLL_ATTEMPTS:-100}"
   poll_seconds="${SP_DELIVERY_CANCEL_POLL_SECONDS:-0.05}"
   attempts=0
+  missing_streak=0
   while :; do
     case "$terminal" in
       completed|errored|cancelled)
         printf '%s\n' "$terminal" > "$dir/result"; DELIVERY_CANCEL_OUTCOME="$terminal"; rc=0; break ;;
+      missing)
+        # A turn absent from /v1/requests is not pending — the registry holds
+        # every admitted request, so `missing` means the daemon has never heard
+        # of this turn_id. That happens exactly one way: the daemon restarted
+        # and the in-flight turn died with the old process. It can never reach
+        # completed/errored/cancelled, so waiting on it wedges the seat (the
+        # 2026-08-07 deepseek loop). Three consecutive reads guard against one
+        # torn/empty listing; then the turn is terminally errored and the
+        # pending mention gets delivered instead of queued behind a corpse.
+        missing_streak=$((missing_streak + 1))
+        if [ "$missing_streak" -ge 3 ]; then
+          printf '%s|%s\n' "$(delivery_now)" "turn-missing-from-daemon-registry" >> "$dir/attempts"
+          printf 'errored\n' > "$dir/result"; DELIVERY_CANCEL_OUTCOME=errored; rc=0; break
+        fi ;;
+      *) missing_streak=0 ;;
     esac
     attempts=$((attempts + 1))
     if [ "$attempts" -ge "$poll_attempts" ] || [ "$(date +%s)" -ge "$poll_deadline" ]; then
