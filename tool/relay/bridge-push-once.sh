@@ -72,17 +72,38 @@ for _name in $(echo "[$roster]" | jq -r '.[].name' 2>/dev/null); do
   _adp0="$(echo "[$roster]" | jq -r '.[] | select(.name=="'"$_name"'") | .adapter // ""' 2>/dev/null)"
   _last_model=""
   if [ "$_adp0" = "ocean" ] && [ -n "$_tgt" ] && [ "$_tgt" != "-" ]; then
-    _live="$(curl -sf --max-time 2 "${OCEAN_DAEMON_URL:-http://127.0.0.1:4780}/v1/agent/sessions/$_tgt/config" 2>/dev/null | jq -r '.model // empty' 2>/dev/null)"
+    _cfg_json="$(curl -sf --max-time 2 "${OCEAN_DAEMON_URL:-http://127.0.0.1:4780}/v1/agent/sessions/$_tgt/config" 2>/dev/null)"
+    _live="$(printf '%s' "$_cfg_json" | jq -r '.model // empty' 2>/dev/null)"
+    _live_src="$(printf '%s' "$_cfg_json" | jq -r '.model_source // empty' 2>/dev/null)"
     if [ -n "$_live" ]; then _model="$_live"; printf '%s' "$_live" > "$padd/.state/model.$_name" 2>/dev/null; fi
-    # TASK-1: mirror the daemon readback into the resolved record (telemetry
-    # only ever writes resolved-*, never the operator's seat-model pin).
-    if [ -n "$_live" ]; then
-      printf '%s' "$_live" > "$padd/.state/resolved-model.$_name" 2>/dev/null
-      printf 'session-config-rpc|%s|%s' "$(date +%s)" "$_tgt" > "$padd/.state/resolved-model-meta.$_name" 2>/dev/null
-    fi
     # what the session ACTUALLY ran last: clients (TUI/GUI) pass explicit
     # per-turn models that outrank the session default the chip shows
     _last_model="$(tail -c 2000000 /tmp/ocean-daemon.log 2>/dev/null | perl -pe 's/\e\[[0-9;]*m//g' | grep "provider_stream" | grep "$_tgt" | tail -1 | grep -oE 'model=[a-zA-Z0-9._-]+' | head -1 | cut -d= -f2)"
+    # TASK-1: mirror a daemon readback into the resolved record (telemetry
+    # only ever writes resolved-*, never the operator's seat-model pin).
+    # THE FALSE-MISMATCH TRAP (third sighting — adapter #2, keeper #5, now
+    # here): the config RPC reports the SESSION model, whose model_source is
+    # "global" whenever no session-level pin exists; per-turn --model wakes
+    # are invisible to it. This recorder fires on EVERY pad edit (fs.watch),
+    # so writing the global model here re-stamped a false mismatch seconds
+    # after any repair — under policy=refuse that deadlocks the seat forever.
+    # Resolved-truth precedence: (1) the model the daemon log says the
+    # session actually ran; (2) with a pin + a config read that is only
+    # echoing the global default, the pin (per-turn override contract);
+    # (3) the config model, for unpinned seats.
+    _pin="$(cat "$padd/.state/seat-model.$_name" 2>/dev/null || true)"
+    _resolved=""; _rsrc=""
+    if [ -n "$_last_model" ]; then
+      _resolved="$_last_model"; _rsrc="daemon-log-provider-stream"
+    elif [ "$_live_src" = "global" ] && [ -n "$_pin" ]; then
+      _resolved="$_pin"; _rsrc="pin-per-turn-contract"
+    elif [ -n "$_live" ]; then
+      _resolved="$_live"; _rsrc="session-config-rpc"
+    fi
+    if [ -n "$_resolved" ]; then
+      printf '%s' "$_resolved" > "$padd/.state/resolved-model.$_name" 2>/dev/null
+      printf '%s|%s|%s' "$_rsrc" "$(date +%s)" "$_tgt" > "$padd/.state/resolved-model-meta.$_name" 2>/dev/null
+    fi
   fi
   _role="$(cat "$padd/.state/role.$_name" 2>/dev/null || echo '')"
   _level="$(cat "$padd/.state/level.$_name" 2>/dev/null || echo '')"
