@@ -41,10 +41,45 @@ state_dir="$(dirname "$pad")/.state"
 # mismatch into a refused wake (loud, never silent).
 sp_model_pin_preflight "$state_dir" "$name" || exit 1
 
+# Per-seat working directory override (opt-in). A build seat runs in its own
+# git worktree, not the pad's checkout — without this, a woken seat is rooted
+# at the pad dir and any file work lands in the wrong tree (or collides with
+# main / another seat). When .state/seat-cwd.<name> holds an existing dir, the
+# wake is rooted there and the prompt directs the seat to DO its lane's work,
+# not merely reply. No file (every chat pad) = unchanged reply-oriented wake.
+seat_cwd=""
+_seat_cwd_file="$state_dir/seat-cwd.$name"
+if [ -f "$_seat_cwd_file" ] && [ ! -L "$_seat_cwd_file" ]; then
+  _sc="$(head -c 4096 "$_seat_cwd_file" 2>/dev/null | tr -d '[:space:]')"
+  if [ -n "$_sc" ] && [ -d "$_sc" ]; then
+    seat_cwd="$_sc"
+  else
+    echo "[ocean.sh] seat-cwd for @$name is set but not a dir ($_sc) — falling back to pad dir" >&2
+  fi
+fi
+wake_cwd="${seat_cwd:-$pad_dir}"
+
 # Ocean-backed seats include Kimi, GLM, and DeepSeek. Build their wake through
 # the same canonical prompt path as Stop/Herdr/Pi rather than maintaining a
 # model-specific copy here.
-prompt="$("$sp_bin" prompt-context <<EOF
+if [ -n "$seat_cwd" ]; then
+  prompt="$("$sp_bin" prompt-context <<EOF
+stitchpad: new @${name} mention — you are a BUILD seat, working in ${seat_cwd}.
+
+${msg}
+
+You are @${name}. Your workspace is ${seat_cwd} (your own git worktree —
+never work in another tree). Read the pad for coordination:
+  cd $(dirname "$pad")/.. && ~/.stitchpad/bin/stitchpad read -n 30
+then DO your lane's work in ${seat_cwd}: read the build's GOAL/LOOP docs,
+make small test-first commits on your branch, push, and report progress or a
+blocker on the pad with:
+  cd $(dirname "$pad")/.. && STITCHPAD_NAME=${name} ~/.stitchpad/bin/stitchpad say '<progress or blocker>'
+Replying on the pad is NOT the deliverable — landing reviewed, tested code is.
+EOF
+)"
+else
+  prompt="$("$sp_bin" prompt-context <<EOF
 stitchpad: new @${name} mention on the pad at ${pad}.
 
 ${msg}
@@ -55,6 +90,7 @@ then reply with:
   cd ${pad_dir} && STITCHPAD_NAME=${name} ~/.stitchpad/bin/stitchpad say '<your reply>'
 EOF
 )"
+fi
 
 # IDLE-GUARD: posting a wake turn while the session is mid-turn queues it as
 # stale pending input (the parked-message bug smaths hit). Defer instead — the
@@ -116,7 +152,7 @@ seat_model="$(sp_model_pin_requested "$state_dir" "$name")"
 # adapter exits 1, the wake gate never clears, and the seat goes silently deaf.
 # wake_args below is always initialised NON-EMPTY, so it cannot hit that.
 [ -z "$seat_model" ] && [ -n "${SP_MODEL:-}" ] && [ "${SP_MODEL}" != "-" ] && seat_model="$SP_MODEL"
-wake_args=(wake --session-id "$session_id" --cwd "$pad_dir" --client-type stitchpad \
+wake_args=(wake --session-id "$session_id" --cwd "$wake_cwd" --client-type stitchpad \
   --timeout-seconds 600 --prompt "$prompt")
 [ -n "$seat_model" ] && wake_args+=(--model "$seat_model")
 [ -n "${SP_DELIVERY_ACK_FILE:-}" ] && wake_args+=(--no-wait)
