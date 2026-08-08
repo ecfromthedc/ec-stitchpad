@@ -4954,6 +4954,39 @@ PY
       printf '  ✓ pad git healthy (%s commits, HEAD %s)\n' "$_doc_commit_count" "$_doc_head"
     fi
 
+    # Orphan-journal self-heal: a PARTIAL rollback (e.g. a `say` killed mid-op)
+    # PRESERVES its .registry-journal.* dir, and journal_recover then refuses to
+    # auto-roll-back anything it can't prove safe — which permanently wedges
+    # every subsequent guarded `say`. Doctor clears ONLY the provably-safe case:
+    # an orphan whose stamped .base-sha equals current pad-git HEAD means the
+    # crashed operation's commit never landed, so the pre-op bytes are already
+    # live and there is nothing to undo — dropping the journal is a no-op-safe
+    # unwedge. Every other orphan (base-sha != HEAD, missing/unborn stamp, live
+    # owner) is left untouched for the existing recovery path to adjudicate.
+    printf '\nStale journals:\n'
+    _doc_head_sha=""
+    if [ -d "$PAD_GIT" ]; then
+      _doc_head_sha="$(sgit rev-parse --verify -q HEAD 2>/dev/null || true)"
+    fi
+    _doc_orphan_found=0
+    for _orphan in "$PAD_STATE"/.registry-journal.*; do
+      [ -d "$_orphan" ] || continue
+      _doc_orphan_found=1
+      _ob="$(cat "$_orphan/.base-sha" 2>/dev/null || true)"
+      if [ -n "$_doc_head_sha" ] && [ -n "$_ob" ] && [ "$_ob" = "$_doc_head_sha" ]; then
+        if rm -rf "$_orphan" 2>/dev/null; then
+          printf '  \033[0;32m✓\033[0m cleared safe orphan %s (base-sha == HEAD; commit never landed)\n' "$(basename "$_orphan")"
+        else
+          printf '  \033[0;31m✗\033[0m could not remove %s\n' "$(basename "$_orphan")"
+          (( err++ ))
+        fi
+      else
+        printf '  \033[0;33m!\033[0m %s preserved — base-sha does not match HEAD; needs manual review\n' "$(basename "$_orphan")"
+        (( warn++ ))
+      fi
+    done
+    [ "$_doc_orphan_found" -eq 0 ] && printf '  ✓ no stale journals\n'
+
     # Summary
     total=$(( warn + err ))
     printf '\n%d issues found (%d warnings, %d errors)\n' "$total" "$warn" "$err"
