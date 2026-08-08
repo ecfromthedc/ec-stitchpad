@@ -343,7 +343,23 @@ except Exception: print("")' 2>/dev/null)"
                   _rp="$(printf '%s' "$_cfg" | python3 -c 'import json,sys
 try: print(json.load(sys.stdin).get("provider") or "")
 except Exception: print("")' 2>/dev/null)"
-                  if [ -n "$_rm" ]; then
+                  _rs="$(printf '%s' "$_cfg" | python3 -c 'import json,sys
+try: print(json.load(sys.stdin).get("model_source") or "")
+except Exception: print("")' 2>/dev/null)"
+                  # Same false-mismatch bug as the ocean adapter (fixed there
+                  # first): the config RPC reports the SESSION model, whose
+                  # model_source is "global" whenever no session-level pin
+                  # exists — a per-turn --model wake is invisible to it. When
+                  # THIS wake carried a pin and the RPC is only echoing the
+                  # global default, the pin IS the effective model; recording
+                  # the global here stamped a mismatch after every keeper
+                  # wake, and under policy=refuse that deadlocks the seat
+                  # (every corrective wake is itself refused).
+                  if [ "$_rs" = "global" ] && [ -n "$model" ]; then
+                    sp_model_pin_record_resolved "$ST" "$name" "$model" "" \
+                      "keeper-wake-model-arg" "$sid" || true
+                    sp_model_pin_check "$ST" "$name" || true
+                  elif [ -n "$_rm" ]; then
                     sp_model_pin_record_resolved "$ST" "$name" "$_rm" "$_rp" \
                       "keeper-wake-config-rpc" "$sid" || true
                     sp_model_pin_check "$ST" "$name" || true
