@@ -126,7 +126,7 @@ wake_args=(wake --session-id "$session_id" --cwd "$pad_dir" --client-type stitch
 # against the requested pin. Best-effort: a daemon that cannot answer leaves
 # the previous resolved record untouched (an empty read never erases truth).
 record_resolved_from_daemon() {
-  local cfg rmodel rprovider
+  local cfg rmodel rprovider rsource
   cfg="$(curl -sf --max-time 3 "$daemon_url/v1/agent/sessions/$session_id/config" 2>/dev/null || true)"
   [ -n "$cfg" ] || return 0
   rmodel="$(printf '%s' "$cfg" | python3 -c 'import json,sys
@@ -135,6 +135,23 @@ except Exception: print("")' 2>/dev/null)"
   rprovider="$(printf '%s' "$cfg" | python3 -c 'import json,sys
 try: print(json.load(sys.stdin).get("provider") or "")
 except Exception: print("")' 2>/dev/null)"
+  rsource="$(printf '%s' "$cfg" | python3 -c 'import json,sys
+try: print(json.load(sys.stdin).get("model_source") or "")
+except Exception: print("")' 2>/dev/null)"
+  # The session-config RPC reports the SESSION's model, whose model_source is
+  # "global" whenever no session-level pin exists. A per-turn `--model` wake is
+  # invisible to it — the daemon applies model_id as a hard per-turn override
+  # (explicit model_id always wins; heartbeat preflights it against
+  # /v1/models before posting). Recording the global model here stamped a
+  # FALSE MISMATCH on every correctly-pinned wake. When we passed a pin this
+  # turn and the config read is only echoing the global default, the pin IS
+  # the effective model — record that, from its real source.
+  if [ "$rsource" = "global" ] && [ -n "$seat_model" ]; then
+    sp_model_pin_record_resolved "$state_dir" "$name" "$seat_model" "" \
+      "ocean-wake-model-arg" "$session_id" || true
+    sp_model_pin_check "$state_dir" "$name" || true
+    return 0
+  fi
   [ -n "$rmodel" ] || return 0
   sp_model_pin_record_resolved "$state_dir" "$name" "$rmodel" "$rprovider" \
     "ocean-wake-config-rpc" "$session_id" || true
