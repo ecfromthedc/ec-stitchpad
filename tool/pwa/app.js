@@ -187,6 +187,15 @@ function setSidebar(next) {
 export function pinPad(name) { setSidebar(togglePin(store.sidebar, name)); }
 export function nudgePad(name, d) { setSidebar(movePinned(store.sidebar, name, d)); }
 export function dropPad(name, i) { setSidebar(reorderPinned(store.sidebar, name, i)); }
+// Long-press drag drops a pad at an absolute slot in the ordered zone. A pad
+// the operator hasn't arranged yet has no stored position, so placing it there
+// IS pinning it — "hold any pad and put it where you want" means it joins the
+// custom order. reorderPinned clamps, so a drop past the end lands at the end.
+export function placePad(name, toIndex) {
+  let next = store.sidebar;
+  if (!isPinned(next, name)) next = togglePin(next, name);
+  setSidebar(reorderPinned(next, name, toIndex));
+}
 
 const subs = new Set();
 const publish = () => subs.forEach(f => f());
@@ -554,19 +563,87 @@ function Login() {
 function Sidebar({ drawer, setDrawer }) {
   const s = useStore();
   const roster = (s.doc?.roster || []).map(m => m.name);
+  // Touch reorder: hold a pad ~0.4s to lift it, drag up/down, release to drop.
+  // `drag` = { name, overIdx } where overIdx is the insertion slot in the
+  // ordered (pinned) zone. HTML5 drag events never fire on touch, so this is
+  // the only reorder path on a phone — it drives the same placePad/reorderPinned
+  // the mouse path does, so the gated ordering logic is unchanged.
+  const [drag, setDrag] = useState(null);
+  useEffect(() => {
+    const list = document.getElementById("chanlist");
+    if (!list) return;
+    let holdTimer = null, dragging = null, startY = 0, target = null;
+    const clearHold = () => { if (holdTimer) { clearTimeout(holdTimer); holdTimer = null; } };
+    // Insertion index among the ordered-zone rows nearest the finger.
+    const slotAt = (y) => {
+      const rows = [...list.querySelectorAll('[data-pad][data-pinned="1"]')];
+      for (let j = 0; j < rows.length; j++) {
+        const r = rows[j].getBoundingClientRect();
+        if (y < r.top + r.height / 2) return j;
+      }
+      return rows.length;
+    };
+    const onStart = (e) => {
+      if (e.touches.length !== 1) return;
+      const row = e.target.closest && e.target.closest("[data-pad]");
+      if (!row || (e.target.closest && e.target.closest("button"))) return;
+      startY = e.touches[0].clientY;
+      const name = row.dataset.pad;
+      clearHold();
+      holdTimer = setTimeout(() => {
+        dragging = name; target = slotAt(startY);
+        if (navigator.vibrate) { try { navigator.vibrate(14); } catch {} }
+        document.body.classList.add("sp-reordering");
+        setDrag({ name, overIdx: target });
+      }, 420);
+    };
+    const onMove = (e) => {
+      const y = e.touches[0].clientY;
+      if (!dragging) { if (Math.abs(y - startY) > 8) clearHold(); return; }
+      e.preventDefault();                       // we own the gesture — no page scroll
+      const t = slotAt(y);
+      if (t !== target) { target = t; setDrag({ name: dragging, overIdx: t }); }
+    };
+    const onEnd = () => {
+      clearHold();
+      if (dragging && target != null) placePad(dragging, target);
+      dragging = null; target = null;
+      document.body.classList.remove("sp-reordering");
+      setDrag(null);
+    };
+    list.addEventListener("touchstart", onStart, { passive: true });
+    list.addEventListener("touchmove", onMove, { passive: false });
+    list.addEventListener("touchend", onEnd);
+    list.addEventListener("touchcancel", onEnd);
+    return () => {
+      list.removeEventListener("touchstart", onStart);
+      list.removeEventListener("touchmove", onMove);
+      list.removeEventListener("touchend", onEnd);
+      list.removeEventListener("touchcancel", onEnd);
+      clearHold();
+    };
+  }, [s.pads, s.sidebar]);
+  const ordered = sidebarOrder(s.pads, s.sidebar);
+  const pinnedCount = ordered.filter(p => isPinned(s.sidebar, p.name)).length;
   return html`<div id="chans" class=${drawer ? "open" : ""}>
     <h1><span style="width:22px;height:22px;display:inline-flex"><${LOGO}/></span>pasture</h1>
     <div class="sect">Pastures</div>
     <div id="chanlist">
-      ${sidebarOrder(s.pads, s.sidebar).map((p, i) => {
+      ${ordered.map((p, i) => {
         const pinned = isPinned(s.sidebar, p.name);
+        const lifting = drag && drag.name === p.name;
+        const dropLine = drag && pinned && i === drag.overIdx && drag.name !== p.name;
+        const dropLineEnd = drag && !dropLine && drag.overIdx >= pinnedCount && i === pinnedCount - 1 && drag.name !== p.name;
         return html`<div key=${p.name}
-          class=${"chan" + (p.name === s.pad && !s.dmWith ? " on" : "") + (pinned ? " pinned" : "")}
+          data-pad=${p.name} data-idx=${i} data-pinned=${pinned ? "1" : "0"}
+          class=${"chan" + (p.name === s.pad && !s.dmWith ? " on" : "") + (pinned ? " pinned" : "")
+            + (lifting ? " sp-lift" : "") + (dropLine ? " sp-drop-before" : "") + (dropLineEnd ? " sp-drop-after" : "")}
           draggable=${pinned}
           onDragStart=${e => { e.dataTransfer.setData("text/plain", p.name); e.dataTransfer.effectAllowed = "move"; }}
           onDragOver=${e => { if (pinned) { e.preventDefault(); e.dataTransfer.dropEffect = "move"; } }}
           onDrop=${e => { e.preventDefault(); const n = e.dataTransfer.getData("text/plain"); if (n) dropPad(n, i); }}
-          onClick=${() => { setDrawer(false); if (p.name === s.pad) closeDM(); else switchPad(p.name); }}>
+          onClick=${() => { if (drag) return; setDrawer(false); if (p.name === s.pad) closeDM(); else switchPad(p.name); }}>
+          <span class="chan-grip" aria-hidden="true">⠿</span>
           <span class="h">#</span><span class="chan-name">${p.name}</span>
           ${pinned ? html`<span class="chan-move">
               <button title="move up" onClick=${e => { e.stopPropagation(); nudgePad(p.name, -1); }}>▴</button>

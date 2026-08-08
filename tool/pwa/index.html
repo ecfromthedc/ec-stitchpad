@@ -45,6 +45,18 @@ button{font:inherit}
 .chan .chan-pin.on{color:var(--accent)}
 .chan.on .chan-pin.on{color:#fff}
 .chan.pinned{font-weight:600}
+/* ── touch reorder (long-press drag) ── */
+.chan{position:relative;touch-action:pan-y}
+.chan .chan-grip{display:none;flex:0 0 auto;color:var(--dim,#9aa4b2);font-size:13px;line-height:1;opacity:.5;cursor:grab;margin-right:-2px}
+.chan.sp-lift{background:var(--accent);color:#fff;transform:scale(1.03);box-shadow:0 10px 26px rgba(0,0,0,.34);z-index:2;opacity:.97}
+.chan.sp-lift .chan-grip,.chan.sp-lift .chan-pin,.chan.sp-lift .h{color:#fff;opacity:.85}
+.chan.sp-drop-before::before,.chan.sp-drop-after::after{content:"";position:absolute;left:10px;right:10px;height:2px;border-radius:2px;background:var(--accent)}
+.chan.sp-drop-before::before{top:-1px}
+.chan.sp-drop-after::after{bottom:-1px}
+body.sp-reordering{-webkit-user-select:none;user-select:none}
+body.sp-reordering #chans{overflow:hidden}
+@media(hover:none){.chan .chan-grip{display:inline-flex}}
+@media(prefers-reduced-motion:reduce){.chan.sp-lift{transform:none}}
 .chan[draggable="true"]{cursor:grab}
 .chan.on .h{opacity:.8}
 .dm-item{gap:9px}
