@@ -227,12 +227,46 @@ while IFS= read -r repo; do
   TASKFILE="$repo/.stitchpad/tasks.md"     # where `task new` actually writes
   [ -d "$ST" ] || continue
 
+  # Discovery self-heal: the keeper finds seats via ocean-session.<name> files,
+  # but a seat joined with `stitchpad join <name> ocean push <sid>` records its
+  # session id in the ROSTER's target field, not necessarily as that file — so
+  # an ocean seat could be live on the pad yet invisible to the keeper and never
+  # re-woken (the exact stall this watchdog exists to prevent). Reconcile from
+  # the roster: for every `name | ocean | push | <sid>` row, ensure
+  # ocean-session.<name> exists. Never overwrite a present file (an explicit
+  # binding wins); only fill the gap.
+  if [ -f "$PADFILE" ] && [ ! -L "$PADFILE" ]; then
+    while IFS='|' read -r _rn _ra _rw _rt; do
+      _rn="$(printf '%s' "$_rn" | tr -d '[:space:]')"
+      _ra="$(printf '%s' "$_ra" | tr -d '[:space:]')"
+      _rt="$(printf '%s' "$_rt" | tr -d '[:space:]')"
+      [ "$_ra" = "ocean" ] || continue
+      [ -n "$_rn" ] && [ -n "$_rt" ] && [ "$_rt" != "-" ] || continue
+      case "$_rn" in ''|*[!a-zA-Z0-9_-]*) continue ;; esac
+      [ -e "$ST/ocean-session.$_rn" ] || printf '%s' "$_rt" > "$ST/ocean-session.$_rn" 2>/dev/null || true
+    done < <(awk '/^```roster/{r=1;next} /^```/{r=0} r && /\|/ && $0 !~ /^#/' "$PADFILE")
+  fi
+
   for f in "$ST"/ocean-session.*; do
     [ -f "$f" ] || continue
     name="${f##*/ocean-session.}"
     sid="$(cat "$f" 2>/dev/null)"
     [ -z "$sid" ] && continue
     model="$(cat "$ST/seat-model.$name" 2>/dev/null || echo '')"
+    # Per-seat worktree cwd (opt-in), mirroring the ocean adapter: a build seat
+    # runs in its own git worktree, not the pad's checkout. Without this the
+    # keeper would wake it rooted at $repo (main checkout) — clobbering the
+    # worktree the operator assigned and colliding with other seats. Same
+    # contract as the adapter's .state/seat-cwd.<name>: an existing dir wins,
+    # anything else falls back to $repo. No file (chat pads) = unchanged.
+    wake_cwd="$repo"
+    _sc_file="$ST/seat-cwd.$name"
+    if [ -f "$_sc_file" ] && [ ! -L "$_sc_file" ]; then
+      _sc="$(head -c 4096 "$_sc_file" 2>/dev/null | tr -d '[:space:]')"
+      if [ -n "$_sc" ] && [ -d "$_sc" ]; then
+        wake_cwd="$_sc"
+      fi
+    fi
 
     STRIKE="$ST/keeper-strike.$name"
     OBS="$ST/keeper-obs.$name"
@@ -325,7 +359,7 @@ while IFS= read -r repo; do
           elif [ "$DRY" -eq 1 ]; then
             decision="WOULD WAKE — $reason"
           else
-            out=$("$HB" wake --session-id "$sid" --cwd "$repo" --client-type stitchpad \
+            out=$("$HB" wake --session-id "$sid" --cwd "$wake_cwd" --client-type stitchpad \
               ${model:+--model "$model"} --no-wait --prompt "$prompt" 2>&1)
             if echo "$out" | grep -q '"ok": *true'; then
               # RESOLVED-MODEL TELEMETRY (ported from the task-parser keeper this
