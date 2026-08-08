@@ -68,3 +68,22 @@ export function movePinned(prefs, name, delta) {
   if (from < 0) return { ...prefs, pinned: [...pinned] };
   return reorderPinned(prefs, name, from + delta);
 }
+
+// Long-press drag places a pad at an ABSOLUTE visual slot in the full list.
+// Reordering by drag means the operator wants an explicit manual order, so this
+// snapshots the current visible order, moves `name` to toIndex, and stores that
+// whole order. After the first drop every pad has a fixed slot, so a release
+// lands exactly where the finger let go — there is no pinned/unpinned split to
+// reason about on a touch screen. toIndex is clamped, so a drop past the end
+// lands at the end. A name not currently visible is a no-op (never corrupts the
+// order). Composes sidebarOrder above, so pins already set are respected as the
+// starting order.
+export function placeInOrder(pads, prefs, name, toIndex) {
+  const order = sidebarOrder(pads, prefs).map(p => p.name);
+  const from = order.indexOf(name);
+  if (from < 0) return { ...(prefs || {}), pinned: order };
+  order.splice(from, 1);
+  const to = Math.max(0, Math.min(toIndex, order.length));
+  order.splice(to, 0, name);
+  return { ...(prefs || {}), pinned: order };
+}

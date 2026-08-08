@@ -8,7 +8,7 @@
 //   transport  — websocket to the PadHub DO + polling fallback (unchanged logic)
 //   components — App / Login / Sidebar / Log / Composer / cards stay imperative
 import { html, render, useState, useEffect, useLayoutEffect, useRef } from "./vendor/preact-standalone.module.js";
-import { loadPrefs, savePrefs, sidebarOrder, isPinned, togglePin, reorderPinned, movePinned } from "./sidebar-order.mjs";
+import { loadPrefs, savePrefs, sidebarOrder, isPinned, togglePin, reorderPinned, movePinned, placeInOrder } from "./sidebar-order.mjs";
 import { renderUi, extractUi } from "./ui/render.js";
 import { composeFence, validate as validateUi } from "./ui/schemas.mjs";
 
@@ -187,15 +187,11 @@ function setSidebar(next) {
 export function pinPad(name) { setSidebar(togglePin(store.sidebar, name)); }
 export function nudgePad(name, d) { setSidebar(movePinned(store.sidebar, name, d)); }
 export function dropPad(name, i) { setSidebar(reorderPinned(store.sidebar, name, i)); }
-// Long-press drag drops a pad at an absolute slot in the ordered zone. A pad
-// the operator hasn't arranged yet has no stored position, so placing it there
-// IS pinning it — "hold any pad and put it where you want" means it joins the
-// custom order. reorderPinned clamps, so a drop past the end lands at the end.
-export function placePad(name, toIndex) {
-  let next = store.sidebar;
-  if (!isPinned(next, name)) next = togglePin(next, name);
-  setSidebar(reorderPinned(next, name, toIndex));
-}
+// Long-press drag drops a pad at an absolute visual slot in the full list —
+// "hold any pad and put it where you want." placeInOrder snapshots the current
+// order and moves the pad there, so a release lands exactly where the finger
+// let go, for every pad, not only already-arranged ones.
+export function placePad(name, toIndex) { setSidebar(placeInOrder(store.pads, store.sidebar, name, toIndex)); }
 
 const subs = new Set();
 const publish = () => subs.forEach(f => f());
@@ -574,9 +570,9 @@ function Sidebar({ drawer, setDrawer }) {
     if (!list) return;
     let holdTimer = null, dragging = null, startY = 0, target = null;
     const clearHold = () => { if (holdTimer) { clearTimeout(holdTimer); holdTimer = null; } };
-    // Insertion index among the ordered-zone rows nearest the finger.
+    // Absolute insertion slot in the FULL list nearest the finger (0..N).
     const slotAt = (y) => {
-      const rows = [...list.querySelectorAll('[data-pad][data-pinned="1"]')];
+      const rows = [...list.querySelectorAll('[data-pad]')];
       for (let j = 0; j < rows.length; j++) {
         const r = rows[j].getBoundingClientRect();
         if (y < r.top + r.height / 2) return j;
@@ -624,7 +620,6 @@ function Sidebar({ drawer, setDrawer }) {
     };
   }, [s.pads, s.sidebar]);
   const ordered = sidebarOrder(s.pads, s.sidebar);
-  const pinnedCount = ordered.filter(p => isPinned(s.sidebar, p.name)).length;
   return html`<div id="chans" class=${drawer ? "open" : ""}>
     <h1><span style="width:22px;height:22px;display:inline-flex"><${LOGO}/></span>pasture</h1>
     <div class="sect">Pastures</div>
@@ -632,8 +627,8 @@ function Sidebar({ drawer, setDrawer }) {
       ${ordered.map((p, i) => {
         const pinned = isPinned(s.sidebar, p.name);
         const lifting = drag && drag.name === p.name;
-        const dropLine = drag && pinned && i === drag.overIdx && drag.name !== p.name;
-        const dropLineEnd = drag && !dropLine && drag.overIdx >= pinnedCount && i === pinnedCount - 1 && drag.name !== p.name;
+        const dropLine = drag && drag.overIdx === i && drag.name !== p.name;
+        const dropLineEnd = drag && drag.overIdx >= ordered.length && i === ordered.length - 1 && drag.name !== p.name;
         return html`<div key=${p.name}
           data-pad=${p.name} data-idx=${i} data-pinned=${pinned ? "1" : "0"}
           class=${"chan" + (p.name === s.pad && !s.dmWith ? " on" : "") + (pinned ? " pinned" : "")

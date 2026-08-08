@@ -16,6 +16,9 @@
 #   G5  drag-to-index is clamped (a drop past the end cannot corrupt the list)
 #   G6  the sidebar actually RENDERS through sidebarOrder (wiring, not just logic)
 #   G7  MUTANT: break the ordering -> G1 goes RED
+#   G8  placeInOrder (long-press drag) drops a pad at the EXACT slot released,
+#       for a pad with no prior position — not just an already-pinned one
+#   G9  the touch long-press reorder is WIRED to placePad (mobile has no HTML5 drag)
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
@@ -65,6 +68,18 @@ out.prefsRetained = (prefs.pinned || []).join(",");
 const clamped = reorderPinned(prefs, "gamma", 99);
 out.clamped = (clamped.pinned || []).join(",");
 out.clampedLen = String((clamped.pinned || []).length);
+
+// placeInOrder: long-press drag. From server order [alpha,beta,gamma,delta]
+// with NO prior prefs, dropping "delta" at slot 1 must land it exactly at 1 —
+// this is the flaw the live test caught: the old model jumped it to the top.
+const { placeInOrder } = mod;
+const fresh = { pinned: [] };
+const p1 = placeInOrder(pads, fresh, "delta", 1);
+out.placedMid = names(p1);                             // alpha,delta,beta,gamma
+const p2 = placeInOrder(pads, fresh, "alpha", 99);
+out.placedEnd = names(p2);                             // beta,gamma,delta,alpha (clamped)
+const p3 = placeInOrder(pads, fresh, "ghost", 0);
+out.placedGhost = names(p3);                           // unchanged server order
 
 console.log(JSON.stringify(out));
 JS
@@ -124,6 +139,26 @@ if [ $? -eq 0 ] && grep -q 'MUTANT: pins ignored' "$TMP/mutant.mjs"; then
   fi
 else
   bad "G7: MUTANT DID NOT APPLY — inconclusive, never treat as a pass"
+fi
+
+# G8: placeInOrder drops at the exact released slot, for an unarranged pad.
+if [ "$(get placedMid)" = "alpha,delta,beta,gamma" ] \
+   && [ "$(get placedEnd)" = "beta,gamma,delta,alpha" ] \
+   && [ "$(get placedGhost)" = "alpha,beta,gamma,delta" ]; then
+  ok "G8: long-press drag lands a pad exactly where released (mid=$(get placedMid))"
+else
+  bad "G8: placeInOrder wrong (mid=$(get placedMid) end=$(get placedEnd) ghost=$(get placedGhost))"
+fi
+
+# G9: wiring — the gesture is worthless if it is not attached to placePad. On a
+# phone there is NO HTML5 drag, so this touch path is the only reorder there.
+if grep -q 'placeInOrder' "$ROOT/tool/pwa/app.js" \
+   && grep -q 'export function placePad' "$ROOT/tool/pwa/app.js" \
+   && grep -q 'addEventListener("touchmove"' "$ROOT/tool/pwa/app.js" \
+   && grep -q 'placePad(dragging, target)' "$ROOT/tool/pwa/app.js"; then
+  ok "G9: the touch long-press reorder is wired to placePad"
+else
+  bad "G9: the long-press drag is not wired — mobile reorder does nothing"
 fi
 
 echo ""

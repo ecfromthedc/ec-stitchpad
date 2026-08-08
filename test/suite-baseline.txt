@@ -103,7 +103,7 @@ pad-narration-gate.sh 8 0
 p38-task-list-readable-gate.sh 5 0
 terminal-isolation-gate.sh 7 0
 help-discoverability-gate.sh 101 0
-p25-sidebar-organisation-gate.sh 7 0
+p25-sidebar-organisation-gate.sh 9 0
 p42-subagent-spawn-gate.sh 12 0
 p43-wake-push-misdirect-gate.sh 12 0
 p44-roster-live-role-key-gate.sh 7 0
