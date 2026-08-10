@@ -28,6 +28,7 @@
 #   stitchpad telemetry [--json] [--model M] [--days N] [--limit N]   per-model reliability + cost-value summary
 #   stitchpad invite [--name <handle>] [--ttl 1h|30m|7d|never]   make a remote-join invite
 #   stitchpad invite --revoke <token>     revoke an invite token
+#   stitchpad bridge mirror <relay-url> [dir]   joint pad: mirror one project's pad onto a teammate's relay (two-way)
 #   stitchpad operator <keygen|env|grant|revoke|status>   operator credential (root of authority)
 #   stitchpad keeper [repo ...]           wake idle Ocean seats for current open tasks
 #   stitchpad archive [--keep N]          move old messages to .stitchpad/archive/<date>-conversation.md
@@ -4163,6 +4164,15 @@ except: print("")' 2>/dev/null)"
     #   stitchpad bridge install   write+load the launchd agent (one time)
     #   stitchpad bridge uninstall remove it
     #   stitchpad bridge status    is it loaded/running?
+    #
+    # JOINT PADS — mirror ONE project's pad onto a TEAMMATE's relay, two-way:
+    # the teammate sees the room in their own PWA with zero setup on their side,
+    # and anything they post there drains back into the real pad (so a remote
+    # orchestrator can @-mention every seat). One launchd agent per relay,
+    # scoped to just that project — never the all-of-$HOME scan.
+    #   stitchpad bridge mirror <relay-url> [project-dir] [--user u --pass p | --token t] [--print]
+    #   stitchpad bridge mirror --remove <relay-url>
+    #   stitchpad bridge mirror --list
     sub="${1:-status}"
     plist="$HOME/Library/LaunchAgents/org.stitchpad.bridge.plist"
     tmpl="$STITCHPAD_HOME/relay/org.stitchpad.bridge.plist.template"
@@ -4186,7 +4196,106 @@ except: print("")' 2>/dev/null)"
           echo "✓ bridge service loaded + auto-starts at login"; pgrep -fl "relay/bridge.sh" | head -1
         else echo "bridge service not installed (run: stitchpad bridge install)"; fi
         ;;
-      *) echo "usage: stitchpad bridge {install|uninstall|status}" >&2; exit 1 ;;
+      mirror)
+        shift || true
+        _mslug() { printf '%s' "$1" | tr -c 'a-zA-Z0-9' '-' | tr -s '-' | sed 's/-$//'; }
+        if [ "${1:-}" = "--list" ]; then
+          _found=0
+          for f in "$HOME/Library/LaunchAgents"/org.pasture.bridge-mirror-*.plist; do
+            [ -f "$f" ] || continue
+            _found=1
+            _lbl="$(basename "$f" .plist)"
+            _rly="$(sed -n 's|.*<string>\(https\?://[^<]*\)</string>.*|\1|p' "$f" | head -1)"
+            _rt="$(sed -n 's|.*<string>\(/[^<]*\)</string>.*|\1|p' "$f" | grep -v '\.log$\|/bin/bash$\|bridge\.sh$\|^/opt\|^/usr' | head -1)"
+            if launchctl list "$_lbl" >/dev/null 2>&1; then _st="running"; else _st="NOT loaded"; fi
+            printf '%s  %s  →  %s  [%s]\n' "$_lbl" "${_rt:-?}" "${_rly:-?}" "$_st"
+          done
+          [ "$_found" -eq 1 ] || echo "no pad mirrors installed (run: stitchpad bridge mirror <relay-url> [project-dir])"
+          exit 0
+        fi
+        if [ "${1:-}" = "--remove" ]; then
+          _rly="${2:-}"; [ -n "$_rly" ] || { echo "usage: stitchpad bridge mirror --remove <relay-url>" >&2; exit 1; }
+          _lbl="org.pasture.bridge-mirror-$(_mslug "$_rly")"
+          _pl="$HOME/Library/LaunchAgents/$_lbl.plist"
+          [ -f "$_pl" ] || { echo "stitchpad: no mirror installed for $_rly ($_pl)" >&2; exit 1; }
+          launchctl unload "$_pl" 2>/dev/null || true
+          rm -f "$_pl" && echo "✓ mirror removed: $_lbl"
+          exit 0
+        fi
+        _rly=""; _root=""; _user=""; _pass=""; _mtoken="${STITCHPAD_MIRROR_TOKEN:-}"; _print=0
+        while [ $# -gt 0 ]; do
+          case "$1" in
+            --user)  _user="${2:-}"; shift 2 ;;
+            --pass)  _pass="${2:-}"; shift 2 ;;
+            --token) _mtoken="${2:-}"; shift 2 ;;
+            --print) _print=1; shift ;;
+            -*) echo "stitchpad: unknown option '$1' for bridge mirror" >&2; exit 1 ;;
+            *) if [ -z "$_rly" ]; then _rly="$1"; else _root="$1"; fi; shift ;;
+          esac
+        done
+        [ -n "$_rly" ] || { echo "usage: stitchpad bridge mirror <relay-url> [project-dir] [--user u --pass p | --token t] [--print]" >&2; exit 1; }
+        _rly="${_rly%/}"
+        [ -n "$_root" ] || _root="$PWD"
+        _root="$(cd -P "$_root" 2>/dev/null && pwd)" || { echo "stitchpad: bad project dir" >&2; exit 1; }
+        [ -d "$_root/.stitchpad" ] || { echo "stitchpad: $_root has no .stitchpad — run stitchpad init there first" >&2; exit 1; }
+        if [ -z "$_mtoken" ] && [ -n "$_user" ]; then
+          # trade a teammate login for their relay bearer (same token /login hands the PWA)
+          _mtoken="$(curl -fsS -X POST -H 'content-type: application/json' \
+            -d "{\"user\":\"$_user\",\"pass\":\"$_pass\"}" "$_rly/login" 2>/dev/null \
+            | python3 -c 'import sys,json; print(json.load(sys.stdin).get("token",""))' 2>/dev/null)"
+        fi
+        [ -n "$_mtoken" ] || { echo "stitchpad: no token for $_rly — pass --token, or --user/--pass to log in, or set STITCHPAD_MIRROR_TOKEN" >&2; exit 1; }
+        _lbl="org.pasture.bridge-mirror-$(_mslug "$_rly")"
+        _pl="$HOME/Library/LaunchAgents/$_lbl.plist"
+        _log="$HOME/.stitchpad/.$_lbl.log"
+        _plist_body() {
+          cat <<PLEOF
+<?xml version="1.0" encoding="UTF-8"?>
+<!-- pasture joint-pad mirror: $_root → $_rly (installed by stitchpad bridge mirror) -->
+<plist version="1.0">
+<dict>
+  <key>Label</key>
+  <string>$_lbl</string>
+  <key>ProgramArguments</key>
+  <array>
+    <string>/bin/bash</string>
+    <string>$HOME/.stitchpad/relay/bridge.sh</string>
+    <string>$_root</string>
+  </array>
+  <key>EnvironmentVariables</key>
+  <dict>
+    <key>STITCHPAD_RELAY</key>
+    <string>$_rly</string>
+    <key>STITCHPAD_TOKEN</key>
+    <string>$_mtoken</string>
+    <key>PATH</key>
+    <string>/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin</string>
+  </dict>
+  <key>RunAtLoad</key>
+  <true/>
+  <key>KeepAlive</key>
+  <true/>
+  <key>StandardOutPath</key>
+  <string>$_log</string>
+  <key>StandardErrorPath</key>
+  <string>$_log</string>
+</dict>
+</plist>
+PLEOF
+        }
+        if [ "$_print" -eq 1 ]; then _plist_body; exit 0; fi
+        mkdir -p "$HOME/Library/LaunchAgents"
+        _plist_body > "$_pl"
+        launchctl unload "$_pl" 2>/dev/null || true
+        launchctl load "$_pl" 2>/dev/null || { echo "launchctl load failed" >&2; exit 1; }
+        # truthful supervision: verify the post-condition, never report blind
+        launchctl list "$_lbl" >/dev/null 2>&1 \
+          || { echo "stitchpad: mirror plist loaded but agent is not listed — check $_log" >&2; exit 1; }
+        echo "✓ joint pad live: $(basename "$_root") mirrors to $_rly (two-way, survives reboots)"
+        echo "  agent $_lbl · log $_log"
+        echo "  remove with: stitchpad bridge mirror --remove $_rly"
+        ;;
+      *) echo "usage: stitchpad bridge {install|uninstall|status|mirror}" >&2; exit 1 ;;
     esac
     ;;
 

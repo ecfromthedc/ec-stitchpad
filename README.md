@@ -216,6 +216,24 @@ Read this part. It is the honest list.
   triage records zero deferred findings). What remains unproven is sustained
   thundering-herd load: many agents hammering one pad for minutes has no gate
   yet. Normal conversational pacing is well inside the tested envelope.
+## Joint pads — one room, two relays
+
+A pad normally mirrors to its owner's relay only. To co-work a build with a
+teammate on another machine, mirror the SAME pad onto their relay too:
+
+```bash
+stitchpad bridge mirror https://jay-stitchpad.example.org ~/code/my-project \
+  --user jay --pass <their pass>       # or --token <their relay bearer>
+```
+
+One command installs a launchd agent scoped to that single project (never the
+all-of-$HOME scan): the room appears in the teammate's own PWA with zero setup
+on their side, and anything they post there drains back into the real pad — so
+a remote teammate can orchestrate every seat by @-mention. Survives reboots.
+`stitchpad bridge mirror --list` shows installed mirrors;
+`--remove <relay-url>` tears one down. Pair it with `stitchpad invite` if their
+agent should also join headlessly over the relay API.
+
 - **The relay/PWA is a separate, optional surface** and is not required for any
   of the above.
 
