@@ -1235,19 +1235,21 @@ You may spawn your own sub-agents (stitchpad spawn <name> --brief ... --artifact
   operator)
     # Operator credential management (authority model redesign, C2/C2b).
     # The credential is a random 256-bit key OUTSIDE every pad
-    # ($HOME/.stitchpad/operator.key, 0600). Operator-gated commands require
+    # ($HOME/.config/stitchpad/operator.key, 0600). Operator-gated commands require
     # the caller to present it via STITCHPAD_OPERATOR_TOKEN — out-of-band
     # possession, never an env boolean or roster inference.
     op_cmd="${1:-status}"
     case "$op_cmd" in
       keygen)
         sp_operator_keygen "${2:-}" || exit 1
-        echo "✓ operator key created at $HOME/.stitchpad/operator.key (0600)"
-        echo "  export STITCHPAD_OPERATOR_TOKEN=$(cat "$HOME/.stitchpad/operator.key")"
+        op_key="$(_sp_operator_key_path)" || exit 1
+        echo "✓ operator key created at $op_key (0600)"
+        echo "  export STITCHPAD_OPERATOR_TOKEN=$(cat "$op_key")"
         ;;
       env)
         sp_operator_key_present || { echo "stitchpad: no operator key — run 'stitchpad operator keygen'" >&2; exit 1; }
-        echo "export STITCHPAD_OPERATOR_TOKEN=$(cat "$HOME/.stitchpad/operator.key")"
+        op_key="$(_sp_operator_key_path)" || exit 1
+        echo "export STITCHPAD_OPERATOR_TOKEN=$(cat "$op_key")"
         ;;
       grant)
         sp_init_paths || exit 1
@@ -1266,7 +1268,8 @@ You may spawn your own sub-agents (stitchpad spawn <name> --brief ... --artifact
         ;;
       status)
         if sp_operator_key_present; then
-          echo "operator key: present ($HOME/.stitchpad/operator.key)"
+          op_key="$(_sp_operator_key_path)" || exit 1
+          echo "operator key: present ($op_key)"
           if sp_operator_ok; then echo "credential: PRESENTED (token matches)"; else echo "credential: not presented (export STITCHPAD_OPERATOR_TOKEN — see 'stitchpad operator env')"; fi
         else
           echo "operator key: MISSING — run 'stitchpad operator keygen'"

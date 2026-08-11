@@ -63,7 +63,7 @@ _sp_scope_seat() {
 #     roster lives in pad markdown the seat can edit — a seat could remove
 #     itself and pass the non-roster check), and unsealed grant files
 #     (pad-state the seat can write).
-#   - ROOT: $HOME/.stitchpad/operator.key — a random 256-bit secret OUTSIDE
+#   - ROOT: $HOME/.config/stitchpad/operator.key — a random 256-bit secret OUTSIDE
 #     every pad, created only by an explicit human `stitchpad operator
 #     keygen`. Operator-gated commands require the caller to PRESENT the
 #     secret via STITCHPAD_OPERATOR_TOKEN (out-of-band possession: the
@@ -107,7 +107,11 @@ _sp_operator_key_path() {
   local realhome
   realhome="$(python3 -c 'import os,pwd; print(pwd.getpwuid(os.getuid()).pw_dir)' 2>/dev/null)"
   [ -n "$realhome" ] || realhome="$HOME"
-  printf '%s' "$realhome/.stitchpad/operator.key"
+  # Keep the credential outside the install tree. Supported installations may
+  # expose ~/.stitchpad through symlinks into a Git checkout; placing the key
+  # below the XDG-style config root avoids both the symlink-parent rejection
+  # and any chance of an untracked credential appearing in the tool repo.
+  printf '%s' "$realhome/.config/stitchpad/operator.key"
 }
 
 # Key file sanity: exists, regular file, not a symlink, non-empty — and not
