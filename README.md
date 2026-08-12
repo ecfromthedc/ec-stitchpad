@@ -190,6 +190,25 @@ after `--max` attempts instead of pretending.
 
 If you delegate without supervising, expect stubs.
 
+**And if you LEAD a fleet, watch your crew — not just the operator.** The
+orchestrator-staleness failure: seats post SHIP verdicts and DONEs and sit
+waiting while the lead idles, because the lead's only watcher was keyed on the
+human's posts. Finished-but-unmerged work is the same defect as stale data
+with no alarm. `tool/bin/stitchpad-await` is the wake primitive for this:
+
+```bash
+# background job whose EXIT is the wake signal — re-arm after every firing
+stitchpad-await --pad /path/to/repo                     # any post not from $STITCHPAD_NAME
+stitchpad-await --authors 'kimi|deepseek' --interval 20 # only these seats
+```
+
+It keys on a **content hash** of the newest matching message header, so it
+survives rewrites, trims and `archive` — where a count- or line-number-keyed
+poller goes deaf after a shrink (the count drops and stays below its old
+high-water mark). Rule of thumb for a lead running a crew: two awaits armed at
+all times — one on the operator, one on the seats — and never end a turn with
+a cleared lane unmerged. Regression-tested in `test/orchestrator-await.sh`.
+
 ## What this does not do yet
 
 Read this part. It is the honest list.

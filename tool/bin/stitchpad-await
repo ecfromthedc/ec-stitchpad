@@ -1,0 +1,62 @@
+#!/usr/bin/env bash
+# stitchpad-await — block until someone ELSE posts on the pad, then exit 0.
+#
+# The orchestrator-staleness fix. A lead seat that only watches the operator
+# goes deaf to its own crew: seats post SHIP verdicts and DONEs and sit
+# waiting while the lead idles — work that is finished but unmerged is the
+# same defect as data that is stale with no alarm. Run this as a background
+# job whose EXIT is the wake signal (background-task completion notifications
+# are dependable where long-lived monitors are not). Re-arm it after every
+# firing and after every reply you post.
+#
+#   stitchpad-await                              # fire on any post not from $STITCHPAD_NAME
+#   stitchpad-await --authors 'kimi|deepseek'    # fire only on these authors
+#   stitchpad-await --pad /path/to/repo          # pad repo root (default: cwd)
+#   stitchpad-await --interval 20                # poll seconds (default 20)
+#
+# Why not `tail -f`: pad rewrites replay history, and a shrink (archive)
+# rewinds tail to zero — see test/pad-io-and-archive.sh. This keys on a
+# CONTENT HASH of the newest matching message header (stable across rewrites,
+# trims and archives) and plain-greps the file each poll.
+set -uo pipefail
+
+PAD_DIR="$PWD"; AUTHORS=""; INTERVAL=20
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --pad)      PAD_DIR="$2"; shift 2 ;;
+    --authors)  AUTHORS="$2"; shift 2 ;;
+    --interval) INTERVAL="$2"; shift 2 ;;
+    *) echo "stitchpad-await: unknown arg $1" >&2; exit 2 ;;
+  esac
+done
+PAD="$PAD_DIR/.stitchpad/stitchpad.md"
+[ -f "$PAD" ] || { echo "stitchpad-await: no pad at $PAD" >&2; exit 2; }
+ME="${STITCHPAD_NAME:-}"
+
+sha() { shasum 2>/dev/null || sha1sum; }
+
+# Newest message header from a watched author. Message headers are
+# "## @name · time · #m-id" — the id makes each header unique, so its hash
+# identifies the message regardless of where in the file it sits.
+last_match() {
+  if [ -n "$AUTHORS" ]; then
+    grep -E "^## @(${AUTHORS}) " "$PAD" 2>/dev/null | tail -1
+  elif [ -n "$ME" ]; then
+    grep -E '^## @' "$PAD" 2>/dev/null | grep -Ev "^## @${ME} " | tail -1
+  else
+    grep -E '^## @' "$PAD" 2>/dev/null | tail -1
+  fi
+}
+
+BASE="$(printf '%s' "$(last_match)" | sha | cut -d' ' -f1)"
+while :; do
+  sleep "$INTERVAL"
+  hdr="$(last_match)"
+  CUR="$(printf '%s' "$hdr" | sha | cut -d' ' -f1)"
+  if [ -n "$hdr" ] && [ "$CUR" != "$BASE" ]; then
+    echo "stitchpad-await: new post — $hdr"
+    awk -v h="$hdr" 'index($0,h)==1{i=NR} {l[NR]=$0}
+      END{if(i){n=i; while(n<=NR){if(n>i && l[n] ~ /^## /) break; print l[n]; n++}}}' "$PAD"
+    exit 0
+  fi
+done
