@@ -1632,9 +1632,29 @@ except: print("")' 2>/dev/null)"
   watch)   exec "$STITCHPAD_HOME/bin/watch.sh" ;;
   daemon)  exec "$STITCHPAD_HOME/bin/daemon.sh" "${@}" ;;
 
+  workspace)
+    # One visible home for agent-created work. The bridge mirrors pads only
+    # below this root unless a caller explicitly supplies another root.
+    workspace_sub="${1:-path}"
+    workspace_root="${STITCHPAD_WORKSPACE_ROOT:-$HOME/Stitchpad Workspaces}"
+    case "$workspace_sub" in
+      path)
+        printf '%s\n' "$workspace_root"
+        ;;
+      init)
+        mkdir -p "$workspace_root"
+        printf '✓ Stitchpad workspace ready: %s\n' "$workspace_root"
+        ;;
+      *)
+        echo "usage: stitchpad workspace {path|init}" >&2
+        exit 1
+        ;;
+    esac
+    ;;
+
   bridge)
-    # The relay bridge as a permanent login service — so EVERY pad anywhere under
-    # $HOME auto-mirrors to the PWA with zero per-pad setup, surviving reboots.
+    # The relay bridge as a permanent login service. It mirrors only pads below
+    # one deliberate workspace root, never every pad under $HOME.
     #   stitchpad bridge install   write+load the launchd agent (one time)
     #   stitchpad bridge uninstall remove it
     #   stitchpad bridge status    is it loaded/running?
@@ -1645,12 +1665,13 @@ except: print("")' 2>/dev/null)"
       install)
         relay="${STITCHPAD_RELAY:-https://stitchpad.agentsworld.org}"
         token="${STITCHPAD_TOKEN:-}"
+        workspace_root="${STITCHPAD_WORKSPACE_ROOT:-$HOME/Stitchpad Workspaces}"
         [ -z "$token" ] && { echo "set STITCHPAD_TOKEN (the relay bearer token) and re-run" >&2; exit 1; }
         [ -f "$tmpl" ] || { echo "missing template: $tmpl" >&2; exit 1; }
-        mkdir -p "$HOME/Library/LaunchAgents"
-        sed -e "s|__HOME__|$HOME|g" -e "s|__RELAY__|$relay|g" -e "s|__TOKEN__|$token|g" "$tmpl" > "$plist"
+        mkdir -p "$HOME/Library/LaunchAgents" "$workspace_root"
+        sed -e "s|__HOME__|$HOME|g" -e "s|__RELAY__|$relay|g" -e "s|__TOKEN__|$token|g" -e "s|__WORKSPACE_ROOT__|$workspace_root|g" "$tmpl" > "$plist"
         launchctl unload "$plist" 2>/dev/null || true
-        launchctl load "$plist" 2>/dev/null && echo "✓ bridge installed + running (auto-starts at login, scans all of \$HOME)" || { echo "launchctl load failed" >&2; exit 1; }
+        launchctl load "$plist" 2>/dev/null && echo "✓ bridge installed + running (workspace only: $workspace_root)" || { echo "launchctl load failed" >&2; exit 1; }
         ;;
       uninstall)
         launchctl unload "$plist" 2>/dev/null || true
@@ -1658,7 +1679,9 @@ except: print("")' 2>/dev/null)"
         ;;
       status)
         if launchctl list org.stitchpad.bridge >/dev/null 2>&1; then
-          echo "✓ bridge service loaded + auto-starts at login"; pgrep -fl "relay/bridge.sh" | head -1
+          echo "✓ bridge service loaded + auto-starts at login"
+          echo "  workspace: ${STITCHPAD_WORKSPACE_ROOT:-$HOME/Stitchpad Workspaces}"
+          pgrep -fl "relay/bridge.sh" | head -1
         else echo "bridge service not installed (run: stitchpad bridge install)"; fi
         ;;
       *) echo "usage: stitchpad bridge {install|uninstall|status}" >&2; exit 1 ;;

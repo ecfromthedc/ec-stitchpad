@@ -1,8 +1,8 @@
 <?xml version="1.0" encoding="UTF-8"?>
-<!-- stitchpad bridge — auto-starts at login, scans all of $HOME for .stitchpad pads,
-     mirrors each to the relay (so new pads appear in the PWA with zero setup), and
+<!-- stitchpad bridge — auto-starts at login, scopes discovery to one workspace root,
+     mirrors each pad under that root to the relay, and
      drains phone→pad messages. KeepAlive restarts it if it dies.
-     Install: `stitchpad bridge install` (fills __HOME__/__TOKEN__ and loads it). -->
+     Install: `stitchpad bridge install` (fills paths/credentials and loads it). -->
 <plist version="1.0">
 <dict>
   <key>Label</key>
@@ -18,6 +18,8 @@
     <string>__RELAY__</string>
     <key>STITCHPAD_TOKEN</key>
     <string>__TOKEN__</string>
+    <key>STITCHPAD_WORKSPACE_ROOT</key>
+    <string>__WORKSPACE_ROOT__</string>
     <key>PATH</key>
     <string>/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin</string>
   </dict>

@@ -10,6 +10,7 @@
 // drain every 30s (catches messages queued while a socket was down).
 //
 //   STITCHPAD_RELAY=... STITCHPAD_TOKEN=... node bridge-ws.mjs [roots...]
+//   Default scope: ~/Stitchpad Workspaces (override with STITCHPAD_WORKSPACE_ROOT).
 import { execFile, spawn, spawnSync } from "node:child_process";
 import { existsSync, mkdirSync, watch, writeFileSync, readFileSync, readdirSync, truncateSync, statSync, openSync, readSync, closeSync } from "node:fs";
 import { readFile } from "node:fs/promises";
@@ -18,13 +19,18 @@ import os from "node:os";
 
 // PASTURE COMPAT (stage 1): PASTURE_* env wins, STITCHPAD_* accepted until stage 4
 const env = (k, d) => process.env["PASTURE_" + k] ?? process.env["STITCHPAD_" + k] ?? d;
+const HOME = os.homedir();
+const WORKSPACE_ROOT = env("WORKSPACE_ROOT", join(HOME, "Stitchpad Workspaces"));
+const ROOTS = process.argv.slice(2).length ? process.argv.slice(2) : [WORKSPACE_ROOT];
+if (env("BRIDGE_PRINT_ROOTS") === "1") {
+  console.log(ROOTS.join("\n"));
+  process.exit(0);
+}
 const RELAY = env("RELAY", "https://pasture.agentsworld.org");
 const TOKEN = env("TOKEN");
 if (!TOKEN) { console.error("[bridge-ws] PASTURE_TOKEN (or STITCHPAD_TOKEN) required"); process.exit(1); }
-const ROOTS = process.argv.slice(2).length ? process.argv.slice(2) : [os.homedir()];
 // optional allowlist: PASTURE_PADS="ocean-surface,ocean-os" → only these sync
 const ONLY = (env("PADS", "")).split(",").map(s => s.trim()).filter(Boolean);
-const HOME = os.homedir();
 const SP = [join(HOME, ".pasture/bin/pasture"), join(HOME, ".stitchpad/bin/stitchpad")].find(existsSync) || "stitchpad";
 // migrated pads carry pasture.md; legacy stitchpad.md accepted until stage 4
 const padMd = (padd) => { const f = join(padd, "pasture.md"); return existsSync(f) ? f : join(padd, "stitchpad.md"); };
@@ -46,9 +52,8 @@ const api = (path, opts = {}) => fetch(RELAY + path, { ...opts, headers: { autho
 function findPads() {
   const out = [];
   for (const r of ROOTS) {
-    // find exits non-zero on permission noise under $HOME — stdout is still good.
-    // Prune the heavy trees (Library, node_modules, …): full-home scans were the
-    // old bridge's slowest leg by far.
+    // The scoped workspace avoids a full-home scan. Keep pruning heavy project
+    // trees so an explicit broad root remains safe enough for migration use.
     const res = spawnSync("find", [r, "-maxdepth", "4",
       "(", "-name", "Library", "-o", "-name", "node_modules", "-o", "-name", ".Trash",
       "-o", "-name", ".git", "-o", "-name", ".nvm", "-o", "-name", ".cache",
