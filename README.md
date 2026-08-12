@@ -209,6 +209,12 @@ high-water mark). Rule of thumb for a lead running a crew: two awaits armed at
 all times — one on the operator, one on the seats — and never end a turn with
 a cleared lane unmerged. Regression-tested in `test/orchestrator-await.sh`.
 
+**Two more lead laws (each cost a real build hours — docs/KNOWN-WEDGES.md #4):**
+the lead never ends a turn with its OWN work pending unless a dead-man timer
+is armed to re-invoke it; and every seat push is accompanied by a one-line
+pad post naming branch + SHA — pad-keyed waiters cannot see git, so a silent
+push is an invisible finish.
+
 **And run the watchdog so no seat stalls.** The keeper wakes idle seats with
 an open todo/in_progress task; `tool/bin/stitchpad-watchdog` covers the gap
 the keeper cannot see — a seat that is idle with an **unacked @mention** and
