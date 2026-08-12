@@ -68,3 +68,25 @@ re-merge. If they differ, STOP — someone's real work is only in that tree.
 work ONLY in their assigned worktrees, never the shared checkouts. To
 inspect pushed work, read from the ref (`git show origin/<branch>:<file>`),
 never by checking anything out into a tree you don't own.
+
+## 4. The lead stalls on its own promises (and a silent push is invisible)
+
+**Repro (cost hours, 2026-08-12, twice):** the LEAD ends a turn after a
+status message with its own build work promised ("building now") — nothing
+re-invokes it: the operator-waiter and crew-waiter watch OTHERS' posts;
+nobody watches the lead's own pending work. Compounding it: a seat that
+fixes-and-PUSHES without posting to the pad never fires the crew-waiter
+(it is pad-keyed, not git-keyed) — the lead sits idle on work that is
+already done.
+
+**Recovery:** the operator yells. That is the failure, not a recovery.
+
+**Prevention (both laws, now in the fleet README):**
+1. **The dead-man timer:** the lead NEVER ends a turn with own-work pending
+   unless a timer is armed that will re-invoke it (harness scheduler when
+   available, else a background `sleep N && echo CONTINUE <task>` whose
+   exit is the wake). Re-arm on every firing.
+2. **Every push posts:** a seat that pushes commits MUST post one pad line
+   naming the branch and SHA in the same breath — the push itself is
+   invisible to pad-keyed waiters. "Push after every green unit" therefore
+   reads "push AND post after every green unit."
