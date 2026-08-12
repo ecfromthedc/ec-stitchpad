@@ -1,0 +1,109 @@
+#!/usr/bin/env bash
+# stitchpad-watchdog — wakes any Ocean seat that is idle-with-pending-work.
+#
+# Until now this lived as a hand-copied per-pad script (.stitchpad/
+# session-watchdog.sh), passed from build to build as folklore. A crew that a
+# team runs for long-standing workflows cannot depend on folklore; this is the
+# tooling version.
+#
+# WHY IT EXISTS (alongside the keeper): the seat-keeper wakes idle seats that
+# have an open todo/in_progress task. But a seat can stall in ways the keeper
+# cannot see — an unacked @mention with no open task, or a wedged delivery.
+# The watchdog covers the gap: any seat that is idle AND has pending work
+# (an open todo/in_progress task OR an unacked mention) gets woken, in its
+# own worktree, on its pinned model.
+#
+# LESSONS ENCODED (each cost a real build real time):
+# - in_review does NOT count as pending work: a seat whose task is in_review
+#   is legitimately waiting on the OTHER seat's verdict, which arrives as a
+#   mention. Counting in_review over-wakes the author every cooldown.
+# - Never wake a mid-turn session (the busy gate). Rate-limit per seat.
+# - Root the wake in .state/seat-cwd.<name>; pin .state/seat-model.<name> —
+#   a seat woken unpinned records the daemon's global model and can deadlock
+#   the wake gate.
+# - bash 3.2 (macOS) has no associative arrays: counters live in files.
+#
+#   stitchpad-watchdog [--pad DIR] [--interval SECS]
+#     --pad       pad repo root (default: cwd)
+#     --interval  seconds between sweeps (default 90; env WATCHDOG_INTERVAL)
+#   debug: stitchpad-watchdog --pad DIR --check-task NAME
+#     exits 0 iff NAME has an open todo/in_progress task in tasks.md
+#     (the awk that is easy to get wrong — this flag is what the test drives)
+set -uo pipefail
+
+_src="${BASH_SOURCE[0]}"; while [ -h "$_src" ]; do
+  _dir="$(cd -P "$(dirname "$_src")" && pwd)"; _src="$(readlink "$_src")"
+  [ "${_src#/}" = "$_src" ] && _src="$_dir/$_src"
+done
+BIN_DIR="$(cd -P "$(dirname "$_src")" && pwd)"
+SP="$BIN_DIR/stitchpad"
+
+PAD_DIR="$PWD"; INTERVAL="${WATCHDOG_INTERVAL:-90}"; CHECK_TASK=""
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --pad) PAD_DIR="$2"; shift 2 ;;
+    --interval) INTERVAL="$2"; shift 2 ;;
+    --check-task) CHECK_TASK="$2"; shift 2 ;;
+    *) echo "stitchpad-watchdog: unknown arg $1" >&2; exit 2 ;;
+  esac
+done
+PAD_STATE="$PAD_DIR/.stitchpad/.state"
+TASKS="$PAD_DIR/.stitchpad/tasks.md"
+[ -d "$PAD_STATE" ] || { echo "stitchpad-watchdog: no pad state at $PAD_STATE" >&2; exit 2; }
+
+HB="$(command -v ocean-heartbeat || echo "$HOME/dev/ocean-os/target/release/ocean-heartbeat")"
+DAEMON="${OCEAN_DAEMON_URL:-http://127.0.0.1:4780}"
+IDLE_STRIKES=2          # consecutive idle sweeps before waking
+WAKE_COOLDOWN=300       # never wake the same seat more than once per 5 min
+
+has_open_task() { # $1=name → 0 iff a todo/in_progress task is assigned to it.
+  awk -v who="$1" 'BEGIN{RS="";FS="\n"} {a=0;s=""; for(i=1;i<=NF;i++){if($i ~ "assignee: *"who"$")a=1; if($i ~ /status:/){sub(/.*status: */,"",$i); s=$i}} if(a && (s=="todo"||s=="in_progress")) {found=1}} END{exit found?0:1}' "$TASKS" 2>/dev/null
+}
+
+if [ -n "$CHECK_TASK" ]; then
+  has_open_task "$CHECK_TASK"; exit $?
+fi
+
+busy() { # $1=sid → "busy"|"idle"|"unknown"
+  local b; b=$(curl -sf -m 4 "$DAEMON/v1/agent/sessions/$1" 2>/dev/null) || { echo unknown; return; }
+  [ -z "$b" ] && { echo unknown; return; }
+  printf '%s' "$b" | python3 -c 'import json,sys
+try: s=json.load(sys.stdin).get("session")
+except Exception: print("unknown"); raise SystemExit
+print("busy" if isinstance(s,dict) and s.get("active_turn") else "idle")' 2>/dev/null || echo unknown
+}
+
+has_unacked_mention() { # $1=name → 0 iff the seat has unacked @mentions
+  local out; out=$(cd "$PAD_DIR" && STITCHPAD_NAME="$1" "$SP" wake "$1" --peek 2>/dev/null)
+  [ -n "$out" ]
+}
+
+SEATS="$(for f in "$PAD_STATE"/ocean-session.*; do [ -f "$f" ] || continue; n="${f##*/ocean-session.}"; printf '%s:%s\n' "$n" "$(cat "$f")"; done)"
+[ -n "$SEATS" ] || { echo "stitchpad-watchdog: no ocean-session.* seats under $PAD_STATE" >&2; exit 2; }
+
+_sf() { printf '%s/.watchdog-%s.%s' "$PAD_STATE" "$1" "$2"; }   # $1=kind $2=name
+_get() { cat "$(_sf "$1" "$2")" 2>/dev/null || echo 0; }
+_set() { printf '%s' "$3" > "$(_sf "$1" "$2")" 2>/dev/null || true; }
+
+echo "[watchdog] armed for: $(echo "$SEATS" | tr '\n' ' ')"
+while :; do
+  now=$(date +%s)
+  while IFS=: read -r name sid; do
+    [ -n "$name" ] && [ -n "$sid" ] || continue
+    st=$(busy "$sid")
+    if [ "$st" != "idle" ]; then _set strike "$name" 0; continue; fi
+    if has_open_task "$name" || has_unacked_mention "$name"; then
+      _set strike "$name" $(( $(_get strike "$name") + 1 ))
+    else
+      _set strike "$name" 0; continue
+    fi
+    [ "$(_get strike "$name")" -ge "$IDLE_STRIKES" ] || continue
+    lw=$(_get lastwake "$name"); [ $(( now - lw )) -lt "$WAKE_COOLDOWN" ] && continue
+    cwd="$(head -c 4096 "$PAD_STATE/seat-cwd.$name" 2>/dev/null | tr -d '[:space:]')"; [ -d "$cwd" ] || cwd="$PAD_DIR"
+    model="$(head -c 64 "$PAD_STATE/seat-model.$name" 2>/dev/null | tr -d '[:space:]')"
+    "$HB" wake --session-id "$sid" --cwd "$cwd" ${model:+--model "$model"} --client-type stitchpad --no-wait \
+      --prompt "Auto-resume (stitchpad-watchdog): you are idle but have pending work on the pad. cd $cwd, then: cd $PAD_DIR && $SP read -n 20 to see what's waiting (a review verdict, a task, or a reply), and continue your lane. If genuinely nothing is actionable, post one line saying so and yield." >/dev/null 2>&1 \
+      && { echo "[watchdog] WOKE stalled seat @$name (idle, has pending work)"; _set lastwake "$name" "$now"; _set strike "$name" 0; }
+  done <<< "$SEATS"
+  sleep "$INTERVAL"
+done

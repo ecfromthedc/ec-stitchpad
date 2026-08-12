@@ -209,6 +209,25 @@ high-water mark). Rule of thumb for a lead running a crew: two awaits armed at
 all times — one on the operator, one on the seats — and never end a turn with
 a cleared lane unmerged. Regression-tested in `test/orchestrator-await.sh`.
 
+**And run the watchdog so no seat stalls.** The keeper wakes idle seats with
+an open todo/in_progress task; `tool/bin/stitchpad-watchdog` covers the gap
+the keeper cannot see — a seat that is idle with an **unacked @mention** and
+no open task (a review request, a handoff). One per pad:
+
+```bash
+stitchpad-watchdog --pad /path/to/repo   # sweeps every 90s; wakes idle-with-pending-work
+```
+
+It never wakes a mid-turn session, rate-limits per seat, roots each wake in
+`.state/seat-cwd.<name>`, pins `.state/seat-model.<name>` — and deliberately
+does NOT count `in_review` tasks as pending: that seat is waiting on the
+OTHER seat's verdict, which arrives as a mention; counting in_review
+over-wakes the author every cooldown. Previously a hand-copied per-pad
+script; the matching rules are pinned in `test/watchdog-task-matching.sh`.
+Fleet setup order that never stalls: create session → write seat-model +
+seat-cwd → join → first wake pinned → enroll the repo in the keeper →
+watchdog + two awaits running.
+
 ## What this does not do yet
 
 Read this part. It is the honest list.
