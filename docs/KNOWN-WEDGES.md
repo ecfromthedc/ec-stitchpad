@@ -162,3 +162,47 @@ actually on this pad's roster**; an unrostered name is still refused. This
 does not weaken a security boundary — the CLI has always trusted
 `STITCHPAD_NAME` on an unclaimed terminal — it removes a delegation blocker.
 Pinned by `test/delegate-can-speak.sh`.
+
+## 8. A headless agent parks forever on stdin, and "running" is a lie
+
+**Repro (cost 2h21m of a three-lane build, 2026-08-12):** a lead spawns a
+headless agent from an orchestration shell or a pipeline —
+`codex exec … "$brief" | tail -20`, or any background launcher whose stdin is
+an open socket. The agent prints nothing and sits at **0% CPU**. No session
+file is ever created. **Not one API call is made.** `ps` shows it `S` and
+alive, the task tracker shows "running", the orchestrator believes both, and
+the lane it was supposed to build sits untouched for hours.
+
+The cause is the agent's own first startup step, which you never see because
+it is buffered behind the block:
+
+    Reading additional input from stdin...
+
+A headless agent treats a non-TTY stdin as piped context and **blocks reading
+it**. From a pipeline, a background shell, or anything whose stdin never
+reaches EOF, that read never returns. It is not slow, not rate-limited, not
+thinking — it is parked before it ever started.
+
+**Recovery:** kill it and relaunch with stdin closed —
+`codex exec … "$brief" < /dev/null > run.log 2>&1 &` — then confirm real
+output within ~10s. In the incident the relaunched agent produced 18KB of work
+in ten seconds, against zero bytes in two hours and twenty-one minutes.
+
+**Detection you can trust:** a fresh session file under `~/.codex/sessions/`,
+or growth in the log. Never `ps`. **A process that exists is not a process
+that is working.**
+
+**Real fix (shipped): `tool/bin/stitchpad-exec`.** It redirects stdin from
+`/dev/null` so the startup read EOFs instantly, and — because the redirect
+alone would still fail quiet if the agent stalled for any *other* reason — it
+refuses to call the spawn successful until the child has actually PRODUCED
+something. Nothing before the deadline means the child is killed and the wedge
+announced (exit 78), rather than left as a corpse that looks alive. Pinned by
+`test/headless-spawn-stdin.sh`, which also asserts the wedge itself is still
+reproducible, so the test goes loud instead of blind if the behaviour changes.
+
+**Prevention, and the better answer:** prefer a **managed seat** (an ocean
+session) over a raw headless exec for any long-lived agent. A seat is
+watchdog-covered, posts to the pad as itself, and cannot enter this state. The
+crew that hit this moved its last CLI agent onto an ocean seat the same night.
+Reach for `stitchpad-exec` for one-shot work, not for a lane.

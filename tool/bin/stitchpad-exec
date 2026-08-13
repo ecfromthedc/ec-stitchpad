@@ -1,0 +1,98 @@
+#!/usr/bin/env bash
+# stitchpad-exec — spawn a headless agent so that it CANNOT silently do nothing.
+#
+# The wedge this exists for (2026-08-12, cost 2h21m of a three-lane build):
+# a lead spawned `codex exec … "<brief>"` from an orchestration shell. The
+# process sat at 0% CPU for two hours and twenty-one minutes. It never created
+# a session file. It never made a single API call. `ps` said `S`, the task
+# tracker said "running", and the orchestrator believed it — while the lane it
+# was supposed to be building sat untouched.
+#
+# The cause is one line of the agent's own startup:
+#
+#     Reading additional input from stdin...
+#
+# A headless agent treats a non-TTY stdin as piped context and BLOCKS reading
+# it. Spawned from a pipeline (`… | tail -20`), from a background shell, or
+# from anything whose stdin is an open socket that never reaches EOF, that read
+# never returns. The agent is not slow, not rate-limited, not thinking. It is
+# parked before it has started, forever, and nothing anywhere says so.
+#
+# Two guards, because either alone still fails quiet:
+#
+#   1. stdin is redirected from /dev/null, so the read EOFs instantly.
+#   2. the spawn is not called successful until the child has actually PRODUCED
+#      something. A process that exists is not a process that is working; the
+#      only honest evidence of a start is output. If nothing arrives before the
+#      deadline, we kill it and say so loudly rather than leaving a corpse that
+#      looks alive.
+#
+#   stitchpad-exec --log run.log -- codex exec --sandbox workspace-write "$brief"
+#   stitchpad-exec --deadline 120 --detach --log run.log -- claude -p "$brief"
+#
+# Exit: 0 started (and, without --detach, the child's own status)
+#       78 the child produced nothing before the deadline — a wedged spawn
+set -uo pipefail
+
+deadline=90
+logfile=""
+detach=0
+
+die() { printf '\033[31mstitchpad-exec: %s\033[0m\n' "$*" >&2; exit 2; }
+
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --deadline) deadline="${2:-}"; shift 2 ;;
+    --log)      logfile="${2:-}";  shift 2 ;;
+    --detach)   detach=1; shift ;;
+    --)         shift; break ;;
+    -h|--help)  sed -n '2,32p' "$0"; exit 0 ;;
+    *)          die "unknown option: $1 (did you forget the -- before the command?)" ;;
+  esac
+done
+
+[ $# -gt 0 ] || die "no command given; usage: stitchpad-exec [opts] -- <command...>"
+case "$deadline" in ''|*[!0-9]*) die "--deadline wants whole seconds, got: $deadline" ;; esac
+
+if [ -z "$logfile" ]; then
+  logfile="${TMPDIR:-/tmp}/stitchpad-exec.$$.log"
+fi
+: > "$logfile" || die "cannot write log: $logfile"
+
+# THE FIX. stdin from /dev/null so a "reading additional input from stdin"
+# startup read hits EOF immediately instead of blocking on a pipe that no one
+# will ever close. Do not "simplify" this away — the whole wedge lives here.
+"$@" < /dev/null > "$logfile" 2>&1 &
+child=$!
+
+# A spawn is not a start. Wait for real output; a signed-in agent emits its
+# banner within a second or two, so anything past the deadline is parked.
+started=0
+waited=0
+while [ "$waited" -lt "$deadline" ]; do
+  if ! kill -0 "$child" 2>/dev/null; then
+    started=1; break          # already exited — it ran, for better or worse
+  fi
+  if [ -s "$logfile" ]; then
+    started=1; break
+  fi
+  sleep 1
+  waited=$(( waited + 1 ))
+done
+
+if [ "$started" -eq 0 ]; then
+  kill "$child" 2>/dev/null
+  sleep 1
+  kill -9 "$child" 2>/dev/null
+  printf '\033[31mWEDGED SPAWN: %s produced no output in %ss and was killed.\033[0m\n' \
+    "${1##*/}" "$deadline" >&2
+  printf 'Almost always a blocking stdin read. See docs/KNOWN-WEDGES.md #8.\n' >&2
+  printf 'log: %s\n' "$logfile" >&2
+  exit 78
+fi
+
+printf 'started %s (pid %s, first output after %ss) log: %s\n' \
+  "${1##*/}" "$child" "$waited" "$logfile"
+
+[ "$detach" -eq 1 ] && exit 0
+wait "$child"
