@@ -206,3 +206,51 @@ session) over a raw headless exec for any long-lived agent. A seat is
 watchdog-covered, posts to the pad as itself, and cannot enter this state. The
 crew that hit this moved its last CLI agent onto an ocean seat the same night.
 Reach for `stitchpad-exec` for one-shot work, not for a lane.
+
+## 9. A seat goes inert near ~200 turns and never says so
+
+**Repro (2026-08-13, cost most of an hour and three silently-dropped tasks):**
+an ocean seat accumulates turns across a long build. Somewhere around **~200**
+it stops doing work. It does not error. Every wake is accepted, the session
+reports `running` and then `completed`, and the seat produces **nothing** — no
+commit, no push, no pad post, an untouched worktree. Three seats hit this
+within minutes of each other at **198, 199 and 200 turns**. Three dispatches
+were dropped before anyone thought to compare branch heads before and after a
+dispatch and noticed nothing had moved.
+
+The tell is brutal in hindsight: a seat that "completed" a 20-minute review in
+under two seconds. `completed` means *the turn ended*, never *the work
+happened* — the same lie as wedges #5 and #6, one layer up.
+
+**Recovery that worked:** archive the session file, delete it, mint a fresh one
+with the SAME name/model/cwd, and re-brief. The rotated seat produced a full
+cross-review within two minutes of a rotation that had been silent for three
+dispatches. Turn counts after rotation: 1, 9, 36 — all working.
+
+**Two signals, and only one of them is proof:**
+
+| | |
+|---|---|
+| turn count | a **leading indicator**. Cheap, available before the damage, never conclusive — a seat can be fine at 210 or dead at 150 depending on how heavy its turns were. |
+| an artifact | the **proof**. A moved branch head, a new commit, a pad post. No artifact means the seat is inert regardless of what the daemon says. |
+
+**Real fix (shipped): `tool/bin/stitchpad-seat-health`.** It reports every
+seat's turns and state, warns at 150, says ROTATE NOW at 185 (before ~200, not
+after) and exits 3 so a script can act, and prints the reminder that turns are
+not proof. `--rotate <seat>` does the archive/delete/mint dance, and:
+
+- **it refuses to rotate without `--brief`.** A fresh seat remembers nothing;
+  rotating without re-briefing trades an inert seat for an amnesiac one, which
+  is worse — the inert seat at least does no damage, while an unbriefed seat
+  acts confidently on nothing.
+- **it verifies the mint produced a NEW id** and fails loudly if the daemon
+  reused the old one (wedge #2), instead of reporting a rotation that did not
+  happen.
+- it archives the dead session rather than destroying it.
+
+Pinned by `test/seat-context-exhaustion.sh` (9 cases, including the reused-id
+no-op and the missing-brief refusal).
+
+**Prevention:** run it between phases of a long build, and after any dispatch
+confirm an artifact moved. Rotate at a clean break — never mid-lane, since the
+seat loses its working context.

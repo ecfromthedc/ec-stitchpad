@@ -1,0 +1,141 @@
+#!/usr/bin/env bash
+# stitchpad-seat-health — catch a seat that has gone inert, and rotate it safely.
+#
+# The wedge this exists for (2026-08-13, cost a three-lane build most of an
+# hour and three silently-dropped tasks):
+#
+# An ocean seat accumulates turns for the life of a build. Somewhere around
+# ~200 it stops doing work. It does NOT error. It does not say anything. Each
+# wake is accepted, the session reports `running` and then `completed`, and the
+# seat produces nothing — no commit, no push, no pad post, an untouched
+# worktree. Three seats hit this within minutes of each other at 198, 199 and
+# 200 turns, and the only reason it was caught is that someone compared branch
+# heads before and after a dispatch and noticed nothing had moved.
+#
+# This is the house failure family exactly: A THING THAT REPORTS SUCCESS WHILE
+# DOING NOTHING. `completed` means "the turn ended", never "the work happened".
+#
+# TWO SIGNALS, and only one of them is proof:
+#
+#   turn count   — a LEADING INDICATOR. Cheap, available before the damage, and
+#                  never conclusive on its own; a seat can be fine at 210 or
+#                  dead at 150 depending on how heavy its turns were.
+#   an artifact  — the PROOF. A new commit, a moved branch head, a pad post.
+#                  If a dispatch produced none of these, the seat is inert no
+#                  matter what the daemon says about it.
+#
+# So this tool reports both and refuses to call a seat healthy on turns alone.
+#
+#   stitchpad-seat-health                          # table of every seat
+#   stitchpad-seat-health --warn-at 150            # tighter leading indicator
+#   stitchpad-seat-health --rotate kimi --brief b.txt --model gpt-5.6-sol \
+#                         --cwd ~/dev/wt-pulse-kimi
+#
+# Exit: 0 all seats under the threshold · 3 at least one at/over it
+set -uo pipefail
+
+DAEMON="${OCEAN_DAEMON:-http://127.0.0.1:4780}"
+STATE="${STITCHPAD_STATE:-.stitchpad/.state}"
+WARN_AT=150      # start watching
+CRIT_AT=185      # rotate before ~200, not after
+rotate=""; brief=""; model=""; cwd=""
+
+die() { printf '\033[31mstitchpad-seat-health: %s\033[0m\n' "$*" >&2; exit 2; }
+
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --warn-at)  WARN_AT="${2:-}"; shift 2 ;;
+    --crit-at)  CRIT_AT="${2:-}"; shift 2 ;;
+    --rotate)   rotate="${2:-}";  shift 2 ;;
+    --brief)    brief="${2:-}";   shift 2 ;;
+    --model)    model="${2:-}";   shift 2 ;;
+    --cwd)      cwd="${2:-}";     shift 2 ;;
+    --state)    STATE="${2:-}";   shift 2 ;;
+    -h|--help)  sed -n '2,36p' "$0"; exit 0 ;;
+    *)          die "unknown option: $1" ;;
+  esac
+done
+
+turns_of() {  # session id -> turn count, or empty
+  curl -s -m 5 "$DAEMON/v1/sessions/$1" 2>/dev/null \
+    | /usr/bin/python3 -c 'import json,sys
+try: print(json.load(sys.stdin)["session"].get("turns",""))
+except Exception: print("")' 2>/dev/null
+}
+state_of() {
+  curl -s -m 5 "$DAEMON/v1/sessions/$1" 2>/dev/null \
+    | /usr/bin/python3 -c 'import json,sys
+try: print(json.load(sys.stdin)["session"].get("state",""))
+except Exception: print("")' 2>/dev/null
+}
+
+# ─────────────────────────────────────────────────────────── rotate one seat
+if [ -n "$rotate" ]; then
+  f="$STATE/ocean-session.$rotate"
+  [ -f "$f" ] || die "no session file for seat '$rotate' at $f"
+
+  # A fresh seat remembers NOTHING. Rotating without re-briefing trades an
+  # inert seat for an amnesiac one, which is worse: the inert seat at least
+  # does no damage, while an unbriefed seat will confidently do the wrong
+  # thing. So the brief is mandatory, not advisory.
+  [ -n "$brief" ] || die "--rotate requires --brief <file>: a fresh seat remembers nothing, and an unbriefed seat is worse than an inert one"
+  [ -s "$brief" ] || die "brief file is empty or missing: $brief"
+  [ -n "$model" ] || die "--rotate requires --model (an unpinned seat inherits the daemon default, which is rarely what a roster wants)"
+  [ -n "$cwd" ]   || die "--rotate requires --cwd"
+
+  old="$(cat "$f")"
+  archive="$f.exhausted-$(turns_of "$old" | tr -d ' ')turns"
+  cp "$f" "$archive" || die "could not archive the old session"
+
+  # The file MUST be removed before minting. `--session-file` with
+  # `--allow-new-session` resolves an existing file to its old id and reuses
+  # it — the wake lands on the dead session and everything looks fine.
+  # (KNOWN-WEDGES #2.)
+  rm -f "$f"
+
+  ocean-heartbeat wake \
+    --session-file "$f" --allow-new-session \
+    --model "$model" --cwd "$cwd" --prompt - --no-wait < "$brief" >/dev/null 2>&1
+
+  new="$(cat "$f" 2>/dev/null || true)"
+  if [ -z "$new" ]; then
+    cp "$archive" "$f"   # put the old id back rather than leave the seat with none
+    die "mint produced no session file — old id restored from $archive"
+  fi
+  if [ "$new" = "$old" ]; then
+    die "mint REUSED the old session id ($old) — the seat was not rotated (KNOWN-WEDGES #2)"
+  fi
+
+  printf '\033[32mrotated %s\033[0m  %s -> %s  (old archived: %s)\n' \
+    "$rotate" "$old" "$new" "$(basename "$archive")"
+  printf 'Now confirm it PRODUCES — a state of "running" is not work.\n'
+  exit 0
+fi
+
+# ─────────────────────────────────────────────────────────────── report all
+shopt -s nullglob 2>/dev/null
+files=("$STATE"/ocean-session.*)
+[ ${#files[@]} -gt 0 ] || die "no seats found under $STATE"
+
+printf '%-14s %-38s %-11s %6s  %s\n' SEAT SESSION STATE TURNS HEALTH
+hot=0
+for f in "${files[@]}"; do
+  case "$f" in *.exhausted*|*.bak) continue ;; esac
+  seat="$(basename "$f" | sed 's/^ocean-session\.//')"
+  sid="$(cat "$f" 2>/dev/null)"
+  t="$(turns_of "$sid")"; s="$(state_of "$sid")"
+  case "$t" in
+    ''|*[!0-9]*) health=$'\033[33mUNREADABLE — treat as suspect\033[0m' ;;
+    *)
+      if   [ "$t" -ge "$CRIT_AT" ]; then health=$'\033[31mROTATE NOW — seats go inert near 200\033[0m'; hot=1
+      elif [ "$t" -ge "$WARN_AT" ]; then health=$'\033[33mwatch — rotate at next clean break\033[0m'
+      else health=$'\033[32mok\033[0m'
+      fi ;;
+  esac
+  printf '%-14s %-38s %-11s %6s  %b\n' "$seat" "${sid:0:36}" "${s:-?}" "${t:-?}" "$health"
+done
+
+printf '\nTurns are a LEADING INDICATOR, never proof. The only proof a seat is\n'
+printf 'working is an ARTIFACT: a moved branch head, a new commit, a pad post.\n'
+printf 'After every dispatch, check that something actually changed.\n'
+exit $(( hot == 1 ? 3 : 0 ))
