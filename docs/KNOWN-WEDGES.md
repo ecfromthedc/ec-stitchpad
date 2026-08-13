@@ -90,3 +90,27 @@ already done.
    naming the branch and SHA in the same breath — the push itself is
    invisible to pad-keyed waiters. "Push after every green unit" therefore
    reads "push AND post after every green unit."
+
+## 5. The watchdog "wakes" a seat that no longer exists (and says it worked)
+
+**Repro (observed 2026-08-12):** a seat's session is re-minted — a shift
+change, a wedge recovery, `stitchpad reset` — and the watchdog, which read
+`ocean-session.*` ONCE at startup, keeps polling the OLD id. `ocean-heartbeat
+wake` accepts the post against a dead session and exits 0, so the watchdog
+prints `[watchdog] WOKE stalled seat @name` on every cooldown, forever, while
+the seat is never actually woken. Meanwhile a genuinely idle seat with open
+work sits untouched because the log looks healthy.
+
+**Why it hid:** the success message was keyed on the wake command's exit
+code, not on the seat going busy — the same failure family as an alarm that
+prints "healthy" when its own check failed. Both bugs make a guard *look*
+alive while it does nothing.
+
+**Recovery:** restart the watchdog (it re-reads the roster at startup), or
+`rm .state/ocean-session.<name>` and re-seat.
+
+**Real fix (shipped):** `stitchpad-watchdog` now re-reads the roster every
+sweep, and after a wake it polls the session for up to ~12s to confirm the
+turn actually started. A wake that doesn't land is reported as
+`WAKE DID NOT LAND`; three in a row posts an @-visible pad warning that the
+seat is unreachable and hushes it for 30 minutes instead of burning cycles.
