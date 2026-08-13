@@ -1,0 +1,168 @@
+#!/usr/bin/env bash
+# stitchpad-wake — dispatch a seat so that a dispatch which did not happen
+# cannot look like one that did.
+#
+# THE WEDGE (2026-08-13, cost about an hour and three silently dropped tasks):
+#
+# `ocean-heartbeat` is installed as a SYMLINK into a cargo build directory
+# (~/.local/bin/ocean-heartbeat -> ~/dev/ocean/target/release/ocean-heartbeat).
+# A routine disk cleanup swept `target/`. The symlink dangled, and every wake
+# died instantly with:
+#
+#     no such file or directory: .../ocean-heartbeat
+#
+# The orchestrator was calling it as
+#
+#     ocean-heartbeat wake ... >/dev/null 2>&1 ; echo "dispatched"
+#
+# so the error went to /dev/null and a bare `echo` announced success. THREE
+# dispatches were reported as sent while the entire crew was unreachable. The
+# seats then read `completed` in every status check — not because they had
+# finished, but because they had never been reached. Those two states are
+# indistinguishable from the outside, which is what made it cost an hour.
+#
+# THREE THINGS THIS ENFORCES, because any one alone still fails quiet:
+#
+#   1. PREFLIGHT the launcher. A dangling symlink, a non-executable file, or a
+#      binary missing from PATH is caught BEFORE a brief is sent, and named.
+#   2. NEVER SWALLOW THE WAKE'S OWN OUTPUT. The response is captured and
+#      inspected; a wake is only "sent" if the response actually identifies a
+#      session. `echo "dispatched"` is not evidence of anything.
+#   3. OPTIONALLY PROVE WORK, not just delivery. --expect-artifact records a
+#      baseline (a branch head, a file, a pad post count) so a later
+#      --verify-artifact can answer the only question that matters: did
+#      anything actually change?
+#
+#   stitchpad-wake --seat kimi --session-file .state/ocean-session.kimi \
+#                  --model gpt-5.6-sol --cwd ~/work --brief brief.txt
+#   stitchpad-wake --preflight-only
+#   stitchpad-wake --seat kimi --verify-artifact --repo ~/work --branch lane/x
+#
+# Exit: 0 sent (and verified, if asked) · 4 launcher unusable
+#       5 wake produced no session · 6 no artifact since the baseline
+set -uo pipefail
+
+LAUNCHER="${OCEAN_HEARTBEAT_BIN:-ocean-heartbeat}"
+seat=""; session_file=""; model=""; cwd=""; brief=""
+preflight_only=0; expect_artifact=0; verify_artifact=0; repo=""; branch=""
+state_dir="${STITCHPAD_STATE:-.stitchpad/.state}"
+
+say()  { printf '%s\n' "$*"; }
+warn() { printf '\033[33m%s\033[0m\n' "$*" >&2; }
+die()  { printf '\033[31mstitchpad-wake: %s\033[0m\n' "$*" >&2; exit "${2:-2}"; }
+
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --seat)            seat="${2:-}"; shift 2 ;;
+    --session-file)    session_file="${2:-}"; shift 2 ;;
+    --model)           model="${2:-}"; shift 2 ;;
+    --cwd)             cwd="${2:-}"; shift 2 ;;
+    --brief)           brief="${2:-}"; shift 2 ;;
+    --repo)            repo="${2:-}"; shift 2 ;;
+    --branch)          branch="${2:-}"; shift 2 ;;
+    --state)           state_dir="${2:-}"; shift 2 ;;
+    --preflight-only)  preflight_only=1; shift ;;
+    --expect-artifact) expect_artifact=1; shift ;;
+    --verify-artifact) verify_artifact=1; shift ;;
+    -h|--help)         sed -n '2,44p' "$0"; exit 0 ;;
+    *)                 die "unknown option: $1" ;;
+  esac
+done
+
+# ─────────────────────────────────────────────────────────────── 1. preflight
+#
+# `command -v` alone is NOT enough: it happily resolves a symlink whose target
+# has been deleted. That is the exact shape of the outage — the name resolved,
+# the file did not exist. Follow it to something executable or refuse.
+preflight() {
+  local path=""
+  # `command -v` returns NOTHING for a dangling symlink, because the target is
+  # not executable — so resolving through it first would collapse the most
+  # useful diagnosis ("your launcher points at a deleted build") into the
+  # vaguest one ("not on PATH"). Look at the path itself before asking PATH.
+  case "$LAUNCHER" in
+    */*) path="$LAUNCHER" ;;
+    *)   path="$(command -v "$LAUNCHER" 2>/dev/null || true)"
+         if [ -z "$path" ]; then
+           # Still possibly a dangling symlink sitting on PATH: find it by name.
+           local d
+           IFS=: read -ra _dirs <<< "$PATH"
+           for d in "${_dirs[@]}"; do
+             [ -L "$d/$LAUNCHER" ] && { path="$d/$LAUNCHER"; break; }
+           done
+         fi ;;
+  esac
+  if [ -z "$path" ] || { [ ! -e "$path" ] && [ ! -L "$path" ]; }; then
+    die "launcher '$LAUNCHER' is not on PATH — no wake can be delivered" 4
+  fi
+  if [ -L "$path" ] && [ ! -e "$path" ]; then
+    local target; target="$(readlink "$path" 2>/dev/null || echo '?')"
+    die "launcher '$path' is a DANGLING SYMLINK -> $target
+       Its target is gone — most often a disk cleanup swept a build directory.
+       Every wake would fail instantly and every seat would read 'completed'
+       because it was never reached. Rebuild the target, then retry." 4
+  fi
+  if [ ! -x "$path" ]; then
+    die "launcher '$path' exists but is not executable" 4
+  fi
+  say "preflight ok: $LAUNCHER -> $path"
+}
+
+preflight
+[ "$preflight_only" -eq 1 ] && exit 0
+
+# ────────────────────────────────────────────────────── artifact bookkeeping
+baseline_file() { printf '%s/wake-baseline.%s' "$state_dir" "${seat:-unknown}"; }
+
+current_artifact() {
+  # A branch head is the cheapest honest proof that a seat did something.
+  if [ -n "$repo" ] && [ -n "$branch" ]; then
+    git -C "$repo" rev-parse "$branch" 2>/dev/null && return
+  fi
+  printf 'no-artifact-source\n'
+}
+
+if [ "$verify_artifact" -eq 1 ]; then
+  [ -n "$seat" ] || die "--verify-artifact needs --seat"
+  bf="$(baseline_file)"
+  [ -f "$bf" ] || die "no baseline recorded for '$seat' — dispatch with --expect-artifact first" 6
+  before="$(cat "$bf")"
+  after="$(current_artifact)"
+  if [ "$before" = "$after" ]; then
+    die "SEAT '$seat' PRODUCED NOTHING since its last dispatch (still $after).
+       A state of 'running' or 'completed' is not work. Re-dispatch, or rotate
+       the seat — it may have gone inert." 6
+  fi
+  say "artifact confirmed for $seat: $before -> $after"
+  exit 0
+fi
+
+# ───────────────────────────────────────────────────────────────── 2. wake
+[ -n "$brief" ] || die "--brief <file> is required (an unbriefed seat acts confidently on nothing)"
+[ -s "$brief" ] || die "brief file is empty or missing: $brief"
+[ -n "$model" ] || die "--model is required (an unpinned seat inherits the daemon default)"
+[ -n "$cwd" ]   || die "--cwd is required"
+[ -n "$session_file" ] || die "--session-file is required"
+
+if [ "$expect_artifact" -eq 1 ]; then
+  mkdir -p "$state_dir"
+  current_artifact > "$(baseline_file)"
+fi
+
+# The response is CAPTURED, never discarded. Piping this to /dev/null is what
+# turned a dead launcher into three phantom dispatches.
+resp="$("$LAUNCHER" wake \
+          --session-id "$(cat "$session_file" 2>/dev/null)" \
+          --model "$model" --cwd "$cwd" --prompt - --no-wait < "$brief" 2>&1)"
+
+# A wake counts as delivered only if the response identifies a session. Anything
+# else — an error string, empty output, a usage dump — is a failed dispatch, and
+# must be reported as one rather than assumed.
+if printf '%s' "$resp" | grep -qE '[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}'; then
+  say "wake delivered to ${seat:-seat}"
+  exit 0
+fi
+
+printf '\033[31mWAKE NOT DELIVERED to %s — the launcher returned no session.\033[0m\n' "${seat:-seat}" >&2
+printf 'launcher said: %s\n' "${resp:-<no output at all>}" >&2
+exit 5

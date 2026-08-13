@@ -254,3 +254,49 @@ no-op and the missing-brief refusal).
 **Prevention:** run it between phases of a long build, and after any dispatch
 confirm an artifact moved. Rotate at a clean break — never mid-lane, since the
 seat loses its working context.
+
+## 9. A dead launcher makes every dispatch look sent, and every seat look finished
+
+**Repro (2026-08-13, cost about an hour and three silently dropped tasks):**
+`ocean-heartbeat` is installed as a symlink into a cargo build directory
+(`~/.local/bin/ocean-heartbeat -> ~/dev/ocean/target/release/ocean-heartbeat`).
+A routine disk cleanup swept `target/`. The symlink dangled, and every wake
+died instantly with `no such file or directory`.
+
+The orchestrator was dispatching like this:
+
+    ocean-heartbeat wake … >/dev/null 2>&1 ; echo "dispatched"
+
+so the error went to `/dev/null` and success was announced by a bare `echo`.
+**Three dispatches were reported sent while the entire crew was unreachable.**
+
+The second half is what made it expensive: every seat then read `completed` in
+the status API — **not because it had finished, but because it had never been
+reached.** Those two states are indistinguishable from outside, so the roster
+looked like a crew that had quietly finished its work.
+
+**Recovery:** `cd ~/dev/ocean && cargo build --release --bin ocean-heartbeat`
+(~10s incremental; the source is untouched by a cleanup). Then re-dispatch and
+confirm each wake's response actually names a session.
+
+**Real fix (shipped): `tool/bin/stitchpad-wake`.** Three guards, because any
+one alone still fails quiet:
+
+1. **Preflight the launcher** before a brief is sent. A dangling symlink is
+   named as such — `command -v` returns nothing for one, so the tool inspects
+   the path itself first, or the most useful diagnosis ("your launcher points
+   at a deleted build") collapses into the vaguest one ("not on PATH").
+2. **Never swallow the wake's output.** The response is captured and a wake
+   counts as delivered only if it identifies a session. `echo "dispatched"` is
+   evidence of nothing.
+3. **Prove work, not just delivery.** `--expect-artifact` records a baseline
+   (a branch head) and `--verify-artifact` answers the only question that
+   matters afterwards: did anything change? A seat that produced nothing is
+   named, whatever it reported about itself.
+
+Pinned by `test/wake-preflight.sh` (7 cases, including the dangling symlink and
+the produced-nothing seat).
+
+**Prevention:** never install a launcher as a symlink into a build directory —
+or if you must, preflight it. And never redirect a dispatch's stderr to
+`/dev/null`; that single habit turned a ten-second rebuild into an hour.
