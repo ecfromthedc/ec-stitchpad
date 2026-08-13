@@ -44,6 +44,7 @@ herdr-nudge-sanitize-gate.sh 6 0
 identity-survival-under-join.sh 11 0
 install-wiring-gate.sh 13 0
 lanes-quarantine-gate.sh 9 0
+leave-lane-cleanup-gate.sh 11 0
 model-pinning.sh 49 0
 multipad-isolation.sh 42 0
 ocean-idle-guard-gate.sh 7 0
@@ -70,6 +71,7 @@ roster-duplicate-gate.sh 14 0
 rp2-directory-pathspec-gate.sh 10 0
 roster-recovery-guard-regression.sh 21 0
 roster-validation-gate.sh 12 0
+say-file-input-gate.sh 10 0
 say-image.sh 0 0
 seat-keeper.sh 11 0
 session-start-identity-claim-gate.sh 7 0

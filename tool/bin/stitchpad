@@ -967,6 +967,14 @@ You may spawn your own sub-agents (stitchpad spawn <name> --brief ... --artifact
     # broke heal-roster). Placed AFTER the commit above so we never narrate a
     # lane that did not durably land.
     STITCHPAD_NAME="$who" sp_narrate "took a lane in the roster as @$who ($adapter)" 2>/dev/null || true
+    # The departure receipt is a claim about this seat's LAST transition, and it
+    # has just been overtaken by this join. `leave` writes departed.<name>, and
+    # sp_lanes_names uses it to keep a retired seat off the board; leaving a
+    # stale one behind would let a later roster rewrite (heal-roster, a hand
+    # edit) drop this seat's row and have the old receipt silently suppress its
+    # lane — a live seat, invisible. Nothing else reads it, so clearing it here
+    # is the whole lifecycle: leave writes it, join retires it.
+    rm -f "$PAD_STATE/departed.$who" 2>/dev/null || true
     # Persist role/level for bridge profiles push + roster cards.
     [ -n "$_role" ] && printf '%s' "$_role" > "$PAD_STATE/role.$who"
     [ -n "$_level" ] && printf '%s' "$_level" > "$PAD_STATE/level.$who"
@@ -2277,6 +2285,13 @@ PY
     sp_init_paths || exit 1
     who="${1:-$(sp_me)}"
     [ -z "$who" ] && { echo "usage: stitchpad leave <name>" >&2; exit 1; }
+    # Tell sp_commit's V1 auto-register to keep its hands off THIS name for the
+    # rest of this command. Without it, the commit that removes @who's roster
+    # row re-adds @who in the same commit, because V1 resolves the identity of
+    # the process doing the committing — which, when a seat retires itself, is
+    # the seat being removed. Exported so the `heartbeat --stop` child below is
+    # covered too. See the SP_LEAVING comment in lib.sh sp_commit.
+    export SP_LEAVING="$who"
     sp_stop_delivery_worker "$who"
     if sp_delivery_ocean_unresolved_after_stop "$who"; then
       echo "stitchpad: refusing to remove @$who — Ocean acceptance/cancellation outcome is unresolved" >&2

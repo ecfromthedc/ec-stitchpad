@@ -1522,9 +1522,21 @@ sp_commit() {
   # yet in the roster is inserted as cli|pull|- before their first commit
   # lands.  Without this, @km2 shipped 14 commits of central work while
   # completely invisible to `stitchpad roster`.
+  # SP_LEAVING is the one identity auto-register must NOT resurrect: the seat
+  # whose departure is being committed right now. `leave` drops the roster row
+  # from PAD_MD and then calls sp_commit — and V1, reading the pad it has just
+  # rewritten, saw a resolvable @who with no roster row and helpfully put the
+  # row back inside that same commit. `stitchpad leave dale` run BY dale (the
+  # normal case — a seat retires itself) was therefore a no-op on the roster:
+  # "✓ dale left" printed, dale still a member, dale still on the lanes board.
+  # The two rules only look contradictory: V1 registers an agent that is WORKING
+  # while invisible, and a seat committing its own removal is the exact opposite
+  # of that. The guard is scoped to the leave command's own process (and its
+  # heartbeat --stop child, hence export), so nothing else can be suppressed.
   local _v1_who=""
   _v1_who="$(sp_me 2>/dev/null)" || _v1_who=""
-  if [ -n "$_v1_who" ] && [ "$_v1_who" != "stitchpad" ]; then
+  if [ -n "$_v1_who" ] && [ "$_v1_who" != "stitchpad" ] \
+     && [ "$_v1_who" != "${SP_LEAVING:-}" ]; then
     if ! sp_user_exists "$_v1_who" 2>/dev/null; then
       case "$_v1_who" in *[!abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789_-]*) ;; *)
         _v1_tmp="$(sp_stage "$PAD_MD")"

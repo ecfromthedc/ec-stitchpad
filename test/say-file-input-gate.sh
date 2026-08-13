@@ -24,7 +24,8 @@
 #   G6  --file on an unreadable path fails loudly and posts nothing
 #   G7  THE INCIDENT: the same brief through the arg form loses the backticked
 #       token; through --file/stdin it survives
-#   G8  MUTANT: drop the --file branch → G1 goes RED
+#   G8  --file composes with --image (parse-level; images need a live relay)
+#   G9  MUTANT: drop the --file branch → G1 goes RED
 set -uo pipefail
 
 HERE="$(cd -P "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -150,7 +151,26 @@ else
   bad "G7b --file did not rescue the brief — the corruption is still unavoidable"
 fi
 
-# ── G8 MUTANT ─────────────────────────────────────────────────────────────
+# ── G8 composes with --image ──────────────────────────────────────────────
+# HONEST LIMIT: `--image` uploads through STITCHPAD_RELAY, so no image can
+# actually be posted offline — that is why say-image.sh is baselined 0 0. What
+# is checkable here is the part that could regress: the two flags PARSE
+# together and the body is read, so the run reaches the relay precondition
+# rather than dying as a usage/argument error. If --file ever broke --image
+# parsing, this would come back as a usage error instead.
+_out="$(sp "$TOP/tool" "$P" 1 say --image "$TMP/nope.png" --file "$TMP/brief.txt" 2>&1)"; _rc=$?
+case "$_out" in
+  *usage*|*"mutually exclusive"*)
+    bad "G8 --image with --file is rejected at argument level: $(printf '%s' "$_out" | head -1)" ;;
+  *)
+    if [ "$_rc" -ne 0 ]; then
+      ok "G8 --image and --file parse together (stopped at the relay/image precondition, not on args)"
+    else
+      bad "G8 --image + --file unexpectedly succeeded offline — probe is not measuring what it claims"
+    fi ;;
+esac
+
+# ── G9 MUTANT ─────────────────────────────────────────────────────────────
 echo "  -- mutant: say forgets --file --"
 MUT="$TMP/mutant"; mkdir -p "$MUT"; cp -R "$TOP/tool/." "$MUT/"
 python3 - "$MUT/bin/stitchpad" <<'PY'
@@ -162,15 +182,15 @@ if s.count(old) != 1:
 open(p, 'w', encoding='utf-8').write(s.replace(old, '      --file-disabled-by-mutant)', 1))
 PY
 if [ $? -eq 9 ]; then
-  bad "G8 MUTANT DID NOT APPLY — INCONCLUSIVE, not a pass"
+  bad "G9 MUTANT DID NOT APPLY — INCONCLUSIVE, not a pass"
 else
   P3="$(build "$MUT" 3)"
   PAD3="$P3/.stitchpad/stitchpad.md"
   sp "$MUT" "$P3" 3 say --file "$TMP/brief.txt" >/dev/null 2>&1
   if grep -qF -- '`--ignored`' "$PAD3"; then
-    bad "G8 mutant applied but the body still landed — G1 may be testing nothing"
+    bad "G9 mutant applied but the body still landed — G1 may be testing nothing"
   else
-    ok "G8 without the --file branch the body never lands — G1 detects it"
+    ok "G9 without the --file branch the body never lands — G1 detects it"
   fi
 fi
 
