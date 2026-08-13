@@ -78,7 +78,20 @@ has_unacked_mention() { # $1=name → 0 iff the seat has unacked @mentions
   [ -n "$out" ]
 }
 
-SEATS="$(for f in "$PAD_STATE"/ocean-session.*; do [ -f "$f" ] || continue; n="${f##*/ocean-session.}"; printf '%s:%s\n' "$n" "$(cat "$f")"; done)"
+# Re-read the roster EVERY sweep. Capturing it once at startup means a seat
+# whose session is re-minted (a shift change, a wedge recovery) is polled at
+# its DEAD id forever: the watchdog keeps printing "WOKE stalled seat" while
+# the wake lands nowhere. Observed in the wild 2026-08-12 — a dead seat was
+# "woken" every cooldown for hours. A guard that reports success while doing
+# nothing is worse than no guard.
+read_seats() {
+  for f in "$PAD_STATE"/ocean-session.*; do
+    [ -f "$f" ] || continue
+    n="${f##*/ocean-session.}"
+    printf '%s:%s\n' "$n" "$(cat "$f")"
+  done
+}
+SEATS="$(read_seats)"
 [ -n "$SEATS" ] || { echo "stitchpad-watchdog: no ocean-session.* seats under $PAD_STATE" >&2; exit 2; }
 
 _sf() { printf '%s/.watchdog-%s.%s' "$PAD_STATE" "$1" "$2"; }   # $1=kind $2=name
@@ -88,6 +101,7 @@ _set() { printf '%s' "$3" > "$(_sf "$1" "$2")" 2>/dev/null || true; }
 echo "[watchdog] armed for: $(echo "$SEATS" | tr '\n' ' ')"
 while :; do
   now=$(date +%s)
+  SEATS="$(read_seats)"
   while IFS=: read -r name sid; do
     [ -n "$name" ] && [ -n "$sid" ] || continue
     st=$(busy "$sid")
@@ -103,7 +117,30 @@ while :; do
     model="$(head -c 64 "$PAD_STATE/seat-model.$name" 2>/dev/null | tr -d '[:space:]')"
     "$HB" wake --session-id "$sid" --cwd "$cwd" ${model:+--model "$model"} --client-type stitchpad --no-wait \
       --prompt "Auto-resume (stitchpad-watchdog): you are idle but have pending work on the pad. cd $cwd, then: cd $PAD_DIR && $SP read -n 20 to see what's waiting (a review verdict, a task, or a reply), and continue your lane. If genuinely nothing is actionable, post one line saying so and yield." >/dev/null 2>&1 \
-      && { echo "[watchdog] WOKE stalled seat @$name (idle, has pending work)"; _set lastwake "$name" "$now"; _set strike "$name" 0; }
+      && {
+        _set lastwake "$name" "$now"; _set strike "$name" 0
+        # Did the wake actually LAND? Poll briefly; a dead/errored session
+        # accepts the post and never runs. Say so instead of claiming success.
+        landed=""
+        for _ in 1 2 3 4 5 6; do
+          sleep 2
+          [ "$(busy "$sid")" = "busy" ] && { landed=yes; break; }
+        done
+        if [ -n "$landed" ]; then
+          echo "[watchdog] WOKE stalled seat @$name (idle, has pending work)"
+          _set deaf "$name" 0
+        else
+          d=$(( $(_get deaf "$name") + 1 )); _set deaf "$name" "$d"
+          echo "[watchdog] WAKE DID NOT LAND for @$name (session $sid) — strike $d"
+          if [ "$d" -ge 3 ]; then
+            echo "[watchdog] @$name is UNREACHABLE after $d attempts — its session is dead or its model is down; re-seat it."
+            (cd "$PAD_DIR" && STITCHPAD_NAME=watchdog "$SP" say \
+              "⚠️ @$name is UNREACHABLE — $d wakes accepted but never ran (session ${sid%%-*}…). Its session is dead or its provider is down; the seat needs re-seating. The watchdog will keep it quiet until then." >/dev/null 2>&1 || true)
+            _set deaf "$name" 0
+            _set lastwake "$name" $(( now + 1800 ))   # hush this seat for 30 min
+          fi
+        fi
+      }
   done <<< "$SEATS"
   sleep "$INTERVAL"
 done
