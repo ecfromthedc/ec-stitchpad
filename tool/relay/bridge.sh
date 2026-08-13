@@ -1,16 +1,24 @@
 #!/usr/bin/env bash
-# stitchpad relay bridge — runs on the Mac. Mirrors EVERY local stitchpad up to
-# the Cloudflare relay (keyed by pad name = directory basename), and drains each
-# pad's phone→pad queue back into the real pad via `stitchpad say` (which the
-# watcher then wakes agents from). The CLI stays the source of truth.
+# stitchpad relay bridge — runs on the Mac. Mirrors pads from one explicit
+# workspace root up to the Cloudflare relay (keyed by pad name = directory
+# basename), and drains each pad's phone→pad queue back into the real pad via
+# `stitchpad say` (which the watcher then wakes agents from). The CLI stays the
+# source of truth.
 #
 #   STITCHPAD_RELAY=https://stitchpad.agentsworld.org \
 #   STITCHPAD_TOKEN=<secret> \
-#   stitchpad-bridge [roots...]      # roots to scan for .stitchpad dirs (default: ~ )
+#   stitchpad-bridge [roots...]      # roots to scan for .stitchpad dirs
+#                                      (default: ~/Stitchpad Workspaces)
 set -uo pipefail
+WORKSPACE_ROOT="${PASTURE_WORKSPACE_ROOT:-${STITCHPAD_WORKSPACE_ROOT:-$HOME/Stitchpad Workspaces}}"
+if [ "$#" -gt 0 ]; then ROOTS=("$@"); else ROOTS=("$WORKSPACE_ROOT"); fi
+# Test hook: resolve the scope without requiring relay credentials or network.
+if [ "${STITCHPAD_BRIDGE_PRINT_ROOTS:-${PASTURE_BRIDGE_PRINT_ROOTS:-0}}" = "1" ]; then
+  printf '%s\n' "${ROOTS[@]}"
+  exit 0
+fi
 RELAY="${STITCHPAD_RELAY:?set STITCHPAD_RELAY}"
 TOKEN="${STITCHPAD_TOKEN:?set STITCHPAD_TOKEN}"
-ROOTS=("${@:-$HOME}")
 SP="$(command -v stitchpad || echo "$HOME/.stitchpad/bin/stitchpad")"
 INTERVAL="${STITCHPAD_BRIDGE_INTERVAL:-3}"
 
