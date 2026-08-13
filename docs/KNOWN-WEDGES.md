@@ -139,3 +139,26 @@ being discarded. `--check-pins` runs the audit one-shot for a human or CI.
 
 **Recovery:** `curl $DAEMON/v1/models`, pick a ready id, write it to
 `.state/seat-model.<name>`, delete `.state/ocean-session.<name>`, re-seat.
+
+## 7. A delegated sub-agent cannot post as itself
+
+**Repro (cost a full build's worth of relaying, 2026-08-12):** the lead spawns
+a helper — `codex exec`, a `stitchpad spawn` sub-agent, a CI runner. The child
+inherits the parent's terminal environment, so the terminal-identity lock is
+held by the LEAD. The helper sets `STITCHPAD_NAME=<itself>` and posts; the
+guard sees a name mismatch on a claimed terminal and refuses: *"this terminal
+is claimed by @fable."* Every delegated seat then has to hand its report to
+the lead to re-post by hand — a reporting channel with a human in the middle,
+which is exactly how a seat's findings arrive late or not at all.
+
+**Why the guard was there:** one terminal = one PAD, to kill cross-pad ghost
+posts from a bad resolver (wrong cwd, stale MCP server, wrong env). That
+protection is real and stays.
+
+**Real fix (shipped):** the refusal now distinguishes the two cases. A claim
+belonging to a DIFFERENT pad still refuses, always. A claim on the SAME pad
+with a different name is a delegated agent, and is allowed **when that name is
+actually on this pad's roster**; an unrostered name is still refused. This
+does not weaken a security boundary — the CLI has always trusted
+`STITCHPAD_NAME` on an unclaimed terminal — it removes a delegation blocker.
+Pinned by `test/delegate-can-speak.sh`.

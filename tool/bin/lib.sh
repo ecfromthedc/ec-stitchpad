@@ -2702,7 +2702,25 @@ sp_term_lock_check() { # $1=target $2=name → 0 ok; 1 = LIVE claim by someone e
   IFS='|' read -r pad name ts <<<"$cur"
   # honored = fresh timestamp OR live owner process (rc7 F4); neither → expired
   _sp_term_claim_honored "$cur" || return 0
-  if [ "$pad" != "$PAD_DIR" ] || [ "$name" != "$who" ]; then printf '%s' "$cur"; return 1; fi
+  # A DIFFERENT PAD is the ghost-post this guard exists to kill: one terminal =
+  # one pad, always.
+  if [ "$pad" != "$PAD_DIR" ]; then printf '%s' "$cur"; return 1; fi
+  # Same pad, different name: that is a DELEGATED AGENT, not a resolver
+  # accident. A sub-agent (codex exec, a spawned helper, a CI runner) inherits
+  # its parent's terminal env, so the terminal is claimed by the LEAD while the
+  # helper legitimately posts as itself. Refusing it forced every delegated
+  # seat to hand its reports to the lead to re-post — for an entire build, in
+  # the case that produced this fix, which is also how a seat's findings can
+  # arrive late or not at all. Allow it when the name is genuinely on THIS
+  # pad's roster; anything else still refuses.
+  if [ "$name" != "$who" ]; then
+    if sp_roster 2>/dev/null | awk -F'|' -v w="$who" '
+         { n=$1; gsub(/^[ \t]+|[ \t]+$/, "", n); if (n == w) found=1 }
+         END { exit found ? 0 : 1 }'; then
+      return 0
+    fi
+    printf '%s' "$cur"; return 1
+  fi
   return 0
 }
 
