@@ -7,7 +7,7 @@
 #   stitchpad set-wake <name> <push|pull> <target> [adapter]   update wake mode for an existing row
 #   stitchpad rename <old> <new>          rename a member everywhere local state knows them
 #   STITCHPAD_NAME=<you> stitchpad say [--image <path>] <text...>   post a message (auto-commits)
-#   STITCHPAD_NAME=<you> stitchpad say [--re <#m-id>] [--image <path>] <text...>   post a message (auto-commits; --re threads it)
+#   STITCHPAD_NAME=<you> stitchpad say [--re <#m-id>] [--image <path>] <text...|--file <path|->>   post a message (auto-commits; --re threads it; --file/- takes the body verbatim)
 #   STITCHPAD_NAME=<you> stitchpad react <#m-id> <emoji>   react to a message (toggle; never wakes)
 #   STITCHPAD_NAME=<you> stitchpad amend <#m-id> <text|--file f>   rewrite YOUR message's body in place (live cards)
 #   STITCHPAD_NAME=<you> stitchpad run [--title t] <label>=<cmd>...   run steps as a live-amending ui timeline
@@ -1097,11 +1097,11 @@ You may spawn your own sub-agents (stitchpad spawn <name> --brief ... --artifact
     # Every simple name-keyed state file this arm knows how to carry across.
     # Declared ONCE and used twice — the pre-flight refusal below and the move
     # loop further down — so the two can never disagree about what is handled.
-    _rename_prefixes="seen seen.relay count alive role level runtime forcewake dnd
-      delivered_no_reply ocean-session seat-model resolved-model model
-      keeper-strike keeper-obs keeper-last supervise-strikes
-      artifact-expect authority scope scope-cleared scope-violation
-      operator-grant pending"
+    # It now lives in lib.sh as SP_SEAT_STATE_PREFIXES, because `leave` asks the
+    # same question ("what belongs to exactly one seat?") and two copies of the
+    # answer would rot in opposite directions: rename stranding state that leave
+    # deletes, leave orphaning state that rename carries.
+    _rename_prefixes="$SP_SEAT_STATE_PREFIXES"
     # PRE-FLIGHT. The old list stopped at delivered_no_reply, so .state/ocean-session.<old>
     # survived a rename: seat-keeper iterates ocean-session.* and logged
     # "SEAT NOT ON ROSTER" forever for a name that no longer existed, while the
@@ -2312,12 +2312,29 @@ PY
       inblk && /^```/ { inblk=0; print; next }
       inblk && tolower($1)==tolower(who) { next }   # drop this roster line
       { print }
-    ' "$PAD_MD" > "$tmp" && sp_write_inplace "$tmp" "$PAD_MD" || {
+    ' "$PAD_MD" > "$tmp"
+    sp_write_inplace "$tmp" "$PAD_MD"; _leave_edit_rc=$?
+    # sp_write_inplace returns 2 for "staged bytes are identical to the target,
+    # nothing written". After a roster-drop awk that means exactly one thing: no
+    # row matched, i.e. @who was never in this roster. The arm used to fold rc=2
+    # into the generic failure branch and report "roster edit failed for @X —
+    # rolled back pad state; @X still in roster", which got all three facts
+    # wrong: the edit did not fail, there was nothing to roll back, and @X was
+    # never in the roster to remain in it. Someone chasing that message goes
+    # looking for pad corruption instead of reading their own typo.
+    if [ "$_leave_edit_rc" -eq 2 ]; then
+      sp_session_registry_journal_rollback "$_leave_journal" "$_leave_sid"
+      sp_unlock
+      echo "stitchpad: @$who is not in the roster — nothing to remove (the pad was not modified)" >&2
+      echo "  current members: $(sp_roster 2>/dev/null | cut -d'|' -f1 | tr -d ' ' | tr '\n' ' ')" >&2
+      exit 1
+    fi
+    if [ "$_leave_edit_rc" -ne 0 ]; then
       sp_session_registry_journal_rollback "$_leave_journal" "$_leave_sid"
       sp_unlock
       echo "stitchpad: roster edit failed for @$who — rolled back pad state; @$who still in roster" >&2
       exit 1
-    }
+    fi
     sp_system "@$who left the stitchpad"
     # REAL lifecycle projection: leaving ends the seat's session. We already
     # hold the pad mutation lock — record the terminal event against the seat's
@@ -2342,17 +2359,28 @@ PY
     fi
     sp_session_registry_journal_commit "$_leave_journal"
     # also release any file claims and wake state this agent held
-    rm -f "$PAD_STATE/seen.$who" "$PAD_STATE/forcewake.$who" 2>/dev/null
     rm -f "$PAD_STATE"/delivery."$who".* 2>/dev/null || true
     rm -rf "$PAD_STATE"/delivery."$who".*.lock.d "$PAD_STATE"/delivery."$who".cancel.* 2>/dev/null || true
     for _ld in "$PAD_STATE"/claims/*.d; do
       [ -d "$_ld" ] && read -r _h _ < "$_ld/holder" 2>/dev/null && [ "$_h" = "$who" ] && rm -rf "$_ld"
     done
+    # The roster row is committed out of the pad; now retire everything on disk
+    # that still answers questions about this seat. Two lines (seen./forcewake.)
+    # used to be handled here by hand while artifact-expect.<who> — the one the
+    # lanes board reads — was left sitting there, so a departed seat kept a lane
+    # reading FAILED forever. Under the same lock as the roster edit, so the
+    # board can never observe a seat that is off the roster but still carries a
+    # contract.
+    sp_leave_purge_seat_state "$who"
     sp_unlock
     echo "✓ $who left"
     # KEEP-ALIVE: stop this agent's heartbeat ticker so the watcher can self-stop
     # once all remaining agents go stale.
     STITCHPAD_NAME="$who" "$BIN_DIR/stitchpad" heartbeat --stop "$who" >/dev/null 2>&1 || true
+    # ...and take alive.<who> again AFTER the ticker is gone. The purge above
+    # runs while the ticker may still be mid-tick, and a tick that lands after
+    # the delete resurrects the heartbeat — which `lanes` reads as a live seat.
+    rm -f "$PAD_STATE/alive.$who" 2>/dev/null || true
     # release this agent's terminal claims so the terminal can join another pad
     sp_term_lock_release "$who" 2>/dev/null || true
     # AUTO-WATCHER: stop watcher if roster is empty (no members = no heartbeats).
@@ -2488,6 +2516,8 @@ PY
     # Sender is your pinned STITCHPAD_NAME — never an argument — so a terminal can
     # only ever post as itself. Everything after `say` is the message.
     #   stitchpad say [--image <path>] <text...>
+    #   stitchpad say [--image <path>] --file <path>   body read verbatim from a file
+    #   stitchpad say [--image <path>] --file -        body read verbatim from stdin
     from="$(sp_me)"
     [ -z "$from" ] && { echo "stitchpad: no identity — call the MCP join tool first (or set STITCHPAD_NAME for CLI/testing)" >&2; exit 1; }
     # TASK-7: record say outcome (best-effort; never affects the post).
@@ -2525,21 +2555,52 @@ PY
       _holder="$(sp_term_byname_check "$from")" || {
         echo "stitchpad: REFUSED — @$from is live-bound to ${_holder}, not $PAD_DIR (no terminal identity resolvable — env cleared?). cd there or 'stitchpad leave' first." >&2; exit 1; }
     fi
-    image_path=""; reply_to=""
+    _say_usage="usage: stitchpad say [--re <#m-id>] [--image <path>] <text...|--file <path|->>"
+    image_path=""; reply_to=""; body_src=""
     while :; do case "${1:-}" in
       --image)
         image_path="${2:-}"
-        [ -n "$image_path" ] || { echo "usage: stitchpad say [--re <#m-id>] [--image <path>] <text...>" >&2; exit 1; }
+        [ -n "$image_path" ] || { echo "$_say_usage" >&2; exit 1; }
         shift 2 ;;
       --re)
         reply_to="${2:-}"
-        [ -n "$reply_to" ] || { echo "usage: stitchpad say [--re <#m-id>] [--image <path>] <text...>" >&2; exit 1; }
+        [ -n "$reply_to" ] || { echo "$_say_usage" >&2; exit 1; }
         reply_to="#${reply_to#\#}"   # normalize: accept "m-abc" or "#m-abc"
+        shift 2 ;;
+      --file)
+        # THE MESSAGE MUST ARRIVE AS IT WAS WRITTEN. Every caller of `say` is a
+        # shell, and an argv-only interface makes the shell an editor: backticks
+        # in a brief are command-substituted before stitchpad is ever exec'd, so
+        # the words inside them are replaced by whatever running them printed —
+        # usually nothing. Two coordination briefs went out of a live session
+        # with a token silently deleted (`--ignored` in one, `simulated` in the
+        # other) and the recipients acted on the truncated instructions. A
+        # channel that rewrites what it carries is broken, not merely awkward.
+        # `--file` is the same door `amend` has had all along; `-` is stdin, so a
+        # caller with the text in a variable can pipe bytes instead of arguing
+        # about quoting.
+        body_src="${2:-}"
+        [ -n "$body_src" ] || { echo "$_say_usage" >&2; exit 1; }
         shift 2 ;;
       *) break ;;
     esac; done
-    text="$*"
-    [ -z "$text" ] && [ -z "$image_path" ] && { echo "usage: stitchpad say [--image <path>] <text...>  (you are @$from)" >&2; exit 1; }
+    if [ -n "$body_src" ]; then
+      # No silent precedence rule. If both a file and trailing words are given,
+      # one of the two bodies would have to be discarded, and discarding a
+      # message body without saying so is the failure this flag exists to end.
+      [ $# -eq 0 ] || { echo "stitchpad: --file and trailing text are mutually exclusive — pass the body one way or the other" >&2; echo "$_say_usage" >&2; exit 1; }
+      if [ "$body_src" = "-" ]; then
+        text="$(cat)"
+      else
+        # -r not -f, matching `amend`: process substitution (/dev/fd/N) and
+        # fifos are legitimate sources for a body.
+        [ -r "$body_src" ] || { echo "stitchpad: --file needs a readable path (or '-' for stdin): $body_src" >&2; exit 1; }
+        text="$(cat "$body_src")"
+      fi
+    else
+      text="$*"
+    fi
+    [ -z "$text" ] && [ -z "$image_path" ] && { echo "$_say_usage  (you are @$from)" >&2; exit 1; }
 
     if [ -n "$image_path" ]; then
       [ -f "$image_path" ] || { echo "stitchpad: image not found: $image_path" >&2; exit 1; }

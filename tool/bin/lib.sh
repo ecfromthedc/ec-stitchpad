@@ -3752,6 +3752,107 @@ sp_artifact_clear() {
   rm -f "$PAD_STATE/artifact-expect.$name"
 }
 
+# ── Per-seat state, in one place ─────────────────────────────────────────
+# SP_SEAT_STATE_PREFIXES — every simple name-keyed file under .state/ that the
+# tool owns, as `<prefix>.<name>`. It was born inside the `rename` arm, where an
+# omission was never cosmetic: .state/ocean-session.<old> once survived a rename
+# and seat-keeper logged "SEAT NOT ON ROSTER" forever for a name that no longer
+# existed. It lives here now because `leave` needs the SAME answer to the same
+# question — what belongs to exactly one seat — and two lists would rot apart in
+# opposite directions: rename stranding state, leave orphaning it.
+SP_SEAT_STATE_PREFIXES="seen seen.relay count alive role level runtime forcewake dnd
+  delivered_no_reply ocean-session seat-model resolved-model model
+  keeper-strike keeper-obs keeper-last supervise-strikes
+  artifact-expect authority scope scope-cleared scope-violation
+  operator-grant pending departed"
+
+# SP_SEAT_STATE_KEEP_ON_LEAVE — the deliberate exceptions to the purge below.
+#   scope-violation.<name>  the seat overstepped its scope; scope-authority.sh
+#                           calls that record "sticky" on purpose and `scope
+#                           --violations` reports it across the pad's life. It
+#                           is an incident record, not a lane, and a departure
+#                           is not an acquittal.
+#   departed.<name>         written BY the purge as its own receipt (see below).
+SP_SEAT_STATE_KEEP_ON_LEAVE="scope-violation departed"
+
+# sp_leave_purge_seat_state <name>
+# Retire everything the lanes board, the watchdog and seat-keeper still believe
+# about a seat that has formally left.
+#
+# THE FAILURE THIS ENDS: `leave` used to drop the roster row and stop there, so
+# .state/artifact-expect.<name> stayed behind — and the lanes board is built from
+# roster ∪ session-registry ∪ artifact-expect.*. A seat that left hours ago kept
+# its row, permanently reading `ARTIFACT: NO  VERDICT: FAILED`, because the
+# contract it could no longer possibly fulfil was still on disk. Two dead seats
+# sat on the board as FAILED for a whole night. The repo has paid for this shape
+# before (test/bridge-heartbeat-interval.sh: doctor flagged a healthy bridge as
+# stale on every check) and the lesson was the same — a board that always shows
+# a failure teaches everyone to stop reading the board.
+#
+# Only files keyed to THIS seat are touched. Shared state (the pad, the session
+# registry, watch/lock directories, claims held by others) is never in scope.
+# Caller must hold the pad lock: these are the same .state writes every other
+# mutation serialises on.
+sp_leave_purge_seat_state() {
+  local who="${1:?usage: sp_leave_purge_seat_state <name>}" pfx keep k f leftover=""
+  [ -n "${PAD_STATE:-}" ] || return 0
+  for pfx in $SP_SEAT_STATE_PREFIXES; do
+    keep=0
+    for k in $SP_SEAT_STATE_KEEP_ON_LEAVE; do [ "$pfx" = "$k" ] && { keep=1; break; }; done
+    [ "$keep" -eq 1 ] && continue
+    rm -f "$PAD_STATE/$pfx.$who" 2>/dev/null || true
+  done
+  # Compound keys the prefix loop cannot express. Each is still one seat's:
+  #   authority.<name>.seal      the HMAC over that seat's authority level
+  #   pending.<name>.reset       that seat's pending-reset marker
+  #   operator-grant.<name>.<op> per-operation grants; a departed seat keeps no
+  #                              standing authorisation — a returning @name must
+  #                              be granted again, never inherit silently
+  #   spawn.<name>.{parent,brief,at}  its lineage row. `spawn --tree` exists to
+  #                              show WHO asked for a seat that is now silent; a
+  #                              seat that announced its departure is not silent,
+  #                              and the brief itself was posted to the pad, so
+  #                              the durable copy is in git either way.
+  #   seen.relay.<padkey>.<name> per-relay read cursor (name is the LAST field)
+  rm -f "$PAD_STATE/authority.$who.seal" "$PAD_STATE/pending.$who.reset" 2>/dev/null || true
+  rm -f "$PAD_STATE"/operator-grant."$who".* 2>/dev/null || true
+  rm -f "$PAD_STATE"/spawn."$who".* 2>/dev/null || true
+  rm -f "$PAD_STATE"/seen.relay.*."$who" 2>/dev/null || true
+  # DELIBERATELY LEFT ALONE, and none of it is a lane source:
+  #   session-registry.jsonl + session-{start,end,activity}.<sid>, sessions/<sid>
+  #     the append-only lifecycle audit trail and its identity bindings. `leave`
+  #     WRITES to it (the seat's `terminal` event); deleting the record of a
+  #     departure to hide a departure is not a fix.
+  #   heartbeat.<name>.lock/  the ticker owns that directory and `heartbeat
+  #     --stop` is its owner-checked teardown. Racing it from here orphans a
+  #     live ticker — `rename` declines to move it for the same reason.
+  #   .watchdog-*.<name>, .busy-ack*.<name>.*  post-mortem breadcrumbs an
+  #     operator reads AFTER a seat dies. Hidden files; no surface derives a
+  #     verdict from them.
+  #
+  # POST-CONDITION, in rename's spirit: an allow-list is guaranteed to rot, so
+  # rather than trust it, look for what it was meant to eliminate. Anything left
+  # keyed to this name that we did not deliberately keep is reported — loud, not
+  # silent, and not deleted on a guess.
+  for f in "$PAD_STATE"/*."$who"; do
+    [ -e "$f" ] || continue
+    pfx="$(basename "$f")"; pfx="${pfx%".$who"}"; keep=0
+    for k in $SP_SEAT_STATE_KEEP_ON_LEAVE; do [ "$pfx" = "$k" ] && { keep=1; break; }; done
+    [ "$keep" -eq 1 ] && continue
+    leftover="${leftover:+$leftover }$(basename "$f")"
+  done
+  if [ -n "$leftover" ]; then
+    echo "stitchpad: note — state still keyed to the departed @$who: $leftover" >&2
+    echo "  it will keep answering for a seat that is gone. Add the prefix to" >&2
+    echo "  SP_SEAT_STATE_PREFIXES (or to SP_SEAT_STATE_KEEP_ON_LEAVE, with a reason)." >&2
+  fi
+  # The receipt, written LAST so the purge above cannot eat it. This is the only
+  # positive evidence anywhere on disk that @who left on purpose rather than
+  # vanished mid-turn, and the lanes board needs exactly that distinction: a
+  # crashed seat must keep its row and its verdict, a departed one must not.
+  printf '%s\n' "$(date +%s)" > "$PAD_STATE/departed.$who" 2>/dev/null || true
+}
+
 # sp_wake_mode_for <name> — the roster's wake column for a seat: pull|push|"".
 # Roster rows are `name | adapter | wake | target`.
 sp_wake_mode_for() {
@@ -3941,7 +4042,7 @@ sp_spawn_tree() {
 # --json used to list ONLY seats with an artifact claim, so a quarantined seat
 # without one was invisible to every dashboard and cron that reads it (k3 F0).
 sp_lanes_names() {
-  local proj names claim cn rn rest
+  local proj names roster_names claim cn rn rest n
   proj="${1:-$(sp_session_registry_project 2>/dev/null || echo '[]')}"
   names="$(echo "$proj" | python3 -c "
 import json, sys
@@ -3958,46 +4059,44 @@ for s in data:
     cn="${claim##*/artifact-expect.}"
     echo "$names" | grep -qxF "$cn" 2>/dev/null || names="$names"$'\n'"$cn"
   done
+  roster_names=""
   while IFS='|' read -r rn rest; do
     rn="$(printf '%s' "$rn" | tr -d '[:space:]')"
     [ -n "$rn" ] || continue
+    roster_names="$roster_names$rn"$'\n'
     echo "$names" | grep -qxF "$rn" 2>/dev/null || names="$names"$'\n'"$rn"
   done <<< "$(sp_roster 2>/dev/null || true)"
-  echo "$names" | sort -u | sed '/^$/d'
+  # A seat that formally LEFT is not a lane. `leave` purges its per-seat state,
+  # but it also appends that seat's `terminal` lifecycle event to the session
+  # registry — one of the three sources unioned above — so a departed seat kept
+  # its row on the strength of the very record saying it was gone, and aged
+  # from WORKING into a permanent FAILED/STALE nobody could clear.
+  # The filter is POSITIVE evidence only, all three at once: the departure
+  # receipt on disk, AND no roster row, AND no outstanding artifact contract.
+  # Rejoin, or take a new contract, and the lane comes straight back. Nothing is
+  # hidden by inference — a roster we merely failed to READ must never be able
+  # to blank the board, which is exactly what "not in the roster" alone would do.
+  while IFS= read -r n; do
+    [ -n "$n" ] || continue
+    if [ -f "$PAD_STATE/departed.$n" ] \
+      && ! printf '%s' "$roster_names" | grep -qxF "$n" 2>/dev/null \
+      && [ ! -f "$PAD_STATE/artifact-expect.$n" ]; then
+      continue
+    fi
+    printf '%s\n' "$n"
+  done <<< "$(echo "$names" | sort -u | sed '/^$/d')"
 }
 
 sp_lanes_display() {
-  local proj name status age_s claim claim_file present verdict art_display
+  local proj name status age_s claim_file present verdict art_display
   proj="$(sp_session_registry_project 2>/dev/null || echo '[]')"
-  # Build a list of names from roster + session registry + artifact claims
+  # ONE definition of "who has a lane", shared with `lanes --json`. This block
+  # used to be a hand-copied duplicate of sp_lanes_names — same three sources,
+  # same sort — which is precisely how the two surfaces drifted apart the last
+  # time (--json listed only seats with an artifact claim). A rule the board
+  # applies to who exists has to live in one function or it will diverge again.
   local names=""
-  # From session registry
-  names="$(echo "$proj" | python3 -c "
-import json, sys
-data = json.load(sys.stdin)
-for s in data:
-    n = s.get('name','')
-    if n: print(n)
-" 2>/dev/null)"
-  # From artifact claims
-  for claim in "$PAD_STATE"/artifact-expect.*; do
-    [ -f "$claim" ] || continue
-    local cn="${claim##*/artifact-expect.}"
-    echo "$names" | grep -qxF "$cn" 2>/dev/null || names="$names"$'\n'"$cn"
-  done
-  # From roster. This used to read "$PAD_DIR/roster.csv" — a file NOTHING in the
-  # codebase has ever written. The roster lives in the ```roster``` fence inside
-  # stitchpad.md, so the read always came back empty and `lanes` reported
-  # "no lanes — empty roster" while `roster` printed the members one line above.
-  # sp_roster is the canonical reader (name|adapter|wake|target).
-  # The old condition was `[ -n "$rn" ] && ... || names=...`, which appended an
-  # EMPTY name whenever rn was blank — guard with an explicit continue instead.
-  while IFS='|' read -r rn rest; do
-    rn="$(printf '%s' "$rn" | tr -d '[:space:]')"
-    [ -n "$rn" ] || continue
-    echo "$names" | grep -qxF "$rn" 2>/dev/null || names="$names"$'\n'"$rn"
-  done <<< "$(sp_roster 2>/dev/null || true)"
-  names="$(echo "$names" | sort -u | sed '/^$/d')"
+  names="$(sp_lanes_names "$proj")"
   [ -z "$names" ] && { echo "no lanes — no roster members and no artifact claims"; return 0; }
   printf '%-12s %-12s %6s %-20s %-12s %-16s\n' "LANE" "STATUS" "AGE" "ARTIFACT" "PRESENT" "VERDICT"
   printf '%-12s %-12s %6s %-20s %-12s %-16s\n' "------------" "------------" "------" "--------------------" "------------" "----------------"
