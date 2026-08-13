@@ -40,7 +40,7 @@ url="${@: -1}"
 sid="${url##*/}"
 turns="$(grep "^$sid " "$SEATDB" 2>/dev/null | awk '{print $2}')"
 [ -n "$turns" ] || turns=0
-printf '{"session":{"state":"completed","turns":%s}}' "$turns"
+printf '{"session":{"state":"%s","turns":%s}}' "${SEATSTATE:-completed}" "$turns"
 EOF
 chmod +x "$WORK/bin/curl"
 export SEATDB="$WORK/seatdb"
@@ -66,6 +66,18 @@ else bad "no artifact reminder — turns alone would be trusted"; fi
 printf 'sess-hot 20\nsess-cold 12\n' > "$SEATDB"
 "$TOOL" --state "$WORK/state" >/dev/null 2>&1
 [ $? -eq 0 ] && ok "all-healthy exits 0" || bad "healthy roster did not exit 0"
+
+# ------------------------------- 2b. a bad STATE is not healthy at any turns
+# This tool judged health on turn count alone, so a seat sitting in `errored`
+# was reported "ok" purely because its turns were low — the exact failure the
+# tool exists to catch, in the tool itself.
+printf 'sess-hot 12\nsess-cold 12\n' > "$SEATDB"
+out="$(SEATSTATE=errored "$TOOL" --state "$WORK/state" 2>&1)"; rc=$?
+if [ $rc -eq 3 ] && printf '%s' "$out" | grep -q 'STATE errored'; then
+  ok "an errored seat is flagged and exits 3, even with low turns"
+else
+  bad "errored seat reported healthy (rc=$rc) — turns alone decided it"
+fi
 
 # --------------------------------------------- 3. rotation demands a brief
 out="$("$TOOL" --state "$WORK/state" --rotate tired --model m --cwd /tmp 2>&1)"; rc=$?

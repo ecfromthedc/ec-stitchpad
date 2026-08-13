@@ -123,7 +123,17 @@ for f in "${files[@]}"; do
   case "$f" in *.exhausted*|*.bak) continue ;; esac
   seat="$(basename "$f" | sed 's/^ocean-session\.//')"
   sid="$(cat "$f" 2>/dev/null)"
-  t="$(turns_of "$sid")"; s="$(state_of "$sid")"
+  t="$(turns_of "$sid")"; s="$(state_of "$sid")"; health=""
+  # STATE FIRST. This tool judged health on turn count alone, so a seat sitting
+  # in `errored` was reported as "ok" purely because its turn count was low —
+  # the exact failure this tool exists to catch, in the tool itself. A seat that
+  # is not running or completed is not healthy, whatever its turns say.
+  case "$s" in
+    running|completed) ;;
+    ''|'?') health=$'\033[33mUNREADABLE — treat as suspect\033[0m' ;;
+    *) health=$'\033[31mSTATE '"$s"$' — not working; restart or rotate\033[0m'; hot=1 ;;
+  esac
+  if [ -z "${health:-}" ] || [ "$s" = running ] || [ "$s" = completed ]; then
   case "$t" in
     ''|*[!0-9]*) health=$'\033[33mUNREADABLE — treat as suspect\033[0m' ;;
     *)
@@ -132,6 +142,7 @@ for f in "${files[@]}"; do
       else health=$'\033[32mok\033[0m'
       fi ;;
   esac
+  fi
   printf '%-14s %-38s %-11s %6s  %b\n' "$seat" "${sid:0:36}" "${s:-?}" "${t:-?}" "$health"
 done
 
