@@ -114,3 +114,28 @@ sweep, and after a wake it polls the session for up to ~12s to confirm the
 turn actually started. A wake that doesn't land is reported as
 `WAKE DID NOT LAND`; three in a row posts an @-visible pad warning that the
 seat is unreachable and hushes it for 30 minutes instead of burning cycles.
+
+## 6. A seat pinned to a model the daemon no longer offers goes dark in silence
+
+**Repro (cost the most time of any wedge so far, 2026-08-12):** a seat is
+pinned via `.state/seat-model.<name>`. The daemon later stops offering that
+model — a provider dropped, a key expired, the model renamed. Every wake now
+fails `ocean-heartbeat`'s model preflight, the seat never runs a turn, and
+**nothing says why**: the watchdog piped wake stderr to `/dev/null`, so the
+operator sees a seat that "keeps going idle" and debugs the agent instead of
+the engine. Hours were spent re-seating, re-minting sessions, and rewriting
+prompts for a seat whose model simply no longer existed.
+
+**The tell that would have solved it in a minute:** `GET /v1/models` listed
+neither the pin nor — remarkably — the daemon's own advertised `current`
+model, which was the same dead id.
+
+**Real fix (shipped):** `stitchpad-watchdog` now audits every seat's pin
+against the daemon's ready list each sweep and posts ONE pad warning naming
+the seat, the dead pin, and the models that ARE available; the warning
+repeats only if the pin changes and re-arms once it is fixed. Wake stderr is
+captured and included in `WAKE DID NOT LAND` / unreachable reports instead of
+being discarded. `--check-pins` runs the audit one-shot for a human or CI.
+
+**Recovery:** `curl $DAEMON/v1/models`, pick a ready id, write it to
+`.state/seat-model.<name>`, delete `.state/ocean-session.<name>`, re-seat.

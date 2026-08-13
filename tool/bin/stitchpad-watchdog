@@ -26,6 +26,8 @@
 #   stitchpad-watchdog [--pad DIR] [--interval SECS]
 #     --pad       pad repo root (default: cwd)
 #     --interval  seconds between sweeps (default 90; env WATCHDOG_INTERVAL)
+#   stitchpad-watchdog --pad DIR --check-pins
+#     one-shot: report any seat pinned to a model the daemon cannot run
 #   debug: stitchpad-watchdog --pad DIR --check-task NAME
 #     exits 0 iff NAME has an open todo/in_progress task in tasks.md
 #     (the awk that is easy to get wrong — this flag is what the test drives)
@@ -44,6 +46,7 @@ while [ $# -gt 0 ]; do
     --pad) PAD_DIR="$2"; shift 2 ;;
     --interval) INTERVAL="$2"; shift 2 ;;
     --check-task) CHECK_TASK="$2"; shift 2 ;;
+    --check-pins) CHECK_PINS=1; shift ;;
     *) echo "stitchpad-watchdog: unknown arg $1" >&2; exit 2 ;;
   esac
 done
@@ -63,6 +66,45 @@ has_open_task() { # $1=name → 0 iff a todo/in_progress task is assigned to it.
 if [ -n "$CHECK_TASK" ]; then
   has_open_task "$CHECK_TASK"; exit $?
 fi
+
+
+# Is a seat's pinned model something the daemon can actually run?
+#
+# A pin is a promise: "wake this seat on THIS model." When the daemon stops
+# offering it — a provider is dropped, a key expires, the model is renamed —
+# every wake fails preflight and the seat goes dark. Nothing announced it:
+# the watchdog discarded wake stderr, the seat simply stopped answering, and
+# hours were spent debugging a "stalled agent" that was actually an
+# unavailable engine. (Observed 2026-08-12: a seat pinned to a model the
+# daemon no longer listed — while the daemon's own `current` model was that
+# same dead id.) Check the pin, not just the pulse.
+ready_models() {
+  curl -sf -m 4 "$DAEMON/v1/models" 2>/dev/null | python3 -c 'import json,sys
+try: d=json.load(sys.stdin)
+except Exception: raise SystemExit
+for m in (d.get("models") or []):
+    if m.get("ready", True) and m.get("id"): print(m["id"])' 2>/dev/null
+}
+
+check_model_pins() {
+  local ready; ready="$(ready_models)"
+  [ -n "$ready" ] || return 0          # daemon unreachable — busy() will say so
+  while IFS=: read -r name sid; do
+    [ -n "$name" ] || continue
+    local pin; pin="$(head -c 64 "$PAD_STATE/seat-model.$name" 2>/dev/null | tr -d '[:space:]')"
+    [ -n "$pin" ] || continue
+    if ! printf '%s\n' "$ready" | grep -qx "$pin"; then
+      local marker="$PAD_STATE/.watchdog-deadpin.$name"
+      [ "$(cat "$marker" 2>/dev/null)" = "$pin" ] && continue   # already reported
+      printf '%s' "$pin" > "$marker"
+      echo "[watchdog] DEAD MODEL PIN: @$name is pinned to '$pin', which this daemon does not offer"
+      (cd "$PAD_DIR" && STITCHPAD_NAME=watchdog "$SP" say \
+        "⚠️ @$name cannot be woken: its pinned model '$pin' is not available on this daemon. Ready models: $(printf '%s' "$ready" | tr '\n' ' '). Re-pin .state/seat-model.$name and re-seat, or the seat stays dark no matter how many wakes it gets." >/dev/null 2>&1 || true)
+    else
+      rm -f "$PAD_STATE/.watchdog-deadpin.$name" 2>/dev/null
+    fi
+  done <<< "$SEATS"
+}
 
 busy() { # $1=sid → "busy"|"idle"|"unknown"
   local b; b=$(curl -sf -m 4 "$DAEMON/v1/agent/sessions/$1" 2>/dev/null) || { echo unknown; return; }
@@ -98,10 +140,19 @@ _sf() { printf '%s/.watchdog-%s.%s' "$PAD_STATE" "$1" "$2"; }   # $1=kind $2=nam
 _get() { cat "$(_sf "$1" "$2")" 2>/dev/null || echo 0; }
 _set() { printf '%s' "$3" > "$(_sf "$1" "$2")" 2>/dev/null || true; }
 
+# One-shot pin audit. Placed AFTER read_seats/check_model_pins are defined —
+# the first cut of this ran before their definitions and died with
+# "command not found", which the test caught.
+if [ "${CHECK_PINS:-}" = "1" ]; then
+  check_model_pins
+  exit 0
+fi
+
 echo "[watchdog] armed for: $(echo "$SEATS" | tr '\n' ' ')"
 while :; do
   now=$(date +%s)
   SEATS="$(read_seats)"
+  check_model_pins
   while IFS=: read -r name sid; do
     [ -n "$name" ] && [ -n "$sid" ] || continue
     st=$(busy "$sid")
@@ -116,7 +167,8 @@ while :; do
     cwd="$(head -c 4096 "$PAD_STATE/seat-cwd.$name" 2>/dev/null | tr -d '[:space:]')"; [ -d "$cwd" ] || cwd="$PAD_DIR"
     model="$(head -c 64 "$PAD_STATE/seat-model.$name" 2>/dev/null | tr -d '[:space:]')"
     "$HB" wake --session-id "$sid" --cwd "$cwd" ${model:+--model "$model"} --client-type stitchpad --no-wait \
-      --prompt "Auto-resume (stitchpad-watchdog): you are idle but have pending work on the pad. cd $cwd, then: cd $PAD_DIR && $SP read -n 20 to see what's waiting (a review verdict, a task, or a reply), and continue your lane. If genuinely nothing is actionable, post one line saying so and yield." >/dev/null 2>&1 \
+      --prompt "Auto-resume (stitchpad-watchdog): you are idle but have pending work on the pad. cd $cwd, then: cd $PAD_DIR && $SP read -n 20 to see what's waiting (a review verdict, a task, or a reply), and continue your lane. If genuinely nothing is actionable, post one line saying so and yield." \
+      >/dev/null 2>"$PAD_STATE/.watchdog-wake-err.$name" \
       && {
         _set lastwake "$name" "$now"; _set strike "$name" 0
         # Did the wake actually LAND? Poll briefly; a dead/errored session
@@ -131,11 +183,12 @@ while :; do
           _set deaf "$name" 0
         else
           d=$(( $(_get deaf "$name") + 1 )); _set deaf "$name" "$d"
-          echo "[watchdog] WAKE DID NOT LAND for @$name (session $sid) — strike $d"
+          why="$(head -c 300 "$PAD_STATE/.watchdog-wake-err.$name" 2>/dev/null | tr '\n' ' ')"
+          echo "[watchdog] WAKE DID NOT LAND for @$name (session $sid) — strike $d${why:+ — $why}"
           if [ "$d" -ge 3 ]; then
             echo "[watchdog] @$name is UNREACHABLE after $d attempts — its session is dead or its model is down; re-seat it."
             (cd "$PAD_DIR" && STITCHPAD_NAME=watchdog "$SP" say \
-              "⚠️ @$name is UNREACHABLE — $d wakes accepted but never ran (session ${sid%%-*}…). Its session is dead or its provider is down; the seat needs re-seating. The watchdog will keep it quiet until then." >/dev/null 2>&1 || true)
+              "⚠️ @$name is UNREACHABLE — $d wakes never ran (session ${sid%%-*}…).${why:+ Daemon said: $why} Its session is dead, its model is gone, or its provider is down; the seat needs re-seating. Hushing it for 30 minutes." >/dev/null 2>&1 || true)
             _set deaf "$name" 0
             _set lastwake "$name" $(( now + 1800 ))   # hush this seat for 30 min
           fi
