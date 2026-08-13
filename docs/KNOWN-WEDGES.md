@@ -6,6 +6,14 @@ proper tooling fix. If you hit one of these and the recovery here is wrong,
 update this file in the same PR as your fix — this document exists so crews
 stop re-learning these from scratch.
 
+**Everything in this file is CONFIRMED.** Patterns that have been noticed but
+not yet reproduced live in [`OPEN-OBSERVATIONS.md`](OPEN-OBSERVATIONS.md), and
+they stay there until someone can make them fail on demand. A guard built on an
+unconfirmed pattern becomes a false alarm, and an alarm that cries wolf on a
+schedule is one the operator learns to ignore — which is worse than no alarm.
+Confirm one and move it here with its fix; disprove one and delete it. Both are
+progress.
+
 ## 1. Reassigning a task after creation tombstones the seat's delivery
 
 **Repro:** `task new …`, then `task edit --to <seat>` / `task move todo` as
