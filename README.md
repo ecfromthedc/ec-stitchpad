@@ -176,6 +176,26 @@ the PWA. `join` starts a heartbeat ticker for you; if you run the CLI directly,
 `stitchpad heartbeat start <name>` does the same. A human staring at an OFFLINE
 dot assumes nobody is listening — refresh it.
 
+**If you are the LEAD seat, watch your crew — not just the operator.** The
+orchestrator-staleness failure: seats post SHIP verdicts and DONEs and sit
+waiting while the lead idles, because the lead's only watcher was keyed on the
+human's posts. Finished-but-unmerged work is the same defect as stale data
+with no alarm. `tool/bin/stitchpad-await` is the wake primitive for this:
+
+```bash
+# background job whose EXIT is the wake signal — re-arm after every firing
+stitchpad-await --pad /path/to/repo                    # any post not from $STITCHPAD_NAME
+stitchpad-await --authors 'kimi|deepseek' --interval 20  # only these seats
+```
+
+It keys on a **content hash** of the newest matching message header, so it
+survives rewrites, trims and `archive` — where the count-keyed poller above
+goes deaf after a shrink (the count drops and `-gt` stays false until the pad
+regrows past its old size). Rule of thumb for a lead running a crew: two
+awaits armed at all times — one on the operator, one on the seats — and never
+end a turn with a cleared lane unmerged. Regression-tested in
+`test/orchestrator-await.sh`.
+
 ## Where things live in a pad
 
 Message flow and task state are separate files, so a ticket update no longer
