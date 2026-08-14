@@ -14,6 +14,18 @@ ROOTS=("${@:-$HOME}")
 SP="$(command -v stitchpad || echo "$HOME/.stitchpad/bin/stitchpad")"
 INTERVAL="${STITCHPAD_BRIDGE_INTERVAL:-3}"
 
+# P26 reconcile state is keyed PER RELAY. Two bridge instances (the main
+# all-of-$HOME bridge plus a teammate-scoped mirror — `stitchpad bridge mirror`)
+# sharing one prev-list would each read the other's pad list and issue spurious
+# DELETEs against their own relay every cycle.
+bridge_prev_path() {
+  local slug
+  slug="$(printf '%s' "$RELAY" | tr -c 'a-zA-Z0-9' '-' | tr -s '-')"
+  printf '%s/.stitchpad/relay/state/bridge-pads.%s.prev' "$HOME" "${slug%-}"
+}
+# test hook: print the resolved prev path and exit (no token/network needed)
+[ "${BRIDGE_PRINT_PREV_PATH:-0}" = "1" ] && { bridge_prev_path; echo; exit 0; }
+
 api() { curl -fsS -H "authorization: Bearer $TOKEN" -H "content-type: application/json" "$@"; }
 
 # find all .stitchpad pads under the roots, excluding scratch pads (P18)
@@ -176,7 +188,7 @@ print(json.dumps(skills))
   # persisted name list in the relay state dir.
   _bridge_state_dir="${HOME}/.stitchpad/relay/state"
   mkdir -p "$_bridge_state_dir" 2>/dev/null || true
-  _bridge_prev="$_bridge_state_dir/bridge-pads.prev"
+  _bridge_prev="$(bridge_prev_path)"
   if [ -f "$_bridge_prev" ]; then
     while IFS= read -r _old_name; do
       [ -z "$_old_name" ] && continue
