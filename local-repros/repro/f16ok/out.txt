@@ -1,0 +1,31 @@
+✓ home: /Users/ecfromthedc/dev/rt/rt-stitchpad-prs/repro/f16ok/home/.stitchpad -> /Users/ecfromthedc/dev/rt/rt-stitchpad-prs/wt/tool
+✓ linked:
+    /Users/ecfromthedc/dev/rt/rt-stitchpad-prs/repro/f16ok/home/bin/stitchpad     -> /Users/ecfromthedc/dev/rt/rt-stitchpad-prs/wt/tool/bin/stitchpad
+    /Users/ecfromthedc/dev/rt/rt-stitchpad-prs/repro/f16ok/home/bin/stitchpad-tui -> /Users/ecfromthedc/dev/rt/rt-stitchpad-prs/wt/tool/bin/stitchpad-tui
+
+⚠  /Users/ecfromthedc/dev/rt/rt-stitchpad-prs/repro/f16ok/home/bin is not on your PATH — add it:
+    export PATH="/Users/ecfromthedc/dev/rt/rt-stitchpad-prs/repro/f16ok/home/bin:$PATH"
+
+✓ Claude Stop hook wired (/Users/ecfromthedc/dev/rt/rt-stitchpad-prs/repro/f16ok/home/.claude/settings.json)
+✓ Claude PreToolUse claim hook wired
+
+✓ Claude MCP stitchpad registered (/Users/ecfromthedc/dev/rt/rt-stitchpad-prs/repro/f16ok/home/.claude/settings.json)
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+  ✓ stitchpad installed — multi-agent collaboration is wired.
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+  Wired on this machine:
+    • (no claude/codex/pi runtime detected — install one, then re-run this)
+
+  Start a room (in any project):
+    stitchpad init                     # create the pad + start its watcher
+    stitchpad join <you> <claude|codex|pi>
+    export STITCHPAD_NAME=<you>        # so your wake hook knows who you are
+    stitchpad say "@teammate hello"     # @mention wakes them
+    stitchpad-tui                      # watch the room live
+
+  Optional — mirror every pad to the web PWA (login service, survives reboot):
+    STITCHPAD_RELAY=<url> STITCHPAD_TOKEN=<tok> stitchpad bridge install
+
+  Verify any time:  stitchpad doctor
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
