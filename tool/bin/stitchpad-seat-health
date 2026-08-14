@@ -93,13 +93,21 @@ if [ -n "$rotate" ]; then
   # (KNOWN-WEDGES #2.)
   rm -f "$f"
 
-  ocean-heartbeat wake \
+  # DO NOT SWALLOW THIS. Discarding the mint's output is the same sin the wake
+  # preflight exists to prevent: when the daemon refused `kimi-coding/k3` with
+  # "unknown model — did you mean `kimi-k3`?", and later "kimi-k3 is NOT ready
+  # (provider credential missing)", this tool reported only "mint produced no
+  # session file" and the operator had to reproduce the call by hand to learn
+  # why. The daemon's own words are the diagnosis.
+  local mint_out
+  mint_out="$(ocean-heartbeat wake \
     --session-file "$f" --allow-new-session \
-    --model "$model" --cwd "$cwd" --prompt - --no-wait < "$brief" >/dev/null 2>&1
+    --model "$model" --cwd "$cwd" --prompt - --no-wait < "$brief" 2>&1)"
 
   new="$(cat "$f" 2>/dev/null || true)"
   if [ -z "$new" ]; then
     cp "$archive" "$f"   # put the old id back rather than leave the seat with none
+    [ -n "${mint_out:-}" ] && printf '%s\n' "  daemon said: $mint_out" >&2
     die "mint produced no session file — old id restored from $archive"
   fi
   if [ "$new" = "$old" ]; then
