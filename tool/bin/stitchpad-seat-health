@@ -99,7 +99,6 @@ if [ -n "$rotate" ]; then
   # (provider credential missing)", this tool reported only "mint produced no
   # session file" and the operator had to reproduce the call by hand to learn
   # why. The daemon's own words are the diagnosis.
-  local mint_out
   mint_out="$(ocean-heartbeat wake \
     --session-file "$f" --allow-new-session \
     --model "$model" --cwd "$cwd" --prompt - --no-wait < "$brief" 2>&1)"
