@@ -26,6 +26,46 @@
 #
 # So this tool reports both and refuses to call a seat healthy on turns alone.
 #
+# THERE IS NO TURN LIMIT TO RAISE (established 2026-08-17, during a 12-seat
+# overnight build that rotated ~35 times):
+#
+#   No turn or context cap exists in ~/.config/ocean-rs/, and the daemon exposes
+#   no token/context field per session — `messages` is just a duplicate of
+#   `turns`. The variance noted above (fine at 210, dead at 150) is itself the
+#   proof: a fixed threshold could not produce it. The exhausted resource is
+#   CONTEXT, and a seat that read three large files burns it faster than one that
+#   ran greps. So ~200 is a heuristic for "context is probably full", not a
+#   number anyone chose, and asking to extend it has nothing to extend.
+#
+# ROTATION POLICY that follows from that. Rotation is SCHEDULED, not reactive:
+#
+#   1. NO-ARTIFACT ROTATE, at any turn count. Check `git log` AND
+#      `git log origin/<branch>..HEAD` — not just `git status`, because a seat
+#      can hold committed-but-unpushed work that a worktree check calls clean.
+#      (Two seats were found holding 15 and 23 such commits.)
+#   2. SOFT ROTATE AT ~150, ON A LANE BOUNDARY — the moment a lane merges or an
+#      item closes. This is the rule that pays. Rotating reactively at ~200
+#      MID-WORK is where the cost lives: the seat holds uncommitted state and
+#      half-formed intent, and the overseer eats a detection lag first. At a
+#      boundary it costs almost nothing.
+#   3. HARD CEILING ~185.
+#
+# What makes this survivable is not the number: it is that briefs and per-seat
+# wake notes are SELF-CONTAINED, so a fresh seat resumes from the note rather
+# than from memory. Keep them that way and rotation is nearly free. The expensive
+# failures were never rotations — they were DETECTION LAGS while a seat sat inert
+# and the operator assumed it was working.
+#
+# Two corollaries, both learned by getting them wrong:
+#   · CONFIRM what a push DID; never assert it. Record the real state
+#     (pushed-N / already-current / REJECTED-diverged-N-STILL-LOCAL) in the
+#     rotation note. A rejected push described as "pushed" leaves a fresh seat
+#     believing its work is safe on the remote.
+#   · Do NOT blanket-"secure dirty work" in a SHARED clone. Its dirty files may
+#     be stale local copies of files already tracked upstream, and committing
+#     them puts stale content on a local branch. Staging paths explicitly is not
+#     sufficient when the paths themselves are the wrong ones.
+#
 #   stitchpad-seat-health                          # table of every seat
 #   stitchpad-seat-health --warn-at 150            # tighter leading indicator
 #   stitchpad-seat-health --rotate kimi --brief b.txt --model gpt-5.6-sol \
