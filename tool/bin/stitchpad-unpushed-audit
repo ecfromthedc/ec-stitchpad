@@ -1,0 +1,132 @@
+#!/usr/bin/env bash
+# stitchpad-unpushed-audit — find work that exists in exactly one place.
+#
+# The wedge this exists for (2026-08-17, found twice in one morning):
+#
+# A seat can look perfectly clean and still be holding work nobody else can see.
+# `git status` says nothing because the work is COMMITTED; the commit is simply
+# not pushed. During one overnight build two seats were found holding 15 and 23
+# such commits, and one of them was the highest-value fix on the board — sitting
+# where no reviewer could reach it. Separately, the tool everyone depends on for
+# rotations had two unpushed fixes on a branch the operator was not looking at,
+# because the main clone sits on a different branch and the installed binary
+# symlinks into another worktree entirely.
+#
+# Same house failure family as the seat death zone: A THING THAT LOOKS FINE AND
+# IS NOT. "clean worktree" means "nothing uncommitted", never "nothing at risk".
+#
+# THREE WAYS WORK HIDES, and this checks all three:
+#
+#   unpushed commits  — committed on a branch, ahead of its upstream. Invisible to
+#                       `git status`. The common case.
+#   ORPHAN commits    — committed on a DETACHED HEAD, reachable from no branch at
+#                       all. Strictly worse: no branch name to find it by, and a
+#                       per-branch sweep cannot see it. This is the one that gets
+#                       lost for good.
+#   diverged branches — local and upstream have both moved, so a plain push is
+#                       REJECTED. Work stays local while the operator believes a
+#                       push succeeded. Only the branch's owner should resolve
+#                       this, with --force-with-lease; never force another lane.
+#
+# Usage:
+#   stitchpad-unpushed-audit [repo ...]        # default: cwd
+#   stitchpad-unpushed-audit --quiet [repo]    # findings only, for a loop tick
+#
+# Exit: 0 nothing at risk · 3 something is held in one place (advisory, not fatal
+#       — the caller decides; a build loop should report it, not stop for it)
+set -uo pipefail
+
+QUIET=0
+ROOTS=""
+for arg in "$@"; do
+  case "$arg" in
+    --quiet|-q) QUIET=1 ;;
+    -h|--help) sed -n '2,40p' "$0"; exit 0 ;;
+    *) ROOTS="$ROOTS $arg" ;;
+  esac
+done
+[ -n "${ROOTS// /}" ] || ROOTS="$PWD"
+
+FOUND=0
+
+say() { [ "$QUIET" = "1" ] || printf '%s\n' "$*"; }
+finding() { FOUND=1; printf '%s\n' "$*"; }
+
+for repo in $ROOTS; do
+  if ! git -C "$repo" rev-parse --git-dir >/dev/null 2>&1; then
+    finding "NOT-A-REPO $repo"
+    continue
+  fi
+  say "== $repo"
+  git -C "$repo" fetch --all --quiet 2>/dev/null || say "   (fetch failed — results may be stale)"
+
+  # 1. Branches ahead of, or diverged from, their upstream.
+  #    Bash 3.2: one `local`-free loop, one variable per line. (A `local` used
+  #    with multiple assignments outside a function is the bug that shipped in
+  #    this tool's sibling — see its history.)
+  for br in $(git -C "$repo" for-each-ref --format='%(refname:short)' refs/heads/ 2>/dev/null); do
+    up=$(git -C "$repo" rev-parse --abbrev-ref --symbolic-full-name "$br@{upstream}" 2>/dev/null)
+    if [ -z "$up" ]; then
+      # Same test as below: a branch with no upstream is only a problem if some
+      # commit on it is reachable from no remote ref at all. Local backup/ and
+      # rescue/ refs pointing at already-pushed history are not findings.
+      at_risk=$(git -C "$repo" rev-list "$br" --not --remotes 2>/dev/null | wc -l | tr -d ' ')
+      if [ "${at_risk:-0}" != "0" ]; then
+        finding "NO-UPSTREAM  $repo  $br — no upstream AND $at_risk commit(s) on no remote ref"
+      fi
+      continue
+    fi
+    ahead=$(git -C "$repo" rev-list --count "$up..$br" 2>/dev/null)
+    behind=$(git -C "$repo" rev-list --count "$br..$up" 2>/dev/null)
+    # AHEAD OF ITS OWN UPSTREAM IS NOT THE SAME AS AT RISK. A fully-merged lane
+    # branch is ahead of its stale `origin/<lane>` ref forever while every one of
+    # its commits sits safely in `origin/main`. Reporting those cries wolf, and a
+    # noisy audit gets ignored — which is worse than no audit. So the question is
+    # not "ahead of upstream" but "reachable from ANY remote ref". This caught a
+    # 38-commit lane that looked lost and was entirely merged.
+    at_risk=$(git -C "$repo" rev-list "$up..$br" --not --remotes 2>/dev/null | wc -l | tr -d ' ')
+    if [ "${at_risk:-0}" = "0" ]; then
+      if [ "${ahead:-0}" != "0" ]; then
+        say "   ok  $br — $ahead ahead of $up but every commit is on some remote ref (merged elsewhere)"
+      fi
+      continue
+    fi
+    if [ "${ahead:-0}" != "0" ] && [ "${behind:-0}" != "0" ]; then
+      finding "DIVERGED     $repo  $br — $at_risk commit(s) on NO remote ref, $behind remote-only; a plain push WILL be rejected. The branch OWNER resolves with --force-with-lease."
+    else
+      finding "UNPUSHED     $repo  $br — $at_risk commit(s) exist only here"
+    fi
+  done
+
+  # 2. Detached-HEAD worktrees whose HEAD is on no remote branch = orphan.
+  git -C "$repo" worktree list --porcelain 2>/dev/null \
+    | awk '/^worktree /{w=$2} /^detached$/{print w}' \
+    | while read -r wt; do
+        [ -n "$wt" ] || continue
+        h=$(git -C "$wt" rev-parse --short HEAD 2>/dev/null)
+        [ -n "$h" ] || continue
+        onremote=$(git -C "$repo" branch -r --contains "$h" 2>/dev/null | wc -l | tr -d ' ')
+        if [ "${onremote:-0}" = "0" ]; then
+          # Orphan: no branch name to recover this by.
+          printf '%s\n' "ORPHAN       $repo  $wt @ $h — detached HEAD on NO remote branch. Give it a branch before this worktree is pruned."
+        fi
+      done
+  # The while-loop above runs in a subshell, so FOUND cannot be set there.
+  # Re-detect cheaply so the exit code is honest.
+  if git -C "$repo" worktree list --porcelain 2>/dev/null \
+      | awk '/^worktree /{w=$2} /^detached$/{print w}' \
+      | while read -r wt; do
+          [ -n "$wt" ] || continue
+          h=$(git -C "$wt" rev-parse --short HEAD 2>/dev/null) || continue
+          n=$(git -C "$repo" branch -r --contains "$h" 2>/dev/null | wc -l | tr -d ' ')
+          [ "${n:-0}" = "0" ] && exit 7
+        done; [ $? -eq 7 ]; then
+    FOUND=1
+  fi
+done
+
+if [ "$FOUND" = "0" ]; then
+  say "nothing held in one place — every commit is on a remote branch"
+  exit 0
+fi
+exit 3
