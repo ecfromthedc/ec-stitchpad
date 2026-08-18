@@ -27,6 +27,15 @@
 #                       REJECTED. Work stays local while the operator believes a
 #                       push succeeded. Only the branch's owner should resolve
 #                       this, with --force-with-lease; never force another lane.
+#   UNREACHABLE wip    — a commit that no branch and no worktree HEAD points at,
+#                       findable only through the reflog. Added 2026-08-17 after
+#                       this tool MISSED 333 lines of the last open P0 for nine
+#                       hours: a rotation-secure commit whose branch then moved,
+#                       recovered only because a stash message happened to name
+#                       the SHA. A per-branch sweep cannot see it by construction,
+#                       and the detached-HEAD check above does not either — the
+#                       worktree had a branch, the COMMIT just stopped being on it.
+#                       One `git gc` from gone.
 #
 # Usage:
 #   stitchpad-unpushed-audit [repo ...]        # default: cwd
@@ -91,12 +100,58 @@ for repo in $ROOTS; do
       fi
       continue
     fi
-    if [ "${ahead:-0}" != "0" ] && [ "${behind:-0}" != "0" ]; then
-      finding "DIVERGED     $repo  $br — $at_risk commit(s) on NO remote ref, $behind remote-only; a plain push WILL be rejected. The branch OWNER resolves with --force-with-lease."
+    # PREDICT THE PUSH AGAINST THE REF THE PUSH ACTUALLY TARGETS.
+    #
+    # `git push origin <br>` writes refs/heads/<br> on the remote — which is NOT
+    # necessarily `<br>@{upstream}`. A lane tracking origin/main is "0 behind"
+    # its upstream while origin/sell/<lane> has moved on, and this tool then
+    # reported UNPUSHED for a branch whose plain push is rejected
+    # non-fast-forward. Measured on sell/billing and sell/ops-hardening: both
+    # called UNPUSHED, both rejected. A wrong prediction is worse than none,
+    # because the caller acts on it — so ask origin/<same-name>.
+    push_target="origin/$br"
+    if git -C "$repo" rev-parse --verify -q "$push_target" >/dev/null 2>&1; then
+      target_only=$(git -C "$repo" rev-list --count "$br..$push_target" 2>/dev/null)
     else
-      finding "UNPUSHED     $repo  $br — $at_risk commit(s) exist only here"
+      target_only=0   # no such remote ref: a plain push CREATES it, never rejected
+    fi
+    if [ "${target_only:-0}" != "0" ]; then
+      finding "DIVERGED     $repo  $br — $at_risk commit(s) on NO remote ref, $target_only on $push_target that you do not have; a plain push WILL be rejected non-fast-forward. The branch OWNER resolves with --force-with-lease."
+    else
+      finding "UNPUSHED     $repo  $br — $at_risk commit(s) exist only here; a plain push to $push_target should succeed"
     fi
   done
+
+  # 1b. UNREACHABLE wip commits — reachable from the reflog and nothing else.
+  #
+  # Precision matters more than recall here. A busy repo has hundreds of
+  # reflog-only commits (every intermediate rebase state), and reporting them all
+  # would bury the one that counts — a noisy audit gets ignored, which is worse
+  # than no audit. So report only commits that were created to PRESERVE work and
+  # then fell off: this tooling's own rotation-secure commits, whose subject is
+  # `wip(...)` / `secured by overseer`. That is exactly the commit shape that hid
+  # 333 lines of P0-12. Everything else is counted, not listed, so the noise
+  # floor stays visible without drowning the signal.
+  unreachable_all=$(git -C "$repo" rev-list --reflog --not --all 2>/dev/null | wc -l | tr -d ' ')
+  if [ "${unreachable_all:-0}" != "0" ]; then
+    listed=0
+    for h in $(git -C "$repo" rev-list --reflog --not --all 2>/dev/null | head -400); do
+      subj=$(git -C "$repo" log -1 --format='%s' "$h" 2>/dev/null)
+      case "$subj" in
+        wip\(*|*"secured by overseer"*) ;;
+        *) continue ;;
+      esac
+      short=$(git -C "$repo" rev-parse --short "$h" 2>/dev/null)
+      files=$(git -C "$repo" show --stat --format='' "$h" 2>/dev/null | tail -1 | tr -d '\n')
+      finding "UNREACHABLE  $repo  $short — on NO branch and no worktree HEAD, findable only via reflog: \"$subj\" ($files). Some of these are SUPERSEDED (the work landed later via a rebase) and some are lost work — this tool does not know which, and finding out costs more than insuring against it. So rescue first, decide after: git branch rescue/wip-$short $short && git push origin rescue/wip-$short. Cheap, reversible, and one gc from impossible."
+      listed=$((listed + 1))
+    done
+    if [ "$listed" = "0" ]; then
+      say "   ok  $unreachable_all reflog-only commit(s), none of them secured-work commits (rebase noise)"
+    else
+      say "   note $unreachable_all reflog-only commit(s) total; $listed look like preserved work and are listed above"
+    fi
+  fi
 
   # 2. Detached-HEAD worktrees whose HEAD is on no remote branch = orphan.
   git -C "$repo" worktree list --porcelain 2>/dev/null \

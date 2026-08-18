@@ -133,13 +133,20 @@ if [ -n "$rotate" ]; then
   # (KNOWN-WEDGES #2.)
   rm -f "$f"
 
-  ocean-heartbeat wake \
+  # DO NOT SWALLOW THIS. Discarding the mint's output is the same sin the wake
+  # preflight exists to prevent: when the daemon refused `kimi-coding/k3` with
+  # "unknown model — did you mean `kimi-k3`?", and later "kimi-k3 is NOT ready
+  # (provider credential missing)", this tool reported only "mint produced no
+  # session file" and the operator had to reproduce the call by hand to learn
+  # why. The daemon's own words are the diagnosis.
+  mint_out="$(ocean-heartbeat wake \
     --session-file "$f" --allow-new-session \
-    --model "$model" --cwd "$cwd" --prompt - --no-wait < "$brief" >/dev/null 2>&1
+    --model "$model" --cwd "$cwd" --prompt - --no-wait < "$brief" 2>&1)"
 
   new="$(cat "$f" 2>/dev/null || true)"
   if [ -z "$new" ]; then
     cp "$archive" "$f"   # put the old id back rather than leave the seat with none
+    [ -n "${mint_out:-}" ] && printf '%s\n' "  daemon said: $mint_out" >&2
     die "mint produced no session file — old id restored from $archive"
   fi
   if [ "$new" = "$old" ]; then
@@ -163,7 +170,17 @@ for f in "${files[@]}"; do
   case "$f" in *.exhausted*|*.bak) continue ;; esac
   seat="$(basename "$f" | sed 's/^ocean-session\.//')"
   sid="$(cat "$f" 2>/dev/null)"
-  t="$(turns_of "$sid")"; s="$(state_of "$sid")"
+  t="$(turns_of "$sid")"; s="$(state_of "$sid")"; health=""
+  # STATE FIRST. This tool judged health on turn count alone, so a seat sitting
+  # in `errored` was reported as "ok" purely because its turn count was low —
+  # the exact failure this tool exists to catch, in the tool itself. A seat that
+  # is not running or completed is not healthy, whatever its turns say.
+  case "$s" in
+    running|completed) ;;
+    ''|'?') health=$'\033[33mUNREADABLE — treat as suspect\033[0m' ;;
+    *) health=$'\033[31mSTATE '"$s"$' — not working; restart or rotate\033[0m'; hot=1 ;;
+  esac
+  if [ -z "${health:-}" ] || [ "$s" = running ] || [ "$s" = completed ]; then
   case "$t" in
     ''|*[!0-9]*) health=$'\033[33mUNREADABLE — treat as suspect\033[0m' ;;
     *)
@@ -172,6 +189,7 @@ for f in "${files[@]}"; do
       else health=$'\033[32mok\033[0m'
       fi ;;
   esac
+  fi
   printf '%-14s %-38s %-11s %6s  %b\n' "$seat" "${sid:0:36}" "${s:-?}" "${t:-?}" "$health"
 done
 
