@@ -97,13 +97,13 @@ while [ $# -gt 0 ]; do
 done
 
 turns_of() {  # session id -> turn count, or empty
-  curl -s -m 5 "$DAEMON/v1/sessions/$1" 2>/dev/null \
+  curl -s -m "${OCEAN_READ_TIMEOUT_SECS:-30}" "$DAEMON/v1/sessions/$1" 2>/dev/null \
     | /usr/bin/python3 -c 'import json,sys
 try: print(json.load(sys.stdin)["session"].get("turns",""))
 except Exception: print("")' 2>/dev/null
 }
 state_of() {
-  curl -s -m 5 "$DAEMON/v1/sessions/$1" 2>/dev/null \
+  curl -s -m "${OCEAN_READ_TIMEOUT_SECS:-30}" "$DAEMON/v1/sessions/$1" 2>/dev/null \
     | /usr/bin/python3 -c 'import json,sys
 try: print(json.load(sys.stdin)["session"].get("state",""))
 except Exception: print("")' 2>/dev/null
