@@ -64,6 +64,55 @@
 # and add one roster line — or connect via the stitchpad MCP server. That's the
 # whole extension model.
 set -uo pipefail
+
+# ── CREW LAWS ───────────────────────────────────────────────────────────────
+# Printed on every join and available as `stitchpad laws`. These are the rules
+# that were learned by losing work, each one paid for in real hours.
+sp_print_crew_laws() {
+  cat <<'LAWS'
+
+── CREW LAWS ───────────────────────────────────────────────────────────────
+
+1. NEVER END A TURN WITH WORK MID-FLIGHT.
+   Context is not durable. A turn that ends without an artifact did not
+   happen. Commit what you have — partial, rough, marked WIP — before the
+   turn can end. Write the deliverable FIRST and amend it as you learn,
+   rather than composing it at the end where the turn boundary eats it.
+   Never end on uncommitted edits, an unwritten verdict, or "I'll write it
+   up next turn." There may be no next turn: provider lines die mid-work.
+
+2. POST FINDINGS AS YOU GO (S15).
+   Every ~5 findings: commit to your audit file AND post to the pad. A
+   deliverable held in context is one crash from gone. Two whole lanes were
+   lost this way before this rule existed.
+
+3. BLOCKED IS A DELIVERABLE.
+   "BLOCKED: could not build X because Y" — committed and posted — is real
+   output. Silence is indistinguishable from death. Say what stopped you.
+
+4. RECORD THE REAL RESULT, NEVER THE INTENDED ONE.
+   Push rejected? Say rejected. Tests red? Say red, with counts. A push
+   described as successful when it failed leaves the next seat believing
+   work is safe when it is lost.
+
+5. EVIDENCE, NOT ASSERTION.
+   Drive the built binary; render the actual page; run the command. Gates
+   must ASSERT inside the && chain (cmd | grep -q 'ok' && commit), never
+   print-and-hope — an absent line looks exactly like success.
+
+6. CROSS-FAMILY REVIEW.
+   Work is reviewed by a different model family than the author, and the
+   reviewer reproduces the author's evidence independently. HOLDs are a
+   gift: convert each one into a permanent gate.
+
+7. THE OVERSEER OWES THE SAME.
+   Whoever runs the loop re-arms it as the LAST ACT of every turn. A
+   supervisor that stalls silently is the same defect as a seat that does.
+
+────────────────────────────────────────────────────────────────────────────
+LAWS
+}
+
 # Resolve our real dir even when invoked through a symlink (install puts a
 # symlink on PATH; lib.sh sits next to the real script).
 _src="${BASH_SOURCE[0]}"; while [ -h "$_src" ]; do
@@ -862,6 +911,10 @@ You may spawn your own sub-agents (stitchpad spawn <name> --brief ... --artifact
     echo "  brief posted to the pad — the watcher delivers it; check with: stitchpad lanes"
     ;;
 
+  laws)
+    sp_print_crew_laws
+    exit 0
+    ;;
   join)
     sp_init_paths || exit 1
     # Parse optional flags: --role <role> [--level junior|senior|lead|principal]
@@ -982,6 +1035,7 @@ You may spawn your own sub-agents (stitchpad spawn <name> --brief ... --artifact
     # overstated it — you could be in the roster and still be nobody.
     if [ -n "${_join_surface:-}" ] && [ "$target" = "${_join_surface:-}" ]; then
       echo "✓ $who joined (adapter=$adapter wake=$wake) — identity bound to this terminal"
+      sp_print_crew_laws
     elif [ -n "${STITCHPAD_NAME:-}" ] || [ -n "$(sp_me 2>/dev/null)" ]; then
       echo "✓ $who joined (adapter=$adapter wake=$wake)"
     else
