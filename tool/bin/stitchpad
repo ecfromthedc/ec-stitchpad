@@ -65,6 +65,55 @@
 # and add one roster line — or connect via the stitchpad MCP server. That's the
 # whole extension model.
 set -uo pipefail
+
+# ── CREW LAWS ───────────────────────────────────────────────────────────────
+# Printed on every join and available as `stitchpad laws`. These are the rules
+# that were learned by losing work, each one paid for in real hours.
+sp_print_crew_laws() {
+  cat <<'LAWS'
+
+── CREW LAWS ───────────────────────────────────────────────────────────────
+
+1. NEVER END A TURN WITH WORK MID-FLIGHT.
+   Context is not durable. A turn that ends without an artifact did not
+   happen. Commit what you have — partial, rough, marked WIP — before the
+   turn can end. Write the deliverable FIRST and amend it as you learn,
+   rather than composing it at the end where the turn boundary eats it.
+   Never end on uncommitted edits, an unwritten verdict, or "I'll write it
+   up next turn." There may be no next turn: provider lines die mid-work.
+
+2. POST FINDINGS AS YOU GO (S15).
+   Every ~5 findings: commit to your audit file AND post to the pad. A
+   deliverable held in context is one crash from gone. Two whole lanes were
+   lost this way before this rule existed.
+
+3. BLOCKED IS A DELIVERABLE.
+   "BLOCKED: could not build X because Y" — committed and posted — is real
+   output. Silence is indistinguishable from death. Say what stopped you.
+
+4. RECORD THE REAL RESULT, NEVER THE INTENDED ONE.
+   Push rejected? Say rejected. Tests red? Say red, with counts. A push
+   described as successful when it failed leaves the next seat believing
+   work is safe when it is lost.
+
+5. EVIDENCE, NOT ASSERTION.
+   Drive the built binary; render the actual page; run the command. Gates
+   must ASSERT inside the && chain (cmd | grep -q 'ok' && commit), never
+   print-and-hope — an absent line looks exactly like success.
+
+6. CROSS-FAMILY REVIEW.
+   Work is reviewed by a different model family than the author, and the
+   reviewer reproduces the author's evidence independently. HOLDs are a
+   gift: convert each one into a permanent gate.
+
+7. THE OVERSEER OWES THE SAME.
+   Whoever runs the loop re-arms it as the LAST ACT of every turn. A
+   supervisor that stalls silently is the same defect as a seat that does.
+
+────────────────────────────────────────────────────────────────────────────
+LAWS
+}
+
 # Resolve our real dir even when invoked through a symlink (install puts a
 # symlink on PATH; lib.sh sits next to the real script).
 _src="${BASH_SOURCE[0]}"; while [ -h "$_src" ]; do
@@ -863,6 +912,10 @@ You may spawn your own sub-agents (stitchpad spawn <name> --brief ... --artifact
     echo "  brief posted to the pad — the watcher delivers it; check with: stitchpad lanes"
     ;;
 
+  laws)
+    sp_print_crew_laws
+    exit 0
+    ;;
   join)
     sp_init_paths || exit 1
     # Parse optional flags: --role <role> [--level junior|senior|lead|principal]
@@ -983,6 +1036,7 @@ You may spawn your own sub-agents (stitchpad spawn <name> --brief ... --artifact
     # overstated it — you could be in the roster and still be nobody.
     if [ -n "${_join_surface:-}" ] && [ "$target" = "${_join_surface:-}" ]; then
       echo "✓ $who joined (adapter=$adapter wake=$wake) — identity bound to this terminal"
+      sp_print_crew_laws
     elif [ -n "${STITCHPAD_NAME:-}" ] || [ -n "$(sp_me 2>/dev/null)" ]; then
       echo "✓ $who joined (adapter=$adapter wake=$wake)"
     else
@@ -1236,19 +1290,21 @@ You may spawn your own sub-agents (stitchpad spawn <name> --brief ... --artifact
   operator)
     # Operator credential management (authority model redesign, C2/C2b).
     # The credential is a random 256-bit key OUTSIDE every pad
-    # ($HOME/.stitchpad/operator.key, 0600). Operator-gated commands require
+    # ($HOME/.config/stitchpad/operator.key, 0600). Operator-gated commands require
     # the caller to present it via STITCHPAD_OPERATOR_TOKEN — out-of-band
     # possession, never an env boolean or roster inference.
     op_cmd="${1:-status}"
     case "$op_cmd" in
       keygen)
         sp_operator_keygen "${2:-}" || exit 1
-        echo "✓ operator key created at $HOME/.stitchpad/operator.key (0600)"
-        echo "  export STITCHPAD_OPERATOR_TOKEN=$(cat "$HOME/.stitchpad/operator.key")"
+        op_key="$(_sp_operator_key_path)" || exit 1
+        echo "✓ operator key created at $op_key (0600)"
+        echo "  export STITCHPAD_OPERATOR_TOKEN=$(cat "$op_key")"
         ;;
       env)
         sp_operator_key_present || { echo "stitchpad: no operator key — run 'stitchpad operator keygen'" >&2; exit 1; }
-        echo "export STITCHPAD_OPERATOR_TOKEN=$(cat "$HOME/.stitchpad/operator.key")"
+        op_key="$(_sp_operator_key_path)" || exit 1
+        echo "export STITCHPAD_OPERATOR_TOKEN=$(cat "$op_key")"
         ;;
       grant)
         sp_init_paths || exit 1
@@ -1267,7 +1323,8 @@ You may spawn your own sub-agents (stitchpad spawn <name> --brief ... --artifact
         ;;
       status)
         if sp_operator_key_present; then
-          echo "operator key: present ($HOME/.stitchpad/operator.key)"
+          op_key="$(_sp_operator_key_path)" || exit 1
+          echo "operator key: present ($op_key)"
           if sp_operator_ok; then echo "credential: PRESENTED (token matches)"; else echo "credential: not presented (export STITCHPAD_OPERATOR_TOKEN — see 'stitchpad operator env')"; fi
         else
           echo "operator key: MISSING — run 'stitchpad operator keygen'"
