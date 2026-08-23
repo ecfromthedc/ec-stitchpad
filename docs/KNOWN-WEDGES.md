@@ -308,3 +308,54 @@ the produced-nothing seat).
 **Prevention:** never install a launcher as a symlink into a build directory —
 or if you must, preflight it. And never redirect a dispatch's stderr to
 `/dev/null`; that single habit turned a ten-second rebuild into an hour.
+
+## 10. "RECOVERY EXHAUSTED" on every `say` — a bound that was announced but never enforced
+
+**Repro:** crash a guarded write (`say`, `leave`, a lifecycle commit) so its
+`.registry-journal.*` dir survives in `PAD_STATE`, then keep posting. Pad-git
+HEAD advances past the journal's stamped `.base-sha`, which makes the orphan
+**permanently** unrecoverable — restoring its snapshot would revert every
+commit since, so recovery refuses, correctly. But nothing consumed that
+verdict, so recovery re-ran on the very next command:
+
+```
+stitchpad: RECOVERY EXHAUSTED for @system (journal-recovery) — 519/3 attempts,
+budget 120s; key=journal:.registry-journal.sxoQ1b; state preserved for manual
+inspection
+✓ posted as @fable (#m-e8bb79)
+```
+
+Observed live on 2026-08-23 with four orphans on one pad, counters at
+**530/516/383/81 against a max of 3**, the oldest running nine days. The
+numerator being two orders of magnitude past the limit is the tell. Every post
+succeeded; the alarm was pure noise on a working path — and noise on a working
+path is how an operator learns to ignore stderr, which is the expensive part.
+
+**Why it never gave up:** `sp_recovery_is_exhausted` was consulted, the
+diagnostic was printed, and then the loop simply `continue`d. Nothing marked
+the key so the *next* invocation would skip it. Worse, the attempt was recorded
+BEFORE the refusal branch, so every command pushed the counter higher, and at
+1000 `attempt_record`'s corruption clamp would have reset it to 0 and started
+the whole cycle again.
+
+**Fix (shipped):** exhaustion now LATCHES. `sp_recovery_mark_terminal` writes a
+`.terminal` sibling of the counter file; `sp_session_registry_journal_recover`
+checks `sp_recovery_is_terminal` *before* recording an attempt and skips a
+latched key entirely — no attempt, no diagnostic. The terminal refusal is
+printed exactly once, with the remediation on the next line. Nothing is
+deleted: the orphan's bytes stay exactly where the message says they are.
+
+**Recovery / disposition:**
+
+- `stitchpad doctor` lists stale journals and now marks the latched ones
+  `[QUARANTINED]`.
+- `stitchpad doctor --archive-stale-journals` **moves** quarantined orphans to
+  `.state/journal-archive/` (a move, never a delete) and clears their counters.
+- `stitchpad reset --recovery-counters` (operator credential) clears the latch
+  and re-arms recovery, for the case where the refusal was transient.
+
+**Prevention:** any bounded-recovery loop must make the exhausted verdict
+*durable*. Printing a terminal refusal and then looping is not a bound; it is a
+bound-shaped log line. Pinned by `test/journal-quarantine-regression.sh`, which
+builds an orphan of exactly this shape and asserts the alarm fires once across
+eight posts (it fired six times on the pre-fix build, counter climbing 1→8).

@@ -836,12 +836,37 @@ sp_session_registry_journal_recover() {
     # first, is_exhausted sees a clean count, and the bound engages correctly.
     # The attempt is still recorded before the stale-base check (E2a) so
     # repeated refusals accumulate toward the bound.
+    #
+    # 2026-08-23: the bound above was announced but never ENFORCED. Every pass
+    # recorded a fresh attempt and re-printed the terminal refusal, so a
+    # permanently-unrecoverable orphan (base-sha left behind by an advancing
+    # HEAD can never become recoverable again) nagged on stderr before every
+    # otherwise-successful `say`, with the counter climbing past 500 against a
+    # max of 3. Exhaustion now LATCHES: the key is marked terminal, and a
+    # latched key is skipped before an attempt is even recorded.
     local _recovery_key="journal:$(basename "$orphan")"
     if type sp_recovery_attempt_record >/dev/null 2>&1; then
+      # Already latched by an earlier exhaustion — skip in silence. The bytes
+      # are still on disk; `stitchpad doctor` lists them, `stitchpad reset
+      # --recovery-counters` re-arms them. What must NOT happen is another
+      # attempt, another counter increment, and another alarming line on the
+      # stderr of a command that is about to succeed.
+      if type sp_recovery_is_terminal >/dev/null 2>&1 && \
+         sp_recovery_is_terminal "$PAD_STATE" "$_recovery_key"; then
+        continue
+      fi
       sp_recovery_attempt_record "$PAD_STATE" "$_recovery_key"
       if sp_recovery_is_exhausted "$PAD_STATE" "$_recovery_key"; then
         type sp_recovery_terminal_refuse >/dev/null 2>&1 && \
           sp_recovery_terminal_refuse "system" "journal-recovery" "$_recovery_key"
+        # Latch it so this is the LAST time. If the latch cannot be written we
+        # fall through to the old (noisy) behaviour rather than stopping
+        # retries with nothing on disk to say why.
+        if type sp_recovery_mark_terminal >/dev/null 2>&1 && \
+           sp_recovery_mark_terminal "$PAD_STATE" "$_recovery_key"; then
+          echo "stitchpad: journal $(basename "$orphan") QUARANTINED — recovery will not be retried; the snapshot is preserved at $orphan" >&2
+          echo "  inspect: stitchpad doctor   ·   re-arm: stitchpad reset --recovery-counters   ·   dispose: stitchpad doctor --archive-stale-journals" >&2
+        fi
         continue
       fi
     fi

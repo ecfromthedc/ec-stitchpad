@@ -239,14 +239,25 @@ git --git-dir="$E2A_GIT" --work-tree="$E2A_WORK/test-pad/.stitchpad" commit -q -
 echo "uncommitted crash residue" >> "$E2A_PAD_MD"
 
 SP_RECOVERY_MAX_ATTEMPTS=3 SP_RECOVERY_BUDGET_SECONDS=120
+E2A_KEY="journal:$(basename "$E2A_ORPHAN")"
 
-# Run recovery 5 times — each pass should hit the refusal branch and record
-# an attempt. After 3 attempts the terminal-refusal fires.
+# Run recovery 5 times — each pass hits the refusal branch and records an
+# attempt until the bound is crossed. Pass 3 crosses it: terminal refusal +
+# QUARANTINE. Passes 4 and 5 must then do NOTHING AT ALL.
+#
+# 2026-08-23: this loop used to assert only that the diagnostic still fired on
+# pass 6, which is precisely the bug it should have caught — "exhausted" was
+# announced and then ignored, so a permanently-unrecoverable orphan re-ran its
+# recovery and re-printed RECOVERY EXHAUSTED before every single `say` for
+# nine days, counter climbing to 530 against a max of 3. The contract now is
+# ONCE, then silence.
+E2A_NOISY=0
 for _i in 1 2 3 4 5; do
-  sp_session_registry_journal_recover >/dev/null 2>&1
+  E2A_OUT="$(sp_session_registry_journal_recover 2>&1)"
+  case "$E2A_OUT" in *"RECOVERY EXHAUSTED"*) E2A_NOISY=$((E2A_NOISY + 1)) ;; esac
 done
 
-E2A_COUNT="$(sp_recovery_attempt_count "$PAD_STATE" "journal:$(basename "$E2A_ORPHAN")")"
+E2A_COUNT="$(sp_recovery_attempt_count "$PAD_STATE" "$E2A_KEY")"
 [ "$E2A_COUNT" -ge 3 ] 2>/dev/null && \
   ok "E2Aa: attempt counter incremented on base-SHA refusal (count=$E2A_COUNT)" \
   || bad "E2Aa: attempt counter did not increment on refusal (count=$E2A_COUNT, was 0 in the bug)"
@@ -254,10 +265,34 @@ E2A_COUNT="$(sp_recovery_attempt_count "$PAD_STATE" "journal:$(basename "$E2A_OR
 [ -d "$E2A_ORPHAN" ] && ok "E2Ab: orphan still preserved (real refusal, not consumed)" \
   || bad "E2Ab: orphan disappeared unexpectedly"
 
+[ "$E2A_NOISY" -eq 1 ] && \
+  ok "E2Ac: terminal refusal fires EXACTLY ONCE across 5 passes (not once per command)" \
+  || bad "E2Ac: terminal refusal fired $E2A_NOISY times in 5 passes (expected exactly 1)"
+
+sp_recovery_is_terminal "$PAD_STATE" "$E2A_KEY" && \
+  ok "E2Ad: exhausted key latched terminal (recovery will not be retried)" \
+  || bad "E2Ad: key not latched terminal — the bound is announced but not enforced"
+
 E2A_LAST="$(sp_session_registry_journal_recover 2>&1)"
 echo "$E2A_LAST" | grep -qi "RECOVERY EXHAUSTED" && \
-  ok "E2Ac: terminal refusal fires after attempts exhausted" \
-  || bad "E2Ac: no terminal refusal after exhausting attempts (got: $(printf '%s' "$E2A_LAST" | head -c 150))"
+  bad "E2Ae: a latched key still printed RECOVERY EXHAUSTED (got: $(printf '%s' "$E2A_LAST" | head -c 150))" \
+  || ok "E2Ae: a latched key is silent on later passes"
+
+E2A_COUNT2="$(sp_recovery_attempt_count "$PAD_STATE" "$E2A_KEY")"
+[ "$E2A_COUNT2" = "$E2A_COUNT" ] && \
+  ok "E2Af: attempt counter stops climbing once latched ($E2A_COUNT2)" \
+  || bad "E2Af: counter kept climbing after the latch ($E2A_COUNT -> $E2A_COUNT2 — the 530/3 bug)"
+
+# The latch must be reversible by the operator, or it is just a nicer wedge.
+sp_recovery_reset "$PAD_STATE" "$E2A_KEY"
+sp_recovery_is_terminal "$PAD_STATE" "$E2A_KEY" && \
+  bad "E2Ag: operator reset did not clear the terminal latch" \
+  || ok "E2Ag: operator reset clears the terminal latch"
+sp_session_registry_journal_recover >/dev/null 2>&1
+E2A_COUNT3="$(sp_recovery_attempt_count "$PAD_STATE" "$E2A_KEY")"
+[ "$E2A_COUNT3" = "1" ] && \
+  ok "E2Ah: recovery re-arms after reset (attempt counted again)" \
+  || bad "E2Ah: recovery did not re-arm after reset (count=$E2A_COUNT3, expected 1)"
 
 # ============================================================================
 # E2b: crash-after-commit archived; unrelated-commit still refused (R3 shape)
@@ -386,15 +421,30 @@ E3_COUNT="$(sp_recovery_attempt_count "$PAD_STATE" "journal:$(basename "$E3_ORPH
   ok "E3d: attempt counter NOT reset after a FAILED recovery (count=$E3_COUNT)" \
   || bad "E3d: attempt counter reset to 0 despite recovery failing (count=$E3_COUNT — terminal refusal unreachable)"
 
-# Run recovery repeatedly — since the counter is never reset on failure, it
-# should eventually hit the terminal refusal (the bound becomes reachable).
+# Run recovery repeatedly — since the counter is never reset on failure, the
+# bound becomes reachable, fires ONCE, and latches. A persistently-failing
+# rollback must not re-announce itself on every subsequent guarded write.
+E3_KEY="journal:$(basename "$E3_ORPHAN")"
+E3_NOISY=0
 for _i in 1 2 3 4 5; do
-  sp_session_registry_journal_recover >/dev/null 2>&1
+  E3_OUT="$(sp_session_registry_journal_recover 2>&1)"
+  case "$E3_OUT" in *"RECOVERY EXHAUSTED"*) E3_NOISY=$((E3_NOISY + 1)) ;; esac
 done
+[ "$E3_NOISY" -eq 1 ] && \
+  ok "E3e: terminal refusal becomes reachable via a persistently-failing rollback, and fires once" \
+  || bad "E3e: expected exactly 1 terminal refusal across 5 passes, got $E3_NOISY"
+
+sp_recovery_is_terminal "$PAD_STATE" "$E3_KEY" && \
+  ok "E3f: persistently-failing rollback latches terminal (stops retrying)" \
+  || bad "E3f: failing rollback never latched — it would retry forever"
+
+[ -d "$E3_ORPHAN" ] && ok "E3g: latched orphan is still preserved on disk (nothing deleted)" \
+  || bad "E3g: latching an orphan destroyed it"
+
 E3_LAST="$(sp_session_registry_journal_recover 2>&1)"
 echo "$E3_LAST" | grep -qi "RECOVERY EXHAUSTED" && \
-  ok "E3e: terminal refusal becomes reachable via a persistently-failing rollback" \
-  || bad "E3e: terminal refusal never reachable (counter kept resetting on failure)"
+  bad "E3h: latched key still printed RECOVERY EXHAUSTED" \
+  || ok "E3h: latched key is silent on later passes"
 
 # ============================================================================
 # E4: atomic bind-session + shift-change --save (kill torn/duplicate races)

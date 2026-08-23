@@ -4889,8 +4889,16 @@ PLEOF
     # session identity, duplicate names, orphaned session files.
     #   stitchpad doctor
     #   stitchpad doctor --json   machine-readable roster array for TUI/widgets
+    #   stitchpad doctor --archive-stale-journals
+    #                     move QUARANTINED orphan journals out of the way
     sp_init_paths_readonly || exit 1
-    _json=0; [ "${1:-}" = "--json" ] && _json=1
+    _json=0; _doc_archive_stale=0
+    for _darg in "$@"; do
+      case "$_darg" in
+        --json) _json=1 ;;
+        --archive-stale-journals) _doc_archive_stale=1 ;;
+      esac
+    done
     warn=0; err=0
     declare -a _json_entries=()
     _doc_read_state() {
@@ -5170,10 +5178,41 @@ PY
           (( err++ ))
         fi
       else
-        printf '  \033[0;33m!\033[0m %s preserved — base-sha does not match HEAD; needs manual review\n' "$(basename "$_orphan")"
-        (( warn++ ))
+        # Quarantine-aware. An orphan whose recovery bound has been latched
+        # terminal is no longer retried on every guarded write, so "needs
+        # manual review" is the whole truth about it — say so, and offer the
+        # one disposition that is safe: a MOVE (bytes preserved) out of the
+        # .registry-journal.* glob, never a delete.
+        _doc_q=""
+        if type sp_recovery_is_terminal >/dev/null 2>&1 &&
+           sp_recovery_is_terminal "$PAD_STATE" "journal:$(basename "$_orphan")"; then
+          _doc_q=" [QUARANTINED — recovery latched off, no longer retried]"
+        fi
+        if [ "$_doc_archive_stale" -eq 1 ] && [ -n "$_doc_q" ]; then
+          if [ -L "$PAD_STATE/journal-archive" ] || [ -f "$PAD_STATE/journal-archive" ]; then
+            printf '  \033[0;31m✗\033[0m %s NOT archived — journal-archive is not a directory\n' "$(basename "$_orphan")"
+            (( err++ ))
+          else
+            mkdir -p "$PAD_STATE/journal-archive" 2>/dev/null || true
+            if [ ! -L "$PAD_STATE/journal-archive" ] && [ -d "$PAD_STATE/journal-archive" ] &&
+               mv "$_orphan" "$PAD_STATE/journal-archive/$(basename "$_orphan")" 2>/dev/null; then
+              printf '  \033[0;32m✓\033[0m archived %s → .state/journal-archive/ (bytes preserved, not deleted)\n' "$(basename "$_orphan")"
+              type sp_recovery_reset >/dev/null 2>&1 &&
+                sp_recovery_reset "$PAD_STATE" "journal:$(basename "$_orphan")" || true
+            else
+              printf '  \033[0;31m✗\033[0m could not archive %s\n' "$(basename "$_orphan")"
+              (( err++ ))
+            fi
+          fi
+        else
+          printf '  \033[0;33m!\033[0m %s preserved — base-sha does not match HEAD; needs manual review%s\n' "$(basename "$_orphan")" "$_doc_q"
+          (( warn++ ))
+        fi
       fi
     done
+    if [ "$_doc_orphan_found" -eq 1 ] && [ "$_doc_archive_stale" -eq 0 ]; then
+      printf '    (quarantined ones can be moved aside with: stitchpad doctor --archive-stale-journals)\n'
+    fi
     [ "$_doc_orphan_found" -eq 0 ] && printf '  ✓ no stale journals\n'
 
     # Summary
