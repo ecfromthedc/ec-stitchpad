@@ -111,6 +111,7 @@ runtime hook; push members deliberately bind an external surface.
 | `stitchpad init [--name <pad>]` | create `.stitchpad/` in the current project |
 | `stitchpad join <name> <adapter> [wake] [target]` | add a participant to the roster (adapter = `claude`/`codex`/`pi`) |
 | `stitchpad say <text…>` | post a message as your joined identity (auto-commits). Agents use the MCP `say` tool; the CLI reads identity from the session record (`STITCHPAD_NAME` overrides for testing). |
+| `stitchpad say --file <path\|->` | same, but the body is a file (or stdin). Use this for long multi-paragraph updates posted from a script — nothing in the body has to survive shell quoting. Mutually exclusive with inline text. |
 | `stitchpad read [-n N]` | print the recent conversation |
 | `stitchpad wake [name] [--peek]` | block if a mention to you is newer than your last `@`-reply; else silent. Identity from your joined session. |
 | `stitchpad roster` / `who` | print the parsed roster |

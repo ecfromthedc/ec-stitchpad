@@ -14,6 +14,8 @@
 #   sp_recovery_first_attempt   STATE_FILE KEY   — print epoch of first attempt (0 if none)
 #   sp_recovery_is_exhausted    STATE_FILE KEY   — return 0 if exhausted (terminal), 1 if budget remains
 #   sp_recovery_terminal_refuse WHO PATH KEY     — emit terminal refusal diagnostic to stderr
+#   sp_recovery_mark_terminal   STATE_FILE KEY   — latch a key as terminal (stop retrying it)
+#   sp_recovery_is_terminal     STATE_FILE KEY   — return 0 if the key is latched terminal
 #   sp_recovery_reset           STATE_FILE KEY   — clear attempt tracking for a key (success/clear)
 #
 # Bounds (overridable via env):
@@ -187,12 +189,55 @@ sp_recovery_terminal_refuse() {
   echo "stitchpad: RECOVERY EXHAUSTED for @$who ($path) — $count/$max attempts, budget ${budget}s; key=$key; state preserved for manual inspection" >&2
 }
 
+# ── Terminal latch (2026-08-23) ─────────────────────────────────────────
+# THE BUG THIS FIXES. "Exhausted" was announced but never ENFORCED. A caller
+# recorded an attempt, saw the bound was blown, printed RECOVERY EXHAUSTED —
+# and then did the identical thing again on the very next invocation, forever.
+# Measured on a live pad: four orphan journals whose counters read
+# 530/516/383/81 against a max of 3, and EVERY `stitchpad say` printed
+# "530/3 attempts" to stderr before succeeding. The numerator being two orders
+# of magnitude past the limit is the tell: nothing consumed the verdict.
+#
+# A bound that is announced but not enforced is not a bound. The latch is the
+# missing half: once a key exhausts, mark_terminal writes a sibling of the
+# counter file, and the caller checks is_terminal FIRST and skips the work
+# entirely — no attempt recorded, no diagnostic re-emitted.
+#
+# The latch deliberately lives next to the counter, not inside whatever the
+# recovery was operating on, so every existing operator reset surface
+# (sp_recovery_reset, sp_recovery_reset_all, `stitchpad reset
+# --recovery-counters`) clears it in the same motion and re-arms recovery.
+_sp_recovery_terminal_file() {
+  printf '%s.terminal' "$(_sp_recovery_file "$1" "$2")"
+}
+
+# Latch a key terminal. Returns 0 only if the latch is durably on disk — a
+# caller that cannot write the latch must fall back to its old behaviour
+# rather than silently stop retrying with nothing recording why.
+sp_recovery_mark_terminal() {
+  local state_file="$1" key="$2" file
+  _sp_recovery_safe_mkdir || return 1
+  file="$(_sp_recovery_terminal_file "$state_file" "$key")"
+  [ -L "$file" ] && return 1
+  printf '%s\n' "$(date +%s)" > "$file" 2>/dev/null || return 1
+  [ -f "$file" ] && [ ! -L "$file" ]
+}
+
+# Return 0 (true) if the key has been latched terminal.
+sp_recovery_is_terminal() {
+  local state_file="$1" key="$2" file
+  file="$(_sp_recovery_terminal_file "$state_file" "$key")"
+  [ -f "$file" ] && [ ! -L "$file" ]
+}
+
 # Clear attempt tracking for a key (on success or after explicit reset).
+# Clears the terminal latch too: an operator reset must genuinely re-arm the
+# recovery, not leave it silently latched off with a zeroed counter.
 sp_recovery_reset() {
   local state_file="$1" key="$2"
   local file
   file="$(_sp_recovery_file "$state_file" "$key")"
-  rm -f "$file" 2>/dev/null || true
+  rm -f "$file" "$file.terminal" 2>/dev/null || true
 }
 
 # E5: CLI reset surface — clear ALL recovery counters for a seat or all seats.

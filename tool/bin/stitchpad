@@ -7,6 +7,7 @@
 #   stitchpad set-wake <name> <push|pull> <target> [adapter]   update wake mode for an existing row
 #   stitchpad rename <old> <new>          rename a member everywhere local state knows them
 #   STITCHPAD_NAME=<you> stitchpad say [--image <path>] <text...>   post a message (auto-commits)
+#   STITCHPAD_NAME=<you> stitchpad say --file <path|->   post a message whose body is a file (or stdin)
 #   STITCHPAD_NAME=<you> stitchpad say [--re <#m-id>] [--image <path>] <text...>   post a message (auto-commits; --re threads it)
 #   STITCHPAD_NAME=<you> stitchpad react <#m-id> <emoji>   react to a message (toggle; never wakes)
 #   STITCHPAD_NAME=<you> stitchpad amend <#m-id> <text|--file f>   rewrite YOUR message's body in place (live cards)
@@ -2546,6 +2547,7 @@ PY
     # Sender is your pinned STITCHPAD_NAME — never an argument — so a terminal can
     # only ever post as itself. Everything after `say` is the message.
     #   stitchpad say [--image <path>] <text...>
+    #   stitchpad say [--image <path>] --file <path|->
     from="$(sp_me)"
     [ -z "$from" ] && { echo "stitchpad: no identity — call the MCP join tool first (or set STITCHPAD_NAME for CLI/testing)" >&2; exit 1; }
     # TASK-7: record say outcome (best-effort; never affects the post).
@@ -2583,7 +2585,7 @@ PY
       _holder="$(sp_term_byname_check "$from")" || {
         echo "stitchpad: REFUSED — @$from is live-bound to ${_holder}, not $PAD_DIR (no terminal identity resolvable — env cleared?). cd there or 'stitchpad leave' first." >&2; exit 1; }
     fi
-    image_path=""; reply_to=""
+    image_path=""; reply_to=""; body_file=""
     while :; do case "${1:-}" in
       --image)
         image_path="${2:-}"
@@ -2594,10 +2596,35 @@ PY
         [ -n "$reply_to" ] || { echo "usage: stitchpad say [--re <#m-id>] [--image <path>] <text...>" >&2; exit 1; }
         reply_to="#${reply_to#\#}"   # normalize: accept "m-abc" or "#m-abc"
         shift 2 ;;
+      --file)
+        # A long multi-paragraph status update composed in a shell heredoc has
+        # to survive the shell's quoting, word-splitting and history expansion
+        # before it ever reaches the pad; backticks, $(...) and stray quotes in
+        # a report body are a live footgun for a script driving several seats.
+        # `amend` has taken a body from a file since it existed — `say`, the
+        # command an orchestrator actually calls, did not. It does now.
+        body_file="${2:-}"
+        [ -n "$body_file" ] || { echo "usage: stitchpad say --file <path|->   ('-' reads stdin)" >&2; exit 1; }
+        shift 2 ;;
       *) break ;;
     esac; done
-    text="$*"
-    [ -z "$text" ] && [ -z "$image_path" ] && { echo "usage: stitchpad say [--image <path>] <text...>  (you are @$from)" >&2; exit 1; }
+    if [ -n "$body_file" ]; then
+      # Mutually exclusive with inline text: two sources for one body is an
+      # ambiguity, and silently picking one is how the wrong message ships.
+      [ $# -eq 0 ] || { echo "stitchpad: --file and inline text are mutually exclusive — pass one or the other" >&2; exit 1; }
+      if [ "$body_file" = "-" ]; then
+        text="$(cat)"
+      else
+        # -r, not -f: process substitution (/dev/fd/N) is a legitimate source,
+        # same rule `amend --file` already follows.
+        [ -r "$body_file" ] || { echo "stitchpad: --file needs a readable path (got: $body_file)" >&2; exit 1; }
+        text="$(cat -- "$body_file")"
+      fi
+      [ -n "$text" ] || [ -n "$image_path" ] || { echo "stitchpad: --file body is empty — nothing to post" >&2; exit 1; }
+    else
+      text="$*"
+    fi
+    [ -z "$text" ] && [ -z "$image_path" ] && { echo "usage: stitchpad say [--image <path>] <text...|--file <path|->>  (you are @$from)" >&2; exit 1; }
 
     if [ -n "$image_path" ]; then
       [ -f "$image_path" ] || { echo "stitchpad: image not found: $image_path" >&2; exit 1; }
@@ -4889,8 +4916,16 @@ PLEOF
     # session identity, duplicate names, orphaned session files.
     #   stitchpad doctor
     #   stitchpad doctor --json   machine-readable roster array for TUI/widgets
+    #   stitchpad doctor --archive-stale-journals
+    #                     move QUARANTINED orphan journals out of the way
     sp_init_paths_readonly || exit 1
-    _json=0; [ "${1:-}" = "--json" ] && _json=1
+    _json=0; _doc_archive_stale=0
+    for _darg in "$@"; do
+      case "$_darg" in
+        --json) _json=1 ;;
+        --archive-stale-journals) _doc_archive_stale=1 ;;
+      esac
+    done
     warn=0; err=0
     declare -a _json_entries=()
     _doc_read_state() {
@@ -5170,10 +5205,41 @@ PY
           (( err++ ))
         fi
       else
-        printf '  \033[0;33m!\033[0m %s preserved — base-sha does not match HEAD; needs manual review\n' "$(basename "$_orphan")"
-        (( warn++ ))
+        # Quarantine-aware. An orphan whose recovery bound has been latched
+        # terminal is no longer retried on every guarded write, so "needs
+        # manual review" is the whole truth about it — say so, and offer the
+        # one disposition that is safe: a MOVE (bytes preserved) out of the
+        # .registry-journal.* glob, never a delete.
+        _doc_q=""
+        if type sp_recovery_is_terminal >/dev/null 2>&1 &&
+           sp_recovery_is_terminal "$PAD_STATE" "journal:$(basename "$_orphan")"; then
+          _doc_q=" [QUARANTINED — recovery latched off, no longer retried]"
+        fi
+        if [ "$_doc_archive_stale" -eq 1 ] && [ -n "$_doc_q" ]; then
+          if [ -L "$PAD_STATE/journal-archive" ] || [ -f "$PAD_STATE/journal-archive" ]; then
+            printf '  \033[0;31m✗\033[0m %s NOT archived — journal-archive is not a directory\n' "$(basename "$_orphan")"
+            (( err++ ))
+          else
+            mkdir -p "$PAD_STATE/journal-archive" 2>/dev/null || true
+            if [ ! -L "$PAD_STATE/journal-archive" ] && [ -d "$PAD_STATE/journal-archive" ] &&
+               mv "$_orphan" "$PAD_STATE/journal-archive/$(basename "$_orphan")" 2>/dev/null; then
+              printf '  \033[0;32m✓\033[0m archived %s → .state/journal-archive/ (bytes preserved, not deleted)\n' "$(basename "$_orphan")"
+              type sp_recovery_reset >/dev/null 2>&1 &&
+                sp_recovery_reset "$PAD_STATE" "journal:$(basename "$_orphan")" || true
+            else
+              printf '  \033[0;31m✗\033[0m could not archive %s\n' "$(basename "$_orphan")"
+              (( err++ ))
+            fi
+          fi
+        else
+          printf '  \033[0;33m!\033[0m %s preserved — base-sha does not match HEAD; needs manual review%s\n' "$(basename "$_orphan")" "$_doc_q"
+          (( warn++ ))
+        fi
       fi
     done
+    if [ "$_doc_orphan_found" -eq 1 ] && [ "$_doc_archive_stale" -eq 0 ]; then
+      printf '    (quarantined ones can be moved aside with: stitchpad doctor --archive-stale-journals)\n'
+    fi
     [ "$_doc_orphan_found" -eq 0 ] && printf '  ✓ no stale journals\n'
 
     # Summary
