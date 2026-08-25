@@ -867,11 +867,11 @@ sp_stop_watchers_for_pad() {
   done < <(sp_watch_processes_for_pad)
 
   rm -rf "$watch_lock" 2>/dev/null || true
-  for p in "${pids[@]}"; do
+  for p in ${pids[@]+"${pids[@]}"}; do
     kill "$p" 2>/dev/null || true
   done
   sleep 0.2
-  for p in "${pids[@]}"; do
+  for p in ${pids[@]+"${pids[@]}"}; do
     kill -0 "$p" 2>/dev/null && kill -KILL "$p" 2>/dev/null || true
   done
 }
