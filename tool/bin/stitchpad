@@ -3579,6 +3579,37 @@ PY
     fi
     n=80; [ "${1:-}" = "-n" ] && n="$2"
     tail -n "$n" "$PAD_MD"
+    # A tail window is a SILENT truncation, and that is how a lead reads three
+    # lines of board moves and concludes a seat shipped nothing — while the
+    # seat's deliverable sits one entry above the window. That exact mistake was
+    # made on this fleet and cost a public false accusation of a working seat.
+    #
+    # `read --new` already solves it properly (a git-commit delta cursor). The
+    # gap was never capability, it was that nothing on the truncating path said
+    # the truncation had happened or named the command that avoids it. Say both.
+    # stdout stays byte-identical; this is stderr, on the usual tty/opt-in gate.
+    if [ -t 2 ] || [ "${STITCHPAD_WARN:-0}" = "1" ]; then
+      _rd_total="$(wc -l < "$PAD_MD" 2>/dev/null | tr -d ' ')"
+      case "$_rd_total" in ''|*[!0-9]*) _rd_total=0 ;; esac
+      case "$n" in ''|*[!0-9]*) n=0 ;; esac
+      if [ "$_rd_total" -gt "$n" ] && [ "$n" -gt 0 ]; then
+        _rd_hint=""
+        _rd_me="$(sp_me 2>/dev/null || true)"
+        if [ -n "$_rd_me" ]; then
+          case "$_rd_me" in *[!abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789_-]*) _rd_me="" ;; esac
+        fi
+        if [ -n "$_rd_me" ]; then
+          _rd_key="$(printf '%s' "$_rd_me" | shasum -a 256 | cut -d' ' -f1 | cut -c1-16)"
+          _rd_ref="$(cat "$PAD_STATE/readref.$_rd_key" 2>/dev/null || true)"
+          if [ -n "$_rd_ref" ] && sgit cat-file -e "${_rd_ref}^{commit}" 2>/dev/null; then
+            _rd_unread="$(sgit diff "$_rd_ref..HEAD" -- stitchpad.md 2>/dev/null | sed -n -e '/^+++/d' -e 's/^+//p' | wc -l | tr -d ' ')"
+            case "$_rd_unread" in ''|*[!0-9]*) _rd_unread=0 ;; esac
+            [ "$_rd_unread" -gt "$n" ] && _rd_hint=" — $_rd_unread lines are unread by @$_rd_me, so this window does NOT show everything new"
+          fi
+        fi
+        echo "  ⓘ showing the last $n of $_rd_total pad lines$_rd_hint. For everything you have not seen: stitchpad read --new" >&2
+      fi
+    fi
     ;;
 
   dm)
