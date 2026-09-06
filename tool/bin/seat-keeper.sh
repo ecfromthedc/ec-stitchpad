@@ -51,7 +51,24 @@ LOG="${SEAT_KEEPER_LOG:-$HOME/.pasture/keeper.log}"
 # HB/SP/DAEMON were hardcoded to the INSTALL, which is right in production and
 # is also why this keeper had no gate: a suite cannot point it at a throwaway
 # tree. Same treatment as CONF/LOG above — overridable, identical defaults.
-HB="${OCEAN_HEARTBEAT_BIN:-$HOME/dev/ocean-os/target/release/ocean-heartbeat}"
+# Resolve the heartbeat binary: explicit override, then PATH, then the dev
+# build path as a last resort.
+#
+# PATH USED TO BE MISSING FROM THAT LIST, and it cost the whole watchdog. The
+# default pointed only at a cargo RELEASE BUILD inside a checkout
+# ($HOME/dev/ocean-os/target/release/ocean-heartbeat). On a machine where
+# ocean-heartbeat is INSTALLED — ~/.local/bin/ocean-heartbeat, on PATH, working —
+# but not built from source in that directory, this resolved to a nonexistent
+# file, the guard below exited 1 on every run, and the keeper did nothing at all.
+# Every seat it was meant to watch went unattended while the binary it needed sat
+# on PATH the entire time. The failure is silent by design (rate-limited log,
+# exit 1), so from the outside the keeper simply appeared dead — and six pasture
+# LaunchAgents were disabled in one sweep on 2026-08-28, plausibly for exactly
+# this reason.
+#
+# A tool should look where its dependency is actually installed before declaring
+# the fleet unattended.
+HB="${OCEAN_HEARTBEAT_BIN:-$(command -v ocean-heartbeat 2>/dev/null || echo "$HOME/dev/ocean-os/target/release/ocean-heartbeat")}"
 SP="${SEAT_KEEPER_SP:-$HOME/.stitchpad/bin/stitchpad}"   # the mention oracle {@see seat_pending}
 DAEMON="${OCEAN_DAEMON_URL:-http://127.0.0.1:4780}"
 
@@ -155,9 +172,21 @@ print("busy" if s.get("active_turn") else "idle")
 }
 
 # --- turn count for one session: <int> | "" ---------------------------------
+# NOTE THE ENDPOINT, it is not the one probe_session uses and that is the whole
+# point. /v1/agent/sessions/<sid> returns {active_turn, client_type, created_at,
+# cwd, id, title, updated_at} — it can say whether a turn is IN FLIGHT but it
+# does not carry a turn COUNT. The count lives on /v1/sessions/<sid> as `turns`.
+#
+# The first version of this function reused probe_session's URL because the two
+# reads looked interchangeable. They are not: `turns` was simply absent, so this
+# returned empty on every call and cap_watch returned early on every seat. The
+# feature was inert and silent — and the unit proof did not catch it because it
+# STUBBED this function and exercised only the threshold arithmetic. Testing the
+# half you wrote while faking the half that supplies its data proves the
+# thresholds and nothing about the feature.
 session_turns() {
   local sid="$1" body
-  body=$(curl -sf -m 4 "$DAEMON/v1/agent/sessions/$sid" 2>/dev/null) || return 0
+  body=$(curl -sf -m 4 "$DAEMON/v1/sessions/$sid" 2>/dev/null) || return 0
   printf '%s' "$body" | python3 -c '
 import json, sys
 try:
