@@ -154,6 +154,64 @@ print("busy" if s.get("active_turn") else "idle")
 ' 2>/dev/null || echo "unknown:probe-crashed"
 }
 
+# --- turn count for one session: <int> | "" ---------------------------------
+session_turns() {
+  local sid="$1" body
+  body=$(curl -sf -m 4 "$DAEMON/v1/agent/sessions/$sid" 2>/dev/null) || return 0
+  printf '%s' "$body" | python3 -c '
+import json, sys
+try:
+    s = json.load(sys.stdin).get("session") or {}
+    t = s.get("turns")
+    print(int(t) if isinstance(t, int) else "")
+except Exception:
+    print("")
+' 2>/dev/null
+}
+
+# --- cap watch: ask a seat to hand off BEFORE the runtime cuts it off -------
+#
+# An Ocean session ends near TURN_CAP. That is a property of the runtime, not a
+# judgement about the work — but left unmanaged it decides where work STOPS. On
+# one fleet night thirteen sessions died at the cap and every cold respawn threw
+# away whatever the seat had not written down; three lost real findings that had
+# to be reconstructed from worktrees afterwards.
+#
+# A seat cannot see its own turn count, so it cannot plan around the cap. The
+# keeper can: it already polls every seat every two minutes. So it posts ONE
+# nudge as the seat approaches, asking for a structured handoff while the seat
+# still has turns left to write it.
+#
+# Posted ONCE per session (marker file keyed by session id), because a seat
+# nagged every two minutes for its last twenty turns would spend them replying.
+TURN_CAP="${SEAT_TURN_CAP:-200}"
+CAP_WARN_AT="${SEAT_CAP_WARN_AT:-175}"
+
+cap_watch() {
+  local repo="$1" name="$2" sid="$3" turns marker
+  [ -n "$sid" ] || return 0
+  turns="$(session_turns "$sid")"
+  case "$turns" in ''|*[!0-9]*) return 0 ;; esac
+  [ "$turns" -ge "$CAP_WARN_AT" ] || return 0
+
+  marker="$repo/.stitchpad/.state/cap-warned.$sid"
+  [ -f "$marker" ] && return 0
+
+  (cd "$repo" 2>/dev/null && STITCHPAD_NAME=keeper "$SP" say \
+"@$name HANDOFF NOW — you are at turn $turns of roughly $TURN_CAP. Your session will end soon; that is the runtime, not your work, and it must not decide where your work stops.
+
+Post this before you lose the chance, then keep working until the session ends:
+
+  DONE:      what is finished AND committed, with SHAs
+  IN FLIGHT: what you are mid-way through, and exactly where you got to
+  NEXT:      the next concrete step, specific enough to act on without re-deriving it
+  DEAD ENDS: what you already ruled out, so your successor does not repeat it
+
+DEAD ENDS is the line people skip and the one that saves the most time. Commit anything committable first — an uncommitted finding dies with the session." >/dev/null 2>&1) \
+    && { mkdir -p "$(dirname "$marker")"; : > "$marker"; \
+         log "cap-watch: asked $name for a handoff at turn $turns/$TURN_CAP"; }
+}
+
 # --- pending mention for a seat: <ordinal> | "" | unknown:<reason> ----------
 # ASK THE SAME ORACLE THE WATCHER ASKS. watch.sh fires on
 # `stitchpad wake <name> --peek` — an UNANSWERED mention, i.e. an @name newer
@@ -274,6 +332,12 @@ while IFS= read -r repo; do
 
     state="$(probe_session "$sid")"
     pending="$(seat_pending "$repo" "$name")"
+
+    # Ask for a handoff before the runtime cuts this seat off. Runs regardless
+    # of busy/idle and regardless of whether anything is pending — a seat about
+    # to hit the cap needs to write down what it knows whether or not it has
+    # been mentioned. Fires once per session; see cap_watch.
+    cap_watch "$repo" "$name" "$sid"
     strikes="$(cat "$STRIKE" 2>/dev/null || echo 0)"
     case "$strikes" in ''|*[!0-9]*) strikes=0 ;; esac
 

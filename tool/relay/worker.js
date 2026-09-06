@@ -222,19 +222,26 @@ export default {
     if (url.pathname === "/login" && req.method === "POST") {
       const { user, pass } = await req.json().catch(() => ({}));
       let users = {};
-      try { users = JSON.parse((env.PASTURE_USERS || env.STITCHPAD_USERS) || "{}"); } catch {}
-      // Optional per-relay case-insensitive login (PASTURE_LOGIN_CASE_INSENSITIVE=1).
-      // OFF by default so no existing relay's login posture changes silently; a
-      // teammate relay whose password is just their own name can opt in, where the
-      // convenience is worth more than the case bits.
+      // Keep the original relay roster intact while allowing a relay-specific
+      // account map to add or intentionally override individual handles.
+      // This avoids treating a per-relay addition as a destructive replacement.
+      try {
+        const legacyUsers = JSON.parse(env.STITCHPAD_USERS || "{}");
+        const pastureUsers = JSON.parse(env.PASTURE_USERS || "{}");
+        users = { ...legacyUsers, ...pastureUsers };
+      } catch {}
+      // Optional per-relay case-insensitive *username* lookup
+      // (PASTURE_LOGIN_CASE_INSENSITIVE=1). Passwords always remain exact-case:
+      // folding them silently reduces their effective entropy. OFF by default so
+      // no existing relay's login posture changes silently.
       const ci = String(env.PASTURE_LOGIN_CASE_INSENSITIVE || env.STITCHPAD_LOGIN_CASE_INSENSITIVE || "") === "1";
-      const fold = (v) => (ci ? String(v ?? "").toLowerCase() : String(v ?? ""));
+      const username = String(user ?? "");
       let u = users[user];
       if (!u && ci) {
-        const key = Object.keys(users).find((k) => k.toLowerCase() === String(user ?? "").toLowerCase());
+        const key = Object.keys(users).find((k) => k.toLowerCase() === username.toLowerCase());
         if (key) u = users[key];
       }
-      if (u && fold(u.pass) === fold(pass)) return json({ token: tokenFor(u.handle || user), handle: u.handle || user });
+      if (u && String(u.pass ?? "") === String(pass ?? "")) return json({ token: tokenFor(u.handle || user), handle: u.handle || user });
       // fallback: the original single operator login
       if (user === (env.PASTURE_USER || env.STITCHPAD_USER) && pass === (env.PASTURE_PASS || env.STITCHPAD_PASS)) return json({ token: tokenFor("smaths"), handle: "smaths" });
       return json({ error: "bad credentials" }, 401);
