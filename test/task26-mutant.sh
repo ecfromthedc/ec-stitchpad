@@ -7,13 +7,56 @@ HERE="$(cd -P "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 ROOT="$HERE/.."
 SRC="$ROOT/tool/tui-rs/src/widgets/tasks.rs"
 TD="$ROOT/tool/tui-rs"
-BACKUP="/tmp/task26-secure-backup.rs"
+# A PER-RUN backup path. This was a FIXED /tmp filename, and the combination of
+# that, a cleanup that `rm -f`s it, and a restore that swallowed its own failure
+# left a live mutant in the working tree:
+#
+#     for s in [pad_str] { // MUT10: tasks.md IGNORED
+#
+# found committed-adjacent in tool/tui-rs/src/widgets/tasks.rs after a suite
+# run. Two runs sharing one backup path is all it takes — the first run's
+# cleanup deletes the file, the second's `cp ... 2>/dev/null || true` finds
+# nothing, succeeds silently, and the tree keeps the mutation. Anyone running
+# the TUI from that tree afterwards silently loses tasks.md, and a blanket
+# `git add -A` would commit it.
+#
+# A red-proof harness that can leave the tree mutated is the worst possible
+# place for this bug: every proof this project trusts runs through one.
+BACKUP="$(mktemp "${TMPDIR:-/tmp}/task26-backup.XXXXXX.rs")"
 RED='\033[0;31m'; GREEN='\033[0;32m'; YELLOW='\033[1;33m'; NC='\033[0m'
 
 # Snapshot current source (which has the fix + tests)
-cp "$SRC" "$BACKUP"
-cleanup() { cp "$BACKUP" "$SRC" 2>/dev/null || true; rm -f "$BACKUP"; }
+cp "$SRC" "$BACKUP" || { echo "task26-mutant: cannot snapshot $SRC — refusing to mutate" >&2; exit 1; }
+
+# Restore LOUDLY. A harness that cannot put the tree back must say so and fail,
+# never exit 0 having left a mutant behind.
+restore_src() {
+  if [ ! -s "$BACKUP" ]; then
+    echo "task26-mutant: BACKUP $BACKUP is missing or empty — CANNOT RESTORE $SRC" >&2
+    return 1
+  fi
+  cp "$BACKUP" "$SRC" || { echo "task26-mutant: restore of $SRC FAILED" >&2; return 1; }
+  if grep -q 'MUT10: tasks.md IGNORED' "$SRC"; then
+    echo "task26-mutant: $SRC STILL CARRIES THE MUT10 MUTANT after restore" >&2
+    return 1
+  fi
+  return 0
+}
+
+cleanup() {
+  local rc=$?
+  if ! restore_src; then
+    echo "task26-mutant: THE WORKING TREE IS LEFT MUTATED — restore $SRC by hand (git checkout -- $SRC)" >&2
+    rm -f "$BACKUP"
+    exit 1
+  fi
+  rm -f "$BACKUP"
+  exit "$rc"
+}
+# INT/TERM as well as EXIT: a killed run is exactly when a mutant gets stranded.
 trap cleanup EXIT
+trap 'exit 130' INT
+trap 'exit 143' TERM
 
 # ── RED: apply mutation ──
 echo "=== RED: MUT10 single-source revert ==="
@@ -37,7 +80,7 @@ else
 fi
 
 # ── GREEN: restore fix ──
-cp "$BACKUP" "$SRC"
+restore_src || { echo "task26-mutant: cannot restore before the GREEN phase" >&2; exit 1; }
 echo ""
 echo "=== GREEN: dual-file fix restored ==="
 green_out="$(cd "$TD" && cargo test 2>&1)" || true
