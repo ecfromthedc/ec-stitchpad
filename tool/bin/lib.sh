@@ -2580,6 +2580,17 @@ _sp_term_claim_honored() { # $1=claim-line → 0 if the claim must still be hono
   local pad name ts pid pstart now
   IFS='|' read -r pad name ts pid pstart <<<"$1"
   now="$(date +%s)"
+  # A claim on a pad directory that NO LONGER EXISTS can never become live
+  # again, and honoring it is a permanent lockout rather than a safety rule.
+  # Both remedies the refusal offers — "cd there" and "stitchpad leave <name>
+  # there" — name a directory that cannot be entered, so the terminal is stuck
+  # for as long as the owning process lives, unable to post to ANY pad. That is
+  # a communication outage produced entirely by the mutual-exclusion mechanism.
+  # Hit for real: a throwaway pad under $TMPDIR was removed after a test run and
+  # the claim outlived it, because the owner shell was still alive and the
+  # liveness test below asks only about the PROCESS, never about the pad.
+  # One terminal = one pad still holds; a deleted pad is simply not a pad.
+  [ -n "$pad" ] && [ ! -d "$pad" ] && return 1
   [ $((now - ${ts:-0})) -lt 300 ] && return 0
   # Stale timestamp: honor the claim anyway when the recorded owner process is
   # demonstrably alive (kill -0 + start-time match against pid reuse). A claim
@@ -2651,7 +2662,11 @@ sp_term_lock_claim() { # $1=target/surface $2=name [$3=owner_pid] — refuses on
     if { [ "$pad" != "$PAD_DIR" ] || [ "$name" != "$who" ]; } \
        && _sp_term_claim_honored "$cur" && [ "${STITCHPAD_STEAL:-0}" != "1" ]; then
       _sp_term_mutex_release "$surface"
-      echo "stitchpad: REFUSED — terminal $surface is live as @$name in $pad. One terminal = one pad. 'stitchpad leave $name' there first, or STITCHPAD_STEAL=1 to take it over." >&2
+      if [ ! -d "$pad" ]; then
+        echo "stitchpad: REFUSED — terminal $surface is claimed by @$name in $pad, which NO LONGER EXISTS. This should have been reaped; run STITCHPAD_STEAL=1 to clear it and please report it." >&2
+      else
+        echo "stitchpad: REFUSED — terminal $surface is live as @$name in $pad. One terminal = one pad. 'stitchpad leave $name' there first, or STITCHPAD_STEAL=1 to take it over." >&2
+      fi
       return 1
     fi
   fi
