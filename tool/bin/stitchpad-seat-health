@@ -153,6 +153,35 @@ if [ -n "$rotate" ]; then
     die "mint REUSED the old session id ($old) — the seat was not rotated (KNOWN-WEDGES #2)"
   fi
 
+  # REBIND THE ROSTER TOO. A seat's session id lives in two places: this file,
+  # which the keeper wakes, and the roster's target column, which is what an
+  # @mention wakes. Rotating updated only the file, so every rotation MINTED a
+  # divergence: from that moment the keeper drove the new session and every
+  # mention went to the dead one, with both surfaces reporting healthy.
+  #
+  # That is not a hypothetical. Three of six seats on the tides-distro fleet
+  # were split this way, and the keeper had been waking sessions that capped
+  # hours earlier — which is also why the dead sessions carried the freshest
+  # updated_at stamps and read as the live ones.
+  #
+  # Rotation is the only operation that changes a live seat's session id, so it
+  # is the one place that can keep the two in step. Non-fatal: the mint already
+  # succeeded and the seat is running, so a failure here must warn loudly rather
+  # than throw away a good rotation.
+  _pad_root="$(cd "$(dirname "$STATE")/.." 2>/dev/null && pwd)"
+  if [ -n "$_pad_root" ] && command -v stitchpad >/dev/null 2>&1; then
+    if (cd "$_pad_root" && stitchpad set-wake "$rotate" push "$new" ocean >/dev/null 2>&1); then
+      printf 'roster rebound: @%s -> %s\n' "$rotate" "$new"
+    else
+      printf '\033[31mWARNING\033[0m: minted %s but could NOT rebind the roster in %s.\n' "$new" "$_pad_root" >&2
+      printf '  The keeper will wake the new session and @mentions will wake the OLD one. Run:\n' >&2
+      printf '    (cd %s && stitchpad set-wake %s push %s ocean)\n' "$_pad_root" "$rotate" "$new" >&2
+    fi
+  else
+    printf '\033[31mWARNING\033[0m: could not resolve the pad root from STATE=%s — roster NOT rebound.\n' "$STATE" >&2
+    printf '  Run: stitchpad set-wake %s push %s ocean\n' "$rotate" "$new" >&2
+  fi
+
   printf '\033[32mrotated %s\033[0m  %s -> %s  (old archived: %s)\n' \
     "$rotate" "$old" "$new" "$(basename "$archive")"
   printf 'Now confirm it PRODUCES — a state of "running" is not work.\n'

@@ -35,3 +35,8 @@ tool/stitchpad-git/
 # stitchpad runtime (isolated history)
 .stitchpad/
 __pycache__/
+
+# seat-keeper rate-limit stamps: written next to the keeper log, which is the
+# repo tree when the keeper is run from a checkout. State, not source.
+.keeper-*
+tool/.keeper-*

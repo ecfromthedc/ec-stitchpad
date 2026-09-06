@@ -1016,6 +1016,22 @@ You may spawn your own sub-agents (stitchpad spawn <name> --brief ... --artifact
       echo "stitchpad: join failed — roster commit did not complete; worktree may be dirty, @$who may not be in the roster" >&2
       exit 1
     fi
+    # A push seat whose target is not a session is on the roster and reachable
+    # by nobody. join validates the NAME exhaustively — character class, length,
+    # case-collision — and never looked at the target at all, so
+    # `join triage-a ocean push pending` was accepted in full silence and the
+    # seat spent 150-178 turns unaddressable. WARN, never refuse: the two-step
+    # `join <name> ocean push -` then `set-wake` flow is documented and correct,
+    # and a target that only becomes known after the session spawns is the
+    # normal case. The point is that the gap between the two steps stops being
+    # invisible. Same tty/opt-in convention as the `say` warning, for the same
+    # reason: suites parse this stream, and agents have no tty.
+    if [ "$wake" = "push" ] && { [ -t 2 ] || [ "${STITCHPAD_WARN:-0}" = "1" ]; }; then
+      case "$target" in
+        [0-9a-fA-F][0-9a-fA-F][0-9a-fA-F][0-9a-fA-F][0-9a-fA-F][0-9a-fA-F][0-9a-fA-F][0-9a-fA-F]-*) : ;;
+        *) echo "  ⚠ @$who joined with wake=push but target '${target}' is not a session id — @$who is on the roster and NOBODY can wake or mention it until you run: stitchpad set-wake $who push <session-id> $adapter" >&2 ;;
+      esac
+    fi
     # P19: the lane is taken — narrate it. sp_narrate appends `### @name ... · HH:MM`
     # and NEVER commits (a self-committing narration doubled commit counts and
     # broke heal-roster). Placed AFTER the commit above so we never narrate a
@@ -2786,13 +2802,41 @@ PY
     # unconditionally turned six green suites red, including two that could no
     # longer parse their own output. Same convention `task list` already uses:
     # human rendering on a terminal, byte-stable machine output otherwise.
-    if [ -t 2 ]; then
-    _say_roster="$(sp_roster 2>/dev/null | cut -d'|' -f1 | tr -d ' ' | tr 'A-Z' 'a-z')"
+    # STITCHPAD_WARN=1 opts a NON-terminal caller into these warnings. The tty
+    # gate above is right for suites, but it had one perverse consequence: the
+    # callers who most need the warning are agents, and an agent never has a
+    # tty, so the one participant who cannot see a silent failure was also the
+    # only one guaranteed never to be told about it. A human typo got a
+    # suggestion; an agent mentioning a dead seat got a clean tick forever.
+    # Opt-in keeps stderr byte-stable by default and gives fleet leads a way in.
+    if [ -t 2 ] || [ "${STITCHPAD_WARN:-0}" = "1" ]; then
+    # Full rows, not just names: a mention fails in TWO ways and only one of
+    # them is an unknown name. The other is a name that IS on the roster whose
+    # push target is a placeholder — `@name` resolves, posts, ticks, and wakes
+    # nobody. That one cost this fleet three seats running 150-178 turns in
+    # isolation. Same defect the keeper now reports as UNREACHABLE PUSH SEAT;
+    # warned here too, because here is where someone is still in a position to
+    # do something about it.
+    _say_rows="$(sp_roster 2>/dev/null | awk -F'|' '
+      { for (i=1;i<=4;i++) gsub(/^[ \t]+|[ \t]+$/, "", $i)
+        print tolower($1) "|" tolower($2) "|" tolower($3) "|" $4 }')"
+    _say_roster="$(printf '%s\n' "$_say_rows" | cut -d'|' -f1)"
     printf '%s' "$text" | grep -oE '(^|[[:space:]])@[A-Za-z0-9_-]+' | tr -d ' @' | tr 'A-Z' 'a-z' | sort -u \
     | while IFS= read -r _mn; do
         [ -n "$_mn" ] || continue
         [ "$_mn" = "all" ] && continue
-        printf '%s\n' "$_say_roster" | grep -qx "$_mn" && continue
+        if printf '%s\n' "$_say_roster" | grep -qx "$_mn"; then
+          # On the roster. Is the row actually addressable?
+          _row="$(printf '%s\n' "$_say_rows" | awk -F'|' -v n="$_mn" '$1==n {print; exit}')"
+          _wk="$(printf '%s' "$_row" | cut -d'|' -f3)"
+          _tg="$(printf '%s' "$_row" | cut -d'|' -f4)"
+          [ "$_wk" = "push" ] || continue
+          case "$_tg" in
+            [0-9a-fA-F][0-9a-fA-F][0-9a-fA-F][0-9a-fA-F][0-9a-fA-F][0-9a-fA-F][0-9a-fA-F][0-9a-fA-F]-*) continue ;;
+          esac
+          echo "  ⚠ @$_mn is on the roster but its wake target is '${_tg:-<empty>}', not a session — the message posted and woke NOBODY. Bind it: stitchpad set-wake $_mn push <session-id> ocean" >&2
+          continue
+        fi
         _near="$(printf '%s\n' "$_say_roster" | awk -v n="$_mn" '
           { a=$0; if (length(a)==0) next
             if (index(a,substr(n,1,3))==1 || index(n,substr(a,1,3))==1) { print a; exit } }')"
@@ -3535,6 +3579,37 @@ PY
     fi
     n=80; [ "${1:-}" = "-n" ] && n="$2"
     tail -n "$n" "$PAD_MD"
+    # A tail window is a SILENT truncation, and that is how a lead reads three
+    # lines of board moves and concludes a seat shipped nothing — while the
+    # seat's deliverable sits one entry above the window. That exact mistake was
+    # made on this fleet and cost a public false accusation of a working seat.
+    #
+    # `read --new` already solves it properly (a git-commit delta cursor). The
+    # gap was never capability, it was that nothing on the truncating path said
+    # the truncation had happened or named the command that avoids it. Say both.
+    # stdout stays byte-identical; this is stderr, on the usual tty/opt-in gate.
+    if [ -t 2 ] || [ "${STITCHPAD_WARN:-0}" = "1" ]; then
+      _rd_total="$(wc -l < "$PAD_MD" 2>/dev/null | tr -d ' ')"
+      case "$_rd_total" in ''|*[!0-9]*) _rd_total=0 ;; esac
+      case "$n" in ''|*[!0-9]*) n=0 ;; esac
+      if [ "$_rd_total" -gt "$n" ] && [ "$n" -gt 0 ]; then
+        _rd_hint=""
+        _rd_me="$(sp_me 2>/dev/null || true)"
+        if [ -n "$_rd_me" ]; then
+          case "$_rd_me" in *[!abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789_-]*) _rd_me="" ;; esac
+        fi
+        if [ -n "$_rd_me" ]; then
+          _rd_key="$(printf '%s' "$_rd_me" | shasum -a 256 | cut -d' ' -f1 | cut -c1-16)"
+          _rd_ref="$(cat "$PAD_STATE/readref.$_rd_key" 2>/dev/null || true)"
+          if [ -n "$_rd_ref" ] && sgit cat-file -e "${_rd_ref}^{commit}" 2>/dev/null; then
+            _rd_unread="$(sgit diff "$_rd_ref..HEAD" -- stitchpad.md 2>/dev/null | sed -n -e '/^+++/d' -e 's/^+//p' | wc -l | tr -d ' ')"
+            case "$_rd_unread" in ''|*[!0-9]*) _rd_unread=0 ;; esac
+            [ "$_rd_unread" -gt "$n" ] && _rd_hint=" — $_rd_unread lines are unread by @$_rd_me, so this window does NOT show everything new"
+          fi
+        fi
+        echo "  ⓘ showing the last $n of $_rd_total pad lines$_rd_hint. For everything you have not seen: stitchpad read --new" >&2
+      fi
+    fi
     ;;
 
   dm)

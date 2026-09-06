@@ -352,13 +352,77 @@ while IFS= read -r repo; do
       [ "$_ra" = "ocean" ] || continue
       [ -n "$_rn" ] && [ -n "$_rt" ] && [ "$_rt" != "-" ] || continue
       case "$_rn" in ''|*[!a-zA-Z0-9_-]*) continue ;; esac
-      [ -e "$ST/ocean-session.$_rn" ] || printf '%s' "$_rt" > "$ST/ocean-session.$_rn" 2>/dev/null || true
+      if [ -e "$ST/ocean-session.$_rn" ]; then
+        # "Never overwrite a present file" is right — an explicit binding must
+        # win — but it silently created a SECOND source of truth that drifts.
+        # A respawn rebinds the ROSTER (set-wake) and cannot touch this file,
+        # so from then on mentions wake the new session and the keeper wakes
+        # the old one, forever, and every surface looks healthy.
+        #
+        # Measured on the tides-distro fleet: three of six seats had diverged.
+        # The keeper had been faithfully waking sessions that were capped hours
+        # earlier — which is also why those dead sessions kept getting fresh
+        # updated_at stamps, making them look like the LIVE ones.
+        #
+        # Still never overwrite. Just stop being silent about it.
+        _cur="$(cat "$ST/ocean-session.$_rn" 2>/dev/null | tr -d '[:space:]')"
+        if [ -n "$_cur" ] && [ "$_cur" != "$_rt" ]; then
+          log_rl "$ST/.diverged-$_rn" \
+            "SESSION BINDING DIVERGED for @$_rn ($repo): the roster says $_rt but .state/ocean-session.$_rn says $_cur. Mentions wake the roster's session and this keeper wakes the file's — they are different agents. Whichever is live, make them agree: printf '%s' <live-sid> > $ST/ocean-session.$_rn && stitchpad set-wake $_rn push <live-sid> ocean"
+        fi
+      else
+        printf '%s' "$_rt" > "$ST/ocean-session.$_rn" 2>/dev/null || true
+      fi
+    done < <(awk '/^```roster/{r=1;next} /^```/{r=0} r && /\|/ && $0 !~ /^#/' "$PADFILE")
+  fi
+
+  # --- the OTHER half of reachability -------------------------------------
+  #
+  # The keeper already reports SEAT NOT ON ROSTER: a seat bound to an Ocean
+  # session with no roster line, so nothing can address it. This is the mirror
+  # image, and it had no check at all: a roster row that EXISTS but whose push
+  # target is not a session id. The row looks healthy in `stitchpad roster`,
+  # `@name` resolves and posts without error, and the mention reaches nobody.
+  #
+  # Observed cost: three triage seats were joined with placeholder targets
+  # ("pending", "self", "-") and left that way. They ran 150-178 turns each in
+  # total isolation — the lead could not reach them, the keeper could not wake
+  # them, and nothing anywhere said so. Both directions of the conversation were
+  # broken and every surface reported fine.
+  #
+  # A push row whose target is not a plausible session id is a LIE about
+  # reachability, and the watchdog should say so as loudly as it says the
+  # inverse.
+  if [ -f "$PADFILE" ] && [ ! -L "$PADFILE" ]; then
+    while IFS='|' read -r _un _ua _uw _ut; do
+      _un="$(printf '%s' "$_un" | tr -d '[:space:]')"
+      _ua="$(printf '%s' "$_ua" | tr -d '[:space:]')"
+      _uw="$(printf '%s' "$_uw" | tr -d '[:space:]')"
+      _ut="$(printf '%s' "$_ut" | tr -d '[:space:]')"
+      [ "$_ua" = "ocean" ] && [ "$_uw" = "push" ] || continue
+      [ -n "$_un" ] || continue
+      # A session id is a UUID. Anything else — a placeholder, a dash, an empty
+      # field — cannot be woken and cannot receive a mention.
+      case "$_ut" in
+        [0-9a-fA-F][0-9a-fA-F][0-9a-fA-F][0-9a-fA-F][0-9a-fA-F][0-9a-fA-F][0-9a-fA-F][0-9a-fA-F]-*) continue ;;
+      esac
+      log_rl "$ST/.unreachable-$_un" \
+        "UNREACHABLE PUSH SEAT: @$_un ($repo) is on the roster with wake=push but target='${_ut:-<empty>}', which is not a session id. Mentions to @$_un post successfully and reach nobody, and the keeper cannot wake it. Bind it with: stitchpad set-wake $_un push <session-id> ocean"
     done < <(awk '/^```roster/{r=1;next} /^```/{r=0} r && /\|/ && $0 !~ /^#/' "$PADFILE")
   fi
 
   for f in "$ST"/ocean-session.*; do
     [ -f "$f" ] || continue
     name="${f##*/ocean-session.}"
+    # stitchpad-seat-health archives a rotated seat's old id ALONGSIDE the live
+    # one, as ocean-session.<name>.exhausted-<N>turns. Those are records, not
+    # seats. Treating them as seats produced permanent, unfixable noise — a
+    # SEAT NOT ON ROSTER line every run for @kimi.stale-reuse.exhausted-archived
+    # and an UNKNOWN-state line for @kimi.exhausted-144turns, neither of which
+    # anyone can act on because adding an archive to the roster would be wrong.
+    # A watchdog that cries about something nobody should fix trains its reader
+    # to skip its output, which costs far more than the noise itself.
+    case "$name" in *.exhausted-*) continue ;; esac
     sid="$(cat "$f" 2>/dev/null)"
     [ -z "$sid" ] && continue
     model="$(cat "$ST/seat-model.$name" 2>/dev/null || echo '')"
@@ -456,7 +520,7 @@ while IFS= read -r repo; do
             *)
               if [ "$since" -ge "$DRAIN_MIN_S" ]; then
                 reason="unanswered mention #$pending"
-                prompt="stitchpad keeper: you have an unanswered @${name} mention. cd $repo && ~/.stitchpad/bin/pasture read -n 30, handle it per the loop prompt, then continue your task queue."
+                prompt="stitchpad keeper: you have an unanswered @${name} mention. cd $repo && ~/.stitchpad/bin/pasture read --new, handle it per the loop prompt, then continue your task queue."
               fi
               ;;
           esac
@@ -465,7 +529,7 @@ while IFS= read -r repo; do
             open=$(seat_tasks "$name" "$TASKFILE" "$PADFILE")
             if [ "${open:-0}" -gt 0 ]; then
               reason="idle with $open open pad task(s)"
-              prompt="stitchpad keeper: you are idle but have $open open task(s) assigned on the pad. cd $repo && ~/.stitchpad/bin/pasture read -n 30 to refresh context, then continue your task queue per the loop prompt. Post .status when resumed."
+              prompt="stitchpad keeper: you are idle but have $open open task(s) assigned on the pad. cd $repo && ~/.stitchpad/bin/pasture read --new to refresh context, then continue your task queue per the loop prompt. Post .status when resumed."
             fi
           fi
 
