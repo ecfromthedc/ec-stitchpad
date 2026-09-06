@@ -356,6 +356,41 @@ while IFS= read -r repo; do
     done < <(awk '/^```roster/{r=1;next} /^```/{r=0} r && /\|/ && $0 !~ /^#/' "$PADFILE")
   fi
 
+  # --- the OTHER half of reachability -------------------------------------
+  #
+  # The keeper already reports SEAT NOT ON ROSTER: a seat bound to an Ocean
+  # session with no roster line, so nothing can address it. This is the mirror
+  # image, and it had no check at all: a roster row that EXISTS but whose push
+  # target is not a session id. The row looks healthy in `stitchpad roster`,
+  # `@name` resolves and posts without error, and the mention reaches nobody.
+  #
+  # Observed cost: three triage seats were joined with placeholder targets
+  # ("pending", "self", "-") and left that way. They ran 150-178 turns each in
+  # total isolation — the lead could not reach them, the keeper could not wake
+  # them, and nothing anywhere said so. Both directions of the conversation were
+  # broken and every surface reported fine.
+  #
+  # A push row whose target is not a plausible session id is a LIE about
+  # reachability, and the watchdog should say so as loudly as it says the
+  # inverse.
+  if [ -f "$PADFILE" ] && [ ! -L "$PADFILE" ]; then
+    while IFS='|' read -r _un _ua _uw _ut; do
+      _un="$(printf '%s' "$_un" | tr -d '[:space:]')"
+      _ua="$(printf '%s' "$_ua" | tr -d '[:space:]')"
+      _uw="$(printf '%s' "$_uw" | tr -d '[:space:]')"
+      _ut="$(printf '%s' "$_ut" | tr -d '[:space:]')"
+      [ "$_ua" = "ocean" ] && [ "$_uw" = "push" ] || continue
+      [ -n "$_un" ] || continue
+      # A session id is a UUID. Anything else — a placeholder, a dash, an empty
+      # field — cannot be woken and cannot receive a mention.
+      case "$_ut" in
+        [0-9a-fA-F][0-9a-fA-F][0-9a-fA-F][0-9a-fA-F][0-9a-fA-F][0-9a-fA-F][0-9a-fA-F][0-9a-fA-F]-*) continue ;;
+      esac
+      log_rl "$ST/.unreachable-$_un" \
+        "UNREACHABLE PUSH SEAT: @$_un ($repo) is on the roster with wake=push but target='${_ut:-<empty>}', which is not a session id. Mentions to @$_un post successfully and reach nobody, and the keeper cannot wake it. Bind it with: stitchpad set-wake $_un push <session-id> ocean"
+    done < <(awk '/^```roster/{r=1;next} /^```/{r=0} r && /\|/ && $0 !~ /^#/' "$PADFILE")
+  fi
+
   for f in "$ST"/ocean-session.*; do
     [ -f "$f" ] || continue
     name="${f##*/ocean-session.}"
