@@ -219,6 +219,28 @@ CAP_WARN_AT="${SEAT_CAP_WARN_AT:-175}"
 cap_watch() {
   local repo="$1" name="$2" sid="$3" turns marker
   [ -n "$sid" ] || return 0
+
+  # ONLY LIVE SEATS. A handoff request is addressed to somebody who can still
+  # act on it, so a seat that is not on the roster must never receive one.
+  #
+  # Without this the first live run fired at deepseek.exhausted,
+  # deepseek.exhausted-186turns, deepseek.exhausted-199turns,
+  # kimi.exhausted-200turns and codex.exhausted — ARCHIVED bindings for seats
+  # that were already dead, several on pads nobody is working. They are exactly
+  # the rows the keeper separately reports as "SEAT NOT ON ROSTER", and asking a
+  # retired seat to write a handoff is noise that buries the one case that
+  # matters. Worse, at fleet scale it is the nag problem this feature was built
+  # to avoid, arriving from the other direction.
+  #
+  # The roster is the same oracle seat_pending uses to decide whether a mention
+  # can reach a seat at all: if no mention can reach it, no handoff request can
+  # either.
+  # NOTE: no `tr -d '[:space:]'` here. It strips NEWLINES as well as spaces,
+  # collapsing every roster name onto one line so `grep -qxF` can never match —
+  # which silently skips every seat, live ones included, and turns the whole
+  # feature off while looking like a safety check. Same form seat_pending uses.
+  (cd "$repo" 2>/dev/null && "$SP" roster 2>/dev/null) \
+    | cut -d'|' -f1 | grep -qxF "$name" || return 0
   turns="$(session_turns "$sid")"
   case "$turns" in ''|*[!0-9]*) return 0 ;; esac
   [ "$turns" -ge "$CAP_WARN_AT" ] || return 0
