@@ -2561,7 +2561,7 @@ PY
     sp_init_paths || exit 1
     # Sender is your pinned STITCHPAD_NAME — never an argument — so a terminal can
     # only ever post as itself. Everything after `say` is the message.
-    #   stitchpad say [--image <path>] <text...>
+    #   stitchpad say [--image <path>] <text...|--file <path>>
     from="$(sp_me)"
     [ -z "$from" ] && { echo "stitchpad: no identity — call the MCP join tool first (or set STITCHPAD_NAME for CLI/testing)" >&2; exit 1; }
     # TASK-7: record say outcome (best-effort; never affects the post).
@@ -2599,8 +2599,25 @@ PY
       _holder="$(sp_term_byname_check "$from")" || {
         echo "stitchpad: REFUSED — @$from is live-bound to ${_holder}, not $PAD_DIR (no terminal identity resolvable — env cleared?). cd there or 'stitchpad leave' first." >&2; exit 1; }
     fi
-    image_path=""; reply_to=""
+    image_path=""; reply_to=""; _say_file=""
     while :; do case "${1:-}" in
+      --file)
+        # `amend` has taken --file since it existed; `say` never did, and that
+        # asymmetry is a live footgun rather than a missing convenience.
+        # Everything an agent writes is full of backticked code references, and
+        # a backtick inside a quoted shell argument is COMMAND SUBSTITUTION: a
+        # post containing `git -C <worktree>` died with "parse error near '>'"
+        # because the shell tried to run it and read <worktree> as a redirect.
+        # The message never reached the pad. The workarounds are a variable
+        # round-trip or hand-escaping every backtick, both of which have to be
+        # remembered every single time by a caller who has no reason to expect
+        # the trap. Reading the body from a file removes the shell from the
+        # path entirely.
+        # -r not -f, matching `amend`: process substitution (/dev/fd/N) is a
+        # legitimate source.
+        _say_file="${2:-}"
+        [ -r "$_say_file" ] || { echo "stitchpad: --file needs a readable path" >&2; exit 1; }
+        shift 2 ;;
       --image)
         image_path="${2:-}"
         [ -n "$image_path" ] || { echo "usage: stitchpad say [--re <#m-id>] [--image <path>] <text...>" >&2; exit 1; }
@@ -2612,8 +2629,13 @@ PY
         shift 2 ;;
       *) break ;;
     esac; done
-    text="$*"
-    [ -z "$text" ] && [ -z "$image_path" ] && { echo "usage: stitchpad say [--image <path>] <text...>  (you are @$from)" >&2; exit 1; }
+    if [ -n "$_say_file" ]; then
+      [ $# -eq 0 ] || { echo "stitchpad: --file takes the whole body; do not also pass text" >&2; exit 1; }
+      text="$(cat "$_say_file")"
+    else
+      text="$*"
+    fi
+    [ -z "$text" ] && [ -z "$image_path" ] && { echo "usage: stitchpad say [--re <#m-id>] [--image <path>] <text...|--file <path>>  (you are @$from)" >&2; exit 1; }
 
     if [ -n "$image_path" ]; then
       [ -f "$image_path" ] || { echo "stitchpad: image not found: $image_path" >&2; exit 1; }
