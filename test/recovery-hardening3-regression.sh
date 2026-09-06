@@ -240,10 +240,21 @@ echo "uncommitted crash residue" >> "$E2A_PAD_MD"
 
 SP_RECOVERY_MAX_ATTEMPTS=3 SP_RECOVERY_BUDGET_SECONDS=120
 
-# Run recovery 5 times — each pass should hit the refusal branch and record
-# an attempt. After 3 attempts the terminal-refusal fires.
-for _i in 1 2 3 4 5; do
-  sp_session_registry_journal_recover >/dev/null 2>&1
+# Run recovery 6 times — each pass hits the refusal branch and records an
+# attempt; on the pass where the count reaches the bound the terminal refusal
+# fires. That refusal is emitted ONCE per key (see sp_recovery_terminal_refuse:
+# a standing fact about a preserved orphan is not news, and re-shouting it on
+# every guarded operation drowns the actionable warnings that share stderr).
+# So observe EVERY pass rather than only the last, and pin both that it fires
+# and WHEN. This is strictly stronger than the "still shouting on pass 6" check
+# it replaces, which could not distinguish "fires once" from "fires forever".
+E2A_FIRED=0; E2A_FIRST_PASS=0; E2A_SEEN=""
+for _i in 1 2 3 4 5 6; do
+  _e2a_out="$(sp_session_registry_journal_recover 2>&1 >/dev/null)"
+  if printf '%s' "$_e2a_out" | grep -qi "RECOVERY EXHAUSTED"; then
+    E2A_FIRED=$((E2A_FIRED+1))
+    [ "$E2A_FIRST_PASS" -eq 0 ] && { E2A_FIRST_PASS=$_i; E2A_SEEN="$_e2a_out"; }
+  fi
 done
 
 E2A_COUNT="$(sp_recovery_attempt_count "$PAD_STATE" "journal:$(basename "$E2A_ORPHAN")")"
@@ -254,10 +265,17 @@ E2A_COUNT="$(sp_recovery_attempt_count "$PAD_STATE" "journal:$(basename "$E2A_OR
 [ -d "$E2A_ORPHAN" ] && ok "E2Ab: orphan still preserved (real refusal, not consumed)" \
   || bad "E2Ab: orphan disappeared unexpectedly"
 
-E2A_LAST="$(sp_session_registry_journal_recover 2>&1)"
-echo "$E2A_LAST" | grep -qi "RECOVERY EXHAUSTED" && \
-  ok "E2Ac: terminal refusal fires after attempts exhausted" \
-  || bad "E2Ac: no terminal refusal after exhausting attempts (got: $(printf '%s' "$E2A_LAST" | head -c 150))"
+[ "$E2A_FIRED" -ge 1 ] && \
+  ok "E2Ac: terminal refusal fires after attempts exhausted (pass $E2A_FIRST_PASS)" \
+  || bad "E2Ac: no terminal refusal on any of six passes after exhausting attempts"
+
+[ "$E2A_FIRST_PASS" = "3" ] && \
+  ok "E2Ad: it fires on the pass the count reaches the bound (max=3), not before" \
+  || bad "E2Ad: first refusal on pass $E2A_FIRST_PASS (expected 3, the bound)"
+
+[ "$E2A_FIRED" = "1" ] && \
+  ok "E2Ae: said once across six passes — a standing fact is not repeated" \
+  || bad "E2Ae: refusal emitted $E2A_FIRED times across six passes (expected 1)"
 
 # ============================================================================
 # E2b: crash-after-commit archived; unrelated-commit still refused (R3 shape)
@@ -388,13 +406,18 @@ E3_COUNT="$(sp_recovery_attempt_count "$PAD_STATE" "journal:$(basename "$E3_ORPH
 
 # Run recovery repeatedly — since the counter is never reset on failure, it
 # should eventually hit the terminal refusal (the bound becomes reachable).
-for _i in 1 2 3 4 5; do
-  sp_session_registry_journal_recover >/dev/null 2>&1
+# The refusal is said ONCE per key, so watch every pass, not just the last.
+E3_FIRED=0
+for _i in 1 2 3 4 5 6; do
+  _e3_out="$(sp_session_registry_journal_recover 2>&1 >/dev/null)"
+  printf '%s' "$_e3_out" | grep -qi "RECOVERY EXHAUSTED" && E3_FIRED=$((E3_FIRED+1))
 done
-E3_LAST="$(sp_session_registry_journal_recover 2>&1)"
-echo "$E3_LAST" | grep -qi "RECOVERY EXHAUSTED" && \
+[ "$E3_FIRED" -ge 1 ] && \
   ok "E3e: terminal refusal becomes reachable via a persistently-failing rollback" \
   || bad "E3e: terminal refusal never reachable (counter kept resetting on failure)"
+[ "$E3_FIRED" = "1" ] && \
+  ok "E3f: and it is said once, not on every subsequent operation" \
+  || bad "E3f: refusal emitted $E3_FIRED times across six passes (expected 1)"
 
 # ============================================================================
 # E4: atomic bind-session + shift-change --save (kill torn/duplicate races)

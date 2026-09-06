@@ -70,6 +70,15 @@ _sp_recovery_file() {
   # Sanitize key to a safe filename component
   local safe_key
   safe_key="$(printf '%s' "$key" | tr -c 'A-Za-z0-9._-' '_')"
+  # The once-only refusal marker for a key lives at "<file>.refused" (see
+  # sp_recovery_terminal_refuse). '.' survives the sanitizer, so a key whose
+  # sanitized form ALREADY ends in .refused would land on another key's marker
+  # and silence its diagnostic forever. Mangle that one suffix so the two
+  # namespaces provably cannot meet: a counter path never ends in .refused,
+  # and a marker path always does.
+  case "$safe_key" in
+    *.refused) safe_key="${safe_key}_" ;;
+  esac
   printf '%s/%s' "$(_sp_recovery_attempts_dir)" "$safe_key"
 }
 
@@ -87,6 +96,22 @@ sp_recovery_attempt_record() {
   dir="$(_sp_recovery_attempts_dir)"
   _sp_recovery_safe_mkdir || return 1
   file="$(_sp_recovery_file "$state_file" "$key")"
+  # Saturate at the bound rather than counting past it. Once a key is
+  # exhausted the count is a VERDICT, not a tally, and nothing downstream
+  # reads a value above max. Counting on regardless cost two real things on
+  # this fleet: a python3 spawn + flock + write for every stuck orphan on
+  # EVERY guarded operation (12 orphans on one pad = 12 spawns per `say`),
+  # and a count marching toward the >999 branch below — which would then
+  # report ordinary week-long operation as a "corrupt" counter, a false
+  # claim an operator would act on. A count already inside [max, 999] is
+  # left exactly as it is. A count OUTSIDE that range still reaches python,
+  # so E5a's sanitize-first ordering is preserved unchanged.
+  local _sat_max _sat_cur
+  _sat_max="$(_sp_recovery_effective_max)"
+  _sat_cur="$(sp_recovery_attempt_count "$state_file" "$key")"
+  if [ "$_sat_cur" -ge "$_sat_max" ] 2>/dev/null && [ "$_sat_cur" -le 999 ] 2>/dev/null; then
+    return 0
+  fi
   python3 - "$file" <<'PYF3'
 import fcntl, os, sys, time
 path = sys.argv[1]
@@ -179,12 +204,30 @@ sp_recovery_is_exhausted() {
 # Emit a terminal refusal diagnostic. Used when a recovery path is exhausted.
 sp_recovery_terminal_refuse() {
   local who="$1" path="$2" key="$3"
-  local count first_epoch max budget
+  local count first_epoch max budget file marker
   max="$(_sp_recovery_effective_max)"
   budget="$(_sp_recovery_effective_budget)"
   count="$(sp_recovery_attempt_count "$PAD_STATE" "$key")"
   first_epoch="$(sp_recovery_first_attempt "$PAD_STATE" "$key")"
-  echo "stitchpad: RECOVERY EXHAUSTED for @$who ($path) — $count/$max attempts, budget ${budget}s; key=$key; state preserved for manual inspection" >&2
+  # Say it ONCE per key. A terminal refusal is a standing fact about a
+  # preserved orphan, not news, and re-shouting it on every guarded operation
+  # is how the ACTIONABLE warnings that share this stream — UNREACHABLE PUSH
+  # SEAT, SESSION BINDING DIVERGED, an unknown --flag refusal — get tuned out.
+  # Suppressing the repeat hides nothing: the orphan is still preserved on
+  # disk and still enumerated by `stitchpad doctor`, which is the surface for
+  # asking "what is stuck right now". sp_recovery_reset clears the marker, so
+  # a key that becomes terminal again is announced again.
+  file="$(_sp_recovery_file "$PAD_STATE" "$key")"
+  marker="${file}.refused"
+  if [ -L "$marker" ]; then
+    # Not ours. Never write through it, and never let it buy silence.
+    :
+  elif [ -e "$marker" ]; then
+    return 0
+  else
+    : > "$marker" 2>/dev/null || true
+  fi
+  echo "stitchpad: RECOVERY EXHAUSTED for @$who ($path) — $count/$max attempts, budget ${budget}s; key=$key; state preserved for manual inspection. Said once — run 'stitchpad doctor' to list what is still stuck." >&2
 }
 
 # Clear attempt tracking for a key (on success or after explicit reset).
@@ -192,7 +235,10 @@ sp_recovery_reset() {
   local state_file="$1" key="$2"
   local file
   file="$(_sp_recovery_file "$state_file" "$key")"
-  rm -f "$file" 2>/dev/null || true
+  # The once-only refusal marker is part of this key's state: leaving it
+  # behind would silence the diagnostic for a key that is about to start a
+  # fresh attempt budget and may become terminal again for a new reason.
+  rm -f "$file" "${file}.refused" 2>/dev/null || true
 }
 
 # E5: CLI reset surface — clear ALL recovery counters for a seat or all seats.
