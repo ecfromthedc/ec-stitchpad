@@ -2580,17 +2580,6 @@ _sp_term_claim_honored() { # $1=claim-line → 0 if the claim must still be hono
   local pad name ts pid pstart now
   IFS='|' read -r pad name ts pid pstart <<<"$1"
   now="$(date +%s)"
-  # A claim on a pad directory that NO LONGER EXISTS can never become live
-  # again, and honoring it is a permanent lockout rather than a safety rule.
-  # Both remedies the refusal offers — "cd there" and "stitchpad leave <name>
-  # there" — name a directory that cannot be entered, so the terminal is stuck
-  # for as long as the owning process lives, unable to post to ANY pad. That is
-  # a communication outage produced entirely by the mutual-exclusion mechanism.
-  # Hit for real: a throwaway pad under $TMPDIR was removed after a test run and
-  # the claim outlived it, because the owner shell was still alive and the
-  # liveness test below asks only about the PROCESS, never about the pad.
-  # One terminal = one pad still holds; a deleted pad is simply not a pad.
-  [ -n "$pad" ] && [ ! -d "$pad" ] && return 1
   [ $((now - ${ts:-0})) -lt 300 ] && return 0
   # Stale timestamp: honor the claim anyway when the recorded owner process is
   # demonstrably alive (kill -0 + start-time match against pid reuse). A claim
@@ -2659,7 +2648,23 @@ sp_term_lock_claim() { # $1=target/surface $2=name [$3=owner_pid] — refuses on
   cur="$(cat "$SP_TERMDIR/$surface" 2>/dev/null || true)"
   if [ -n "$cur" ]; then
     IFS='|' read -r pad name ts <<<"$cur"
+    # A claim on a pad directory that NO LONGER EXISTS can never become live
+    # again, so refusing on it is a permanent lockout rather than a safety
+    # rule: both remedies the refusal prints — "cd there" and "stitchpad leave
+    # <name> there" — name a directory that cannot be entered, and the terminal
+    # stays unable to post to ANY pad for as long as the owning process lives.
+    # 41 such claims existed on the machine where this was found, nearly all
+    # from suite fixtures under $TMPDIR that were cleaned up normally.
+    #
+    # Deliberately checked HERE and not inside _sp_term_claim_honored. That
+    # predicate is also consulted by lock_check and the by-name lookup on hot
+    # paths, and adding a stat there measurably destabilised
+    # empty-lock-reclaim-gate: 4 failures in 11 runs against 0 in 14 on the
+    # base, interleaved to control for machine load. Claiming is the only place
+    # a vanished pad can wedge anything, so it is the only place that pays.
+    # ([ -z "$pad" ] keeps a malformed claim line refusing exactly as before.)
     if { [ "$pad" != "$PAD_DIR" ] || [ "$name" != "$who" ]; } \
+       && { [ -z "$pad" ] || [ -d "$pad" ]; } \
        && _sp_term_claim_honored "$cur" && [ "${STITCHPAD_STEAL:-0}" != "1" ]; then
       _sp_term_mutex_release "$surface"
       if [ ! -d "$pad" ]; then
