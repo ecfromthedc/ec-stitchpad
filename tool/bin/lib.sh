@@ -3441,9 +3441,32 @@ sp_delivery_ocean_unresolved_after_stop() {
   case "$state" in errored|completed|canceled|cancelled|delivered) return 1;; esac
   pending_adapter="$(cut -d'|' -f6 "$PAD_STATE/delivery.$name.pending" 2>/dev/null || true)"
   [ "$pending_adapter" = ocean ] || return 1
+  # A submit from a SUPERSEDED generation is abandoned, not unresolved. When the
+  # generation advances, the delivery this predicate is protecting moves with it
+  # (`delivery.<name>.pending` carries the current generation), and the old
+  # submit's outcome can no longer reach anything a retarget would disturb.
+  # Counting it anyway produced a live DEADLOCK on this fleet: @triage-b's
+  # generation-27 submit sat with an empty ack and no turn file, so the loop
+  # below returned "unresolved" on every call; set-wake, rename, reset and leave
+  # all refused; and the roster went on pointing at the EXHAUSTED session the
+  # rotation had just replaced. The one action that could have fixed the seat
+  # was the one action the guard forbade, and the delivery could never resolve
+  # because it was aimed at a dead session only a retarget could change. Same
+  # shape as the `errored` case documented above: a seat whose session is broken
+  # is exactly the seat you most need to be able to retarget.
+  local current_generation
+  current_generation="$(cat "$PAD_STATE/delivery.$name.generation" 2>/dev/null || true)"
+  case "$current_generation" in *[!0-9]*|'') current_generation="" ;; esac
   for submit in "$PAD_STATE"/delivery."$name".submit.*; do
     [ -f "$submit" ] || continue
     generation="${submit##*.submit.}"
+    # Only skip on a positive numeric comparison. An unreadable or non-numeric
+    # generation on either side leaves the submit counted — fail closed.
+    case "$generation" in *[!0-9]*|'') ;; *)
+      if [ -n "$current_generation" ] && [ "$generation" -lt "$current_generation" ]; then
+        continue
+      fi ;;
+    esac
     [ -s "$PAD_STATE/delivery.$name.turn.$generation" ] || return 0
   done
   for turn_file in "$PAD_STATE"/delivery."$name".turn.*; do
