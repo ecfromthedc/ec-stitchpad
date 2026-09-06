@@ -1016,6 +1016,22 @@ You may spawn your own sub-agents (stitchpad spawn <name> --brief ... --artifact
       echo "stitchpad: join failed — roster commit did not complete; worktree may be dirty, @$who may not be in the roster" >&2
       exit 1
     fi
+    # A push seat whose target is not a session is on the roster and reachable
+    # by nobody. join validates the NAME exhaustively — character class, length,
+    # case-collision — and never looked at the target at all, so
+    # `join triage-a ocean push pending` was accepted in full silence and the
+    # seat spent 150-178 turns unaddressable. WARN, never refuse: the two-step
+    # `join <name> ocean push -` then `set-wake` flow is documented and correct,
+    # and a target that only becomes known after the session spawns is the
+    # normal case. The point is that the gap between the two steps stops being
+    # invisible. Same tty/opt-in convention as the `say` warning, for the same
+    # reason: suites parse this stream, and agents have no tty.
+    if [ "$wake" = "push" ] && { [ -t 2 ] || [ "${STITCHPAD_WARN:-0}" = "1" ]; }; then
+      case "$target" in
+        [0-9a-fA-F][0-9a-fA-F][0-9a-fA-F][0-9a-fA-F][0-9a-fA-F][0-9a-fA-F][0-9a-fA-F][0-9a-fA-F]-*) : ;;
+        *) echo "  ⚠ @$who joined with wake=push but target '${target}' is not a session id — @$who is on the roster and NOBODY can wake or mention it until you run: stitchpad set-wake $who push <session-id> $adapter" >&2 ;;
+      esac
+    fi
     # P19: the lane is taken — narrate it. sp_narrate appends `### @name ... · HH:MM`
     # and NEVER commits (a self-committing narration doubled commit counts and
     # broke heal-roster). Placed AFTER the commit above so we never narrate a
