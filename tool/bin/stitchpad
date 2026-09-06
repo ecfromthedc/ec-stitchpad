@@ -2627,6 +2627,27 @@ PY
         [ -n "$reply_to" ] || { echo "usage: stitchpad say [--re <#m-id>] [--image <path>] <text...>" >&2; exit 1; }
         reply_to="#${reply_to#\#}"   # normalize: accept "m-abc" or "#m-abc"
         shift 2 ;;
+      # An UNRECOGNISED leading --flag is a mistake, never message text.
+      #
+      # Before this, the catch-all below swallowed it: `say --name bob --file x`
+      # broke out of the loop on `--name`, and every remaining argument —
+      # INCLUDING the --file and its path — became the message body. The pad got
+      # a post whose entire content was "--name bob --file x", the real message
+      # was never read, and the caller saw "✓ posted as @bob" and moved on.
+      #
+      # That happened repeatedly to one seat before anyone noticed, and the
+      # message it lost was a verification result nobody could reconstruct — the
+      # file it named had already been cleaned up. A silent success that discards
+      # the payload is the worst shape this tool can have, and it is the exact
+      # class the pad exists to make impossible between agents.
+      #
+      # Prose starting with `--` is vanishingly rare and has --file as its
+      # escape hatch; a mistyped flag is common. Refuse, and name the flag.
+      --*)
+        echo "stitchpad: unknown flag for say: $1" >&2
+        echo "  usage: stitchpad say [--re <#m-id>] [--image <path>] <text...|--file <path>>" >&2
+        echo "  (if your message really begins with '--', pass it via --file)" >&2
+        exit 2 ;;
       *) break ;;
     esac; done
     if [ -n "$_say_file" ]; then
