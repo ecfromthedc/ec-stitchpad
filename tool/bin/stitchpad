@@ -2786,13 +2786,41 @@ PY
     # unconditionally turned six green suites red, including two that could no
     # longer parse their own output. Same convention `task list` already uses:
     # human rendering on a terminal, byte-stable machine output otherwise.
-    if [ -t 2 ]; then
-    _say_roster="$(sp_roster 2>/dev/null | cut -d'|' -f1 | tr -d ' ' | tr 'A-Z' 'a-z')"
+    # STITCHPAD_WARN=1 opts a NON-terminal caller into these warnings. The tty
+    # gate above is right for suites, but it had one perverse consequence: the
+    # callers who most need the warning are agents, and an agent never has a
+    # tty, so the one participant who cannot see a silent failure was also the
+    # only one guaranteed never to be told about it. A human typo got a
+    # suggestion; an agent mentioning a dead seat got a clean tick forever.
+    # Opt-in keeps stderr byte-stable by default and gives fleet leads a way in.
+    if [ -t 2 ] || [ "${STITCHPAD_WARN:-0}" = "1" ]; then
+    # Full rows, not just names: a mention fails in TWO ways and only one of
+    # them is an unknown name. The other is a name that IS on the roster whose
+    # push target is a placeholder — `@name` resolves, posts, ticks, and wakes
+    # nobody. That one cost this fleet three seats running 150-178 turns in
+    # isolation. Same defect the keeper now reports as UNREACHABLE PUSH SEAT;
+    # warned here too, because here is where someone is still in a position to
+    # do something about it.
+    _say_rows="$(sp_roster 2>/dev/null | awk -F'|' '
+      { for (i=1;i<=4;i++) gsub(/^[ \t]+|[ \t]+$/, "", $i)
+        print tolower($1) "|" tolower($2) "|" tolower($3) "|" $4 }')"
+    _say_roster="$(printf '%s\n' "$_say_rows" | cut -d'|' -f1)"
     printf '%s' "$text" | grep -oE '(^|[[:space:]])@[A-Za-z0-9_-]+' | tr -d ' @' | tr 'A-Z' 'a-z' | sort -u \
     | while IFS= read -r _mn; do
         [ -n "$_mn" ] || continue
         [ "$_mn" = "all" ] && continue
-        printf '%s\n' "$_say_roster" | grep -qx "$_mn" && continue
+        if printf '%s\n' "$_say_roster" | grep -qx "$_mn"; then
+          # On the roster. Is the row actually addressable?
+          _row="$(printf '%s\n' "$_say_rows" | awk -F'|' -v n="$_mn" '$1==n {print; exit}')"
+          _wk="$(printf '%s' "$_row" | cut -d'|' -f3)"
+          _tg="$(printf '%s' "$_row" | cut -d'|' -f4)"
+          [ "$_wk" = "push" ] || continue
+          case "$_tg" in
+            [0-9a-fA-F][0-9a-fA-F][0-9a-fA-F][0-9a-fA-F][0-9a-fA-F][0-9a-fA-F][0-9a-fA-F][0-9a-fA-F]-*) continue ;;
+          esac
+          echo "  ⚠ @$_mn is on the roster but its wake target is '${_tg:-<empty>}', not a session — the message posted and woke NOBODY. Bind it: stitchpad set-wake $_mn push <session-id> ocean" >&2
+          continue
+        fi
         _near="$(printf '%s\n' "$_say_roster" | awk -v n="$_mn" '
           { a=$0; if (length(a)==0) next
             if (index(a,substr(n,1,3))==1 || index(n,substr(a,1,3))==1) { print a; exit } }')"
