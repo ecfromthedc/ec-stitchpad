@@ -2586,7 +2586,7 @@ PY
         if [ "$_hpad" = "$PAD_DIR" ]; then
           echo "stitchpad: REFUSED — this terminal is claimed by @$_hname, but you are @${from:-<no identity>}. Same pad ($PAD_DIR); the IDENTITY differs. Run 'stitchpad leave' to release it, or set STITCHPAD_NAME=$_hname." >&2
         else
-          echo "stitchpad: REFUSED — this terminal is bound to $_hpad (as @$_hname), not $PAD_DIR. cd there or 'stitchpad leave' first." >&2
+          echo "stitchpad: REFUSED — this terminal is bound to $_hpad (as @$_hname), not $PAD_DIR. Release it with 'stitchpad leave $_hname', or cd to $_hpad." >&2
         fi
         exit 1; }
     else
@@ -2597,7 +2597,7 @@ PY
       # cross-pad evidence — refuse. No entry / stale / dead-owner = no
       # evidence = permissive (never locks out the operator or fixtures).
       _holder="$(sp_term_byname_check "$from")" || {
-        echo "stitchpad: REFUSED — @$from is live-bound to ${_holder}, not $PAD_DIR (no terminal identity resolvable — env cleared?). cd there or 'stitchpad leave' first." >&2; exit 1; }
+        echo "stitchpad: REFUSED — @$from is live-bound to ${_holder}, not $PAD_DIR (no terminal identity resolvable — env cleared?). Release it with 'stitchpad leave $from', or cd to ${_holder}." >&2; exit 1; }
     fi
     image_path=""; reply_to=""; _say_file=""
     while :; do case "${1:-}" in

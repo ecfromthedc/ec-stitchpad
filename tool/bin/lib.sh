@@ -2724,7 +2724,24 @@ sp_term_lock_check() { # $1=target $2=name → 0 ok; 1 = LIVE claim by someone e
   _sp_term_claim_honored "$cur" || return 0
   # A DIFFERENT PAD is the ghost-post this guard exists to kill: one terminal =
   # one pad, always.
-  if [ "$pad" != "$PAD_DIR" ]; then printf '%s' "$cur"; return 1; fi
+  #
+  # UNLESS that pad no longer exists. A claim naming a deleted directory cannot
+  # be a cross-pad ghost post — there is no pad to post to — so it is not
+  # evidence of anything. The live case: running the test suite claims the
+  # operator's terminal for a fixture pad under $TMPDIR, the fixture's cleanup
+  # trap removes the directory, and the residue then locks the operator out of
+  # their REAL pad with a remedy that cannot be followed. "cd there" is
+  # impossible once the directory is gone, and the printed `stitchpad leave` is
+  # missing the <name> argument the command requires. Hit on the tides fleet:
+  # the lead could not post to its own pad after a suite run.
+  #
+  # Deliberately read-only. The stale claim file is left in place for
+  # sp_term_lock_claim to reap, so `say` never mutates lock state on a path
+  # whose whole job is to answer a question.
+  if [ "$pad" != "$PAD_DIR" ]; then
+    [ -d "$pad" ] || return 0
+    printf '%s' "$cur"; return 1
+  fi
   # Same pad, different name: that is a DELEGATED AGENT, not a resolver
   # accident. A sub-agent (codex exec, a spawned helper, a CI runner) inherits
   # its parent's terminal env, so the terminal is claimed by the LEAD while the
