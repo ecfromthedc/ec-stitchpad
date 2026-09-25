@@ -455,7 +455,15 @@ delivery_cancel_ocean_turn() {
   [ -f "$dir/reason" ] || printf '%s\n' "$reason" > "$dir/reason"
   printf '%s|%s\n' "$(delivery_now)" "$reason" >> "$dir/attempts"
   [ -f "$dir/requested_at" ] || printf '%s\n' "$(delivery_now)" > "$dir/requested_at"
-  response="$dir/response"; daemon_url="$(sp_seat_daemon_url "$PAD_STATE" "$name")"
+  response="$dir/response"
+  if ! daemon_url="$(sp_seat_daemon_url "$PAD_STATE" "$name")"; then
+    # seat-daemon-url present but unusable: we cannot tell which daemon owns
+    # this turn, so nothing is cancelled and nothing is declared terminal.
+    printf '%s|%s\n' "$(delivery_now)" "seat-daemon-url-unusable" >> "$dir/attempts"
+    printf 'cancel_pending\n' > "$dir/result"; DELIVERY_CANCEL_OUTCOME=pending
+    [ "$(cut -d'|' -f3 "$lock/owner" 2>/dev/null || true)" = "$token" ] && rm -rf "$lock"
+    return 1
+  fi
   cancel_deadline_seconds="${SP_DELIVERY_CANCEL_DEADLINE_SECONDS:-8}"
   case "$cancel_deadline_seconds" in ''|*[!0-9]*) cancel_deadline_seconds=8;; esac
   poll_deadline=$(( $(date +%s) + cancel_deadline_seconds ))
@@ -509,12 +517,14 @@ except Exception: print("invalid")' "$response" 2>/dev/null)"
 
 # The seat's turns live on ITS daemon: sp_seat_daemon_url honours an opt-in
 # .state/seat-daemon-url.<name> (a remote seat) and otherwise returns exactly
-# the global URL these helpers always used. Asking the local daemon about a
-# remote seat's turn would read "missing" three times, declare it errored, and
-# redeliver the same mention into a seat that is still working on it.
+# the global URL these helpers always used. Asked the local daemon instead, a
+# remote turn reads "missing": the poll loop parks it in_flight forever, a
+# cancel (supersede / DND / stop) counts three misses and records a running
+# turn as errored, and reconcile reads "none" and re-fires an accepted mention.
+# A present-but-unusable file makes every helper answer unknown / pending.
 delivery_ocean_turn_status() {
   local target="$1" turn_id="$2" name="${3:-}" daemon_url body
-  daemon_url="$(sp_seat_daemon_url "$PAD_STATE" "$name")"
+  daemon_url="$(sp_seat_daemon_url "$PAD_STATE" "$name")" || { printf 'unknown\n'; return; }
   body="$(curl -sf --max-time 3 "$daemon_url/v1/requests" 2>/dev/null || true)"
   [ -n "$body" ] || { printf 'unknown\n'; return; }
   printf '%s' "$body" | python3 -c 'import json,sys
@@ -529,7 +539,7 @@ except Exception: print("unknown")' "$turn_id" 2>/dev/null || printf 'unknown\n'
 
 delivery_ocean_reconcile_attempt() {
   local target="$1" attempted_at="$2" name="${3:-}" daemon_url body
-  daemon_url="$(sp_seat_daemon_url "$PAD_STATE" "$name")"
+  daemon_url="$(sp_seat_daemon_url "$PAD_STATE" "$name")" || { printf 'unknown\n'; return; }
   body="$(curl -sf --max-time 3 "$daemon_url/v1/requests" 2>/dev/null || true)"
   [ -n "$body" ] || { printf 'unknown\n'; return; }
   printf '%s' "$body" | python3 -c 'import json,sys

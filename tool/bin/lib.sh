@@ -422,8 +422,13 @@ sp_seat_remote_cwd() {
 sp_seat_daemon_url() {
   # $1 = state dir, $2 = name. The daemon this seat's turns live on: the
   # per-seat override when valid, else exactly what every caller used before.
+  # rc 2 and NO output when the seat's file is present but unusable (empty
+  # mid-rewrite, malformed, symlink): the seat's turns are on SOME other
+  # daemon, and asking the local one would read "missing"/"none" for a turn
+  # that is still running there — a false errored cancel, or a re-fire of a
+  # mention that was already accepted. Callers must answer unknown/pending.
   local v
-  v="$(sp_seat_daemon_override "$1" "$2" 2>/dev/null)" || v=""
+  v="$(sp_seat_daemon_override "$1" "$2" 2>/dev/null)" || return 2
   printf '%s' "${v:-${OCEAN_DAEMON_URL:-http://127.0.0.1:4780}}"
 }
 

@@ -26,10 +26,18 @@
 #   R7     unusable seat-remote-cwd (relative) refuses the wake
 #   W1     watch.sh has no hard-coded daemon URL left; all three supervision
 #          helpers resolve per seat
-#   W2     sp_seat_daemon_url: no file → the global URL, exactly as before
+#   W2     sp_seat_daemon_url: no file → the global URL, exactly as before;
+#          present-but-unusable file → rc 2 and NO URL (never the local daemon)
+#   W3     BEHAVIOUR of watch.sh's supervision helpers (sourced as a library,
+#          mock daemons, under /bin/bash 3.2 AND bash 5 when present):
+#          valid file → status read from the SEAT daemon; tunnel down → unknown;
+#          empty / malformed / symlinked file → status unknown, reconcile
+#          unknown (never "none" = no re-fire), cancel pending with NO POST
+#          and no terminal result; no file → the global daemon, as before
 #   K1     seat-keeper skips a remote seat with a voice, never probes it
 #   M1     MUTANT: drop the --daemon-url prefix → R2 goes RED
 #   M2     MUTANT: perturb the no-file wake argv → the D-differential goes RED
+#   M3     MUTANT: restore the silent local fallback in sp_seat_daemon_url → W3 RED
 #
 # LIVE MODE (manual, read-only on live pads): SP_REMOTE_SEAT_KEEPER_CONF=<conf>
 # snapshots every pad named in that keeper.conf (pad file + regular .state
@@ -285,11 +293,77 @@ w2="$(
   b="$(env -u OCEAN_DAEMON_URL bash -c 'BIN_DIR="$1/tool/bin"; source "$1/tool/bin/lib.sh" >/dev/null 2>&1; sp_seat_daemon_url "$2" eve' _ "$TOP" "$ST")"
   printf '%s/' "$URL_B" > "$ST/seat-daemon-url.eve"
   c="$(OCEAN_DAEMON_URL="$URL_A" sp_seat_daemon_url "$ST" eve)"
-  printf '%s|%s|%s' "$a" "$b" "$c"
+  : > "$ST/seat-daemon-url.eve"
+  d="$(OCEAN_DAEMON_URL="$URL_A" sp_seat_daemon_url "$ST" eve)"; drc=$?
+  printf '%s|%s|%s|%s:%s' "$a" "$b" "$c" "$d" "$drc"
 )"
-[ "$w2" = "$URL_A|http://127.0.0.1:4780|$URL_B" ] \
-  && ok "W2 sp_seat_daemon_url: no file → \$OCEAN_DAEMON_URL / :4780 exactly as before; file → the seat daemon" \
+[ "$w2" = "$URL_A|http://127.0.0.1:4780|$URL_B|:2" ] \
+  && ok "W2 sp_seat_daemon_url: no file → \$OCEAN_DAEMON_URL / :4780 exactly as before; file → the seat daemon; unusable file → rc 2, no URL" \
   || bad "W2 sp_seat_daemon_url resolved '$w2'"
+
+# ── W3: watch.sh supervision helpers, behaviourally ───────────────────────
+printf '%s' '{"ok":true,"requests":[]}' > "$TMP/srvA/v1/requests"
+printf '%s' '{"ok":true,"requests":[{"request_id":"turn-w3","session_id":"'"$SID"'","state":"running","started_at":"2099-01-01T00:00:00Z"}]}' > "$TMP/srvB/v1/requests"
+cat > "$TMP/w3.sh" <<'W3'
+# $1=TOP $2=proj $3=URL_A $4=URL_B $5=ST $6=TMP ; prints one line per case
+TOP="$1"; cd "$2" || exit 9; URL_A="$3"; URL_B="$4"; ST="$5"; T="$6"
+export OCEAN_DAEMON_URL="$URL_A" STITCHPAD_HEARTBEAT_AUTOSTART=0
+export SP_DELIVERY_CANCEL_DEADLINE_SECONDS=2 SP_DELIVERY_CANCEL_POLL_SECONDS=0.05
+STITCHPAD_WATCH_LIB_ONLY=1; source "$TOP/tool/bin/watch.sh" >/dev/null 2>&1; unset STITCHPAD_WATCH_LIB_ONLY
+trap - ERR
+reqs() { cat "$T/srvA.log" "$T/srvB.log" 2>/dev/null | grep -c '"[A-Z]* /' | tr -d ' '; }
+clear() { : > "$T/srvA.log"; : > "$T/srvB.log"; rm -rf "$ST"/delivery.eve.cancel.* "$ST/seat-daemon-url.eve"; }
+settle() { sleep 0.15; }
+# valid file: status from the SEAT daemon
+clear; printf '%s' "$URL_B" > "$ST/seat-daemon-url.eve"
+st="$(delivery_ocean_turn_status x turn-w3 eve)"; settle
+echo "valid|$st|A=$(grep -c GET "$T/srvA.log")|B=$(grep -c GET "$T/srvB.log")"
+# tunnel down: unknown
+clear; printf 'http://127.0.0.1:1' > "$ST/seat-daemon-url.eve"
+echo "down|$(delivery_ocean_turn_status x turn-w3 eve)|$(delivery_ocean_reconcile_attempt x 2000-01-01T00:00:00Z eve)"
+# no file: the global daemon, as before
+clear
+st="$(delivery_ocean_turn_status x turn-w3 eve)"; settle
+echo "nofile|$st|A=$(grep -c GET "$T/srvA.log")|B=$(grep -c GET "$T/srvB.log")"
+for kind in empty badurl symlink; do
+  clear
+  case "$kind" in
+    empty)   : > "$ST/seat-daemon-url.eve" ;;
+    badurl)  printf 'http://127.0.0.1:%s/x y' "${URL_B##*:}" > "$ST/seat-daemon-url.eve" ;;
+    symlink) printf '%s' "$URL_B" > "$T/w3-target"; ln -s "$T/w3-target" "$ST/seat-daemon-url.eve" ;;
+  esac
+  st="$(delivery_ocean_turn_status x turn-w3 eve)"
+  rc_="$(delivery_ocean_reconcile_attempt "$(cat "$T/sid")" 2000-01-01T00:00:00Z eve)"
+  DELIVERY_CANCEL_OUTCOME=none
+  delivery_cancel_ocean_turn eve turn-w3 w3probe >/dev/null 2>&1; crc=$?
+  res="$(cat "$(delivery_cancel_dir eve turn-w3)/result" 2>/dev/null)"
+  settle
+  echo "$kind|$st|$rc_|$crc|$DELIVERY_CANCEL_OUTCOME|$res|reqs=$(reqs)"
+done
+clear
+W3
+printf '%s' "$SID" > "$TMP/sid"
+w3_expect="valid|running|A=0|B=1
+down|unknown|unknown
+nofile|missing|A=1|B=0
+empty|unknown|unknown|1|pending|cancel_pending|reqs=0
+badurl|unknown|unknown|1|pending|cancel_pending|reqs=0
+symlink|unknown|unknown|1|pending|cancel_pending|reqs=0"
+# One assertion whatever the machine has (the suite baseline is a fixed count):
+# /bin/bash 3.2 always, plus a bash >= 4 when one is installed.
+reset_seat_state
+w3_ran=""; w3_bad=""
+for _sh in /bin/bash /opt/homebrew/bin/bash /usr/local/bin/bash; do
+  [ -x "$_sh" ] || continue
+  [ "$_sh" != /bin/bash ] && [ "$("$_sh" -c 'echo ${BASH_VERSINFO[0]}')" -lt 4 ] && continue
+  _v="$("$_sh" -c 'echo $BASH_VERSION')"; w3_ran="$w3_ran $_v"
+  w3="$("$_sh" "$TMP/w3.sh" "$TOP" "$TMP/proj" "$URL_A" "$URL_B" "$ST" "$TMP" 2>/dev/null)"
+  [ "$w3" = "$w3_expect" ] || w3_bad="$w3_bad [bash $_v: $(printf '%s' "$w3" | tr '\n' ';')]"
+  reset_seat_state
+done
+[ -z "$w3_bad" ] \
+  && ok "W3 watch.sh helpers (bash$w3_ran): seat daemon when valid, unknown when down, global when no file; empty/malformed/symlink file → status unknown, reconcile unknown (no re-fire), cancel pending with zero daemon requests" \
+  || bad "W3 watch.sh helpers wrong:$w3_bad"
 
 reset_seat_state
 printf '%s' "$SID" > "$ST/ocean-session.eve"
@@ -340,6 +414,26 @@ if [ "$have_base" -eq 1 ]; then
     if [ "$fail" -gt "$_f" ]; then pass=$_p; fail=$_f; ok "M2 mutant (no-file argv perturbed) is caught by the differential"
     else pass=$_p; fail=$_f; bad "M2 the differential passed a changed no-file wake — it is not measuring anything"; fi
   fi
+fi
+
+# ── M3 MUTANT: an unusable seat file silently falls back to the local daemon ──
+echo "  -- mutant: an unusable seat-daemon-url falls back to the global daemon --"
+MUT3="$TMP/mutant3"; mkdir -p "$MUT3/tool"; cp -R "$TOP/tool/adapters" "$TOP/tool/bin" "$TOP/tool/instructions" "$MUT3/tool/"
+python3 - "$MUT3/tool/bin/lib.sh" <<'PY3'
+import sys
+p=sys.argv[1]; s=open(p,encoding='utf-8').read()
+old='v="$(sp_seat_daemon_override "$1" "$2" 2>/dev/null)" || return 2'
+if s.count(old)!=1: sys.exit(9)
+open(p,'w',encoding='utf-8').write(s.replace(old,'v="$(sp_seat_daemon_override "$1" "$2" 2>/dev/null)" || v=""'))
+PY3
+if [ $? -eq 9 ]; then bad "M3 mutant anchor not found"
+else
+  reset_seat_state
+  w3m="$(/bin/bash "$TMP/w3.sh" "$MUT3" "$TMP/proj" "$URL_A" "$URL_B" "$ST" "$TMP" 2>/dev/null)"
+  if [ "$w3m" != "$w3_expect" ] && printf '%s' "$w3m" | grep -q '^empty|missing|none|'; then
+    ok "M3 mutant (silent local fallback) is caught by W3: $(printf '%s' "$w3m" | grep '^empty')"
+  else bad "M3 mutant survived W3: $(printf '%s' "$w3m" | tr '\n' ';')"; fi
+  reset_seat_state
 fi
 
 # ── LIVE MODE: every no-file ocean seat on every keeper pad ───────────────
