@@ -156,7 +156,7 @@ differential() {
   reset_seat_state; "$setup"
   run_adapter "${NEW_TREE:-$TOP/tool}" "$TMP/new" "$@"; local nrc=$RC
   local diffs=""
-  [ "$orc" = "$nrc" ] || diffs="$diffs rc($orc→$nrc)"
+  [ "$orc" = "$nrc" ] || diffs="$diffs rc(${orc}→${nrc})"
   local k; for k in out err argv reqA reqB; do
     cmp -s "$TMP/old.$k" "$TMP/new.$k" || diffs="$diffs $k"
   done
