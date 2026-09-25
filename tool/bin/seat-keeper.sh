@@ -425,6 +425,19 @@ while IFS= read -r repo; do
     case "$name" in *.exhausted-*) continue ;; esac
     sid="$(cat "$f" 2>/dev/null)"
     [ -z "$sid" ] && continue
+    # A seat opted onto ANOTHER daemon (.state/seat-daemon-url.<name>, see
+    # lib.sh "Remote Ocean seats") is not this keeper's to wake: every probe
+    # and wake below targets $DAEMON, where that session does not exist, and
+    # every prompt below tells the seat to run the pad CLI, which a remote
+    # seat cannot. Skip it — loudly, rate-limited — rather than probe the
+    # wrong daemon. Its delivery still runs through watch.sh + ocean.sh.
+    if [ -e "$ST/seat-daemon-url.$name" ] || [ -L "$ST/seat-daemon-url.$name" ]; then
+      log_rl "$ST/.keeper-remote-seat.$name" \
+        "REMOTE SEAT SKIPPED: $name ($repo) has .state/seat-daemon-url.$name — the keeper only manages seats on $DAEMON. Mentions still wake it through the ocean adapter."
+      [ "$REPORT" -eq 1 ] && printf '%-12s %-8s %-20s %-8s %s\n' \
+        "$name" remote - - "skipped: seat-daemon-url set"
+      continue
+    fi
     model="$(cat "$ST/seat-model.$name" 2>/dev/null || echo '')"
     # Per-seat worktree cwd (opt-in), mirroring the ocean adapter: a build seat
     # runs in its own git worktree, not the pad's checkout. Without this the

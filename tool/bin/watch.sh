@@ -455,7 +455,7 @@ delivery_cancel_ocean_turn() {
   [ -f "$dir/reason" ] || printf '%s\n' "$reason" > "$dir/reason"
   printf '%s|%s\n' "$(delivery_now)" "$reason" >> "$dir/attempts"
   [ -f "$dir/requested_at" ] || printf '%s\n' "$(delivery_now)" > "$dir/requested_at"
-  response="$dir/response"; daemon_url="${OCEAN_DAEMON_URL:-http://127.0.0.1:4780}"
+  response="$dir/response"; daemon_url="$(sp_seat_daemon_url "$PAD_STATE" "$name")"
   cancel_deadline_seconds="${SP_DELIVERY_CANCEL_DEADLINE_SECONDS:-8}"
   case "$cancel_deadline_seconds" in ''|*[!0-9]*) cancel_deadline_seconds=8;; esac
   poll_deadline=$(( $(date +%s) + cancel_deadline_seconds ))
@@ -470,7 +470,7 @@ except Exception: print("invalid")' "$response" 2>/dev/null)"
   case "$http:$cancel_state" in
     2??:cancelled) terminal=cancelled ;;
     2??:cancelling) terminal=cancelling ;;
-    *) terminal="$(delivery_ocean_turn_status "" "$turn_id")" ;;
+    *) terminal="$(delivery_ocean_turn_status "" "$turn_id" "$name")" ;;
   esac
   poll_attempts="${SP_DELIVERY_CANCEL_POLL_ATTEMPTS:-100}"
   poll_seconds="${SP_DELIVERY_CANCEL_POLL_SECONDS:-0.05}"
@@ -501,15 +501,20 @@ except Exception: print("invalid")' "$response" 2>/dev/null)"
       printf 'cancel_pending\n' > "$dir/result"; DELIVERY_CANCEL_OUTCOME=pending; rc=1; break
     fi
     sleep "$poll_seconds"
-    terminal="$(delivery_ocean_turn_status "" "$turn_id")"
+    terminal="$(delivery_ocean_turn_status "" "$turn_id" "$name")"
   done
   [ "$(cut -d'|' -f3 "$lock/owner" 2>/dev/null || true)" = "$token" ] && rm -rf "$lock"
   return "$rc"
 }
 
+# The seat's turns live on ITS daemon: sp_seat_daemon_url honours an opt-in
+# .state/seat-daemon-url.<name> (a remote seat) and otherwise returns exactly
+# the global URL these helpers always used. Asking the local daemon about a
+# remote seat's turn would read "missing" three times, declare it errored, and
+# redeliver the same mention into a seat that is still working on it.
 delivery_ocean_turn_status() {
-  local target="$1" turn_id="$2" daemon_url body
-  daemon_url="${OCEAN_DAEMON_URL:-http://127.0.0.1:4780}"
+  local target="$1" turn_id="$2" name="${3:-}" daemon_url body
+  daemon_url="$(sp_seat_daemon_url "$PAD_STATE" "$name")"
   body="$(curl -sf --max-time 3 "$daemon_url/v1/requests" 2>/dev/null || true)"
   [ -n "$body" ] || { printf 'unknown\n'; return; }
   printf '%s' "$body" | python3 -c 'import json,sys
@@ -523,8 +528,8 @@ except Exception: print("unknown")' "$turn_id" 2>/dev/null || printf 'unknown\n'
 }
 
 delivery_ocean_reconcile_attempt() {
-  local target="$1" attempted_at="$2" daemon_url body
-  daemon_url="${OCEAN_DAEMON_URL:-http://127.0.0.1:4780}"
+  local target="$1" attempted_at="$2" name="${3:-}" daemon_url body
+  daemon_url="$(sp_seat_daemon_url "$PAD_STATE" "$name")"
   body="$(curl -sf --max-time 3 "$daemon_url/v1/requests" 2>/dev/null || true)"
   [ -n "$body" ] || { printf 'unknown\n'; return; }
   printf '%s' "$body" | python3 -c 'import json,sys
@@ -735,7 +740,7 @@ delivery_worker() {
     fi
     if [ "$adapter" = ocean ] && [ -z "$turn_id" ] && [ -f "$(delivery_submit_file "$name" "$generation")" ]; then
       attempt_at="$(cut -d'|' -f1 "$(delivery_submit_file "$name" "$generation")")"
-      reconcile="$(delivery_ocean_reconcile_attempt "$target" "$attempt_at")"
+      reconcile="$(delivery_ocean_reconcile_attempt "$target" "$attempt_at" "$name")"
       case "$reconcile" in
         none) rm -f "$(delivery_submit_file "$name" "$generation")" "$(delivery_ack_file "$name" "$generation")" ;;
         *)
@@ -886,7 +891,7 @@ delivery_worker() {
           continue
         fi
       fi
-      turn_status="$(delivery_ocean_turn_status "$target" "$turn_id")"
+      turn_status="$(delivery_ocean_turn_status "$target" "$turn_id" "$name")"
       case "$turn_status" in
         completed)
           delivery_finalize_completed "$name" "$generation" "$ordinal" "$message_id" "$task_id" \
@@ -1035,7 +1040,7 @@ delivery_worker() {
     fi
     if [ "$adapter" = ocean ] && [ -f "$(delivery_submit_file "$name" "$generation")" ]; then
       attempt_at="$(cut -d'|' -f1 "$(delivery_submit_file "$name" "$generation")")"
-      reconcile="$(delivery_ocean_reconcile_attempt "$target" "$attempt_at")"
+      reconcile="$(delivery_ocean_reconcile_attempt "$target" "$attempt_at" "$name")"
       if [ "$reconcile" != none ]; then
         delivery_write_state "$name" acceptance_unknown "$generation" "$ordinal" "$message_id" "$task_id" \
           "$accepted_at" "$started" "" "$(delivery_now)" "adapter_exit_${rc}_after_submit"

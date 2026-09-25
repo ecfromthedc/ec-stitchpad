@@ -368,6 +368,65 @@ sp_model_pin_preflight() {
   return 0
 }
 
+# ── Remote Ocean seats (opt-in, per seat) ───────────────────────────
+# An Ocean seat normally lives on the pad host's daemon
+# (${OCEAN_DAEMON_URL:-http://127.0.0.1:4780}). Two .state files move ONE seat
+# onto another daemon — typically an ssh tunnel to another machine:
+#   seat-daemon-url.<name>  http(s)://host[:port] — probe, wake, turn
+#                           supervision and cancel all go to this daemon
+#   seat-remote-cwd.<name>  absolute path ON THAT HOST, used verbatim as the
+#                           wake --cwd (no local -d check: it does not exist
+#                           here). Honoured only together with seat-daemon-url.
+# A seat with neither file is untouched: every caller keeps its exact previous
+# argv, URL and prompt (remote-seat-gate.sh proves it byte-for-byte).
+#
+# A file that is PRESENT but unusable (symlink, not a regular file, empty,
+# malformed) is rc 2, never a silent fallback. Its presence is the operator
+# saying "this seat is NOT on the local daemon"; quietly waking the local
+# daemon instead would send the turn to a different agent, or to nobody.
+_sp_seat_state_value() {
+  # $1 = file. Prints the whitespace-stripped value. rc 1 absent, 2 unusable.
+  local f="$1" v
+  [ -e "$f" ] || [ -L "$f" ] || return 1
+  [ -f "$f" ] && [ ! -L "$f" ] || return 2
+  v="$(head -c 4096 "$f" 2>/dev/null | tr -d '[:space:]')"
+  [ -n "$v" ] || return 2
+  printf '%s' "$v"
+}
+
+sp_seat_daemon_override() {
+  # $1 = state dir, $2 = name. Prints the per-seat daemon URL (no trailing /)
+  # or nothing. rc 0 = none or valid, rc 2 = present but unusable.
+  local v rc
+  sp_model_pin_valid_name "${2:-}" || return 0
+  v="$(_sp_seat_state_value "$1/seat-daemon-url.$2")"; rc=$?
+  [ "$rc" -eq 1 ] && return 0
+  [ "$rc" -eq 0 ] || return 2
+  v="${v%/}"
+  printf '%s' "$v" | grep -Eq '^https?://[A-Za-z0-9._-]+(:[0-9]{1,5})?$' || return 2
+  printf '%s' "$v"
+}
+
+sp_seat_remote_cwd() {
+  # $1 = state dir, $2 = name. Prints the remote cwd or nothing.
+  # rc 0 = none or valid, rc 2 = present but unusable (must be absolute).
+  local v rc
+  sp_model_pin_valid_name "${2:-}" || return 0
+  v="$(_sp_seat_state_value "$1/seat-remote-cwd.$2")"; rc=$?
+  [ "$rc" -eq 1 ] && return 0
+  [ "$rc" -eq 0 ] || return 2
+  case "$v" in /*) ;; *) return 2 ;; esac
+  printf '%s' "$v"
+}
+
+sp_seat_daemon_url() {
+  # $1 = state dir, $2 = name. The daemon this seat's turns live on: the
+  # per-seat override when valid, else exactly what every caller used before.
+  local v
+  v="$(sp_seat_daemon_override "$1" "$2" 2>/dev/null)" || v=""
+  printf '%s' "${v:-${OCEAN_DAEMON_URL:-http://127.0.0.1:4780}}"
+}
+
 # ── Do Not Disturb ──────────────────────────────────────────────────
 # DND is a local wake-suppression flag. It never mutates the pad or seen cursor:
 # mentions accumulate behind .state/seen.<name> and can be drained on return.

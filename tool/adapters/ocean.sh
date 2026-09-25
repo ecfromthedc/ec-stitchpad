@@ -41,6 +41,26 @@ state_dir="$(dirname "$pad")/.state"
 # mismatch into a refused wake (loud, never silent).
 sp_model_pin_preflight "$state_dir" "$name" || exit 1
 
+# REMOTE SEAT (opt-in, per seat). .state/seat-daemon-url.<name> puts this seat
+# on another Ocean daemon — in practice an ssh tunnel to another machine — for
+# the probe, the wake, and the resolved-model read alike.
+# .state/seat-remote-cwd.<name> is then a path ON THAT HOST, passed as --cwd
+# verbatim: it does not exist here, so the local -d check below would reject it.
+# A remote seat cannot run the stitchpad CLI or reach the pad, so its prompt
+# says so and sends its output to the report path its card names. Neither
+# file (every seat until an operator opts one in) = this block sets nothing.
+seat_daemon_url=""; remote_cwd=""
+seat_daemon_url="$(sp_seat_daemon_override "$state_dir" "$name")" || {
+  echo "[ocean.sh] .state/seat-daemon-url.$name is present but unusable (symlink, empty, or not http(s)://host[:port]) — NOT waking @$name on the local daemon instead" >&2
+  exit 1; }
+if [ -n "$seat_daemon_url" ]; then
+  remote_cwd="$(sp_seat_remote_cwd "$state_dir" "$name")" || {
+    echo "[ocean.sh] .state/seat-remote-cwd.$name is present but unusable (symlink, empty, or not an absolute path) — NOT waking @$name" >&2
+    exit 1; }
+elif [ -e "$state_dir/seat-remote-cwd.$name" ] || [ -L "$state_dir/seat-remote-cwd.$name" ]; then
+  echo "[ocean.sh] .state/seat-remote-cwd.$name ignored: it only applies together with .state/seat-daemon-url.$name" >&2
+fi
+
 # Per-seat working directory override (opt-in). A build seat runs in its own
 # git worktree, not the pad's checkout — without this, a woken seat is rooted
 # at the pad dir and any file work lands in the wrong tree (or collides with
@@ -49,7 +69,9 @@ sp_model_pin_preflight "$state_dir" "$name" || exit 1
 # not merely reply. No file (every chat pad) = unchanged reply-oriented wake.
 seat_cwd=""
 _seat_cwd_file="$state_dir/seat-cwd.$name"
-if [ -f "$_seat_cwd_file" ] && [ ! -L "$_seat_cwd_file" ]; then
+if [ -n "$remote_cwd" ]; then
+  :   # a remote seat's cwd lives on the remote host; seat-cwd is not consulted
+elif [ -f "$_seat_cwd_file" ] && [ ! -L "$_seat_cwd_file" ]; then
   _sc="$(head -c 4096 "$_seat_cwd_file" 2>/dev/null | tr -d '[:space:]')"
   if [ -n "$_sc" ] && [ -d "$_sc" ]; then
     seat_cwd="$_sc"
@@ -58,11 +80,28 @@ if [ -f "$_seat_cwd_file" ] && [ ! -L "$_seat_cwd_file" ]; then
   fi
 fi
 wake_cwd="${seat_cwd:-$pad_dir}"
+[ -n "$remote_cwd" ] && wake_cwd="$remote_cwd"
 
 # Ocean-backed seats include Kimi, GLM, and DeepSeek. Build their wake through
 # the same canonical prompt path as Stop/Herdr/Pi rather than maintaining a
 # model-specific copy here.
-if [ -n "$seat_cwd" ]; then
+if [ -n "$remote_cwd" ]; then
+  prompt="$("$sp_bin" prompt-context <<EOF
+stitchpad: new @${name} mention — you are a REMOTE seat, working in ${remote_cwd} on another host.
+
+${msg}
+
+You are @${name}. You run on a remote Ocean daemon, NOT on the machine that
+hosts the pad: you CANNOT run the stitchpad/pasture CLI, cannot read the pad
+and cannot post to it, and no pad path mentioned above exists on your host.
+Your card (above) is your whole brief. Do the work in ${remote_cwd} and write
+your report to the exact path your card names — that file is your only channel
+back; it is pulled to the pad host and announced there for you. Start the
+report with a line STATUS: IN PROGRESS, and only when it is complete change it
+to STATUS: DONE and add a VERDICT: line.
+EOF
+)"
+elif [ -n "$seat_cwd" ]; then
   prompt="$("$sp_bin" prompt-context <<EOF
 stitchpad: new @${name} mention — you are a BUILD seat, working in ${seat_cwd}.
 
@@ -114,7 +153,7 @@ fi
 # Same three states here, same reason strings, and unknown NEVER wakes.
 # (The retry it defers into is itself bounded now — ds F5 / k3 F14 — so a daemon
 # that stays unreachable ends in an announced terminal state instead of a spin.)
-daemon_url="${OCEAN_DAEMON_URL:-http://127.0.0.1:4780}"
+daemon_url="${seat_daemon_url:-${OCEAN_DAEMON_URL:-http://127.0.0.1:4780}}"
 probe_session_state() {
   local body
   body="$(curl -sf --max-time 3 "$daemon_url/v1/agent/sessions/$session_id" 2>/dev/null)" \
@@ -154,6 +193,8 @@ seat_model="$(sp_model_pin_requested "$state_dir" "$name")"
 [ -z "$seat_model" ] && [ -n "${SP_MODEL:-}" ] && [ "${SP_MODEL}" != "-" ] && seat_model="$SP_MODEL"
 wake_args=(wake --session-id "$session_id" --cwd "$wake_cwd" --client-type stitchpad \
   --timeout-seconds 600 --prompt "$prompt")
+# --daemon-url is a GLOBAL ocean-heartbeat option: it must precede `wake`.
+[ -n "$seat_daemon_url" ] && wake_args=(--daemon-url "$seat_daemon_url" "${wake_args[@]}")
 [ -n "$seat_model" ] && wake_args+=(--model "$seat_model")
 [ -n "${SP_DELIVERY_ACK_FILE:-}" ] && wake_args+=(--no-wait)
 
