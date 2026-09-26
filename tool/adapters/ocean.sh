@@ -22,10 +22,23 @@ session_id="${SP_TARGET:-}"
 [ -n "$session_id" ] && [ "$session_id" != "-" ] || {
   echo "[ocean.sh] no session id in roster target for @$name" >&2; exit 1; }
 
-# Prefer an installed binary; fall back to the ocean-os release build.
+# Prefer an installed binary; fall back to known install roots.
+# The daemon does NOT inherit an interactive PATH, so `command -v` alone misses
+# ~/.local/bin and every ocean wake dies as a silent adapter exit 1. Search the
+# real install locations before giving up.
 bin="$(command -v ocean-heartbeat 2>/dev/null || true)"
-[ -z "$bin" ] && bin="$HOME/dev/ocean-os/target/release/ocean-heartbeat"
-[ -x "$bin" ] || { echo "[ocean.sh] ocean-heartbeat not found" >&2; exit 1; }
+if [ -z "$bin" ] || [ ! -x "$bin" ]; then
+  for _cand in \
+    "$HOME/.local/bin/ocean-heartbeat" \
+    "$HOME/dev/ocean/target/release/ocean-heartbeat" \
+    "$HOME/dev/ocean-os/target/release/ocean-heartbeat" \
+    /opt/homebrew/bin/ocean-heartbeat \
+    /usr/local/bin/ocean-heartbeat
+  do
+    [ -x "$_cand" ] && { bin="$_cand"; break; }
+  done
+fi
+[ -x "$bin" ] || { echo "[ocean.sh] ocean-heartbeat not found (PATH=$PATH)" >&2; exit 1; }
 
 pad_dir="$(cd "$(dirname "$pad")/.." && pwd)"
 msg="$(head -c 2000 "$taskfile" 2>/dev/null)"
