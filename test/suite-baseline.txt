@@ -18,7 +18,7 @@ clear-regression.sh 9 0
 color-bash32.sh 0 0
 command-dispatch-gate.sh 91 0
 commit-fail-postcondition-gate.sh 18 0
-concurrency-round5-regression.sh 8 0
+concurrency-round5-regression.sh 9 0
 coordination-lifecycle-slice-a.sh 7 0
 coordination-lifecycle-sliceB.sh 30 0
 coordination-safety.sh 208 0
@@ -120,3 +120,8 @@ seat-context-exhaustion.sh 9 0
 test-bridge-workspace-scope.sh 7 0
 watchdog-dead-pin.sh 5 0
 watchdog-task-matching.sh 7 0
+deleted-pad-claim-lockout-gate.sh 4 0
+mutant-harness-restores-the-tree-gate.sh 6 0
+recovery-exhaustion-quiet-gate.sh 8 0
+retarget-superseded-generation-gate.sh 5 0
+wake-preflight.sh 7 0

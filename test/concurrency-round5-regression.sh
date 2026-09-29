@@ -172,39 +172,65 @@ rm -rf "$F4_WORK"
 echo ""
 echo "--- F3: recovery-counter atomic increments ---"
 
+# a660c3d made the counter SATURATE at the bound (an exhausted key is a
+# verdict, not a tally), so a raw 40-way tally at the default max of 3 no longer
+# measures atomicity: the saturation check reads before it locks, and a burst
+# settles anywhere in [max, N]. F3a proves the locked read-modify-write loses
+# nothing with the bound above N; F3b proves the saturation holds at the default.
+f3_burst() {  # $1 = pad dir, $2 = max
+  local pads="$1" max="$2" i
+  pids=()
+  for i in $(seq 1 $N); do
+    (
+      export STITCHPAD_PAD_DIR="$pads" SP_RECOVERY_MAX_ATTEMPTS="$max"
+      source "$ROOT/tool/bin/recovery-policy.sh"
+      sp_recovery_attempt_record "$pads/.state" "test:race:key" >/dev/null 2>&1
+    ) &
+    pids+=($!)
+  done
+  for p in "${pids[@]}"; do wait "$p" 2>/dev/null || true; done
+}
+f3_count() {  # $1 = pad dir, $2 = max
+  (
+    export STITCHPAD_PAD_DIR="$1" SP_RECOVERY_MAX_ATTEMPTS="$2"
+    source "$ROOT/tool/bin/recovery-policy.sh"
+    sp_recovery_attempt_count "$1/.state" "test:race:key" 2>/dev/null || echo 0
+  )
+}
+
+N=40
 F3_WORK="$(mktemp -d "${TMPDIR:-/tmp}/sp-c5-f3.XXXXXX")"
 make_pad "$F3_WORK/pad/.stitchpad" "f3-pad"
 F3_PAD_DIR="$F3_WORK/pad/.stitchpad"
-
-N=40
-pids=()
-for i in $(seq 1 $N); do
-  (
-    export STITCHPAD_PAD_DIR="$F3_PAD_DIR"
-    source "$ROOT/tool/bin/recovery-policy.sh"
-    sp_recovery_attempt_record "$F3_PAD_DIR/.state" "test:race:key" >/dev/null 2>&1
-  ) &
-  pids+=($!)
-done
-for p in "${pids[@]}"; do wait "$p" 2>/dev/null || true; done
-
-shared_count="$(
-  export STITCHPAD_PAD_DIR="$F3_PAD_DIR"
-  source "$ROOT/tool/bin/recovery-policy.sh"
-  sp_recovery_attempt_count "$F3_PAD_DIR/.state" "test:race:key" 2>/dev/null || echo 0
-)"
-
-echo "  F3: N=$N concurrent increments on same key, final count=$shared_count (expected: $N)"
+f3_burst "$F3_PAD_DIR" 1000
+shared_count="$(f3_count "$F3_PAD_DIR" 1000)"
+echo "  F3a: N=$N concurrent increments, bound 1000, final count=$shared_count (expected: $N)"
 [ "$shared_count" = "$N" ] && \
-  ok "F3: zero lost updates (was 6/40 lost pre-fix)" \
-  || bad "F3: expected $N, got $shared_count (was 6/40 lost pre-fix)"
+  ok "F3a: zero lost updates below the bound (was 6/40 lost pre-fix)" \
+  || bad "F3a: expected $N, got $shared_count (was 6/40 lost pre-fix)"
 
 _stale_locks="$(find "$F3_PAD_DIR/.state/recovery-attempts" -name '.lock.*' 2>/dev/null | wc -l | tr -d ' ')"
 [ "$_stale_locks" = "0" ] && \
   ok "F3: no stale per-key locks left behind" \
   || bad "F3: $_stale_locks stale lock files remain"
-
 rm -rf "$F3_WORK"
+
+F3B_WORK="$(mktemp -d "${TMPDIR:-/tmp}/sp-c5-f3b.XXXXXX")"
+make_pad "$F3B_WORK/pad/.stitchpad" "f3b-pad"
+F3B_PAD_DIR="$F3B_WORK/pad/.stitchpad"
+f3_burst "$F3B_PAD_DIR" 3
+_sat_before="$(f3_count "$F3B_PAD_DIR" 3)"
+(
+  export STITCHPAD_PAD_DIR="$F3B_PAD_DIR" SP_RECOVERY_MAX_ATTEMPTS=3
+  source "$ROOT/tool/bin/recovery-policy.sh"
+  sp_recovery_attempt_record "$F3B_PAD_DIR/.state" "test:race:key" >/dev/null 2>&1
+)
+_sat_after="$(f3_count "$F3B_PAD_DIR" 3)"
+echo "  F3b: default bound 3: after the burst count=$_sat_before, after one more attempt=$_sat_after"
+[ "$_sat_before" -ge 3 ] 2>/dev/null && [ "$_sat_before" -le "$N" ] 2>/dev/null && [ "$_sat_after" = "$_sat_before" ] && \
+  ok "F3b: an exhausted key saturates (a verdict, not a tally)" \
+  || bad "F3b: expected a saturated count in [3, $N] that one more attempt leaves unchanged, got $_sat_before -> $_sat_after"
+rm -rf "$F3B_WORK"
 
 # ============================================================================
 # F2: proactive dead-holder reclaim (lock-level test)
